@@ -309,6 +309,50 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
         },
     )?;
 
+    // Three imports genuinely missing from this file's initial port of
+    // rs-plugkit's wasm_host.rs -- plugkit.wasm (the "gm" plugin) declares
+    // ALL THREE unconditionally at compile time, so a host missing even one
+    // fails `WebAssembly.instantiate`/wasmtime's linker.instantiate with a
+    // hard "unknown import" error, not a graceful per-call fallback.
+    // Live-witnessed this session: gm.wasm failed to instantiate at all
+    // under agentplug-runner's daemon until host_vec_search was added --
+    // the missing import broke EVERY dispatch, not just calls that would
+    // have used it. host_vec_search and host_task_proc are genuine
+    // not-yet-implemented stubs in the ORIGINAL gm-runner too (see that
+    // file's own `not_implemented` helper) -- porting the same shape here
+    // is not a regression, it matches upstream's real current capability.
+    linker.func_wrap(
+        "env",
+        "host_vec_search",
+        |mut caller: Caller<'_, HostState>, q_ptr: u32, q_len: u32, k: u32| -> u64 {
+            let _ = (q_ptr, q_len, k);
+            write_guest_json(&mut caller, serde_json::json!({"ok": false, "error": "not_implemented_agentplug_host"}))
+        },
+    )?;
+    linker.func_wrap(
+        "env",
+        "host_task_proc",
+        |mut caller: Caller<'_, HostState>, a_ptr: u32, a_len: u32, p_ptr: u32, p_len: u32| -> u64 {
+            let _ = (a_ptr, a_len, p_ptr, p_len);
+            write_guest_json(&mut caller, serde_json::json!({"ok": false, "error": "not_implemented_agentplug_host"}))
+        },
+    )?;
+    // Unlike the two stubs above, host_browser_exec IS fully implemented
+    // upstream (crate::browser::run, a real playwright/chromium automation
+    // module) -- agentplug-host doesn't have that module at all, so this is
+    // a genuine capability gap, not a parity stub. Declared so gm.wasm can
+    // still instantiate and every non-browser verb keeps working; a
+    // dispatch that actually needs the `browser` verb gets a real, typed
+    // failure here instead of the whole plugin refusing to load.
+    linker.func_wrap(
+        "env",
+        "host_browser_exec",
+        |mut caller: Caller<'_, HostState>, body_ptr: u32, body_len: u32, cwd_ptr: u32, cwd_len: u32, sid_ptr: u32, sid_len: u32| -> u64 {
+            let _ = (body_ptr, body_len, cwd_ptr, cwd_len, sid_ptr, sid_len);
+            write_guest_json(&mut caller, serde_json::json!({"ok": false, "error": "not_implemented_agentplug_host_no_browser_module"}))
+        },
+    )?;
+
     // The single new import over the existing gm-runner wasm_host.rs surface:
     // routes to another loaded plugin for the SAME project. Looks up the
     // sibling by name in the shared registry, calls its `plugin_call` export,
