@@ -61,6 +61,14 @@ pub fn register_wasi(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
 pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
     linker.func_wrap(
         "env",
+        "host_cwd",
+        |mut caller: Caller<'_, HostState>| -> u64 {
+            let cwd = caller.data().cwd.to_string_lossy().into_owned();
+            write_guest_bytes(&mut caller, cwd.as_bytes())
+        },
+    )?;
+    linker.func_wrap(
+        "env",
         "host_fs_read",
         |mut caller: Caller<'_, HostState>, path_ptr: u32, path_len: u32| -> u64 {
             let path = read_guest_string(&mut caller, path_ptr, path_len);
