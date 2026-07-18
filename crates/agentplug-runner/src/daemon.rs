@@ -221,6 +221,33 @@ pub fn try_dispatch_via_daemon(cwd: &Path, plugin: &str, verb: &str, body: &str)
 
 pub fn run_daemon() -> anyhow::Result<()> {
     eprintln!("[agentplug daemon] starting, registry {}", registry_path().display());
+
+    // Self-detect losing a spawn race: ensure_daemon_running()'s lock-then-spawn
+    // window has a real gap between removing daemon.lock and this process's
+    // own first heartbeat write below -- a second caller's is_daemon_fresh()
+    // check can land in that gap, see a stale/missing status file, and spawn
+    // its own competing daemon. Without this check, whichever of the two
+    // processes writes its heartbeat SECOND silently claims authority over
+    // the one already serving, and both keep running indefinitely (live-witnessed
+    // this session: two agentplug-runner.exe processes, equal memory, one with
+    // stale-but-real heartbeat history). If a DIFFERENT pid already holds a
+    // fresh heartbeat at this exact moment, this process lost the race --
+    // exit immediately rather than overwrite it and run alongside the winner.
+    if let Ok(raw) = fs::read_to_string(daemon_status_path()) {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
+            let existing_pid = v.get("pid").and_then(|p| p.as_u64());
+            let ts = v.get("ts").and_then(|t| t.as_u64()).unwrap_or(0);
+            let fresh = now_ms().saturating_sub(ts) < DAEMON_STALE_MS;
+            if fresh && existing_pid.is_some() && existing_pid != Some(std::process::id() as u64) {
+                eprintln!(
+                    "[agentplug daemon] lost spawn race -- pid {:?} already holds a fresh heartbeat, exiting",
+                    existing_pid
+                );
+                return Ok(());
+            }
+        }
+    }
+
     let mut plugin_modules = PluginModules::new()?;
     write_daemon_heartbeat(0, 0);
 
@@ -233,6 +260,26 @@ pub fn run_daemon() -> anyhow::Result<()> {
     loop {
         if last_heartbeat.elapsed() >= HEARTBEAT_INTERVAL {
             last_heartbeat = Instant::now();
+            // Closes the residual TOCTOU window the startup check above
+            // can't fully cover (two processes racing the exact same
+            // microsecond-scale check-then-write): re-check every heartbeat
+            // tick too, so a true double-spawn self-corrects within one
+            // HEARTBEAT_INTERVAL instead of running both daemons forever.
+            let lost_race = fs::read_to_string(daemon_status_path())
+                .ok()
+                .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+                .map(|v| {
+                    let other_pid = v.get("pid").and_then(|p| p.as_u64());
+                    let ts = v.get("ts").and_then(|t| t.as_u64()).unwrap_or(0);
+                    now_ms().saturating_sub(ts) < DAEMON_STALE_MS
+                        && other_pid.is_some()
+                        && other_pid != Some(std::process::id() as u64)
+                })
+                .unwrap_or(false);
+            if lost_race {
+                eprintln!("[agentplug daemon] another daemon claimed heartbeat authority -- exiting");
+                return Ok(());
+            }
             write_daemon_heartbeat(projects.len(), plugin_modules.modules.len());
         }
 
