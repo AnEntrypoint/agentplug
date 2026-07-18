@@ -28,7 +28,7 @@ fn write_guest_bytes(caller: &mut Caller<'_, HostState>, bytes: &[u8]) -> u64 {
     }
     let instance = caller
         .data()
-        .instance
+        .self_instance
         .lock()
         .unwrap()
         .expect("instance not yet bound to host state");
@@ -389,45 +389,28 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
                     serde_json::json!({"ok": false, "error": "unknown_plugin", "plugin": plugin}),
                 );
             };
-            let sibling_instance = { *sibling_cell.lock().unwrap() };
-            let Some(sibling_instance) = sibling_instance else {
-                return write_guest_json(
-                    &mut caller,
-                    serde_json::json!({"ok": false, "error": "plugin_not_loaded_yet", "plugin": plugin}),
-                );
+
+            // Drive the call through the SIBLING's own Store, never `caller`
+            // (the CALLING plugin's Store) -- wasmtime::Instance methods
+            // require a StoreContextMut matching the store the Instance was
+            // instantiated in. Reusing `caller` here previously panicked
+            // ("object used with the wrong store", wasmtime-46
+            // store/data.rs:213) the first time gm.wasm's recall path called
+            // into bert via host_plugin_call.
+            let mut guard = sibling_cell.lock().unwrap();
+            let result = match guard.as_mut() {
+                None => Err(anyhow::anyhow!("plugin_not_loaded_yet")),
+                Some(handle) => crate::registry::dispatch_on(&mut handle.store, handle.instance, &verb, &body),
             };
-
-            let result = (|| -> anyhow::Result<String> {
-                let alloc = sibling_instance.get_typed_func::<u32, u32>(&mut caller, "plugkit_alloc")?;
-                let memory = sibling_instance
-                    .get_memory(&mut caller, "memory")
-                    .ok_or_else(|| anyhow::anyhow!("plugin {plugin} has no exported memory"))?;
-
-                let verb_ptr = alloc.call(&mut caller, verb.len() as u32)?;
-                memory.write(&mut caller, verb_ptr as usize, verb.as_bytes())?;
-                let body_ptr = alloc.call(&mut caller, body.len() as u32)?;
-                memory.write(&mut caller, body_ptr as usize, body.as_bytes())?;
-
-                let plugin_call =
-                    sibling_instance.get_typed_func::<(u32, u32, u32, u32), u64>(&mut caller, "plugin_call")?;
-                let packed = plugin_call.call(&mut caller, (verb_ptr, verb.len() as u32, body_ptr, body.len() as u32))?;
-
-                let ptr = (packed & 0xffff_ffff) as u32;
-                let len = (packed >> 32) as u32;
-                if ptr == 0 || len == 0 {
-                    return Ok(String::new());
-                }
-                let mut buf = vec![0u8; len as usize];
-                memory.read(&mut caller, ptr as usize, &mut buf)?;
-                if let Ok(free) = sibling_instance.get_typed_func::<(u32, u32), ()>(&mut caller, "plugkit_free") {
-                    let _ = free.call(&mut caller, (ptr, len));
-                }
-                Ok(String::from_utf8_lossy(&buf).into_owned())
-            })();
+            drop(guard);
 
             match result {
                 Ok(s) if !s.is_empty() => write_guest_bytes(&mut caller, s.as_bytes()),
                 Ok(_) => write_guest_json(&mut caller, serde_json::json!({"ok": true})),
+                Err(e) if e.to_string() == "plugin_not_loaded_yet" => write_guest_json(
+                    &mut caller,
+                    serde_json::json!({"ok": false, "error": "plugin_not_loaded_yet", "plugin": plugin}),
+                ),
                 Err(e) => write_guest_json(&mut caller, serde_json::json!({"ok": false, "error": e.to_string(), "plugin": plugin})),
             }
         },
@@ -440,38 +423,23 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
             let text = read_guest_string(&mut caller, text_ptr, text_len);
             let body = serde_json::json!({"text": text}).to_string();
 
+            // Same fix as host_plugin_call: drive bert's own Store, never
+            // `caller` (this plugin's Store) -- see SiblingHandle's doc
+            // comment for the wasmtime cross-store panic this replaced.
             let sibling_cell = { caller.data().siblings.lock().unwrap().get("bert").cloned() };
-            let Some(Some(sibling_instance)) = sibling_cell.map(|c| *c.lock().unwrap()) else {
+            let Some(sibling_cell) = sibling_cell else {
                 return -1;
             };
-
-            let result = (|| -> anyhow::Result<Vec<f32>> {
-                let alloc = sibling_instance.get_typed_func::<u32, u32>(&mut caller, "plugkit_alloc")?;
-                let memory = sibling_instance
-                    .get_memory(&mut caller, "memory")
-                    .ok_or_else(|| anyhow::anyhow!("bert plugin has no exported memory"))?;
-                let verb = "embed";
-                let verb_ptr = alloc.call(&mut caller, verb.len() as u32)?;
-                memory.write(&mut caller, verb_ptr as usize, verb.as_bytes())?;
-                let body_ptr = alloc.call(&mut caller, body.len() as u32)?;
-                memory.write(&mut caller, body_ptr as usize, body.as_bytes())?;
-                let plugin_call =
-                    sibling_instance.get_typed_func::<(u32, u32, u32, u32), u64>(&mut caller, "plugin_call")?;
-                let packed = plugin_call.call(&mut caller, (verb_ptr, verb.len() as u32, body_ptr, body.len() as u32))?;
-                let ptr = (packed & 0xffff_ffff) as u32;
-                let len = (packed >> 32) as u32;
-                if ptr == 0 || len == 0 {
-                    anyhow::bail!("empty response from bert plugin");
-                }
-                let mut buf = vec![0u8; len as usize];
-                memory.read(&mut caller, ptr as usize, &mut buf)?;
-                if let Ok(free) = sibling_instance.get_typed_func::<(u32, u32), ()>(&mut caller, "plugkit_free") {
-                    let _ = free.call(&mut caller, (ptr, len));
-                }
-                let v: serde_json::Value = serde_json::from_slice(&buf)?;
-                let arr = v.get("embedding").and_then(|e| e.as_array()).ok_or_else(|| anyhow::anyhow!("no embedding field"))?;
-                Ok(arr.iter().filter_map(|x| x.as_f64()).map(|x| x as f32).collect())
-            })();
+            let mut guard = sibling_cell.lock().unwrap();
+            let result = match guard.as_mut() {
+                None => Err(anyhow::anyhow!("bert not loaded yet")),
+                Some(handle) => crate::registry::dispatch_on(&mut handle.store, handle.instance, "embed", &body).and_then(|resp| {
+                    let v: serde_json::Value = serde_json::from_str(&resp)?;
+                    let arr = v.get("embedding").and_then(|e| e.as_array()).ok_or_else(|| anyhow::anyhow!("no embedding field"))?;
+                    Ok::<Vec<f32>, anyhow::Error>(arr.iter().filter_map(|x| x.as_f64()).map(|x| x as f32).collect())
+                }),
+            };
+            drop(guard);
 
             match result {
                 Ok(values) => {
