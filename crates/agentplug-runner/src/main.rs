@@ -34,7 +34,17 @@ fn main() -> anyhow::Result<()> {
             let spool_dir = cwd.join(".gm").join("exec-spool");
             std::fs::create_dir_all(&spool_dir)?;
 
-            download::ensure_plugin_installed("gm", None)?;
+            // No eager gm.wasm download here -- that used to block this
+            // entire invocation for minutes on a cold cache (gm.wasm is a
+            // real ~137MB artifact), violating the gm skill's own
+            // documented "spool is fire-and-forget, does not wait"
+            // contract, live-witnessed this session as a 20s+ hang on a
+            // command that should return near-instantly. The daemon's own
+            // loop (daemon.rs::PluginModules::get_or_compile) already
+            // downloads "gm" lazily on first real dispatch need for a
+            // registered project, the exact same lazy pattern already
+            // proven correct for libsql/bert/treesitter -- register and
+            // hand off, don't block on it here too.
             daemon::register_project(&cwd)?;
             if daemon::ensure_daemon_running()? {
                 eprintln!(
