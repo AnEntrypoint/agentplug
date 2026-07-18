@@ -12,17 +12,37 @@ pub const PLUGIN_IDLE_EVICT_MS: u64 = 30 * 60 * 1000;
 
 /// Plugins with no per-project state (pure function of input -> output,
 /// nothing keyed by project root) get ONE process-wide instance shared by
-/// every project instead of one instantiation per project. "bert" is the
-/// motivating case: its ~133MB embedding model is `include_bytes!`'d into
-/// the wasm module and deserialized into live tensors on first `embed` call
-/// (candle's VarBuilder::from_slice_safetensors) -- with N concurrently
-/// active projects, the old per-project instantiation held N separate
-/// deserialized copies resident at once (live-witnessed: 2 active projects,
-/// ~2.3GB daemon RSS vs the ~500MB expected for one gm.wasm instance).
-/// "gm" (per-project phase/PRD/mutable state) and "libsql" (per-project open
-/// DB connections) are NOT stateless and must keep one instance per project.
+/// every project instead of one instantiation per project.
+///
+/// "bert": ~133MB embedding model `include_bytes!`'d into the wasm module,
+/// deserialized into live tensors on first `embed` call (candle's
+/// VarBuilder::from_slice_safetensors) -- with N concurrently active
+/// projects, per-project instantiation held N separate deserialized copies
+/// resident at once (live-witnessed: 2 active projects, 2.3GB daemon RSS
+/// before this fix vs 937MB after).
+///
+/// "treesitter": confirmed zero static/OnceLock/Mutex state in its source
+/// (grep across agentplug-treesitter/src/*.rs) -- a pure parse function,
+/// genuinely stateless already.
+///
+/// "libsql": DBS/PREPARED maps are keyed by the caller-supplied db `name`
+/// string, not by project, and `open(name, path)` takes an explicit absolute
+/// `path` argument the CALLER resolves (never reads HostState.cwd internally)
+/// -- two projects opening different db files under different names/paths
+/// share one instance safely with zero cross-project collision, same as any
+/// ordinary connection-pool keyed by a unique identifier.
+///
+/// "gm" is the sole holdout: gm.wasm's own orchestrator/mod.rs bakes its
+/// project root into a wasm-side `PROJECT_ROOT: OnceLock<PathBuf>`, resolved
+/// once via a `git rev-parse` subprocess on first `gm_dir()` call and cached
+/// for that instance's lifetime -- sharing one gm instance across two
+/// project roots today would silently misdirect the second project's work
+/// onto the first project's `.gm/` directory. Fixed separately by adding a
+/// `host_cwd` import so gm.wasm asks the host for the CURRENT call's project
+/// root instead of caching a git-subprocess result (rs-plugkit source
+/// change, tracked in its own PRD row).
 fn is_stateless_shared_plugin(plugin_name: &str) -> bool {
-    plugin_name == "bert"
+    matches!(plugin_name, "bert" | "treesitter" | "libsql")
 }
 
 type SharedPluginMap = Mutex<HashMap<String, Arc<Mutex<Option<SiblingHandle>>>>>;
