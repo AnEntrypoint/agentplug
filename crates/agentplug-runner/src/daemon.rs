@@ -251,7 +251,26 @@ pub fn run_daemon() -> anyhow::Result<()> {
             let requested_plugins = {
                 let mut list = read_project_plugin_list(root);
                 if list.is_empty() {
+                    // Default (no .agentplug/plugins.txt): "gm" plus its
+                    // own real runtime dependencies, not "gm" alone. gm.wasm
+                    // itself calls host_plugin_call("libsql"/"bert"/
+                    // "treesitter", ...) unconditionally from inside its own
+                    // recall/memorize/codesearch/embed code paths -- those
+                    // are load-bearing for gm specifically, not an optional
+                    // capability a project opts into. Loading only "gm" left
+                    // every one of those calls hitting the sibling map's
+                    // "plugin_not_loaded_yet" branch, live-witnessed this
+                    // session as codesearch's vector search silently
+                    // failing "invalid query embedding" (embed_query got a
+                    // null embedding back, not a real one) even though bert
+                    // itself worked perfectly when dispatched directly.
+                    // A project WITH its own .agentplug/plugins.txt (a
+                    // future non-gm plugin consumer) still controls its own
+                    // list explicitly and is unaffected by this default.
                     list.push("gm".to_string());
+                    list.push("libsql".to_string());
+                    list.push("bert".to_string());
+                    list.push("treesitter".to_string());
                 }
                 list
             };
