@@ -57,19 +57,59 @@ impl HostState {
         let mut builder = WasiCtxBuilder::new();
         builder.inherit_stderr();
         // Preopened at whichever project instantiates this Store FIRST --
-        // fixed for the Store's lifetime, unlike `cwd` below. Safe only
-        // because every plugin this host currently serves (gm/bert/
-        // treesitter/libsql) does its real file I/O through the host_fs_*
-        // imports (which consult the mutable `cwd` field fresh per call),
-        // never raw WASI filesystem syscalls -- if a future plugin needs
-        // real WASI fs access while also being in the shared-instance set,
-        // this preopen would need the same per-call-refresh treatment.
+        // fixed for the Store's lifetime, unlike `cwd` below. Safe for
+        // gm/bert/treesitter because all three do their real file I/O
+        // through the host_fs_* imports (which consult the mutable `cwd`
+        // field fresh per call), never raw WASI filesystem syscalls.
+        //
+        // "libsql" is the one exception, handled by the caller via
+        // `new_with_fs_roots` below instead of this constructor: it's built
+        // with libsql-ffi's `wasm32-wasi-vfs` feature, so sqlite3_open_v2
+        // resolves paths through REAL WASI path_open syscalls against
+        // whatever got preopened here -- a single project-cwd preopen fixed
+        // at first instantiation would silently misdirect every OTHER
+        // project's absolute db path once libsql became a shared instance
+        // (rc=14 "unable to open database file": the absolute path is
+        // correct, but WASI has nothing preopened that covers it).
         if let Err(e) = builder.preopened_dir(&cwd, ".", DirPerms::all(), FilePerms::all()) {
             eprintln!(
                 "[agentplug] WARNING: failed to preopen {} for WASI ({}): {e}",
                 cwd.display(),
                 plugin_name
             );
+        }
+        let wasi = builder.build_p1();
+        Self { cwd: Mutex::new(cwd), plugin_name, self_instance: Arc::new(Mutex::new(None)), siblings, wasi }
+    }
+
+    /// Same as `new`, but preopens the whole host filesystem root as WASI
+    /// guest path "/" instead of a single project's cwd as ".". Required for
+    /// a shared plugin instance (currently only "libsql") whose wasm module
+    /// performs real WASI filesystem syscalls (libsql-ffi's
+    /// `wasm32-wasi-vfs` feature routes sqlite3_open_v2 through actual
+    /// wasi-libc path_open calls) against a path supplied fresh per call --
+    /// wasi-libc's path resolution (`__wasilibc_find_relpath`) works by
+    /// POSIX-`/`-prefix-matching the requested path against registered
+    /// preopen guest paths, then opening the remainder relative to that
+    /// preopen's fd; it has no concept of a Windows drive letter and a
+    /// single project-cwd preopen fixed at first instantiation would
+    /// silently misdirect every OTHER project's db path once libsql became
+    /// shared (rc=14 CANTOPEN: WASI has nothing preopened whose guest-path
+    /// prefix matches). Preopening the real filesystem root as guest "/"
+    /// once, combined with the caller passing WASI-guest-relative POSIX
+    /// paths (see `posix_guest_path` in registry.rs), covers every project
+    /// without per-call preopen churn (which wasmtime-wasi does not support
+    /// post-instantiation anyway).
+    pub fn new_with_fs_root(
+        cwd: PathBuf,
+        plugin_name: String,
+        siblings: Arc<Mutex<HashMap<String, Arc<Mutex<Option<SiblingHandle>>>>>>,
+        fs_root: &std::path::Path,
+    ) -> Self {
+        let mut builder = WasiCtxBuilder::new();
+        builder.inherit_stderr();
+        if let Err(e) = builder.preopened_dir(fs_root, "/", DirPerms::all(), FilePerms::all()) {
+            eprintln!("[agentplug] WARNING: failed to preopen fs root {} for WASI ({}): {e}", fs_root.display(), plugin_name);
         }
         let wasi = builder.build_p1();
         Self { cwd: Mutex::new(cwd), plugin_name, self_instance: Arc::new(Mutex::new(None)), siblings, wasi }

@@ -30,7 +30,14 @@ pub const PLUGIN_IDLE_EVICT_MS: u64 = 30 * 60 * 1000;
 /// `path` argument the CALLER resolves (never reads HostState.cwd internally)
 /// -- two projects opening different db files under different names/paths
 /// share one instance safely with zero cross-project collision, same as any
-/// ordinary connection-pool keyed by a unique identifier.
+/// ordinary connection-pool keyed by a unique identifier. Its Store is
+/// instantiated via `HostState::new_with_fs_root` (not the plain `new` every
+/// other shared plugin uses) -- libsql-ffi's `wasm32-wasi-vfs` feature makes
+/// sqlite3_open_v2 issue REAL WASI path_open syscalls, so unlike bert/
+/// treesitter/gm (which only ever touch files through the host_fs_* imports
+/// that consult HostState.cwd fresh per call) a single project-cwd preopen
+/// fixed at first instantiation would silently CANTOPEN every other
+/// project's absolute db path. See that constructor's doc comment.
 ///
 /// "gm": previously the sole holdout -- gm.wasm's own orchestrator/mod.rs
 /// used to bake its project root into a wasm-side `PROJECT_ROOT:
@@ -115,6 +122,28 @@ pub fn dispatch_on(store: &mut Store<HostState>, instance: wasmtime::Instance, v
     Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
+/// Host filesystem root covering every project this host can ever preopen
+/// for a shared plugin doing real WASI filesystem syscalls (see
+/// HostState::new_with_fs_root's doc comment). All projects driven by this
+/// host live under a single drive in practice (Windows: the drive letter of
+/// `std::env::current_dir()`, e.g. `C:\`; Unix: `/`), so preopening that one
+/// root as WASI guest path "/" covers every caller's absolute db path.
+fn host_fs_root() -> PathBuf {
+    #[cfg(windows)]
+    {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("C:\\"));
+        let mut root = cwd.components().next().map(|c| PathBuf::from(c.as_os_str())).unwrap_or_else(|| PathBuf::from("C:\\"));
+        if !root.to_string_lossy().ends_with('\\') {
+            root = PathBuf::from(format!("{}\\", root.to_string_lossy()));
+        }
+        root
+    }
+    #[cfg(not(windows))]
+    {
+        PathBuf::from("/")
+    }
+}
+
 fn instantiate_plugin(
     engine: &Engine,
     root: PathBuf,
@@ -126,7 +155,11 @@ fn instantiate_plugin(
     register_wasi(&mut linker)?;
     register_env_imports(&mut linker)?;
 
-    let host_state = HostState::new(root, plugin_name.to_string(), siblings);
+    let host_state = if plugin_name == "libsql" {
+        HostState::new_with_fs_root(root, plugin_name.to_string(), siblings, &host_fs_root())
+    } else {
+        HostState::new(root, plugin_name.to_string(), siblings)
+    };
     let self_instance_cell = host_state.self_instance.clone();
     let mut store = Store::new(engine, host_state);
     let instance = linker.instantiate(&mut store, module)?;
