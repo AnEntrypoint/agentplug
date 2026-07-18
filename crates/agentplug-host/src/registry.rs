@@ -32,17 +32,24 @@ pub const PLUGIN_IDLE_EVICT_MS: u64 = 30 * 60 * 1000;
 /// share one instance safely with zero cross-project collision, same as any
 /// ordinary connection-pool keyed by a unique identifier.
 ///
-/// "gm" is the sole holdout: gm.wasm's own orchestrator/mod.rs bakes its
-/// project root into a wasm-side `PROJECT_ROOT: OnceLock<PathBuf>`, resolved
-/// once via a `git rev-parse` subprocess on first `gm_dir()` call and cached
-/// for that instance's lifetime -- sharing one gm instance across two
-/// project roots today would silently misdirect the second project's work
-/// onto the first project's `.gm/` directory. Fixed separately by adding a
-/// `host_cwd` import so gm.wasm asks the host for the CURRENT call's project
-/// root instead of caching a git-subprocess result (rs-plugkit source
-/// change, tracked in its own PRD row).
+/// "gm": previously the sole holdout -- gm.wasm's own orchestrator/mod.rs
+/// used to bake its project root into a wasm-side `PROJECT_ROOT:
+/// OnceLock<PathBuf>`, resolved once via a `git rev-parse` subprocess on
+/// first `gm_dir()` call and cached for that instance's lifetime, which
+/// would have silently misdirected a second project's work onto the first
+/// project's `.gm/` directory if shared. Fixed in rs-plugkit (commit
+/// a0ddeb6): `gm_dir()` now calls `resolve_project_root_with_retry()` fresh
+/// on every invocation instead of caching, routed through the new
+/// `host_cwd` import this host now exposes (see imports.rs) -- correct
+/// per-call regardless of which project's dispatch is currently running.
+/// libsql's own db-path caller-side threading (rs-plugkit commit 30562b1)
+/// was the second half of this same fix: gm.wasm's internal libsql calls
+/// now forward a real absolute path derived from host_cwd on every call
+/// instead of a bare project-ambiguous name, since libsql itself is now
+/// ALSO a shared, per-call-stateless instance (see "libsql" above and
+/// agentplug-libsql's own db.rs).
 fn is_stateless_shared_plugin(plugin_name: &str) -> bool {
-    matches!(plugin_name, "bert" | "treesitter" | "libsql")
+    matches!(plugin_name, "bert" | "treesitter" | "libsql" | "gm")
 }
 
 type SharedPluginMap = Mutex<HashMap<String, Arc<Mutex<Option<SiblingHandle>>>>>;
@@ -65,7 +72,15 @@ fn shared_plugin_cell(plugin_name: &str) -> Arc<Mutex<Option<SiblingHandle>>> {
 /// produced wasmtime's "object used with the wrong store" panic
 /// (store/data.rs:213) the first time host_plugin_call tried to drive a
 /// sibling Instance using the calling plugin's Caller.
-pub fn dispatch_on(store: &mut Store<HostState>, instance: wasmtime::Instance, verb: &str, body: &str) -> anyhow::Result<String> {
+pub fn dispatch_on(store: &mut Store<HostState>, instance: wasmtime::Instance, verb: &str, body: &str, caller_root: &Path) -> anyhow::Result<String> {
+    // A shared instance (see is_stateless_shared_plugin) reuses the same
+    // HostState across every project's dispatch -- refresh cwd to the
+    // CALLING project's root immediately before every dispatch so
+    // host_cwd/host_fs_*/host_kv_* all resolve against the right project,
+    // never whichever project happened to instantiate this Store first.
+    // Cheap and correct for a per-project (non-shared) instance too, since
+    // caller_root is always that instance's own root in that case.
+    store.data().set_cwd(caller_root.to_path_buf());
     let plugin_name = store.data().plugin_name.clone();
     let alloc = instance.get_typed_func::<u32, u32>(&mut *store, "plugkit_alloc")?;
     let memory = instance.get_memory(&mut *store, "memory").ok_or_else(|| anyhow::anyhow!("plugin {plugin_name} has no exported memory"))?;
@@ -148,12 +163,13 @@ impl ProjectPlugins {
     /// Stateless plugins (see `is_stateless_shared_plugin`) get ONE process-wide
     /// instance reused by every project instead of one instantiation per
     /// project -- this project's siblings map just points at the same shared
-    /// cell everyone else uses. Stateful plugins ("gm": bakes its project
-    /// root into a wasm-side OnceLock on first dispatch, cannot be shared
-    /// across two different project roots without silently operating on the
-    /// wrong project; "libsql": holds real open DB connections keyed by
-    /// project) keep the original expensive-compile/cheap-instantiate-per-project
-    /// split rs-plugkit's gm-runner daemon.rs already established.
+    /// cell everyone else uses. `dispatch`/`dispatch_on` refresh the shared
+    /// Store's HostState.cwd to the calling project's root before every
+    /// call, so a shared instance still resolves files/db paths/git ops
+    /// against the RIGHT project even though the Store itself is reused.
+    /// Any future plugin that is NOT safely shareable this way keeps the
+    /// original expensive-compile/cheap-instantiate-per-project split
+    /// rs-plugkit's gm-runner daemon.rs already established.
     pub fn load_plugin(&mut self, engine: &Engine, plugin_name: &str, module: &Module) -> anyhow::Result<()> {
         if is_stateless_shared_plugin(plugin_name) {
             let cell = shared_plugin_cell(plugin_name);
@@ -182,7 +198,7 @@ impl ProjectPlugins {
         let cell = self.siblings.lock().unwrap().get(plugin_name).cloned().ok_or_else(|| anyhow::anyhow!("plugin {plugin_name} not loaded"))?;
         let mut guard = cell.lock().unwrap();
         let handle = guard.as_mut().ok_or_else(|| anyhow::anyhow!("plugin {plugin_name} not loaded"))?;
-        dispatch_on(&mut handle.store, handle.instance, verb, body)
+        dispatch_on(&mut handle.store, handle.instance, verb, body, &self.root)
     }
 }
 

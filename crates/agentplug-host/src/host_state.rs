@@ -27,7 +27,17 @@ pub struct SiblingHandle {
 /// Each entry owns its OWN Store (see SiblingHandle) so cross-plugin calls
 /// never reuse the calling plugin's Store.
 pub struct HostState {
-    pub cwd: PathBuf,
+    // Mutex, not a plain PathBuf: a SHARED plugin instance (see
+    // is_stateless_shared_plugin) reuses this same HostState across every
+    // project's dispatch -- registry.rs's dispatch_on updates this field to
+    // the CALLING project's root immediately before every call through a
+    // shared instance, so host_cwd (and every host_fs_*/kv import that reads
+    // it) always reflects the current dispatch's real project, never
+    // whichever project happened to instantiate this Store first. A
+    // per-project (non-shared) instance's cwd is set once and never
+    // changes, which is still correct since it's never reused across
+    // projects.
+    pub cwd: Mutex<PathBuf>,
     pub plugin_name: String,
     // Own-plugin Instance handle -- safe to call with THIS HostState's own
     // Caller/Store (that's what `caller` already IS inside an import
@@ -46,6 +56,14 @@ impl HostState {
     ) -> Self {
         let mut builder = WasiCtxBuilder::new();
         builder.inherit_stderr();
+        // Preopened at whichever project instantiates this Store FIRST --
+        // fixed for the Store's lifetime, unlike `cwd` below. Safe only
+        // because every plugin this host currently serves (gm/bert/
+        // treesitter/libsql) does its real file I/O through the host_fs_*
+        // imports (which consult the mutable `cwd` field fresh per call),
+        // never raw WASI filesystem syscalls -- if a future plugin needs
+        // real WASI fs access while also being in the shared-instance set,
+        // this preopen would need the same per-call-refresh treatment.
         if let Err(e) = builder.preopened_dir(&cwd, ".", DirPerms::all(), FilePerms::all()) {
             eprintln!(
                 "[agentplug] WARNING: failed to preopen {} for WASI ({}): {e}",
@@ -54,6 +72,14 @@ impl HostState {
             );
         }
         let wasi = builder.build_p1();
-        Self { cwd, plugin_name, self_instance: Arc::new(Mutex::new(None)), siblings, wasi }
+        Self { cwd: Mutex::new(cwd), plugin_name, self_instance: Arc::new(Mutex::new(None)), siblings, wasi }
+    }
+
+    pub fn set_cwd(&self, cwd: PathBuf) {
+        *self.cwd.lock().unwrap() = cwd;
+    }
+
+    pub fn cwd(&self) -> PathBuf {
+        self.cwd.lock().unwrap().clone()
     }
 }

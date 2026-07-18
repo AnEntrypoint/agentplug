@@ -63,7 +63,7 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
         "env",
         "host_cwd",
         |mut caller: Caller<'_, HostState>| -> u64 {
-            let cwd = caller.data().cwd.to_string_lossy().into_owned();
+            let cwd = caller.data().cwd().to_string_lossy().into_owned();
             write_guest_bytes(&mut caller, cwd.as_bytes())
         },
     )?;
@@ -72,7 +72,7 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
         "host_fs_read",
         |mut caller: Caller<'_, HostState>, path_ptr: u32, path_len: u32| -> u64 {
             let path = read_guest_string(&mut caller, path_ptr, path_len);
-            let full = caller.data().cwd.join(&path);
+            let full = caller.data().cwd().join(&path);
             match fs::read_to_string(&full) {
                 Ok(content) => write_guest_bytes(&mut caller, content.as_bytes()),
                 Err(_) => 0,
@@ -86,7 +86,7 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
         |mut caller: Caller<'_, HostState>, path_ptr: u32, path_len: u32, data_ptr: u32, data_len: u32| -> u32 {
             let path = read_guest_string(&mut caller, path_ptr, path_len);
             let data = read_guest_string(&mut caller, data_ptr, data_len);
-            let full = caller.data().cwd.join(&path);
+            let full = caller.data().cwd().join(&path);
             if let Some(parent) = full.parent() {
                 let _ = fs::create_dir_all(parent);
             }
@@ -102,7 +102,7 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
         "host_fs_remove",
         |mut caller: Caller<'_, HostState>, path_ptr: u32, path_len: u32| -> u32 {
             let path = read_guest_string(&mut caller, path_ptr, path_len);
-            let full = caller.data().cwd.join(&path);
+            let full = caller.data().cwd().join(&path);
             match fs::metadata(&full) {
                 Ok(md) if md.is_dir() => 0,
                 Ok(_) => match fs::remove_file(&full) {
@@ -119,7 +119,7 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
         "host_fs_readdir",
         |mut caller: Caller<'_, HostState>, path_ptr: u32, path_len: u32| -> u64 {
             let path = read_guest_string(&mut caller, path_ptr, path_len);
-            let full = caller.data().cwd.join(&path);
+            let full = caller.data().cwd().join(&path);
             let entries: Vec<String> = fs::read_dir(&full)
                 .map(|rd| rd.filter_map(|e| e.ok()).map(|e| e.file_name().to_string_lossy().into_owned()).collect())
                 .unwrap_or_default();
@@ -132,7 +132,7 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
         "host_fs_stat",
         |mut caller: Caller<'_, HostState>, path_ptr: u32, path_len: u32| -> u64 {
             let path = read_guest_string(&mut caller, path_ptr, path_len);
-            let full = caller.data().cwd.join(&path);
+            let full = caller.data().cwd().join(&path);
             match fs::metadata(&full) {
                 Ok(md) => {
                     let v = serde_json::json!({"isDirectory": md.is_dir(), "isFile": md.is_file(), "size": md.len()});
@@ -237,7 +237,7 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
             if ns.is_empty() || key.is_empty() {
                 return 0;
             }
-            let path = kv_file_path(&caller.data().cwd, &ns, &key);
+            let path = kv_file_path(&caller.data().cwd(), &ns, &key);
             match fs::read_to_string(&path) {
                 Ok(content) => write_guest_bytes(&mut caller, content.as_bytes()),
                 Err(_) => 0,
@@ -254,7 +254,7 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
             if ns.is_empty() || key.is_empty() {
                 return 0;
             }
-            let path = kv_file_path(&caller.data().cwd, &ns, &key);
+            let path = kv_file_path(&caller.data().cwd(), &ns, &key);
             if let Some(parent) = path.parent() {
                 let _ = fs::create_dir_all(parent);
             }
@@ -273,7 +273,7 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
             if ns.is_empty() || key.is_empty() {
                 return 0;
             }
-            let path = kv_file_path(&caller.data().cwd, &ns, &key);
+            let path = kv_file_path(&caller.data().cwd(), &ns, &key);
             match fs::remove_file(&path) {
                 Ok(()) => 1,
                 Err(_) => 0,
@@ -289,7 +289,7 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
             if ns.is_empty() {
                 return 0;
             }
-            let dir = kv_namespace_dir(&caller.data().cwd, &ns);
+            let dir = kv_namespace_dir(&caller.data().cwd(), &ns);
             let mut results = Vec::new();
             if let Ok(entries) = fs::read_dir(&dir) {
                 for entry in entries.flatten() {
@@ -319,7 +319,7 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
             } else {
                 serde_json::from_str(&opts_str).unwrap_or(serde_json::json!({}))
             };
-            let cwd = caller.data().cwd.clone();
+            let cwd = caller.data().cwd();
             let result = crate::exec_js::run(&code, &opts, &cwd);
             write_guest_json(&mut caller, result)
         },
@@ -405,10 +405,11 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
             // ("object used with the wrong store", wasmtime-46
             // store/data.rs:213) the first time gm.wasm's recall path called
             // into bert via host_plugin_call.
+            let caller_root = caller.data().cwd();
             let mut guard = sibling_cell.lock().unwrap();
             let result = match guard.as_mut() {
                 None => Err(anyhow::anyhow!("plugin_not_loaded_yet")),
-                Some(handle) => crate::registry::dispatch_on(&mut handle.store, handle.instance, &verb, &body),
+                Some(handle) => crate::registry::dispatch_on(&mut handle.store, handle.instance, &verb, &body, &caller_root),
             };
             drop(guard);
 
@@ -438,10 +439,11 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
             let Some(sibling_cell) = sibling_cell else {
                 return -1;
             };
+            let caller_root = caller.data().cwd();
             let mut guard = sibling_cell.lock().unwrap();
             let result = match guard.as_mut() {
                 None => Err(anyhow::anyhow!("bert not loaded yet")),
-                Some(handle) => crate::registry::dispatch_on(&mut handle.store, handle.instance, "embed", &body).and_then(|resp| {
+                Some(handle) => crate::registry::dispatch_on(&mut handle.store, handle.instance, "embed", &body, &caller_root).and_then(|resp| {
                     let v: serde_json::Value = serde_json::from_str(&resp)?;
                     let arr = v.get("embedding").and_then(|e| e.as_array()).ok_or_else(|| anyhow::anyhow!("no embedding field"))?;
                     Ok::<Vec<f32>, anyhow::Error>(arr.iter().filter_map(|x| x.as_f64()).map(|x| x as f32).collect())
@@ -479,7 +481,7 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
             } else {
                 trimmed.split_whitespace().map(String::from).collect()
             };
-            let cwd = if cwd_arg.is_empty() { caller.data().cwd.clone() } else { PathBuf::from(&cwd_arg) };
+            let cwd = if cwd_arg.is_empty() { caller.data().cwd() } else { PathBuf::from(&cwd_arg) };
             let mut git_cmd = std::process::Command::new("git");
             git_cmd.args(&argv).current_dir(&cwd);
             #[cfg(windows)]
