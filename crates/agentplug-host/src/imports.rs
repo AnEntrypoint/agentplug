@@ -304,8 +304,16 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
         "env",
         "host_exec_js",
         |mut caller: Caller<'_, HostState>, code_ptr: u32, code_len: u32, opts_ptr: u32, opts_len: u32| -> u64 {
-            let _ = (code_ptr, code_len, opts_ptr, opts_len);
-            write_guest_json(&mut caller, serde_json::json!({"ok": false, "error": "not_implemented_agentplug_host"}))
+            let code = read_guest_string(&mut caller, code_ptr, code_len);
+            let opts_str = read_guest_string(&mut caller, opts_ptr, opts_len);
+            let opts: serde_json::Value = if opts_str.is_empty() {
+                serde_json::json!({})
+            } else {
+                serde_json::from_str(&opts_str).unwrap_or(serde_json::json!({}))
+            };
+            let cwd = caller.data().cwd.clone();
+            let result = crate::exec_js::run(&code, &opts, &cwd);
+            write_guest_json(&mut caller, result)
         },
     )?;
 
