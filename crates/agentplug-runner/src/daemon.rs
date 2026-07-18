@@ -41,7 +41,15 @@ fn read_registry() -> Vec<PathBuf> {
 }
 
 const REGISTRY_POLL_INTERVAL: Duration = Duration::from_secs(5);
-const DAEMON_STALE_MS: u64 = 60_000;
+// 2x the daemon's own HEARTBEAT_INTERVAL (10s) plus slack, not the looser
+// 60s this was originally set to -- a genuinely-alive daemon's ts is never
+// more than ~10-12s stale (one missed tick at worst), so 60s left a wide
+// window where a status file from a daemon killed seconds ago still reads
+// as "fresh," making ensure_daemon_running() report success with no
+// process actually alive. Live-witnessed this session: killed a daemon,
+// immediately re-ran spool, got "registered with the shared daemon" back
+// with zero agentplug-runner.exe processes running at all.
+const DAEMON_STALE_MS: u64 = 20_000;
 
 fn daemon_status_path() -> PathBuf {
     install_dir().join("daemon-status.json")
