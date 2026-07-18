@@ -160,6 +160,57 @@ impl PluginModules {
     }
 }
 
+/// Bounded wait for the daemon to answer a generic plugin+verb dispatch --
+/// `None` means "no daemon reachable within budget", the caller's cue to
+/// fall back to a standalone one-shot instantiate. Never blocks
+/// indefinitely: ensure_daemon_running itself already bounds the
+/// spawn-and-confirm-alive wait, and the response poll below has its own
+/// separate bound so a daemon that's alive but wedged on this specific
+/// project/plugin doesn't hang the caller forever either.
+pub fn try_dispatch_via_daemon(cwd: &Path, plugin: &str, verb: &str, body: &str) -> Option<String> {
+    if std::env::var("AGENTPLUG_NO_DAEMON").is_ok() {
+        return None;
+    }
+    if register_project(cwd).is_err() {
+        return None;
+    }
+    if !ensure_daemon_running().unwrap_or(false) {
+        return None;
+    }
+
+    let pd_dir = cwd.join(".agentplug").join("plugin-dispatch");
+    let in_dir = pd_dir.join("in").join(plugin).join(verb);
+    let out_dir = pd_dir.join("out");
+    if fs::create_dir_all(&in_dir).is_err() || fs::create_dir_all(&out_dir).is_err() {
+        return None;
+    }
+
+    let task = format!("{}{}", std::process::id(), now_ms());
+    let req_path = in_dir.join(format!("{task}.txt"));
+    if fs::write(&req_path, body).is_err() {
+        return None;
+    }
+    let out_path = out_dir.join(format!("{plugin}-{verb}-{task}.json"));
+
+    const POLL_INTERVAL_MS: u64 = 100;
+    const MAX_WAIT_MS: u64 = 30_000;
+    let mut waited = 0u64;
+    while waited < MAX_WAIT_MS {
+        if let Ok(content) = fs::read_to_string(&out_path) {
+            let _ = fs::remove_file(&out_path);
+            return Some(content);
+        }
+        std::thread::sleep(Duration::from_millis(POLL_INTERVAL_MS));
+        waited += POLL_INTERVAL_MS;
+    }
+    // Timed out waiting for a response -- clean up the never-picked-up (or
+    // still-processing) request so a stale file doesn't confuse a later
+    // fallback attempt; the daemon's own removal-on-read makes this a
+    // harmless no-op if it already claimed the file.
+    let _ = fs::remove_file(&req_path);
+    None
+}
+
 pub fn run_daemon() -> anyhow::Result<()> {
     eprintln!("[agentplug daemon] starting, registry {}", registry_path().display());
     let mut plugin_modules = PluginModules::new()?;
@@ -259,6 +310,81 @@ pub fn run_daemon() -> anyhow::Result<()> {
                     let tmp = out_dir.join(format!("{out_name}.tmp.{}", std::process::id()));
                     if fs::write(&tmp, &out_body).is_ok() {
                         let _ = fs::rename(&tmp, out_dir.join(&out_name));
+                    }
+                }
+            }
+
+            // Generic plugin+verb dispatch surface, separate from the gm
+            // spool above -- exists so a host OUTSIDE agentplug's own wasm
+            // graph (e.g. gm-plugkit's JS wrapper, hosting plugkit.wasm
+            // directly via Node/Bun's own WebAssembly.instantiate, not via
+            // agentplug-runner) can still reach a PERSISTENT plugin instance
+            // for stateful plugins (libsql: an `open` in one call must be
+            // visible to a later `exec`/`query` call, which a fresh
+            // one-shot `dispatch` subprocess per call can never provide --
+            // each subprocess gets its own empty in-memory DBS map). Layout:
+            // .agentplug/plugin-dispatch/in/<plugin>/<verb>/<N>.txt ->
+            // .agentplug/plugin-dispatch/out/<plugin>-<verb>-<N>.json,
+            // deliberately mirroring the gm spool's own in/out shape so
+            // agentplug-runner's `dispatch` subcommand (see main.rs) can
+            // poll it the same way the gm skill polls .gm/exec-spool/out/.
+            let pd_dir = root.join(".agentplug").join("plugin-dispatch");
+            let pd_in = pd_dir.join("in");
+            let pd_out = pd_dir.join("out");
+            if fs::create_dir_all(&pd_in).is_err() || fs::create_dir_all(&pd_out).is_err() {
+                continue;
+            }
+            let Ok(plugin_dirs) = fs::read_dir(&pd_in) else { continue };
+            for plugin_entry in plugin_dirs.flatten() {
+                if !plugin_entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                    continue;
+                }
+                let plugin_name = plugin_entry.file_name().to_string_lossy().into_owned();
+                let Ok(verb_dirs) = fs::read_dir(plugin_entry.path()) else { continue };
+                for verb_entry in verb_dirs.flatten() {
+                    if !verb_entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                        continue;
+                    }
+                    let verb = verb_entry.file_name().to_string_lossy().into_owned();
+                    let Ok(files) = fs::read_dir(verb_entry.path()) else { continue };
+                    for file_entry in files.flatten() {
+                        let file_path = file_entry.path();
+                        if file_path.extension().and_then(|e| e.to_str()) != Some("txt") {
+                            continue;
+                        }
+                        any_work = true;
+                        let task = file_path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+                        let body = fs::read_to_string(&file_path).unwrap_or_default();
+                        let _ = fs::remove_file(&file_path);
+
+                        let project = projects.entry(root.clone()).or_insert_with(|| ProjectPlugins::new(root.clone()));
+                        if !project.is_loaded(&plugin_name) {
+                            if let Err(e) = plugin_modules.get_or_compile(&plugin_name) {
+                                let out_name = format!("{plugin_name}-{verb}-{task}.json");
+                                let out_body = serde_json::json!({"ok": false, "error": format!("plugin compile/install failed: {e:#}")}).to_string();
+                                let _ = fs::write(pd_out.join(out_name), out_body);
+                                continue;
+                            }
+                            let module = plugin_modules.modules.get(&plugin_name).unwrap();
+                            if let Err(e) = project.load_plugin(&plugin_modules.engine, &plugin_name, module) {
+                                let out_name = format!("{plugin_name}-{verb}-{task}.json");
+                                let out_body = serde_json::json!({"ok": false, "error": format!("plugin instantiate failed: {e:#}")}).to_string();
+                                let _ = fs::write(pd_out.join(out_name), out_body);
+                                continue;
+                            }
+                        }
+
+                        let result = project.dispatch(&plugin_name, &verb, &body);
+                        let out_name = format!("{plugin_name}-{verb}-{task}.json");
+                        let out_body = match result {
+                            Ok(s) if !s.is_empty() => s,
+                            Ok(_) => serde_json::json!({"ok": false, "error": "empty dispatch result"}).to_string(),
+                            Err(e) => serde_json::json!({"ok": false, "error": format!("{e:#}")}).to_string(),
+                        };
+                        let tmp = pd_out.join(format!("{out_name}.tmp.{}", std::process::id()));
+                        if fs::write(&tmp, &out_body).is_ok() {
+                            let _ = fs::rename(&tmp, pd_out.join(&out_name));
+                        }
                     }
                 }
             }

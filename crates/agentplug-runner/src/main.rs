@@ -58,6 +58,23 @@ fn main() -> anyhow::Result<()> {
             let verb = args.get(3).cloned().unwrap_or_default();
             let body = args.get(4).cloned().unwrap_or_else(|| "{}".to_string());
             let cwd = std::env::current_dir()?;
+
+            // Route through the shared daemon when reachable -- a plain
+            // one-shot instantiate-per-call (the fallback below) is fine
+            // for stateless plugins (bert:embed, treesitter:parse) but
+            // fundamentally wrong for a stateful one like libsql, where an
+            // "open" in one process must still be visible to a later
+            // "exec"/"query": each standalone subprocess gets its own
+            // empty in-memory connection table, so open-then-query across
+            // two separate `dispatch` invocations always fails
+            // "no dbs open" even though the plugin itself is correct. The
+            // daemon keeps one persistent ProjectPlugins per (root, plugin)
+            // across calls, which is the only place this can genuinely work.
+            if let Some(out) = daemon::try_dispatch_via_daemon(&cwd, &plugin, &verb, &body) {
+                println!("{out}");
+                return Ok(());
+            }
+
             let wasm = download::ensure_plugin_installed(&plugin, None)?;
             let engine = build_engine()?;
             let module = Module::from_file(&engine, &wasm)?;
