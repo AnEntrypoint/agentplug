@@ -73,7 +73,23 @@ impl ProjectPlugins {
         let body_ptr = alloc.call(&mut *store, body.len() as u32)?;
         memory.write(&mut *store, body_ptr as usize, body.as_bytes())?;
 
-        let dispatch_fn = instance.get_typed_func::<(u32, u32, u32, u32), u64>(&mut *store, "plugin_call")?;
+        // "plugin_call" is the export name every genuinely agentplug-native
+        // plugin (bert/libsql/treesitter, all built this session) uses --
+        // but "gm" is plugkit-core's own wasm, built by rs-plugkit's own
+        // long-standing cascade, predating the agentplug ABI and still
+        // exporting its original name "dispatch_verb" (see spool.rs's own
+        // PlugkitRuntime::dispatch). Renaming gm.wasm's export would need a
+        // full rs-plugkit source change + cascade rebuild + republish, for
+        // zero behavioral gain -- try the new convention first, fall back
+        // to the pre-existing one, so both plugin generations load through
+        // the same ProjectPlugins::dispatch without gm.wasm needing to
+        // change at all. Live-witnessed this session: hardcoding only
+        // "plugin_call" made every gm dispatch fail
+        // "failed to find function export `plugin_call`" even after gm.wasm
+        // instantiated successfully.
+        let dispatch_fn = instance
+            .get_typed_func::<(u32, u32, u32, u32), u64>(&mut *store, "plugin_call")
+            .or_else(|_| instance.get_typed_func::<(u32, u32, u32, u32), u64>(&mut *store, "dispatch_verb"))?;
         let packed = dispatch_fn.call(&mut *store, (verb_ptr, verb.len() as u32, body_ptr, body.len() as u32))?;
 
         let ptr = (packed & 0xffff_ffff) as u32;
