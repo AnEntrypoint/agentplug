@@ -48,12 +48,26 @@ pub fn download_and_verify(url: &str, dest: &Path, expected_sha256_hex: &str) ->
 /// its `<name>.wasm` + `<name>.wasm.sha256` + `<name>.manifest.json` release
 /// assets live in. New plugins register here; this is the one place
 /// agentplug-runner needs to know a plugin exists before it can fetch it.
-fn plugin_repo(plugin_name: &str) -> Option<&'static str> {
+///
+/// "gm" is special-cased below (see `PluginAssetSpec`) rather than listed
+/// here: it is NOT yet a real agentplug-native plugin release -- there is
+/// no AnEntrypoint/agentplug-gm-bin repo. The actual gm wasm (built by
+/// rs-plugkit's own long-standing cascade, asset name `plugkit.wasm`, not
+/// `gm.wasm`) still ships from AnEntrypoint/plugkit-bin. Routing "gm"
+/// through the generic `{name}.wasm` convention here 404s permanently --
+/// live-witnessed this session as `plugin gm not loaded` on every dispatch
+/// once the daemon tried to auto-serve gm's own spool.
+struct PluginAssetSpec {
+    repo: &'static str,
+    asset_basename: &'static str,
+}
+
+fn plugin_asset_spec(plugin_name: &str) -> Option<PluginAssetSpec> {
     match plugin_name {
-        "gm" => Some("AnEntrypoint/agentplug-gm-bin"),
-        "bert" => Some("AnEntrypoint/agentplug-bert-bin"),
-        "libsql" => Some("AnEntrypoint/agentplug-libsql-bin"),
-        "treesitter" => Some("AnEntrypoint/agentplug-treesitter-bin"),
+        "gm" => Some(PluginAssetSpec { repo: "AnEntrypoint/plugkit-bin", asset_basename: "plugkit" }),
+        "bert" => Some(PluginAssetSpec { repo: "AnEntrypoint/agentplug-bert-bin", asset_basename: "bert" }),
+        "libsql" => Some(PluginAssetSpec { repo: "AnEntrypoint/agentplug-libsql-bin", asset_basename: "libsql" }),
+        "treesitter" => Some(PluginAssetSpec { repo: "AnEntrypoint/agentplug-treesitter-bin", asset_basename: "treesitter" }),
         _ => None,
     }
 }
@@ -67,10 +81,10 @@ fn plugin_version_path(plugin_name: &str) -> PathBuf {
 }
 
 pub fn fetch_latest_plugin_version(plugin_name: &str) -> anyhow::Result<Option<String>> {
-    let Some(repo) = plugin_repo(plugin_name) else {
-        anyhow::bail!("unknown plugin {plugin_name} -- not registered in agentplug-runner's plugin_repo map");
+    let Some(spec) = plugin_asset_spec(plugin_name) else {
+        anyhow::bail!("unknown plugin {plugin_name} -- not registered in agentplug-runner's plugin_asset_spec map");
     };
-    let url = format!("https://api.github.com/repos/{repo}/releases/latest");
+    let url = format!("https://api.github.com/repos/{}/releases/latest", spec.repo);
     let resp = ureq::get(&url).set("User-Agent", "agentplug-runner").call()?;
     let body: serde_json::Value = serde_json::from_str(&resp.into_string()?)?;
     Ok(body.get("tag_name").and_then(|v| v.as_str()).map(|s| s.trim_start_matches('v').to_string()))
@@ -81,8 +95,8 @@ pub fn ensure_plugin_installed(plugin_name: &str, explicit_version: Option<&str>
     if dest.exists() && explicit_version.is_none() {
         return Ok(dest);
     }
-    let Some(repo) = plugin_repo(plugin_name) else {
-        anyhow::bail!("unknown plugin {plugin_name} -- not registered in agentplug-runner's plugin_repo map");
+    let Some(spec) = plugin_asset_spec(plugin_name) else {
+        anyhow::bail!("unknown plugin {plugin_name} -- not registered in agentplug-runner's plugin_asset_spec map");
     };
     let version = match explicit_version {
         Some(v) => v.to_string(),
@@ -99,9 +113,9 @@ pub fn ensure_plugin_installed(plugin_name: &str, explicit_version: Option<&str>
         }
     }
 
-    let base = format!("https://github.com/{repo}/releases/download/v{version}");
-    let wasm_url = format!("{base}/{plugin_name}.wasm");
-    let sha_url = format!("{base}/{plugin_name}.wasm.sha256");
+    let base = format!("https://github.com/{}/releases/download/v{version}", spec.repo);
+    let wasm_url = format!("{base}/{}.wasm", spec.asset_basename);
+    let sha_url = format!("{base}/{}.wasm.sha256", spec.asset_basename);
 
     let sha_resp = ureq::get(&sha_url).call()?;
     let sha_line = sha_resp.into_string()?;

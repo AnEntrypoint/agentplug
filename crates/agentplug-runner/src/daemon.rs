@@ -300,12 +300,22 @@ pub fn run_daemon() -> anyhow::Result<()> {
                     // are only reachable via gm.wasm's own host_plugin_call,
                     // never directly from the spool surface. This keeps the
                     // spool contract byte-identical to today's gm-runner.
-                    let result = project.dispatch("gm", &verb, &body);
+                    // If the compile/install/instantiate loop above failed
+                    // for "gm" specifically (network hiccup, plugin not yet
+                    // published for this platform), dispatching anyway
+                    // produced a bare "plugin gm not loaded" every time,
+                    // live-witnessed this session -- fail loud with the
+                    // real reason instead of a dispatch that was always
+                    // going to fail.
                     let out_name = format!("{verb}-{task}.json");
-                    let out_body = match result {
-                        Ok(s) if !s.is_empty() => s,
-                        Ok(_) => serde_json::json!({"ok": false, "error": "empty dispatch result", "verb": verb}).to_string(),
-                        Err(e) => serde_json::json!({"ok": false, "error": format!("{e:#}"), "verb": verb}).to_string(),
+                    let out_body = if !project.is_loaded("gm") {
+                        serde_json::json!({"ok": false, "error": "gm plugin failed to load for this project (see daemon stderr for the compile/install/instantiate failure)", "verb": verb}).to_string()
+                    } else {
+                        match project.dispatch("gm", &verb, &body) {
+                            Ok(s) if !s.is_empty() => s,
+                            Ok(_) => serde_json::json!({"ok": false, "error": "empty dispatch result", "verb": verb}).to_string(),
+                            Err(e) => serde_json::json!({"ok": false, "error": format!("{e:#}"), "verb": verb}).to_string(),
+                        }
                     };
                     let tmp = out_dir.join(format!("{out_name}.tmp.{}", std::process::id()));
                     if fs::write(&tmp, &out_body).is_ok() {
