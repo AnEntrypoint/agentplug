@@ -347,6 +347,15 @@ pub fn run_daemon() -> anyhow::Result<()> {
                     let tmp = out_dir.join(format!("{out_name}.tmp.{}", std::process::id()));
                     if fs::write(&tmp, &out_body).is_ok() {
                         let _ = fs::rename(&tmp, out_dir.join(&out_name));
+                        // Ready-sentinel: written right after the real response,
+                        // matching rs-plugkit gm-runner's spool.rs and the JS
+                        // wrapper's own convention (both write "<out>.ready").
+                        // Lets a consumer distinguish "not yet dispatched" from
+                        // "genuinely lost" without relying on elapsed-wait
+                        // heuristics -- part of the spool-response-ack-sentinel
+                        // protocol PRD row, previously only ported to two of
+                        // the three dispatch surfaces.
+                        let _ = fs::write(out_dir.join(format!("{out_name}.ready")), b"");
                     }
                 }
             }
@@ -394,19 +403,30 @@ pub fn run_daemon() -> anyhow::Result<()> {
                         let body = fs::read_to_string(&file_path).unwrap_or_default();
                         let _ = fs::remove_file(&file_path);
 
+                        let write_pd_out = |out_name: &str, out_body: &str| {
+                            let tmp = pd_out.join(format!("{out_name}.tmp.{}", std::process::id()));
+                            if fs::write(&tmp, out_body).is_ok() {
+                                let _ = fs::rename(&tmp, pd_out.join(out_name));
+                                // Same ready-sentinel convention as the gm spool
+                                // surface above and rs-plugkit gm-runner's
+                                // spool.rs -- part of spool-response-ack-sentinel-protocol.
+                                let _ = fs::write(pd_out.join(format!("{out_name}.ready")), b"");
+                            }
+                        };
+
                         let project = projects.entry(root.clone()).or_insert_with(|| ProjectPlugins::new(root.clone()));
                         if !project.is_loaded(&plugin_name) {
                             if let Err(e) = plugin_modules.get_or_compile(&plugin_name) {
                                 let out_name = format!("{plugin_name}-{verb}-{task}.json");
                                 let out_body = serde_json::json!({"ok": false, "error": format!("plugin compile/install failed: {e:#}")}).to_string();
-                                let _ = fs::write(pd_out.join(out_name), out_body);
+                                write_pd_out(&out_name, &out_body);
                                 continue;
                             }
                             let module = plugin_modules.modules.get(&plugin_name).unwrap();
                             if let Err(e) = project.load_plugin(&plugin_modules.engine, &plugin_name, module) {
                                 let out_name = format!("{plugin_name}-{verb}-{task}.json");
                                 let out_body = serde_json::json!({"ok": false, "error": format!("plugin instantiate failed: {e:#}")}).to_string();
-                                let _ = fs::write(pd_out.join(out_name), out_body);
+                                write_pd_out(&out_name, &out_body);
                                 continue;
                             }
                         }
@@ -418,10 +438,7 @@ pub fn run_daemon() -> anyhow::Result<()> {
                             Ok(_) => serde_json::json!({"ok": false, "error": "empty dispatch result"}).to_string(),
                             Err(e) => serde_json::json!({"ok": false, "error": format!("{e:#}")}).to_string(),
                         };
-                        let tmp = pd_out.join(format!("{out_name}.tmp.{}", std::process::id()));
-                        if fs::write(&tmp, &out_body).is_ok() {
-                            let _ = fs::rename(&tmp, pd_out.join(&out_name));
-                        }
+                        write_pd_out(&out_name, &out_body);
                     }
                 }
             }
