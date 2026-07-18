@@ -504,7 +504,15 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
                 trimmed.split_whitespace().map(String::from).collect()
             };
             let cwd = if cwd_arg.is_empty() { caller.data().cwd.clone() } else { PathBuf::from(&cwd_arg) };
-            let output = std::process::Command::new("git").args(&argv).current_dir(&cwd).output();
+            let mut git_cmd = std::process::Command::new("git");
+            git_cmd.args(&argv).current_dir(&cwd);
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+                git_cmd.creation_flags(CREATE_NO_WINDOW);
+            }
+            let output = git_cmd.output();
             let v = match output {
                 Ok(out) => serde_json::json!({
                     "stdout": String::from_utf8_lossy(&out.stdout),

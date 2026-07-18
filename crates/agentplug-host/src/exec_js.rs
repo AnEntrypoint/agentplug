@@ -36,13 +36,20 @@ pub fn run(code: &str, opts: &Value, cwd: &Path) -> Value {
     };
 
     let t0 = Instant::now();
-    let spawn = Command::new(&cmd)
+    let mut command = Command::new(&cmd);
+    command
         .args(&args)
         .current_dir(cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn();
+        .stderr(Stdio::piped());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    let spawn = command.spawn();
 
     let mut child = match spawn {
         Ok(c) => c,
