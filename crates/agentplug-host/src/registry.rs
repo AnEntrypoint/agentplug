@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 use wasmtime::{Engine, Linker, Module, Store};
@@ -9,6 +9,34 @@ use crate::host_state::{HostState, SiblingHandle};
 use crate::imports::{register_env_imports, register_wasi};
 
 pub const PLUGIN_IDLE_EVICT_MS: u64 = 30 * 60 * 1000;
+
+/// Plugins with no per-project state (pure function of input -> output,
+/// nothing keyed by project root) get ONE process-wide instance shared by
+/// every project instead of one instantiation per project. "bert" is the
+/// motivating case: its ~133MB embedding model is `include_bytes!`'d into
+/// the wasm module and deserialized into live tensors on first `embed` call
+/// (candle's VarBuilder::from_slice_safetensors) -- with N concurrently
+/// active projects, the old per-project instantiation held N separate
+/// deserialized copies resident at once (live-witnessed: 2 active projects,
+/// ~2.3GB daemon RSS vs the ~500MB expected for one gm.wasm instance).
+/// "gm" (per-project phase/PRD/mutable state) and "libsql" (per-project open
+/// DB connections) are NOT stateless and must keep one instance per project.
+fn is_stateless_shared_plugin(plugin_name: &str) -> bool {
+    plugin_name == "bert"
+}
+
+type SharedPluginMap = Mutex<HashMap<String, Arc<Mutex<Option<SiblingHandle>>>>>;
+static SHARED_PLUGINS: OnceLock<SharedPluginMap> = OnceLock::new();
+
+fn shared_plugin_cell(plugin_name: &str) -> Arc<Mutex<Option<SiblingHandle>>> {
+    SHARED_PLUGINS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap()
+        .entry(plugin_name.to_string())
+        .or_insert_with(|| Arc::new(Mutex::new(None)))
+        .clone()
+}
 
 /// Runs a verb dispatch against an already-instantiated plugin's OWN Store.
 /// Shared by `ProjectPlugins::dispatch` (top-level spool dispatch) and
@@ -52,6 +80,25 @@ pub fn dispatch_on(store: &mut Store<HostState>, instance: wasmtime::Instance, v
     Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
+fn instantiate_plugin(
+    engine: &Engine,
+    root: PathBuf,
+    plugin_name: &str,
+    module: &Module,
+    siblings: Arc<Mutex<HashMap<String, Arc<Mutex<Option<SiblingHandle>>>>>>,
+) -> anyhow::Result<SiblingHandle> {
+    let mut linker: Linker<HostState> = Linker::new(engine);
+    register_wasi(&mut linker)?;
+    register_env_imports(&mut linker)?;
+
+    let host_state = HostState::new(root, plugin_name.to_string(), siblings);
+    let self_instance_cell = host_state.self_instance.clone();
+    let mut store = Store::new(engine, host_state);
+    let instance = linker.instantiate(&mut store, module)?;
+    *self_instance_cell.lock().unwrap() = Some(instance);
+    Ok(SiblingHandle { store, instance })
+}
+
 /// Every plugin instance loaded for one project. `siblings` is the shared
 /// name->handle map every plugin's HostState points at, so any plugin's
 /// `host_plugin_call` can reach any other already-loaded plugin for this
@@ -76,21 +123,29 @@ impl ProjectPlugins {
 
     /// Instantiates `module` under `plugin_name` for this project. Modules
     /// are compiled ONCE per plugin (shared `Module`, keyed by plugin name,
-    /// owned by the caller -- typically agentplug-runner's global registry)
-    /// and instantiated fresh per project, mirroring the same
-    /// expensive-compile/cheap-instantiate split rs-plugkit's gm-runner
-    /// daemon.rs already established for the single-plugin case.
+    /// owned by the caller -- typically agentplug-runner's global registry).
+    ///
+    /// Stateless plugins (see `is_stateless_shared_plugin`) get ONE process-wide
+    /// instance reused by every project instead of one instantiation per
+    /// project -- this project's siblings map just points at the same shared
+    /// cell everyone else uses. Stateful plugins ("gm": bakes its project
+    /// root into a wasm-side OnceLock on first dispatch, cannot be shared
+    /// across two different project roots without silently operating on the
+    /// wrong project; "libsql": holds real open DB connections keyed by
+    /// project) keep the original expensive-compile/cheap-instantiate-per-project
+    /// split rs-plugkit's gm-runner daemon.rs already established.
     pub fn load_plugin(&mut self, engine: &Engine, plugin_name: &str, module: &Module) -> anyhow::Result<()> {
-        let mut linker: Linker<HostState> = Linker::new(engine);
-        register_wasi(&mut linker)?;
-        register_env_imports(&mut linker)?;
+        if is_stateless_shared_plugin(plugin_name) {
+            let cell = shared_plugin_cell(plugin_name);
+            if cell.lock().unwrap().is_none() {
+                let instantiated = instantiate_plugin(engine, self.root.clone(), plugin_name, module, self.siblings.clone())?;
+                *cell.lock().unwrap() = Some(instantiated);
+            }
+            self.siblings.lock().unwrap().insert(plugin_name.to_string(), cell);
+            return Ok(());
+        }
 
-        let host_state = HostState::new(self.root.clone(), plugin_name.to_string(), self.siblings.clone());
-        let self_instance_cell = host_state.self_instance.clone();
-        let mut store = Store::new(engine, host_state);
-        let instance = linker.instantiate(&mut store, module)?;
-        *self_instance_cell.lock().unwrap() = Some(instance);
-
+        let instantiated = instantiate_plugin(engine, self.root.clone(), plugin_name, module, self.siblings.clone())?;
         let cell = self
             .siblings
             .lock()
@@ -98,7 +153,7 @@ impl ProjectPlugins {
             .entry(plugin_name.to_string())
             .or_insert_with(|| Arc::new(Mutex::new(None)))
             .clone();
-        *cell.lock().unwrap() = Some(SiblingHandle { store, instance });
+        *cell.lock().unwrap() = Some(instantiated);
         Ok(())
     }
 
