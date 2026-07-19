@@ -62,9 +62,26 @@ struct PluginAssetSpec {
     asset_basename: &'static str,
 }
 
+/// agentplug-runner always loads "bert" as one of its 4 default plugins
+/// (daemon.rs's default plugin list), and agentplug-host's `host_vec_embed`
+/// import genuinely routes to that shared bert instance -- so gm.wasm's own
+/// `embed.rs::init_ctx()` probe (`probe_host_embed()`) always succeeds under
+/// agentplug, meaning gm.wasm's baked-in bert weights (embed.rs's
+/// `include_bytes!("weights/bge-small-en-v1.5.safetensors")`, 133MB) are
+/// provably dead data: never deserialized into candle tensors, but still
+/// copied into the wasm instance's linear memory at Instantiate time as a
+/// static data segment. `plugkit-slim.wasm` (same AnEntrypoint/plugkit-bin
+/// release, ~3MB, no baked-in weights) is the exact fix -- gm's own JS
+/// wrapper (gm-plugkit/bootstrap.js hasNativeEmbedRunner) already applies
+/// this same slim-when-a-real-embed-answerer-exists logic; agentplug-runner
+/// needs the equivalent since it never routes through that JS bootstrap.
+fn gm_asset_basename() -> &'static str {
+    "plugkit-slim"
+}
+
 fn plugin_asset_spec(plugin_name: &str) -> Option<PluginAssetSpec> {
     match plugin_name {
-        "gm" => Some(PluginAssetSpec { repo: "AnEntrypoint/plugkit-bin", asset_basename: "plugkit" }),
+        "gm" => Some(PluginAssetSpec { repo: "AnEntrypoint/plugkit-bin", asset_basename: gm_asset_basename() }),
         "bert" => Some(PluginAssetSpec { repo: "AnEntrypoint/agentplug-bert-bin", asset_basename: "bert" }),
         "libsql" => Some(PluginAssetSpec { repo: "AnEntrypoint/agentplug-libsql-bin", asset_basename: "libsql" }),
         "treesitter" => Some(PluginAssetSpec { repo: "AnEntrypoint/agentplug-treesitter-bin", asset_basename: "treesitter" }),
@@ -114,12 +131,23 @@ pub fn ensure_plugin_installed(plugin_name: &str, explicit_version: Option<&str>
     }
 
     let base = format!("https://github.com/{}/releases/download/v{version}", spec.repo);
-    let wasm_url = format!("{base}/{}.wasm", spec.asset_basename);
-    let sha_url = format!("{base}/{}.wasm.sha256", spec.asset_basename);
 
-    let sha_resp = ureq::get(&sha_url).call()?;
+    // plugkit-slim.wasm ships from the same release as plugkit.wasm starting
+    // v0.1.915 -- an older/pinned version tag may predate that, so a 404 on
+    // the slim sha256 sidecar falls back to the fat asset_basename rather
+    // than hard-failing the whole plugin install.
+    let sha_url = format!("{base}/{}.wasm.sha256", spec.asset_basename);
+    let sha_resp = match ureq::get(&sha_url).call() {
+        Ok(resp) => resp,
+        Err(_) if spec.asset_basename == "plugkit-slim" => {
+            ureq::get(&format!("{base}/plugkit.wasm.sha256")).call()?
+        }
+        Err(e) => return Err(e.into()),
+    };
+    let effective_basename = if sha_resp.get_url().contains("plugkit-slim") { "plugkit-slim" } else { "plugkit" };
+    let wasm_url = format!("{base}/{effective_basename}.wasm");
     let sha_line = sha_resp.into_string()?;
-    let expected_sha = sha_line.split_whitespace().next().ok_or_else(|| anyhow::anyhow!("empty sha256 sidecar at {sha_url}"))?.to_string();
+    let expected_sha = sha_line.split_whitespace().next().ok_or_else(|| anyhow::anyhow!("empty sha256 sidecar for {effective_basename} at {base}"))?.to_string();
 
     download_and_verify(&wasm_url, &dest, &expected_sha)?;
     fs::write(&version_file, &version)?;
