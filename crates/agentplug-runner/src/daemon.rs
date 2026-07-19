@@ -59,6 +59,26 @@ fn daemon_lock_path() -> PathBuf {
     install_dir().join("daemon.lock")
 }
 
+/// True when the on-disk heartbeat is ours, absent, or stale enough to claim.
+/// A fresh heartbeat naming a DIFFERENT pid means another daemon superseded us
+/// and this process should exit rather than keep serving nobody. Shared by the
+/// heartbeat-tick check and the pre-work check at the top of the poll loop so
+/// both decide identically.
+fn holds_heartbeat_authority() -> bool {
+    let superseded = fs::read_to_string(daemon_status_path())
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .map(|v| {
+            let other_pid = v.get("pid").and_then(|p| p.as_u64());
+            let ts = v.get("ts").and_then(|t| t.as_u64()).unwrap_or(0);
+            now_ms().saturating_sub(ts) < DAEMON_STALE_MS
+                && other_pid.is_some()
+                && other_pid != Some(std::process::id() as u64)
+        })
+        .unwrap_or(false);
+    !superseded
+}
+
 pub fn ensure_daemon_running() -> anyhow::Result<bool> {
     if is_daemon_fresh() {
         return Ok(true);
@@ -295,22 +315,26 @@ pub fn run_daemon() -> anyhow::Result<()> {
             // microsecond-scale check-then-write): re-check every heartbeat
             // tick too, so a true double-spawn self-corrects within one
             // HEARTBEAT_INTERVAL instead of running both daemons forever.
-            let lost_race = fs::read_to_string(daemon_status_path())
-                .ok()
-                .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
-                .map(|v| {
-                    let other_pid = v.get("pid").and_then(|p| p.as_u64());
-                    let ts = v.get("ts").and_then(|t| t.as_u64()).unwrap_or(0);
-                    now_ms().saturating_sub(ts) < DAEMON_STALE_MS
-                        && other_pid.is_some()
-                        && other_pid != Some(std::process::id() as u64)
-                })
-                .unwrap_or(false);
+            let lost_race = !holds_heartbeat_authority();
             if lost_race {
                 eprintln!("[agentplug daemon] another daemon claimed heartbeat authority -- exiting");
                 return Ok(());
             }
             write_daemon_heartbeat(projects.len(), plugin_modules.modules.len());
+        }
+
+        // The authority re-check above only runs inside the heartbeat branch,
+        // so a daemon stuck in one long synchronous wasm call (a full index
+        // pass, a batch of ~3s bert embeds) blows past HEARTBEAT_INTERVAL, a
+        // newer daemon claims authority meanwhile, and the busy one keeps
+        // serving nobody until it happens to return. Live-hit: pid 18820 held
+        // no heartbeat (pid 22420 did) yet burned a full core -- CPU 158.1s to
+        // 170.0s across a 12s sample -- and 2,827MB, versus the live daemon's
+        // 542MB. Check before doing work too, so an orphan exits at the next
+        // loop top rather than only at the next heartbeat it may never reach.
+        if !holds_heartbeat_authority() {
+            eprintln!("[agentplug daemon] heartbeat authority held by another daemon -- exiting before serving further work");
+            return Ok(());
         }
 
         if last_registry_poll.elapsed() >= REGISTRY_POLL_INTERVAL {
