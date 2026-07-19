@@ -277,6 +277,13 @@ pub fn run_daemon() -> anyhow::Result<()> {
     const SELF_RECYCLE_IDLE_MS: u64 = 60 * 60 * 1000;
     let mut last_any_dispatch = Instant::now();
 
+    // Far shorter than the whole-process recycle above: releasing one shared
+    // Store costs a single re-instantiation on next use, so it can run on a
+    // burst-quiet cadence rather than an hour. See the release site below for
+    // the measured numbers this exists to reclaim.
+    const SHARED_PLUGIN_RELEASE_IDLE_MS: u64 = 2 * 60 * 1000;
+    let mut last_shared_release = Instant::now();
+
     loop {
         if last_heartbeat.elapsed() >= HEARTBEAT_INTERVAL {
             last_heartbeat = Instant::now();
@@ -516,6 +523,39 @@ pub fn run_daemon() -> anyhow::Result<()> {
         for root in to_evict {
             eprintln!("[agentplug daemon] evicting idle project {}", root.display());
             projects.remove(&root);
+        }
+
+        // Release the memory-heavy shared plugins once a dispatch burst has
+        // gone quiet, long before the whole-process recycle below. wasm linear
+        // memory only grows -- there is no shrink instruction -- so a plugin
+        // that spikes during one workload pins that peak for as long as its
+        // Store lives. Measured here: 350MB committed on a fresh daemon,
+        // 538MB with all four plugins instantiated, 1545MB after ONE
+        // full-repo codeinsight pass, and it stays at 1545MB afterward.
+        // VirtualQueryEx attributes the step to a single ~1285MB contiguous
+        // PAGE_READWRITE private region -- bert's own grown linear memory.
+        // Dropping the Store hands those pages back; load_plugin transparently
+        // re-instantiates on the next dispatch that needs the plugin (the
+        // compiled Module stays cached in the Engine, so only Store+Instance
+        // are rebuilt). "bert" is the only one worth releasing on this cadence:
+        // it owns essentially all of the growth, while treesitter/libsql/gm
+        // stay small and would just pay pointless re-instantiation churn.
+        //
+        // Judge any change here by PrivateMemorySize64, never WorkingSet64:
+        // Windows trims a cold working set hard (a forced EmptyWorkingSet
+        // dropped WorkingSet 1545.8MB -> 1.0MB while PrivateMemorySize64 held
+        // at 1546.6MB), which looks exactly like accumulate-then-release even
+        // when nothing has actually been freed.
+        if any_work {
+            last_shared_release = Instant::now();
+        } else if last_shared_release.elapsed() >= Duration::from_millis(SHARED_PLUGIN_RELEASE_IDLE_MS)
+            && agentplug_host::release_shared_plugin("bert")
+        {
+            eprintln!(
+                "[agentplug daemon] released idle shared bert Store after {}ms quiet -- returns its grown wasm linear memory; next embed re-instantiates",
+                SHARED_PLUGIN_RELEASE_IDLE_MS
+            );
+            last_shared_release = Instant::now();
         }
 
         if any_work {

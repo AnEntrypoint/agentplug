@@ -7,7 +7,7 @@ mod registry;
 pub use host_state::HostState;
 pub use imports::{register_env_imports, register_wasi};
 pub use install::{install_dir, plugins_dir, wasmtime_cache_dir};
-pub use registry::{read_project_plugin_list, ProjectPlugins, PLUGIN_IDLE_EVICT_MS};
+pub use registry::{read_project_plugin_list, release_shared_plugin, ProjectPlugins, PLUGIN_IDLE_EVICT_MS};
 
 use wasmtime::{Cache, CacheConfig, Config, Engine};
 

@@ -72,6 +72,40 @@ fn shared_plugin_cell(plugin_name: &str) -> Arc<Mutex<Option<SiblingHandle>>> {
         .clone()
 }
 
+/// Drops a shared plugin's Store, returning its committed wasm linear memory
+/// to the OS. `load_plugin` re-instantiates any shared cell holding `None` on
+/// the next dispatch that needs it, so this is a release, not a teardown --
+/// the only cost is one re-instantiation (cheap: the Module stays compiled and
+/// cached in the Engine, only the Store/Instance are rebuilt).
+///
+/// This exists because a wasm linear memory only ever grows: `memory.grow`
+/// commits pages and there is no shrink instruction, so a plugin that spikes
+/// during one workload holds that peak for the lifetime of its Store. Measured
+/// on this host: a fresh daemon sits at 350MB committed, 538MB with all four
+/// plugins instantiated, and 1545MB after a single full-repo codeinsight pass
+/// (114 files / ~697 chunks through bert) -- a +1006MB step that never returns
+/// while the Store lives. VirtualQueryEx attributes it to one contiguous
+/// ~1285MB PAGE_READWRITE private region, i.e. bert's own grown linear memory.
+///
+/// Note the trap this measurement corrects: WorkingSet64 is NOT the number to
+/// judge this by. Windows trims a committed-but-cold working set aggressively
+/// (a forced EmptyWorkingSet took WorkingSet from 1545.8MB to 1.0MB while
+/// PrivateMemorySize64 held flat at 1546.6MB), which reads as an
+/// accumulate-then-release sawtooth and hides the fact that nothing was ever
+/// actually freed. Always judge this by PrivateMemorySize64.
+pub fn release_shared_plugin(plugin_name: &str) -> bool {
+    if !is_stateless_shared_plugin(plugin_name) {
+        return false;
+    }
+    let cell = shared_plugin_cell(plugin_name);
+    let mut guard = cell.lock().unwrap();
+    if guard.is_some() {
+        *guard = None;
+        return true;
+    }
+    false
+}
+
 /// Runs a verb dispatch against an already-instantiated plugin's OWN Store.
 /// Shared by `ProjectPlugins::dispatch` (top-level spool dispatch) and
 /// `host_plugin_call` (cross-plugin dispatch) so both go through the exact
