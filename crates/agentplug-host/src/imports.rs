@@ -299,7 +299,15 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
                     }
                     if let Ok(content) = fs::read_to_string(&path) {
                         if q.is_empty() || content.to_lowercase().contains(&q) {
-                            results.push(content);
+                            // Guest-side readers (code_index::load_manifests and
+                            // every other fv_query consumer) index each row by
+                            // `key`/`value`. Returning the bare content string
+                            // made every one of those lookups yield None, so a
+                            // fully-populated namespace read back as empty --
+                            // 114 valid manifests loaded as 0 chunks, dropping
+                            // codesearch to mode:fallback_kv with no hits.
+                            let key = path.file_stem().and_then(|s| s.to_str()).unwrap_or_default().to_string();
+                            results.push(serde_json::json!({"key": key, "value": content}));
                         }
                     }
                 }
