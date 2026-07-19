@@ -1,3 +1,4 @@
+mod browser;
 mod exec_js;
 mod host_state;
 mod imports;

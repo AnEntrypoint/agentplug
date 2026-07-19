@@ -361,19 +361,29 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
             write_guest_json(&mut caller, serde_json::json!({"ok": false, "error": "not_implemented_agentplug_host"}))
         },
     )?;
-    // Unlike the two stubs above, host_browser_exec IS fully implemented
-    // upstream (crate::browser::run, a real playwright/chromium automation
-    // module) -- agentplug-host doesn't have that module at all, so this is
-    // a genuine capability gap, not a parity stub. Declared so gm.wasm can
-    // still instantiate and every non-browser verb keeps working; a
-    // dispatch that actually needs the `browser` verb gets a real, typed
-    // failure here instead of the whole plugin refusing to load.
+    // host_browser_exec was a documented capability gap -- agentplug-host had
+    // no browser module, so every browser-verb dispatch returned a typed
+    // not_implemented failure and the whole browser subsystem was advertised in
+    // `health` yet non-functional under the native runtime. Ported the same
+    // self-contained module gm-runner uses (crate::browser::run, which shells
+    // out to the playwriter CLI rather than embedding chromium, so it needs no
+    // new deps -- serde_json/directories/wait-timeout were already present).
+    // The guest passes body / cwd / session_id; prefer the passed cwd, falling
+    // back to the host's own cwd when the guest sends an empty string.
     linker.func_wrap(
         "env",
         "host_browser_exec",
         |mut caller: Caller<'_, HostState>, body_ptr: u32, body_len: u32, cwd_ptr: u32, cwd_len: u32, sid_ptr: u32, sid_len: u32| -> u64 {
-            let _ = (body_ptr, body_len, cwd_ptr, cwd_len, sid_ptr, sid_len);
-            write_guest_json(&mut caller, serde_json::json!({"ok": false, "error": "not_implemented_agentplug_host_no_browser_module"}))
+            let body = read_guest_string(&mut caller, body_ptr, body_len);
+            let cwd_str = read_guest_string(&mut caller, cwd_ptr, cwd_len);
+            let sid = read_guest_string(&mut caller, sid_ptr, sid_len);
+            let cwd = if cwd_str.trim().is_empty() {
+                caller.data().cwd()
+            } else {
+                std::path::PathBuf::from(cwd_str)
+            };
+            let result = crate::browser::run(&body, &cwd, &sid);
+            write_guest_json(&mut caller, result)
         },
     )?;
 
