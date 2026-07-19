@@ -338,19 +338,19 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
     // ALL THREE unconditionally at compile time, so a host missing even one
     // fails `WebAssembly.instantiate`/wasmtime's linker.instantiate with a
     // hard "unknown import" error, not a graceful per-call fallback.
-    // Live-witnessed this session: gm.wasm failed to instantiate at all
-    // under agentplug-runner's daemon until host_vec_search was added --
-    // the missing import broke EVERY dispatch, not just calls that would
-    // have used it. host_vec_search and host_task_proc are genuine
-    // not-yet-implemented stubs in the ORIGINAL gm-runner too (see that
-    // file's own `not_implemented` helper) -- porting the same shape here
-    // is not a regression, it matches upstream's real current capability.
+    // host_vec_search must stay DECLARED because gm.wasm imports it
+    // unconditionally at compile time -- a missing import breaks every dispatch,
+    // not just vector calls. But it is no longer CALLED by any guest code path:
+    // the guest now runs vector search in-process against libsql (vec_search_local
+    // in rs-plugkit verbs.rs), so this import is dead. It returns a typed error
+    // only to satisfy the ABI for a call that can never arrive; there is no stub
+    // behind a live subsystem here.
     linker.func_wrap(
         "env",
         "host_vec_search",
         |mut caller: Caller<'_, HostState>, q_ptr: u32, q_len: u32, k: u32| -> u64 {
             let _ = (q_ptr, q_len, k);
-            write_guest_json(&mut caller, serde_json::json!({"ok": false, "error": "not_implemented_agentplug_host"}))
+            write_guest_json(&mut caller, serde_json::json!({"ok": false, "error": "host_vec_search_unused_guest_runs_libsql_directly"}))
         },
     )?;
     // host_task_proc was a not_implemented stub, so task-spawn/task-stop were
