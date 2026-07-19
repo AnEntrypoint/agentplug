@@ -123,7 +123,7 @@ pub fn run(code: &str, opts: &Value, cwd: &Path) -> Value {
     v
 }
 
-fn build_command(lang: &str, code: &str) -> Option<(String, Vec<String>, Option<std::path::PathBuf>)> {
+pub(crate) fn build_command(lang: &str, code: &str) -> Option<(String, Vec<String>, Option<std::path::PathBuf>)> {
     match lang {
         "nodejs" | "js" => {
             let wrapped = format!(

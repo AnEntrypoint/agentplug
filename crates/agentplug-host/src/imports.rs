@@ -353,12 +353,28 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
             write_guest_json(&mut caller, serde_json::json!({"ok": false, "error": "not_implemented_agentplug_host"}))
         },
     )?;
+    // host_task_proc was a not_implemented stub, so task-spawn/task-stop were
+    // non-functional under the native runtime -- the whole background-process
+    // subsystem was unreachable (task-list worked only because it reads an
+    // empty registry). Wired to a real native process registry (crate::task)
+    // that spawns detached children, drains their output opportunistically on
+    // each list/output/stop, and reaps on exit or timeout. Reuses exec_js's
+    // build_command for the lang->command mapping so task and exec_js resolve
+    // languages identically.
     linker.func_wrap(
         "env",
         "host_task_proc",
         |mut caller: Caller<'_, HostState>, a_ptr: u32, a_len: u32, p_ptr: u32, p_len: u32| -> u64 {
-            let _ = (a_ptr, a_len, p_ptr, p_len);
-            write_guest_json(&mut caller, serde_json::json!({"ok": false, "error": "not_implemented_agentplug_host"}))
+            let action = read_guest_string(&mut caller, a_ptr, a_len);
+            let params_str = read_guest_string(&mut caller, p_ptr, p_len);
+            let params: serde_json::Value = if params_str.is_empty() {
+                serde_json::json!({})
+            } else {
+                serde_json::from_str(&params_str).unwrap_or(serde_json::json!({}))
+            };
+            let cwd = caller.data().cwd();
+            let result = crate::task::handle(&action, &params, &cwd);
+            write_guest_json(&mut caller, result)
         },
     )?;
     // host_browser_exec was a documented capability gap -- agentplug-host had

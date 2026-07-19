@@ -1,6 +1,7 @@
 mod browser;
 mod exec_js;
 mod host_state;
+mod task;
 mod imports;
 mod install;
 mod registry;
