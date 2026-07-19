@@ -257,6 +257,26 @@ pub fn run_daemon() -> anyhow::Result<()> {
     let mut known_roots: Vec<PathBuf> = Vec::new();
     const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 
+    // WASM linear memory is architecturally monotonic (memory.grow is the
+    // only size-changing instruction, no shrink exists in the spec) -- once
+    // a shared plugin's Store (gm/bert/treesitter/libsql, see
+    // is_stateless_shared_plugin) grows to accommodate a peak allocation
+    // (live-witnessed: ~1.8GB during the FIRST real codesearch's full-repo
+    // codeinsight index+embed pass, candle's BertModel::forward allocating
+    // batched activation tensors), that memory is retained by THIS PROCESS
+    // for its entire lifetime -- there is no in-place reclamation, and
+    // PLUGIN_IDLE_EVICT_MS only removes per-project ProjectPlugins map
+    // entries, never touches the SHARED_PLUGINS static's actual Stores.
+    // The only way to reclaim a peak is to exit this process entirely and
+    // let a fresh one re-earn a low baseline -- safe because `spool`'s
+    // ensure_daemon_running() always spawns a new daemon on next real need
+    // (main.rs), so a clean self-exit here is a respawn, not an outage.
+    // Gated on genuine full-fleet idleness (every registered project's last
+    // dispatch older than SELF_RECYCLE_IDLE_MS) so an in-flight or
+    // soon-to-resume project is never interrupted mid-use.
+    const SELF_RECYCLE_IDLE_MS: u64 = 60 * 60 * 1000;
+    let mut last_any_dispatch = Instant::now();
+
     loop {
         if last_heartbeat.elapsed() >= HEARTBEAT_INTERVAL {
             last_heartbeat = Instant::now();
@@ -496,6 +516,16 @@ pub fn run_daemon() -> anyhow::Result<()> {
         for root in to_evict {
             eprintln!("[agentplug daemon] evicting idle project {}", root.display());
             projects.remove(&root);
+        }
+
+        if any_work {
+            last_any_dispatch = Instant::now();
+        } else if last_any_dispatch.elapsed() >= Duration::from_millis(SELF_RECYCLE_IDLE_MS) {
+            eprintln!(
+                "[agentplug daemon] self-recycling after {}ms fully idle -- reclaims shared-plugin peak wasm memory (monotonic linear memory, no in-place shrink); next real dispatch spawns a fresh process",
+                SELF_RECYCLE_IDLE_MS
+            );
+            return Ok(());
         }
 
         if !any_work {
