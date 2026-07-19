@@ -574,13 +574,26 @@ pub fn run_daemon() -> anyhow::Result<()> {
 
         if any_work {
             last_shared_release = Instant::now();
-        } else if last_shared_release.elapsed() >= Duration::from_millis(SHARED_PLUGIN_RELEASE_IDLE_MS)
-            && agentplug_host::release_shared_plugin("bert")
-        {
-            eprintln!(
-                "[agentplug daemon] released idle shared bert Store after {}ms quiet -- returns its grown wasm linear memory; next embed re-instantiates",
-                SHARED_PLUGIN_RELEASE_IDLE_MS
-            );
+        } else if last_shared_release.elapsed() >= Duration::from_millis(SHARED_PLUGIN_RELEASE_IDLE_MS) {
+            // Only bert was released, but treesitter and libsql grow their own
+            // linear memory across an indexing pass and never gave it back --
+            // wasm memory.grow has no inverse, so a Store retains its peak for
+            // its whole lifetime and dropping it is the only way to reclaim.
+            // `gm` is deliberately excluded despite being release-eligible: it
+            // holds the orchestrator state this loop is actively serving.
+            let mut released: Vec<&str> = Vec::new();
+            for plugin_name in ["bert", "treesitter", "libsql"] {
+                if agentplug_host::release_shared_plugin(plugin_name) {
+                    released.push(plugin_name);
+                }
+            }
+            if !released.is_empty() {
+                eprintln!(
+                    "[agentplug daemon] released idle shared Stores [{}] after {}ms quiet -- returns their grown wasm linear memory; next call re-instantiates",
+                    released.join(", "),
+                    SHARED_PLUGIN_RELEASE_IDLE_MS
+                );
+            }
             last_shared_release = Instant::now();
         }
 
