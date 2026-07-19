@@ -284,6 +284,9 @@ pub fn run_daemon() -> anyhow::Result<()> {
     const SHARED_PLUGIN_RELEASE_IDLE_MS: u64 = 2 * 60 * 1000;
     let mut last_shared_release = Instant::now();
 
+    const PLUGIN_UPDATE_POLL_INTERVAL: Duration = Duration::from_secs(600);
+    let mut last_plugin_update_poll = Instant::now();
+
     loop {
         if last_heartbeat.elapsed() >= HEARTBEAT_INTERVAL {
             last_heartbeat = Instant::now();
@@ -546,6 +549,29 @@ pub fn run_daemon() -> anyhow::Result<()> {
         // dropped WorkingSet 1545.8MB -> 1.0MB while PrivateMemorySize64 held
         // at 1546.6MB), which looks exactly like accumulate-then-release even
         // when nothing has actually been freed.
+        // A plugin wasm already on disk is never re-fetched by
+        // ensure_plugin_installed (its dest.exists() fast path returns before
+        // the version check), so without this poll a running daemon serves the
+        // wasm it first downloaded forever -- no published fix ever reaches it.
+        // Releasing the shared Store is what actually makes a refreshed wasm
+        // take effect: the module is re-read from disk on next instantiation.
+        if !any_work && last_plugin_update_poll.elapsed() >= PLUGIN_UPDATE_POLL_INTERVAL {
+            last_plugin_update_poll = Instant::now();
+            for plugin_name in plugin_modules.modules.keys().cloned().collect::<Vec<_>>() {
+                match crate::download::refresh_plugin_if_stale(&plugin_name) {
+                    Ok(Some(new_version)) => {
+                        plugin_modules.modules.remove(&plugin_name);
+                        agentplug_host::release_shared_plugin(&plugin_name);
+                        eprintln!(
+                            "[agentplug daemon] refreshed plugin {plugin_name} to {new_version} -- released its Store; next call re-instantiates from the new wasm"
+                        );
+                    }
+                    Ok(None) => {}
+                    Err(e) => eprintln!("[agentplug daemon] plugin update check for {plugin_name} failed: {e}"),
+                }
+            }
+        }
+
         if any_work {
             last_shared_release = Instant::now();
         } else if last_shared_release.elapsed() >= Duration::from_millis(SHARED_PLUGIN_RELEASE_IDLE_MS)

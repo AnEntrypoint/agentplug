@@ -107,6 +107,24 @@ pub fn fetch_latest_plugin_version(plugin_name: &str) -> anyhow::Result<Option<S
     Ok(body.get("tag_name").and_then(|v| v.as_str()).map(|s| s.trim_start_matches('v').to_string()))
 }
 
+pub fn installed_plugin_version(plugin_name: &str) -> Option<String> {
+    fs::read_to_string(plugin_version_path(plugin_name)).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+}
+
+pub fn refresh_plugin_if_stale(plugin_name: &str) -> anyhow::Result<Option<String>> {
+    let Some(installed) = installed_plugin_version(plugin_name) else {
+        return Ok(None);
+    };
+    let Some(latest) = fetch_latest_plugin_version(plugin_name)? else {
+        return Ok(None);
+    };
+    if latest == installed {
+        return Ok(None);
+    }
+    ensure_plugin_installed(plugin_name, Some(&latest))?;
+    Ok(Some(latest))
+}
+
 pub fn ensure_plugin_installed(plugin_name: &str, explicit_version: Option<&str>) -> anyhow::Result<PathBuf> {
     let dest = plugin_wasm_path(plugin_name);
     if dest.exists() && explicit_version.is_none() {
