@@ -97,6 +97,87 @@ fn plugin_version_path(plugin_name: &str) -> PathBuf {
     install_dir().join("plugins").join(format!("{plugin_name}.version"))
 }
 
+/// The runner EXECUTABLE's own self-update, separate from the wasm-guest
+/// update path above (that one hot-reloads gm/bert/libsql/treesitter IN this
+/// process; this one replaces the process itself). Same source repo and
+/// asset-naming convention bin/install.js's agentplugRunnerAssetName() uses
+/// (must stay byte-identical to agentplug's own release.yml matrix), so a
+/// tag published for the JS installer to pick up is the SAME tag this poll
+/// detects -- one release, two independent consumers.
+const RUNNER_BIN_REPO: &str = "AnEntrypoint/agentplug-bin";
+
+fn runner_asset_name() -> Option<&'static str> {
+    match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("windows", "x86_64") => Some("agentplug-runner-windows-x64.exe"),
+        ("windows", "aarch64") => Some("agentplug-runner-windows-arm64.exe"),
+        ("macos", "x86_64") => Some("agentplug-runner-macos-x64"),
+        ("macos", "aarch64") => Some("agentplug-runner-macos-arm64"),
+        ("linux", "x86_64") => Some("agentplug-runner-linux-x64"),
+        ("linux", "aarch64") => Some("agentplug-runner-linux-arm64"),
+        _ => None,
+    }
+}
+
+fn runner_version_path() -> PathBuf {
+    install_dir().join("agentplug-runner.version")
+}
+
+pub fn installed_runner_version() -> Option<String> {
+    fs::read_to_string(runner_version_path()).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+}
+
+pub fn fetch_latest_runner_version() -> anyhow::Result<Option<String>> {
+    let url = format!("https://api.github.com/repos/{RUNNER_BIN_REPO}/releases/latest");
+    let resp = ureq::get(&url).set("User-Agent", "agentplug-runner").call()?;
+    let body: serde_json::Value = serde_json::from_str(&resp.into_string()?)?;
+    Ok(body.get("tag_name").and_then(|v| v.as_str()).map(|s| s.to_string()))
+}
+
+/// Downloads+verifies a newer runner build to `<current-exe-path>.new`,
+/// never overwriting the running exe directly -- Windows refuses to write to
+/// its own currently-mapped executable file (a hard OS-level lock, not a
+/// permissions issue), so the running process can only ever stage the
+/// replacement alongside itself. Returns the staged path and its version tag
+/// on success; `Ok(None)` means already current (no newer tag) or this
+/// platform has no published runner binary (never an error -- a host CI
+/// doesn't build for is expected to silently skip self-update, exactly like
+/// the wasm-guest plugin poll's own None-on-unpublished-platform behavior).
+pub fn stage_runner_self_update() -> anyhow::Result<Option<(PathBuf, String)>> {
+    let Some(asset) = runner_asset_name() else { return Ok(None) };
+    let Some(latest) = fetch_latest_runner_version()? else { return Ok(None) };
+    if installed_runner_version().as_deref() == Some(latest.as_str()) {
+        return Ok(None);
+    }
+    let current_exe = std::env::current_exe()?;
+    let staged = current_exe.with_extension(
+        current_exe.extension().map(|e| format!("{}.new", e.to_string_lossy())).unwrap_or_else(|| "new".to_string())
+    );
+    let base = format!("https://github.com/{RUNNER_BIN_REPO}/releases/download/{latest}");
+    let sha_line = ureq::get(&format!("{base}/{asset}.sha256")).call()?.into_string()?;
+    let expected_sha = sha_line.split_whitespace().next()
+        .ok_or_else(|| anyhow::anyhow!("empty sha256 sidecar for {asset} at {base}"))?.to_string();
+    download_and_verify(&format!("{base}/{asset}"), &staged, &expected_sha)?;
+    #[cfg(not(windows))]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(&staged)?.permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&staged, perms)?;
+    }
+    Ok(Some((staged, latest)))
+}
+
+/// Records the version now actually running -- called by the NEW process
+/// once it has confirmed itself healthy and taken over ownership (never by
+/// the download step itself, which only stages a candidate; writing the
+/// version marker before the candidate has proven it can actually serve
+/// would let a broken build masquerade as "installed" and never get retried).
+pub fn record_runner_version(version: &str) -> anyhow::Result<()> {
+    fs::create_dir_all(install_dir())?;
+    fs::write(runner_version_path(), version)?;
+    Ok(())
+}
+
 pub fn fetch_latest_plugin_version(plugin_name: &str) -> anyhow::Result<Option<String>> {
     let Some(spec) = plugin_asset_spec(plugin_name) else {
         anyhow::bail!("unknown plugin {plugin_name} -- not registered in agentplug-runner's plugin_asset_spec map");

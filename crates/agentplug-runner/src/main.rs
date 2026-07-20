@@ -104,6 +104,14 @@ fn main() -> anyhow::Result<()> {
             run_spool_watcher_single_process(&mut project, &spool_dir)
         }
         "daemon" => daemon::run_daemon(),
+        "takeover" => {
+            let version = args.get(2).cloned().unwrap_or_default();
+            if version.is_empty() {
+                eprintln!("usage: agentplug-runner takeover <version>");
+                std::process::exit(1);
+            }
+            daemon::run_takeover(&version)
+        }
         "dispatch" => {
             let plugin = args.get(2).cloned().unwrap_or_else(|| "gm".to_string());
             let verb = args.get(3).cloned().unwrap_or_default();
@@ -141,7 +149,7 @@ fn main() -> anyhow::Result<()> {
         }
         other => {
             eprintln!(
-                "agentplug-runner: unknown command '{other}'. Usage: agentplug-runner <plugin <name> [version]|spool|daemon|dispatch [plugin] <verb> [body]|version>"
+                "agentplug-runner: unknown command '{other}'. Usage: agentplug-runner <plugin <name> [version]|spool|daemon|takeover <version>|dispatch [plugin] <verb> [body]|version>"
             );
             std::process::exit(1);
         }

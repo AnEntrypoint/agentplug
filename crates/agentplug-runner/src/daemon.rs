@@ -7,7 +7,7 @@ use wasmtime::{Engine, Module};
 
 use agentplug_host::{build_engine, install_dir, now_ms, read_project_plugin_list, ProjectPlugins, PLUGIN_IDLE_EVICT_MS};
 
-use crate::download::ensure_plugin_installed;
+use crate::download::{ensure_plugin_installed, installed_runner_version, record_runner_version};
 
 fn registry_path() -> PathBuf {
     install_dir().join("daemon-registry.txt")
@@ -238,10 +238,9 @@ fn pid_is_alive(pid: u64) -> bool {
         .unwrap_or(true)
 }
 
-fn spawn_detached_daemon() -> anyhow::Result<()> {
-    let exe = std::env::current_exe()?;
-    let mut cmd = std::process::Command::new(&exe);
-    cmd.arg("daemon");
+fn spawn_detached(exe: &Path, args: &[&str]) -> anyhow::Result<()> {
+    let mut cmd = std::process::Command::new(exe);
+    cmd.args(args);
     cmd.stdin(std::process::Stdio::null());
     cmd.stdout(std::process::Stdio::null());
     cmd.stderr(std::process::Stdio::null());
@@ -264,6 +263,116 @@ fn spawn_detached_daemon() -> anyhow::Result<()> {
     }
     cmd.spawn()?;
     Ok(())
+}
+
+fn spawn_detached_daemon() -> anyhow::Result<()> {
+    let exe = std::env::current_exe()?;
+    spawn_detached(&exe, &["daemon"])
+}
+
+fn takeover_ready_path() -> PathBuf {
+    install_dir().join("daemon-takeover-ready.json")
+}
+
+/// Called by an OLD daemon's main loop (see PLUGIN_UPDATE_POLL_INTERVAL's
+/// sibling poll below) once `download::stage_runner_self_update()` has
+/// staged a verified `<exe>.new`. Spawns the staged binary as `takeover
+/// <version>`, waits (bounded) for it to prove itself alive and about to
+/// serve, then VOLUNTARILY releases ownership and returns true (caller exits
+/// the process immediately after) -- a real handoff, never a race-to-
+/// staleness. Returns false (caller keeps running unchanged) if the new
+/// process never proves itself in time, so a broken build can never take
+/// down the one daemon everyone depends on; the stale `.new` is simply
+/// retried next poll (harmless -- download_and_verify's tmp-then-rename
+/// means a half-written `.new` from an interrupted previous attempt is never
+/// left in a state this could pick up broken).
+fn attempt_self_update_handoff(staged_exe: &Path, version: &str) -> bool {
+    let ready_path = takeover_ready_path();
+    let _ = fs::remove_file(&ready_path);
+    if spawn_detached(staged_exe, &["takeover", version]).is_err() {
+        return false;
+    }
+    // Bounded wait for the new process's readiness marker -- generous
+    // relative to a cold boot (engine build + 4 default plugin compiles,
+    // measured this session at several-hundred-ms to low-seconds) but never
+    // unbounded: a hung/crash-looping new binary must not stall the old
+    // daemon's own loop (heartbeat authority re-check, dispatch service)
+    // past the point where ITS OWN heartbeat would go stale and get
+    // reclaimed by yet another process.
+    for _ in 0..40 {
+        std::thread::sleep(Duration::from_millis(250));
+        if let Ok(raw) = fs::read_to_string(&ready_path) {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
+                if v.get("version").and_then(|x| x.as_str()) == Some(version) {
+                    eprintln!("[agentplug daemon] new version {version} confirmed ready -- releasing ownership for handoff");
+                    release_ownership_for_handoff();
+                    return true;
+                }
+            }
+        }
+    }
+    eprintln!("[agentplug daemon] self-update to {version} did not confirm ready in time -- staying on current version, will retry next poll");
+    false
+}
+
+/// Deletes this process's own owner-lock file (only if it is genuinely still
+/// the recorded owner -- never blind-deletes a file another process may have
+/// already taken over) so the new process's own claim_ownership() succeeds
+/// immediately via the create_new fast path, rather than needing to wait out
+/// DAEMON_STALE_MS for a takeover-via-staleness. A true release, not a crash.
+fn release_ownership_for_handoff() {
+    let my_pid = std::process::id() as u64;
+    if read_owner_pid() == Some(my_pid) {
+        let _ = fs::remove_file(daemon_owner_path());
+    }
+}
+
+/// Entry point for the `takeover <version>` subcommand (main.rs) -- run by
+/// the NEWLY STAGED binary the old daemon just spawned. Builds a real engine
+/// and compiles the default plugin set (the same cost run_daemon() itself
+/// pays) BEFORE writing the readiness marker, so "ready" genuinely means
+/// "can serve," not merely "process started." Only after the old daemon
+/// observes readiness and releases ownership does this process claim it and
+/// fall into the exact same run_daemon() loop a normal boot would -- from
+/// that point on it IS the daemon, indistinguishable from one that started
+/// the ordinary way.
+pub fn run_takeover(version: &str) -> anyhow::Result<()> {
+    eprintln!("[agentplug daemon] takeover: building engine for version {version}");
+    let mut plugin_modules = PluginModules::new()?;
+    for plugin_name in ["gm", "bert", "libsql", "treesitter"] {
+        if let Err(e) = plugin_modules.get_or_compile(plugin_name) {
+            eprintln!("[agentplug daemon] takeover: pre-warm of {plugin_name} failed (non-fatal, will lazy-compile on first use): {e}");
+        }
+    }
+    let _ = fs::write(
+        takeover_ready_path(),
+        serde_json::json!({"version": version, "pid": std::process::id(), "ts": now_ms()}).to_string(),
+    );
+    eprintln!("[agentplug daemon] takeover: readiness marker written, waiting for old daemon to release ownership");
+    // Wait for the OLD process to actually release (not just for our own
+    // claim_ownership() to succeed against a file that might still exist
+    // mid-delete) -- polling read_owner_pid()==None avoids a window where we
+    // "claim" by racing a rename the old process is still mid-write on.
+    // Generous window (2 minutes, not the original 10s): live-witnessed this
+    // session that the OLD daemon's own release runs from inside its main
+    // loop, which can be blocked well past a few seconds on one long
+    // synchronous wasm call already in flight when the update poll fires --
+    // the exact same "stuck in one long call, misses its own heartbeat tick"
+    // condition documented at holds_heartbeat_authority's call site above. A
+    // takeover that gives up in 10s under that same realistic load would
+    // abandon a handoff that was genuinely still coming, forcing a full
+    // extra poll-interval wait (up to RUNNER_UPDATE_POLL_INTERVAL) before
+    // the next attempt -- costing far more than patiently waiting out one
+    // busy dispatch actually would have.
+    for _ in 0..480 {
+        if read_owner_pid().is_none() && claim_ownership() {
+            record_runner_version(version)?;
+            eprintln!("[agentplug daemon] takeover: ownership claimed, version recorded, entering normal daemon loop");
+            return run_daemon_body(plugin_modules);
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    anyhow::bail!("takeover: old daemon never released ownership within the wait window -- aborting, old daemon keeps serving")
 }
 
 fn write_daemon_heartbeat(project_count: usize, plugin_module_count: usize) {
@@ -580,7 +689,19 @@ pub fn run_daemon() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let mut plugin_modules = PluginModules::new()?;
+    let plugin_modules = PluginModules::new()?;
+    // A fresh normal boot (never a self-update takeover) has no version
+    // marker to preserve -- record the version this exe actually is now,
+    // matching run_takeover's own record_runner_version call, so
+    // installed_runner_version() is never left stale/absent after a plain
+    // (non-update-triggered) start.
+    if installed_runner_version().is_none() {
+        let _ = record_runner_version(env!("CARGO_PKG_VERSION"));
+    }
+    run_daemon_body(plugin_modules)
+}
+
+fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
     write_daemon_heartbeat(0, 0);
 
     let mut projects: HashMap<PathBuf, ProjectPlugins> = HashMap::new();
@@ -618,6 +739,14 @@ pub fn run_daemon() -> anyhow::Result<()> {
 
     const PLUGIN_UPDATE_POLL_INTERVAL: Duration = Duration::from_secs(600);
     let mut last_plugin_update_poll = Instant::now();
+
+    // Same cadence as the wasm-guest poll -- the runner's own executable
+    // deserves no less frequent an update check than the plugins it hosts.
+    // Per fsm-framework/runner-self-update: closes the "agent had to
+    // manually kill/rebuild/redeploy the daemon" gap this session hit
+    // repeatedly for daemon.rs fixes.
+    const RUNNER_UPDATE_POLL_INTERVAL: Duration = Duration::from_secs(600);
+    let mut last_runner_update_poll = Instant::now();
 
     loop {
         if last_heartbeat.elapsed() >= HEARTBEAT_INTERVAL {
@@ -791,6 +920,28 @@ pub fn run_daemon() -> anyhow::Result<()> {
                     Ok(None) => {}
                     Err(e) => eprintln!("[agentplug daemon] plugin update check for {plugin_name} failed: {e}"),
                 }
+            }
+        }
+
+        // Only when genuinely idle, same reasoning as the plugin-update poll
+        // above: a self-update handoff briefly needs to spawn+wait+release,
+        // which must never interrupt an in-flight dispatch. On success this
+        // process's job is done -- it has voluntarily released ownership to
+        // the new process, so it exits the loop (and the function) here
+        // rather than looping once more and re-claiming what it just handed
+        // off.
+        if !any_work && last_runner_update_poll.elapsed() >= RUNNER_UPDATE_POLL_INTERVAL {
+            last_runner_update_poll = Instant::now();
+            match crate::download::stage_runner_self_update() {
+                Ok(Some((staged, version))) => {
+                    eprintln!("[agentplug daemon] staged self-update to {version} at {}", staged.display());
+                    if attempt_self_update_handoff(&staged, &version) {
+                        eprintln!("[agentplug daemon] handed off to version {version} -- exiting");
+                        return Ok(());
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => eprintln!("[agentplug daemon] runner self-update check failed: {e}"),
             }
         }
 
