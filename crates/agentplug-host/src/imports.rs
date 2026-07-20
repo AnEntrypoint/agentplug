@@ -135,7 +135,22 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
             let full = caller.data().cwd().join(&path);
             match fs::metadata(&full) {
                 Ok(md) => {
-                    let v = serde_json::json!({"isDirectory": md.is_dir(), "isFile": md.is_file(), "size": md.len()});
+                    // mtimeMs lets the guest do a stat-only change check (the
+                    // codeinsight digest / per-file skip) without reading and
+                    // hashing file content -- the cheap-skip the reference
+                    // codebasesearch impl relies on. 0 when the platform can't
+                    // report a modified time.
+                    let mtime_ms = md
+                        .modified()
+                        .ok()
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0);
+                    // Both spellings: fs_stat's public shape uses camelCase
+                    // (isDirectory/isFile), but the codeinsight guest reads
+                    // snake_case `mtime_ms` for its stat-only skip, so emit both
+                    // and let each consumer pick the one it expects.
+                    let v = serde_json::json!({"isDirectory": md.is_dir(), "isFile": md.is_file(), "size": md.len(), "mtimeMs": mtime_ms, "mtime_ms": mtime_ms});
                     write_guest_json(&mut caller, v)
                 }
                 Err(_) => 0,
