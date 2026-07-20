@@ -85,6 +85,32 @@ fn entry_summary(id: &str, entry: &TaskEntry) -> Value {
     })
 }
 
+/// Adopts an ALREADY-RUNNING child (one exec_js's own time-sliced wait loop
+/// started synchronously, then decided to hand off past its first
+/// checkpoint -- see exec_js.rs's SLICE_MS loop) into this SAME registry
+/// spawn() populates, so the resulting id is polled through the identical
+/// task-output/task-list/task-stop verbs regardless of which path created
+/// it. `started` is the ORIGINAL Instant the child was spawned at (not
+/// "now"), so timeout_ms bookkeeping in poll_entry still measures from the
+/// child's true start, not from the moment of hand-off.
+pub fn adopt_running(child: std::process::Child, lang: &str, started: std::time::Instant, timeout_ms: u64) -> String {
+    let started_ms = now_ms().saturating_sub(started.elapsed().as_millis() as u64);
+    let id = next_id(started_ms ^ (child.id() as u64));
+    let entry = TaskEntry {
+        child,
+        lang: lang.to_string(),
+        started_ms,
+        timeout_ms,
+        stdout: Vec::new(),
+        stderr: Vec::new(),
+        exit_code: None,
+        finished_ms: None,
+    };
+    let mut reg = registry().lock().unwrap();
+    reg.insert(id.clone(), entry);
+    id
+}
+
 fn spawn(params: &Value, cwd: &Path) -> Value {
     let lang = params.get("lang").and_then(|v| v.as_str()).unwrap_or("");
     let code = params.get("code").and_then(|v| v.as_str()).unwrap_or("");

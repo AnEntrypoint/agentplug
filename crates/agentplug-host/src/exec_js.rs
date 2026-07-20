@@ -61,15 +61,35 @@ pub fn run(code: &str, opts: &Value, cwd: &Path) -> Value {
         }
     };
 
-    let timed_out = match child.wait_timeout(Duration::from_millis(timeout_ms)) {
-        Ok(Some(_status)) => false,
-        Ok(None) => {
-            let _ = child.kill();
-            let _ = child.wait();
-            true
-        }
-        Err(_) => false,
-    };
+    // Every call still waits the FULL declared timeout_ms as a genuinely
+    // short synchronous call, unchanged from before -- no silent
+    // auto-slicing. The only change: on hitting that timeout with the
+    // child STILL running, instead of unconditionally killing it (the old
+    // behavior, which discarded a job that might have been one dispatch
+    // away from finishing), hand it off ALIVE into task.rs's existing
+    // background registry (same one host_task_proc serves) and return
+    // in_progress:true + its task_id -- the calling agent explicitly
+    // decides next, via `task-output {id}` (keep it running, check
+    // progress -- the queue is NOT blocked on it, this worker already
+    // returned) or `task-stop {id}` (kill it). Never silently continues
+    // running past a timeout with no signal, and never silently discards a
+    // near-complete job by hard-killing on the very call that names the
+    // decision point -- the agent is the one who upgrades-to-background or
+    // closes, per exec-js-time-sliced-lifecycle-control's checkpoint
+    // contract, live-hit this session as a 150s+ cargo check leaving the
+    // agent with zero visibility and zero choice until it finally returned.
+    let still_running = matches!(child.wait_timeout(Duration::from_millis(timeout_ms)), Ok(None));
+    if still_running {
+        let task_id = crate::task::adopt_running(child, lang, t0, timeout_ms);
+        return json!({
+            "ok": true,
+            "timed_out": true,
+            "in_progress": true,
+            "task_id": task_id,
+            "elapsed_ms": t0.elapsed().as_millis() as u64,
+            "decision_required": "this call hit its timeoutMs still running -- it was NOT killed, it is alive in the background task registry as task_id. Decide: `task-output {id}` to keep it running and poll progress/result later (the queue is already free, this worker returned immediately), or `task-stop {id}` to kill it now. It does not run forever unattended -- dispatch one of those two, do not leave it un-decided.",
+        });
+    }
 
     let duration_ms = t0.elapsed().as_millis() as u64;
     let mut stdout_buf = Vec::new();
@@ -114,7 +134,7 @@ pub fn run(code: &str, opts: &Value, cwd: &Path) -> Value {
         "stdout": stdout,
         "stderr": String::from_utf8_lossy(&stderr_buf),
         "exit_code": exit_code,
-        "timed_out": timed_out,
+        "timed_out": false,
         "duration_ms": duration_ms,
     });
     if let Some(r) = result_field {
