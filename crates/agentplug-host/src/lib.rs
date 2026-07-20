@@ -18,6 +18,16 @@ pub fn build_engine() -> anyhow::Result<Engine> {
     let mut cache_config = CacheConfig::new();
     cache_config.with_directory(wasmtime_cache_dir());
     config.cache(Some(Cache::new(cache_config)?));
+    // A guest-side Rust panic (unwrap/expect/index-out-of-bounds/etc) traps
+    // as a bare wasmtime "unreachable" with ZERO diagnostic context unless
+    // backtraces are explicitly enabled -- wasmtime's default is
+    // environment-dependent (often off in release builds), which is exactly
+    // why a real remote-user trap this session produced no actionable info
+    // at all. wasm_backtrace_details(Enabled) makes every trap carry a real
+    // guest-side stack frame (function name + wasm offset) instead of
+    // nothing, at a small binary-size/compile-time cost that is worth it
+    // for a tool whose whole job is to be debuggable when it breaks.
+    config.wasm_backtrace_details(wasmtime::WasmBacktraceDetails::Enable);
     Engine::new(&config).map_err(|e| anyhow::anyhow!(e))
 }
 
