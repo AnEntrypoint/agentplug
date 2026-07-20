@@ -103,7 +103,12 @@ pub fn claim_ownership() -> bool {
     // Owner file already exists. Only ever take over a STALE one -- staleness
     // is judged by the heartbeat file, never by the lock file's own presence,
     // so a live owner (heartbeating fine, but hasn't rewritten its own already-
-    // correct owner file) is never mistaken for dead.
+    // correct owner file) is never mistaken for dead. Timestamp freshness
+    // ALONE is not enough (the same class of race is_daemon_fresh's own fix
+    // closed): a process that just died leaves a heartbeat that reads as
+    // fresh for up to DAEMON_STALE_MS with nothing alive behind it -- verify
+    // the pid is a real live process too, live-hit this session as a direct
+    // `daemon` boot losing its own claim to a pid that no longer existed.
     let existing_pid = read_owner_pid();
     let heartbeat_fresh = fs::read_to_string(daemon_status_path())
         .ok()
@@ -114,7 +119,7 @@ pub fn claim_ownership() -> bool {
             now_ms().saturating_sub(ts) < DAEMON_STALE_MS && pid == existing_pid
         })
         .unwrap_or(false);
-    if heartbeat_fresh {
+    if heartbeat_fresh && existing_pid.map(pid_is_alive).unwrap_or(false) {
         return existing_pid == Some(my_pid);
     }
 
@@ -610,10 +615,35 @@ fn dispatch_project(root: &Path, project: &mut ProjectPlugins, plugin_modules: &
                 let out_body = if !project.is_loaded("gm") {
                     serde_json::json!({"ok": false, "error": "gm plugin failed to load for this project (see daemon stderr for the compile/install/instantiate failure)", "verb": verb}).to_string()
                 } else {
-                    match project.dispatch("gm", &verb, &body) {
-                        Ok(s) if !s.is_empty() => s,
-                        Ok(_) => serde_json::json!({"ok": false, "error": "empty dispatch result", "verb": verb}).to_string(),
-                        Err(e) => serde_json::json!({"ok": false, "error": format!("{e:#}"), "verb": verb}).to_string(),
+                    // A panic inside project.dispatch (a wasmtime trap that
+                    // escapes as a Rust panic rather than surfacing through
+                    // the Result, or a poisoned-Mutex unwrap somewhere in the
+                    // call chain) previously unwound straight through this
+                    // function with no catch -- the request file was ALREADY
+                    // claimed+deleted (rename above, then remove_file) before
+                    // this point, so the panic silently ate the request:
+                    // no response ever written, no error surfaced, the
+                    // caller left polling forever against a file that will
+                    // never appear. Live-hit this session with a jit-hook
+                    // gate (fsm-framework-jit-hook-concreting) whose
+                    // host_exec_js call triggered exactly this. catch_unwind
+                    // converts any panic into a real error response instead,
+                    // so the caller gets a definitive (if unhappy) answer
+                    // rather than an unbounded silent hang.
+                    let dispatch_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        project.dispatch("gm", &verb, &body)
+                    }));
+                    match dispatch_result {
+                        Ok(Ok(s)) if !s.is_empty() => s,
+                        Ok(Ok(_)) => serde_json::json!({"ok": false, "error": "empty dispatch result", "verb": verb}).to_string(),
+                        Ok(Err(e)) => serde_json::json!({"ok": false, "error": format!("{e:#}"), "verb": verb}).to_string(),
+                        Err(panic_payload) => {
+                            let msg = panic_payload.downcast_ref::<&str>().map(|s| s.to_string())
+                                .or_else(|| panic_payload.downcast_ref::<String>().cloned())
+                                .unwrap_or_else(|| "panic with non-string payload".to_string());
+                            eprintln!("[agentplug daemon] verb {verb} PANICKED for {}: {msg}", root.display());
+                            serde_json::json!({"ok": false, "error": format!("dispatch panicked: {msg}"), "verb": verb}).to_string()
+                        }
                     }
                 };
                 let tmp = out_dir.join(format!("{out_name}.tmp.{}", std::process::id()));
