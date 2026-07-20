@@ -59,24 +59,97 @@ fn daemon_lock_path() -> PathBuf {
     install_dir().join("daemon.lock")
 }
 
-/// True when the on-disk heartbeat is ours, absent, or stale enough to claim.
-/// A fresh heartbeat naming a DIFFERENT pid means another daemon superseded us
-/// and this process should exit rather than keep serving nobody. Shared by the
-/// heartbeat-tick check and the pre-work check at the top of the poll loop so
-/// both decide identically.
-fn holds_heartbeat_authority() -> bool {
-    let superseded = fs::read_to_string(daemon_status_path())
+/// The single-instance ownership token. Unlike `daemon-status.json` (a plain
+/// heartbeat, freely overwritten by anyone -- the exact TOCTOU this file
+/// exists to close), ownership of THIS file is claimed exactly once via
+/// `OpenOptions::create_new` (O_EXCL), an atomic check-and-claim the
+/// filesystem itself arbitrates: of any number of processes racing the same
+/// `create_new` call at the same instant, the OS guarantees exactly one
+/// succeeds. Contains only the owning pid as decimal text.
+fn daemon_owner_path() -> PathBuf {
+    install_dir().join("daemon-owner.lock")
+}
+
+fn read_owner_pid() -> Option<u64> {
+    fs::read_to_string(daemon_owner_path()).ok().and_then(|s| s.trim().parse::<u64>().ok())
+}
+
+/// Atomically claim daemon ownership for this process. Returns true iff this
+/// process now holds (or already held) the owner file. Never a check-then-act
+/// window: either `create_new` itself wins (filesystem-arbitrated, the only
+/// non-racy primitive here) or a stale owner is replaced via a tmp-write +
+/// atomic rename (also filesystem-arbitrated -- `rename` is atomic on both
+/// Windows and POSIX, so a second process attempting the same takeover at the
+/// same instant still can't produce a torn/mixed owner file, only a clean
+/// last-writer-wins). The freshness signal for "stale" is the SEPARATE
+/// heartbeat file's ts (a lock file has no ts of its own), so a takeover only
+/// fires once the previous owner has demonstrably stopped heartbeating for
+/// DAEMON_STALE_MS, not merely "some other pid's lock file exists."
+fn claim_ownership() -> bool {
+    let owner_path = daemon_owner_path();
+    if let Some(parent) = owner_path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let my_pid = std::process::id() as u64;
+
+    if fs::OpenOptions::new().write(true).create_new(true).open(&owner_path).is_ok() {
+        use std::io::Write as _;
+        if let Ok(mut f) = fs::OpenOptions::new().write(true).open(&owner_path) {
+            let _ = write!(f, "{my_pid}");
+        }
+        return true;
+    }
+
+    // Owner file already exists. Only ever take over a STALE one -- staleness
+    // is judged by the heartbeat file, never by the lock file's own presence,
+    // so a live owner (heartbeating fine, but hasn't rewritten its own already-
+    // correct owner file) is never mistaken for dead.
+    let existing_pid = read_owner_pid();
+    let heartbeat_fresh = fs::read_to_string(daemon_status_path())
         .ok()
         .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
         .map(|v| {
-            let other_pid = v.get("pid").and_then(|p| p.as_u64());
+            let pid = v.get("pid").and_then(|p| p.as_u64());
             let ts = v.get("ts").and_then(|t| t.as_u64()).unwrap_or(0);
-            now_ms().saturating_sub(ts) < DAEMON_STALE_MS
-                && other_pid.is_some()
-                && other_pid != Some(std::process::id() as u64)
+            now_ms().saturating_sub(ts) < DAEMON_STALE_MS && pid == existing_pid
         })
         .unwrap_or(false);
-    !superseded
+    if heartbeat_fresh {
+        return existing_pid == Some(my_pid);
+    }
+
+    // Stale: replace via tmp-write-then-atomic-rename, never remove+create
+    // (a remove+create window is exactly the TOCTOU gap this file exists to
+    // close -- a second stale-takeover attempt landing in that gap would
+    // itself race a plain create_new). rename() itself is the atomic
+    // publish; whichever racing takeover renames last simply wins cleanly,
+    // no torn intermediate state observable by a third reader.
+    let tmp_path = owner_path.with_extension(format!("lock.tmp.{my_pid}"));
+    if fs::write(&tmp_path, my_pid.to_string()).is_err() {
+        return false;
+    }
+    if fs::rename(&tmp_path, &owner_path).is_err() {
+        let _ = fs::remove_file(&tmp_path);
+        return false;
+    }
+    // Re-read after the rename: another process's takeover may have
+    // rename()'d over ours a moment later. Only proceed if we're still the
+    // recorded owner post-publish.
+    read_owner_pid() == Some(my_pid)
+}
+
+/// True when this process currently holds (or has just reclaimed) ownership.
+/// Shared by the heartbeat-tick re-check and the pre-work check at the top of
+/// the poll loop so both decide identically -- a process that ever reads a
+/// DIFFERENT live pid in the owner file has lost authority and must exit
+/// before doing further work, never merely "before writing its next
+/// heartbeat."
+fn holds_heartbeat_authority() -> bool {
+    match read_owner_pid() {
+        None => claim_ownership(),
+        Some(pid) if pid == std::process::id() as u64 => true,
+        Some(_) => claim_ownership() && read_owner_pid() == Some(std::process::id() as u64),
+    }
 }
 
 pub fn ensure_daemon_running() -> anyhow::Result<bool> {
@@ -242,30 +315,28 @@ pub fn try_dispatch_via_daemon(cwd: &Path, plugin: &str, verb: &str, body: &str)
 pub fn run_daemon() -> anyhow::Result<()> {
     eprintln!("[agentplug daemon] starting, registry {}", registry_path().display());
 
-    // Self-detect losing a spawn race: ensure_daemon_running()'s lock-then-spawn
-    // window has a real gap between removing daemon.lock and this process's
-    // own first heartbeat write below -- a second caller's is_daemon_fresh()
-    // check can land in that gap, see a stale/missing status file, and spawn
-    // its own competing daemon. Without this check, whichever of the two
-    // processes writes its heartbeat SECOND silently claims authority over
-    // the one already serving, and both keep running indefinitely (live-witnessed
-    // this session: two agentplug-runner.exe processes, equal memory, one with
-    // stale-but-real heartbeat history). If a DIFFERENT pid already holds a
-    // fresh heartbeat at this exact moment, this process lost the race --
-    // exit immediately rather than overwrite it and run alongside the winner.
-    if let Ok(raw) = fs::read_to_string(daemon_status_path()) {
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
-            let existing_pid = v.get("pid").and_then(|p| p.as_u64());
-            let ts = v.get("ts").and_then(|t| t.as_u64()).unwrap_or(0);
-            let fresh = now_ms().saturating_sub(ts) < DAEMON_STALE_MS;
-            if fresh && existing_pid.is_some() && existing_pid != Some(std::process::id() as u64) {
-                eprintln!(
-                    "[agentplug daemon] lost spawn race -- pid {:?} already holds a fresh heartbeat, exiting",
-                    existing_pid
-                );
-                return Ok(());
-            }
-        }
+    // Atomic single-instance claim, BEFORE any shared plugin state (engine
+    // build, wasm compile, plugin Store/libsql open) exists. Fully replaces
+    // the former check-then-act heartbeat-timestamp race: that scheme read
+    // daemon-status.json, decided "no fresh owner", and only THEN built an
+    // Engine (build_engine, non-trivial wall time) and wrote its own first
+    // heartbeat -- leaving a real window where a second process's identical
+    // read-then-decide landed before the first's heartbeat write ever
+    // happened, so both passed the check and both proceeded to build
+    // engines, load plugins, and open libsql (live-witnessed this session:
+    // two agentplug-runner.exe processes, equal memory, one with stale-but-
+    // real heartbeat history). `claim_ownership()` is filesystem-arbitrated
+    // (O_EXCL create, or atomic rename for stale takeover) -- there is no
+    // read-then-decide gap for a second process to land in. A losing process
+    // exits HERE, before `PluginModules::new()` (the Engine build) even
+    // runs, so it never opens a plugin Store or a libsql DB at all.
+    if !claim_ownership() {
+        let existing_pid = read_owner_pid();
+        eprintln!(
+            "[agentplug daemon] lost the atomic ownership claim -- pid {:?} already owns the shared daemon, exiting before touching any shared plugin state",
+            existing_pid
+        );
+        return Ok(());
     }
 
     let mut plugin_modules = PluginModules::new()?;
@@ -397,10 +468,32 @@ pub fn run_daemon() -> anyhow::Result<()> {
                     if file_path.extension().and_then(|e| e.to_str()) != Some("txt") {
                         continue;
                     }
+                    // Atomic claim: rename the request file to a
+                    // pid-suffixed claim name BEFORE reading it. rename() is
+                    // the only non-racy primitive here -- a second server
+                    // process (e.g. a `run_spool_watcher_single_process`
+                    // fallback racing the shared daemon after a transient
+                    // ensure_daemon_running() failure) that lists this same
+                    // in_dir a moment later either sees the original filename
+                    // already gone (rename already happened, it moves on) or
+                    // wins the rename itself and this iteration's own rename
+                    // fails -- exactly one of any two racing claimants ever
+                    // successfully reads+dispatches a given request, closing
+                    // the double-processing window that a bare
+                    // read_to_string+remove_file (no ownership claim between
+                    // the two calls) leaves open. This is what was producing
+                    // mislabeled responses under concurrency: two servers
+                    // both reading the same in-file, both dispatching, both
+                    // writing the SAME out_name, one silently clobbering the
+                    // other's (differently-verbed) response.
+                    let claim_path = file_path.with_extension(format!("txt.claim.{}", std::process::id()));
+                    if fs::rename(&file_path, &claim_path).is_err() {
+                        continue;
+                    }
                     any_work = true;
                     let task = file_path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-                    let body = fs::read_to_string(&file_path).unwrap_or_default();
-                    let _ = fs::remove_file(&file_path);
+                    let body = fs::read_to_string(&claim_path).unwrap_or_default();
+                    let _ = fs::remove_file(&claim_path);
 
                     let project = projects.entry(root.clone()).or_insert_with(|| ProjectPlugins::new(root.clone()));
 
@@ -499,10 +592,16 @@ pub fn run_daemon() -> anyhow::Result<()> {
                         if file_path.extension().and_then(|e| e.to_str()) != Some("txt") {
                             continue;
                         }
+                        // Same atomic rename-claim as the gm spool loop above
+                        // -- exactly one racing claimant per request file.
+                        let claim_path = file_path.with_extension(format!("txt.claim.{}", std::process::id()));
+                        if fs::rename(&file_path, &claim_path).is_err() {
+                            continue;
+                        }
                         any_work = true;
                         let task = file_path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-                        let body = fs::read_to_string(&file_path).unwrap_or_default();
-                        let _ = fs::remove_file(&file_path);
+                        let body = fs::read_to_string(&claim_path).unwrap_or_default();
+                        let _ = fs::remove_file(&claim_path);
 
                         let write_pd_out = |out_name: &str, out_body: &str| {
                             let tmp = pd_out.join(format!("{out_name}.tmp.{}", std::process::id()));
