@@ -53,8 +53,49 @@ fn main() -> anyhow::Result<()> {
                 );
                 return Ok(());
             }
-            eprintln!("[agentplug] shared daemon unavailable, falling back to a dedicated per-project process");
+            // ensure_daemon_running()'s bounded wait (~6s) can time out while
+            // the actual winning daemon is still mid-PluginModules::new()
+            // (wasm engine build + compile of gm/bert/libsql/treesitter,
+            // witnessed this session taking well over 6s under load) and
+            // hasn't written its first heartbeat yet. Previously every OTHER
+            // spool invocation that timed out fell straight through to a
+            // standalone long-lived watcher that NEVER calls
+            // claim_ownership()/run_daemon() at all -- not a race the atomic
+            // guard was ever positioned to prevent, since it's a separate
+            // process that never contests the lock. Two (or more) such
+            // standalone watchers then coexisted indefinitely, each serving
+            // its own project -- the "multiple agentplug-runner processes"
+            // symptom, live-witnessed this session. Fix: attempt to become
+            // the ONE shared daemon here too via run_daemon() before ever
+            // falling back to a private one-shot instance. If this process
+            // wins the atomic claim, it becomes the real long-lived daemon
+            // (serving this project and any other that finds it) and never
+            // returns. If it loses (the real winner finished compiling and
+            // claimed first while we were building our own engine or
+            // waiting), run_daemon() returns Ok(()) immediately with zero
+            // plugin state touched -- exactly like the earlier bounded-wait
+            // loss -- so retry the shared-daemon path once more now that the
+            // real winner should be visible. This does NOT fully eliminate a
+            // standalone watcher spawning below (run_spool_watcher_single_process
+            // is still a long-lived loop, not a one-shot) -- it narrows the
+            // window in which one can be spawned at all: a standalone watcher
+            // now only starts if the shared daemon is STILL unclaimed after
+            // this process itself tried and failed to become it, meaning two
+            // consecutive compile-plus-wait cycles both missed the real
+            // daemon, a materially rarer case than the original single
+            // bounded wait.
+            eprintln!("[agentplug] shared daemon not yet visible, attempting to become it before falling back");
+            daemon::run_daemon()?;
 
+            if daemon::ensure_daemon_running()? {
+                eprintln!(
+                    "[agentplug] registered {} with the shared system-wide daemon (converged after retry) -- no dedicated per-project process spawned",
+                    cwd.display()
+                );
+                return Ok(());
+            }
+
+            eprintln!("[agentplug] shared daemon still unavailable after retry -- falling back to a standalone watcher for this project");
             let wasm = download::ensure_plugin_installed("gm", None)?;
             let engine = build_engine()?;
             let module = Module::from_file(&engine, &wasm)?;

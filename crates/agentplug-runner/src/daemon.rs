@@ -85,7 +85,7 @@ fn read_owner_pid() -> Option<u64> {
 /// heartbeat file's ts (a lock file has no ts of its own), so a takeover only
 /// fires once the previous owner has demonstrably stopped heartbeating for
 /// DAEMON_STALE_MS, not merely "some other pid's lock file exists."
-fn claim_ownership() -> bool {
+pub fn claim_ownership() -> bool {
     let owner_path = daemon_owner_path();
     if let Some(parent) = owner_path.parent() {
         let _ = fs::create_dir_all(parent);
@@ -261,6 +261,199 @@ impl PluginModules {
     }
 }
 
+/// Drains one project's ENTIRE pending spool work (both the gm spool ABI
+/// and the generic plugin-dispatch surface) fully sequentially, one request
+/// file at a time, in the exact claim-rename -> read -> dispatch -> respond
+/// order the single-threaded loop used before per-project threading was
+/// added -- a project's own dispatches are never reordered or run
+/// concurrently against EACH OTHER, only run() calling this for up to
+/// MAX_CONCURRENT_PROJECTS different roots on different threads makes
+/// DIFFERENT projects overlap. Returns true iff at least one request file
+/// was actually processed (feeds the outer loop's any_work bookkeeping for
+/// heartbeat/idle-eviction/self-recycle timing, unchanged from before).
+fn dispatch_project(root: &Path, project: &mut ProjectPlugins, plugin_modules: &PluginModules) -> bool {
+    let mut did_work = false;
+
+    let spool_dir = root.join(".gm").join("exec-spool");
+    let in_dir = spool_dir.join("in");
+    let out_dir = spool_dir.join("out");
+    if fs::create_dir_all(&in_dir).is_err() || fs::create_dir_all(&out_dir).is_err() {
+        return did_work;
+    }
+
+    let status_path = spool_dir.join(".status.json");
+    let _ = fs::write(
+        &status_path,
+        serde_json::json!({"pid": std::process::id(), "ts": now_ms(), "daemon": true, "shared_process": true, "runtime": "agentplug"}).to_string(),
+    );
+
+    let requested_plugins = {
+        let mut list = read_project_plugin_list(root);
+        if list.is_empty() {
+            // Default (no .agentplug/plugins.txt): "gm" plus its own real
+            // runtime dependencies, not "gm" alone -- see the historical note
+            // this comment carried before the per-project threading refactor:
+            // gm.wasm calls host_plugin_call("libsql"/"bert"/"treesitter", ...)
+            // unconditionally from inside its own recall/memorize/codesearch/
+            // embed code paths, so loading only "gm" left every one of those
+            // calls hitting "plugin_not_loaded_yet".
+            list.push("gm".to_string());
+            list.push("libsql".to_string());
+            list.push("bert".to_string());
+            list.push("treesitter".to_string());
+        }
+        list
+    };
+
+    if let Ok(entries) = fs::read_dir(&in_dir) {
+        for verb_entry in entries.flatten() {
+            if !verb_entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                continue;
+            }
+            let verb = verb_entry.file_name().to_string_lossy().into_owned();
+            let verb_dir = verb_entry.path();
+            let Ok(files) = fs::read_dir(&verb_dir) else { continue };
+            for file_entry in files.flatten() {
+                let file_path = file_entry.path();
+                if file_path.extension().and_then(|e| e.to_str()) != Some("txt") {
+                    continue;
+                }
+                // Atomic claim: rename the request file to a pid-suffixed
+                // claim name BEFORE reading it -- see the single-instance
+                // ownership-claim doc comment on run_daemon for why rename()
+                // is the only non-racy primitive here (unchanged from
+                // before per-project threading: now it ALSO closes the
+                // window between this thread and any other thread in this
+                // same process touching the same root, though in practice
+                // each root is only ever handed to one thread per chunk).
+                let claim_path = file_path.with_extension(format!("txt.claim.{}", std::process::id()));
+                if fs::rename(&file_path, &claim_path).is_err() {
+                    continue;
+                }
+                did_work = true;
+                let task = file_path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+                let body = fs::read_to_string(&claim_path).unwrap_or_default();
+                let _ = fs::remove_file(&claim_path);
+
+                // Load every plugin this project has requested that isn't
+                // already loaded -- gm dispatches to "gm" by default; a
+                // project opting into libsql/bert/treesitter (via
+                // .agentplug/plugins.txt) gets those instantiated too, so
+                // gm.wasm's own host_plugin_call/host_vec_embed finds them.
+                for plugin_name in &requested_plugins {
+                    if project.is_loaded(plugin_name) {
+                        continue;
+                    }
+                    let Some(module) = plugin_modules.modules.get(plugin_name) else {
+                        eprintln!("[agentplug daemon] plugin {plugin_name} not yet compiled for {}: dispatch this thread's own get_or_compile could not run against the shared PluginModules from a worker thread -- see plugin_modules.get_or_compile() call in run_daemon's pre-chunk warm pass", root.display());
+                        continue;
+                    };
+                    if let Err(e) = project.load_plugin(&plugin_modules.engine, plugin_name, module) {
+                        eprintln!("[agentplug daemon] failed to instantiate plugin {plugin_name} for {}: {e:#}", root.display());
+                    }
+                }
+
+                // The "gm" plugin is the dispatch entrypoint for the
+                // existing spool ABI -- fail loud with the real reason
+                // instead of a dispatch that was always going to fail if
+                // "gm" itself never loaded (network hiccup, plugin not yet
+                // published for this platform).
+                let out_name = format!("{verb}-{task}.json");
+                let out_body = if !project.is_loaded("gm") {
+                    serde_json::json!({"ok": false, "error": "gm plugin failed to load for this project (see daemon stderr for the compile/install/instantiate failure)", "verb": verb}).to_string()
+                } else {
+                    match project.dispatch("gm", &verb, &body) {
+                        Ok(s) if !s.is_empty() => s,
+                        Ok(_) => serde_json::json!({"ok": false, "error": "empty dispatch result", "verb": verb}).to_string(),
+                        Err(e) => serde_json::json!({"ok": false, "error": format!("{e:#}"), "verb": verb}).to_string(),
+                    }
+                };
+                let tmp = out_dir.join(format!("{out_name}.tmp.{}", std::process::id()));
+                if fs::write(&tmp, &out_body).is_ok() {
+                    let _ = fs::rename(&tmp, out_dir.join(&out_name));
+                    let _ = fs::write(out_dir.join(format!("{out_name}.ready")), b"");
+                }
+            }
+        }
+    }
+
+    // Generic plugin+verb dispatch surface, separate from the gm spool
+    // above -- see the original doc comment (preserved in git history at
+    // this refactor's parent commit) for why it exists: a host outside
+    // agentplug's own wasm graph reaching a PERSISTENT stateful plugin
+    // instance (libsql) that a one-shot per-call subprocess could never
+    // provide.
+    let pd_dir = root.join(".agentplug").join("plugin-dispatch");
+    let pd_in = pd_dir.join("in");
+    let pd_out = pd_dir.join("out");
+    if fs::create_dir_all(&pd_in).is_err() || fs::create_dir_all(&pd_out).is_err() {
+        return did_work;
+    }
+    let Ok(plugin_dirs) = fs::read_dir(&pd_in) else { return did_work };
+    for plugin_entry in plugin_dirs.flatten() {
+        if !plugin_entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let plugin_name = plugin_entry.file_name().to_string_lossy().into_owned();
+        let Ok(verb_dirs) = fs::read_dir(plugin_entry.path()) else { continue };
+        for verb_entry in verb_dirs.flatten() {
+            if !verb_entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                continue;
+            }
+            let verb = verb_entry.file_name().to_string_lossy().into_owned();
+            let Ok(files) = fs::read_dir(verb_entry.path()) else { continue };
+            for file_entry in files.flatten() {
+                let file_path = file_entry.path();
+                if file_path.extension().and_then(|e| e.to_str()) != Some("txt") {
+                    continue;
+                }
+                let claim_path = file_path.with_extension(format!("txt.claim.{}", std::process::id()));
+                if fs::rename(&file_path, &claim_path).is_err() {
+                    continue;
+                }
+                did_work = true;
+                let task = file_path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+                let body = fs::read_to_string(&claim_path).unwrap_or_default();
+                let _ = fs::remove_file(&claim_path);
+
+                let write_pd_out = |out_name: &str, out_body: &str| {
+                    let tmp = pd_out.join(format!("{out_name}.tmp.{}", std::process::id()));
+                    if fs::write(&tmp, out_body).is_ok() {
+                        let _ = fs::rename(&tmp, pd_out.join(out_name));
+                        let _ = fs::write(pd_out.join(format!("{out_name}.ready")), b"");
+                    }
+                };
+
+                if !project.is_loaded(&plugin_name) {
+                    let Some(module) = plugin_modules.modules.get(&plugin_name) else {
+                        let out_name = format!("{plugin_name}-{verb}-{task}.json");
+                        let out_body = serde_json::json!({"ok": false, "error": format!("plugin {plugin_name} not compiled yet for this daemon -- retry shortly")}).to_string();
+                        write_pd_out(&out_name, &out_body);
+                        continue;
+                    };
+                    if let Err(e) = project.load_plugin(&plugin_modules.engine, &plugin_name, module) {
+                        let out_name = format!("{plugin_name}-{verb}-{task}.json");
+                        let out_body = serde_json::json!({"ok": false, "error": format!("plugin instantiate failed: {e:#}")}).to_string();
+                        write_pd_out(&out_name, &out_body);
+                        continue;
+                    }
+                }
+
+                let result = project.dispatch(&plugin_name, &verb, &body);
+                let out_name = format!("{plugin_name}-{verb}-{task}.json");
+                let out_body = match result {
+                    Ok(s) if !s.is_empty() => s,
+                    Ok(_) => serde_json::json!({"ok": false, "error": "empty dispatch result"}).to_string(),
+                    Err(e) => serde_json::json!({"ok": false, "error": format!("{e:#}")}).to_string(),
+                };
+                write_pd_out(&out_name, &out_body);
+            }
+        }
+    }
+
+    did_work
+}
+
 /// Bounded wait for the daemon to answer a generic plugin+verb dispatch --
 /// `None` means "no daemon reachable within budget", the caller's cue to
 /// fall back to a standalone one-shot instantiate. Never blocks
@@ -413,237 +606,95 @@ pub fn run_daemon() -> anyhow::Result<()> {
             known_roots = read_registry();
         }
 
-        let mut any_work = false;
+        // Per-project threading: previously this loop dispatched every root
+        // fully sequentially on one thread, so a long-running verb on
+        // project A stalled every other registered project (B, C, D...)
+        // behind it in the same iteration -- live-witnessed this session as
+        // a single ~180s exec_js call on one project freezing the shared
+        // daemon's heartbeat and starving every other project's spool
+        // dispatch, which is what actually drove callers to time out and
+        // spawn competing standalone watchers (see the "spool" fallback fix
+        // in main.rs). Fix: run up to MAX_CONCURRENT_PROJECTS roots'
+        // dispatch bodies on real OS threads simultaneously via
+        // thread::scope, chunked so no more than that many run at once --
+        // "threading up to 4 projects at a time, queuing the rest" per the
+        // explicit design directive. Each root still processes its OWN
+        // in_dir fully sequentially within its thread (one file at a time,
+        // same claim-rename-dispatch-respond order as before) -- a single
+        // project's own dispatches are never reordered or run concurrently
+        // against each other, only DIFFERENT projects' work now overlaps.
+        // ProjectPlugins entries are looked up/inserted by each thread under
+        // a scoped mutable borrow of a disjoint key in the shared `projects`
+        // map (each root maps to at most one thread per chunk), so this
+        // never needs a Mutex around the map itself -- the borrow checker
+        // enforces the disjointness via retain_mut-style partition below.
+        const MAX_CONCURRENT_PROJECTS: usize = 4;
+
+        // Compile-ahead pass, sequential on the main thread, BEFORE any
+        // worker thread spawns: PluginModules::get_or_compile needs &mut
+        // self (it downloads+Module::from_file's a not-yet-seen plugin), but
+        // dispatch_project's worker threads only ever get a shared
+        // &PluginModules -- they can look a compiled Module up, never
+        // compile a new one themselves (that would need a Mutex around the
+        // whole engine+modules map, serializing every project on first-use
+        // of any plugin, defeating the point of this refactor). So warm
+        // every requested-but-not-yet-compiled plugin for every registered
+        // root here first; workers then only ever hit the fast "already
+        // compiled" path. A plugin whose compile genuinely fails here still
+        // surfaces the real error per-dispatch inside dispatch_project (the
+        // "not compiled yet -- retry shortly" / "gm plugin failed to load"
+        // branches), it just isn't retried again until the NEXT full tick.
         for root in &known_roots {
-            let spool_dir = root.join(".gm").join("exec-spool");
-            let in_dir = spool_dir.join("in");
-            let out_dir = spool_dir.join("out");
-            if fs::create_dir_all(&in_dir).is_err() || fs::create_dir_all(&out_dir).is_err() {
-                continue;
-            }
-
-            let status_path = spool_dir.join(".status.json");
-            let _ = fs::write(
-                &status_path,
-                serde_json::json!({"pid": std::process::id(), "ts": now_ms(), "daemon": true, "shared_process": true, "runtime": "agentplug"}).to_string(),
-            );
-
-            let requested_plugins = {
-                let mut list = read_project_plugin_list(root);
-                if list.is_empty() {
-                    // Default (no .agentplug/plugins.txt): "gm" plus its
-                    // own real runtime dependencies, not "gm" alone. gm.wasm
-                    // itself calls host_plugin_call("libsql"/"bert"/
-                    // "treesitter", ...) unconditionally from inside its own
-                    // recall/memorize/codesearch/embed code paths -- those
-                    // are load-bearing for gm specifically, not an optional
-                    // capability a project opts into. Loading only "gm" left
-                    // every one of those calls hitting the sibling map's
-                    // "plugin_not_loaded_yet" branch, live-witnessed this
-                    // session as codesearch's vector search silently
-                    // failing "invalid query embedding" (embed_query got a
-                    // null embedding back, not a real one) even though bert
-                    // itself worked perfectly when dispatched directly.
-                    // A project WITH its own .agentplug/plugins.txt (a
-                    // future non-gm plugin consumer) still controls its own
-                    // list explicitly and is unaffected by this default.
-                    list.push("gm".to_string());
-                    list.push("libsql".to_string());
-                    list.push("bert".to_string());
-                    list.push("treesitter".to_string());
-                }
-                list
-            };
-
-            let Ok(entries) = fs::read_dir(&in_dir) else { continue };
-            for verb_entry in entries.flatten() {
-                if !verb_entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                    continue;
-                }
-                let verb = verb_entry.file_name().to_string_lossy().into_owned();
-                let verb_dir = verb_entry.path();
-                let Ok(files) = fs::read_dir(&verb_dir) else { continue };
-                for file_entry in files.flatten() {
-                    let file_path = file_entry.path();
-                    if file_path.extension().and_then(|e| e.to_str()) != Some("txt") {
-                        continue;
-                    }
-                    // Atomic claim: rename the request file to a
-                    // pid-suffixed claim name BEFORE reading it. rename() is
-                    // the only non-racy primitive here -- a second server
-                    // process (e.g. a `run_spool_watcher_single_process`
-                    // fallback racing the shared daemon after a transient
-                    // ensure_daemon_running() failure) that lists this same
-                    // in_dir a moment later either sees the original filename
-                    // already gone (rename already happened, it moves on) or
-                    // wins the rename itself and this iteration's own rename
-                    // fails -- exactly one of any two racing claimants ever
-                    // successfully reads+dispatches a given request, closing
-                    // the double-processing window that a bare
-                    // read_to_string+remove_file (no ownership claim between
-                    // the two calls) leaves open. This is what was producing
-                    // mislabeled responses under concurrency: two servers
-                    // both reading the same in-file, both dispatching, both
-                    // writing the SAME out_name, one silently clobbering the
-                    // other's (differently-verbed) response.
-                    let claim_path = file_path.with_extension(format!("txt.claim.{}", std::process::id()));
-                    if fs::rename(&file_path, &claim_path).is_err() {
-                        continue;
-                    }
-                    any_work = true;
-                    let task = file_path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-                    let body = fs::read_to_string(&claim_path).unwrap_or_default();
-                    let _ = fs::remove_file(&claim_path);
-
-                    let project = projects.entry(root.clone()).or_insert_with(|| ProjectPlugins::new(root.clone()));
-
-                    // Load every plugin this project has requested that isn't
-                    // already loaded -- gm dispatches to "gm" by default; a
-                    // project opting into libsql/bert/treesitter (via
-                    // .agentplug/plugins.txt) gets those instantiated too, so
-                    // gm.wasm's own host_plugin_call/host_vec_embed finds them.
-                    for plugin_name in &requested_plugins {
-                        if project.is_loaded(plugin_name) {
-                            continue;
-                        }
-                        if let Err(e) = plugin_modules.get_or_compile(plugin_name) {
-                            eprintln!("[agentplug daemon] failed to compile/install plugin {plugin_name}: {e:#}");
-                            continue;
-                        }
-                        let module = plugin_modules.modules.get(plugin_name).unwrap();
-                        if let Err(e) = project.load_plugin(&plugin_modules.engine, plugin_name, module) {
-                            eprintln!("[agentplug daemon] failed to instantiate plugin {plugin_name} for {}: {e:#}", root.display());
-                        }
-                    }
-
-                    // The "gm" plugin is the dispatch entrypoint for the
-                    // existing spool ABI (in/<verb>/<N>.txt) -- other plugins
-                    // are only reachable via gm.wasm's own host_plugin_call,
-                    // never directly from the spool surface. This keeps the
-                    // spool contract byte-identical to today's gm-runner.
-                    // If the compile/install/instantiate loop above failed
-                    // for "gm" specifically (network hiccup, plugin not yet
-                    // published for this platform), dispatching anyway
-                    // produced a bare "plugin gm not loaded" every time,
-                    // live-witnessed this session -- fail loud with the
-                    // real reason instead of a dispatch that was always
-                    // going to fail.
-                    let out_name = format!("{verb}-{task}.json");
-                    let out_body = if !project.is_loaded("gm") {
-                        serde_json::json!({"ok": false, "error": "gm plugin failed to load for this project (see daemon stderr for the compile/install/instantiate failure)", "verb": verb}).to_string()
-                    } else {
-                        match project.dispatch("gm", &verb, &body) {
-                            Ok(s) if !s.is_empty() => s,
-                            Ok(_) => serde_json::json!({"ok": false, "error": "empty dispatch result", "verb": verb}).to_string(),
-                            Err(e) => serde_json::json!({"ok": false, "error": format!("{e:#}"), "verb": verb}).to_string(),
-                        }
-                    };
-                    let tmp = out_dir.join(format!("{out_name}.tmp.{}", std::process::id()));
-                    if fs::write(&tmp, &out_body).is_ok() {
-                        let _ = fs::rename(&tmp, out_dir.join(&out_name));
-                        // Ready-sentinel: written right after the real response,
-                        // matching rs-plugkit gm-runner's spool.rs and the JS
-                        // wrapper's own convention (both write "<out>.ready").
-                        // Lets a consumer distinguish "not yet dispatched" from
-                        // "genuinely lost" without relying on elapsed-wait
-                        // heuristics -- part of the spool-response-ack-sentinel
-                        // protocol PRD row, previously only ported to two of
-                        // the three dispatch surfaces.
-                        let _ = fs::write(out_dir.join(format!("{out_name}.ready")), b"");
-                    }
-                }
-            }
-
-            // Generic plugin+verb dispatch surface, separate from the gm
-            // spool above -- exists so a host OUTSIDE agentplug's own wasm
-            // graph (e.g. gm-plugkit's JS wrapper, hosting plugkit.wasm
-            // directly via Node/Bun's own WebAssembly.instantiate, not via
-            // agentplug-runner) can still reach a PERSISTENT plugin instance
-            // for stateful plugins (libsql: an `open` in one call must be
-            // visible to a later `exec`/`query` call, which a fresh
-            // one-shot `dispatch` subprocess per call can never provide --
-            // each subprocess gets its own empty in-memory DBS map). Layout:
-            // .agentplug/plugin-dispatch/in/<plugin>/<verb>/<N>.txt ->
-            // .agentplug/plugin-dispatch/out/<plugin>-<verb>-<N>.json,
-            // deliberately mirroring the gm spool's own in/out shape so
-            // agentplug-runner's `dispatch` subcommand (see main.rs) can
-            // poll it the same way the gm skill polls .gm/exec-spool/out/.
-            let pd_dir = root.join(".agentplug").join("plugin-dispatch");
-            let pd_in = pd_dir.join("in");
-            let pd_out = pd_dir.join("out");
-            if fs::create_dir_all(&pd_in).is_err() || fs::create_dir_all(&pd_out).is_err() {
-                continue;
-            }
-            let Ok(plugin_dirs) = fs::read_dir(&pd_in) else { continue };
-            for plugin_entry in plugin_dirs.flatten() {
-                if !plugin_entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                    continue;
-                }
-                let plugin_name = plugin_entry.file_name().to_string_lossy().into_owned();
-                let Ok(verb_dirs) = fs::read_dir(plugin_entry.path()) else { continue };
-                for verb_entry in verb_dirs.flatten() {
-                    if !verb_entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                        continue;
-                    }
-                    let verb = verb_entry.file_name().to_string_lossy().into_owned();
-                    let Ok(files) = fs::read_dir(verb_entry.path()) else { continue };
-                    for file_entry in files.flatten() {
-                        let file_path = file_entry.path();
-                        if file_path.extension().and_then(|e| e.to_str()) != Some("txt") {
-                            continue;
-                        }
-                        // Same atomic rename-claim as the gm spool loop above
-                        // -- exactly one racing claimant per request file.
-                        let claim_path = file_path.with_extension(format!("txt.claim.{}", std::process::id()));
-                        if fs::rename(&file_path, &claim_path).is_err() {
-                            continue;
-                        }
-                        any_work = true;
-                        let task = file_path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-                        let body = fs::read_to_string(&claim_path).unwrap_or_default();
-                        let _ = fs::remove_file(&claim_path);
-
-                        let write_pd_out = |out_name: &str, out_body: &str| {
-                            let tmp = pd_out.join(format!("{out_name}.tmp.{}", std::process::id()));
-                            if fs::write(&tmp, out_body).is_ok() {
-                                let _ = fs::rename(&tmp, pd_out.join(out_name));
-                                // Same ready-sentinel convention as the gm spool
-                                // surface above and rs-plugkit gm-runner's
-                                // spool.rs -- part of spool-response-ack-sentinel-protocol.
-                                let _ = fs::write(pd_out.join(format!("{out_name}.ready")), b"");
-                            }
-                        };
-
-                        let project = projects.entry(root.clone()).or_insert_with(|| ProjectPlugins::new(root.clone()));
-                        if !project.is_loaded(&plugin_name) {
-                            if let Err(e) = plugin_modules.get_or_compile(&plugin_name) {
-                                let out_name = format!("{plugin_name}-{verb}-{task}.json");
-                                let out_body = serde_json::json!({"ok": false, "error": format!("plugin compile/install failed: {e:#}")}).to_string();
-                                write_pd_out(&out_name, &out_body);
-                                continue;
-                            }
-                            let module = plugin_modules.modules.get(&plugin_name).unwrap();
-                            if let Err(e) = project.load_plugin(&plugin_modules.engine, &plugin_name, module) {
-                                let out_name = format!("{plugin_name}-{verb}-{task}.json");
-                                let out_body = serde_json::json!({"ok": false, "error": format!("plugin instantiate failed: {e:#}")}).to_string();
-                                write_pd_out(&out_name, &out_body);
-                                continue;
-                            }
-                        }
-
-                        let result = project.dispatch(&plugin_name, &verb, &body);
-                        let out_name = format!("{plugin_name}-{verb}-{task}.json");
-                        let out_body = match result {
-                            Ok(s) if !s.is_empty() => s,
-                            Ok(_) => serde_json::json!({"ok": false, "error": "empty dispatch result"}).to_string(),
-                            Err(e) => serde_json::json!({"ok": false, "error": format!("{e:#}")}).to_string(),
-                        };
-                        write_pd_out(&out_name, &out_body);
-                    }
+            for plugin_name in read_project_plugin_list(root) {
+                if let Err(e) = plugin_modules.get_or_compile(&plugin_name) {
+                    eprintln!("[agentplug daemon] failed to compile/install plugin {plugin_name} for {}: {e:#}", root.display());
                 }
             }
         }
+        for plugin_name in ["gm", "libsql", "bert", "treesitter"] {
+            if let Err(e) = plugin_modules.get_or_compile(plugin_name) {
+                eprintln!("[agentplug daemon] failed to compile/install default plugin {plugin_name}: {e:#}");
+            }
+        }
 
+        let mut any_work = false;
+        for root_chunk in known_roots.chunks(MAX_CONCURRENT_PROJECTS) {
+            // Pull each chunked root's ProjectPlugins out of the shared map
+            // (inserting a fresh one if new) so each thread below gets an
+            // exclusively-owned &mut for the duration of this chunk -- no
+            // aliasing, no lock contention between the up-to-4 threads.
+            let mut chunk_projects: Vec<(PathBuf, ProjectPlugins)> = root_chunk
+                .iter()
+                .map(|root| {
+                    let p = projects.remove(root).unwrap_or_else(|| ProjectPlugins::new(root.clone()));
+                    (root.clone(), p)
+                })
+                .collect();
+            // thread::scope's own contract: every scope.spawn'd closure's
+            // borrow of chunk_projects's elements must be joined (guaranteed
+            // by scope() itself not returning until all handles finish)
+            // BEFORE chunk_projects can be touched again outside the scope
+            // -- so the did-work flags come back OUT of the scope via the
+            // handles' return values (owned bools, not borrows), and
+            // chunk_projects itself (still holding every ProjectPlugins,
+            // mutated in place by its thread) is read again only after
+            // scope() has returned.
+            let plugin_modules_ref: &PluginModules = &plugin_modules;
+            let did_work_flags: Vec<bool> = std::thread::scope(|scope| {
+                let handles: Vec<_> = chunk_projects
+                    .iter_mut()
+                    .map(|(root, project)| {
+                        let root: &Path = root.as_path();
+                        scope.spawn(move || dispatch_project(root, project, plugin_modules_ref))
+                    })
+                    .collect();
+                handles.into_iter().map(|h| h.join().unwrap_or(false)).collect()
+            });
+            for ((root, project), did_work) in chunk_projects.into_iter().zip(did_work_flags) {
+                any_work = any_work || did_work;
+                projects.insert(root, project);
+            }
+        }
         let evict_before = Instant::now() - Duration::from_millis(PLUGIN_IDLE_EVICT_MS);
         let to_evict: Vec<PathBuf> = projects.iter().filter(|(_, p)| p.last_active < evict_before).map(|(root, _)| root.clone()).collect();
         for root in to_evict {
