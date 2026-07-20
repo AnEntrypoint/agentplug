@@ -274,6 +274,97 @@ fn takeover_ready_path() -> PathBuf {
     install_dir().join("daemon-takeover-ready.json")
 }
 
+/// Per-project instruction-source configuration: `.gm/instructions/source.json`
+/// opts a project INTO pulling its phase prose from a git repo other than
+/// the compiled-in default (this repo, gm/AnEntrypoint) -- e.g. an org-wide
+/// shared instruction set, or a project's own fork of the prose files.
+/// `{"repo": "https://...", "branch": "main", "path": "instructions/"}`.
+/// Absence of this file means the project uses only the compiled default and
+/// its own local .gm/instructions/<key>.md overrides -- no new behavior,
+/// pure opt-in.
+#[derive(serde::Deserialize)]
+struct InstructionSourceConfig {
+    repo: String,
+    #[serde(default = "default_branch")]
+    branch: String,
+    // Not read here -- this struct only validates + drives the clone/fetch
+    // (repo+branch). `path` (which subdir within the repo prose lives in)
+    // is read independently, wasm-side, by prose::read_from_source_repo at
+    // actual resolve time. Kept here anyway so a project's source.json with
+    // a `path` field that doesn't match this schema still parses cleanly
+    // (an unknown-to-THIS-struct field would otherwise be silently ignored
+    // by serde regardless, but declaring it documents the full config shape
+    // in one place rather than splitting it silently across two crates).
+    #[allow(dead_code)]
+    #[serde(default)]
+    path: String,
+}
+fn default_branch() -> String { "main".to_string() }
+
+fn instruction_source_config_path(root: &Path) -> PathBuf {
+    root.join(".gm").join("instructions").join("source.json")
+}
+
+/// Where a project's synced source-repo prose lands -- INSIDE that project's
+/// own .gm/ tree (not the global install_dir()), so a project's chosen
+/// source is scoped to that project, never leaked across projects sharing
+/// this one daemon, and travels with the project if .gm/ is itself synced
+/// elsewhere (though the managed-gitignore block excludes this cache dir
+/// from being committed, same treatment as any other transient runtime
+/// artifact -- it is a CACHE of the source repo, not the source of truth).
+fn instruction_source_cache_dir(root: &Path) -> PathBuf {
+    root.join(".gm").join("instructions-source-cache")
+}
+
+/// Reads a project's source.json (if present) and keeps
+/// instruction_source_cache_dir(root) in sync with it via plain `git`
+/// subprocess calls -- clone on first sight, fetch+reset thereafter. Shells
+/// out to the real git binary (same discipline as rs-plugkit's own git
+/// verbs) rather than adding a git library dependency; git is already a
+/// hard runtime requirement everywhere this daemon runs (gm's own git verbs
+/// need it). A missing/unparseable source.json is not an error -- most
+/// projects will never opt into this, so silently doing nothing is correct,
+/// not a fallback path worth logging.
+fn sync_instruction_source_if_configured(root: &Path) -> anyhow::Result<()> {
+    let config_path = instruction_source_config_path(root);
+    let Ok(raw) = fs::read_to_string(&config_path) else { return Ok(()) };
+    let Ok(cfg) = serde_json::from_str::<InstructionSourceConfig>(&raw) else {
+        eprintln!("[agentplug daemon] {} exists but does not parse as {{repo, branch?, path?}} -- ignoring", config_path.display());
+        return Ok(());
+    };
+    let cache_dir = instruction_source_cache_dir(root);
+    let git_dir_marker = cache_dir.join(".git");
+    if !git_dir_marker.exists() {
+        fs::create_dir_all(root.join(".gm"))?;
+        let status = std::process::Command::new("git")
+            .args(["clone", "--depth", "1", "--branch", &cfg.branch, &cfg.repo, &cache_dir.to_string_lossy()])
+            .status()?;
+        if !status.success() {
+            anyhow::bail!("git clone of {} (branch {}) failed", cfg.repo, cfg.branch);
+        }
+        eprintln!("[agentplug daemon] cloned instruction source {} (branch {}) for {}", cfg.repo, cfg.branch, root.display());
+        return Ok(());
+    }
+    // Already cloned -- fetch + hard-reset to the branch tip rather than
+    // pull/merge, since this is a read-only mirror the daemon owns
+    // exclusively (never has local commits of its own to preserve), and a
+    // hard reset is the one operation that can never produce a merge
+    // conflict / diverged-history failure mode on an unattended sync.
+    let fetch = std::process::Command::new("git")
+        .args(["-C", &cache_dir.to_string_lossy(), "fetch", "--depth", "1", "origin", &cfg.branch])
+        .status()?;
+    if !fetch.success() {
+        anyhow::bail!("git fetch of {} (branch {}) failed", cfg.repo, cfg.branch);
+    }
+    let reset = std::process::Command::new("git")
+        .args(["-C", &cache_dir.to_string_lossy(), "reset", "--hard", &format!("origin/{}", cfg.branch)])
+        .status()?;
+    if !reset.success() {
+        anyhow::bail!("git reset of instruction source cache for {} failed", root.display());
+    }
+    Ok(())
+}
+
 /// Called by an OLD daemon's main loop (see PLUGIN_UPDATE_POLL_INTERVAL's
 /// sibling poll below) once `download::stage_runner_self_update()` has
 /// staged a verified `<exe>.new`. Spawns the staged binary as `takeover
@@ -826,6 +917,9 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
                 if let Err(e) = plugin_modules.get_or_compile(&plugin_name) {
                     eprintln!("[agentplug daemon] failed to compile/install plugin {plugin_name} for {}: {e:#}", root.display());
                 }
+            }
+            if let Err(e) = sync_instruction_source_if_configured(root) {
+                eprintln!("[agentplug daemon] instruction source-repo sync failed for {}: {e:#}", root.display());
             }
         }
         for plugin_name in ["gm", "libsql", "bert", "treesitter"] {
