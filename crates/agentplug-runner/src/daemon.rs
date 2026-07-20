@@ -183,11 +183,59 @@ pub fn ensure_daemon_running() -> anyhow::Result<bool> {
     Ok(false)
 }
 
+/// A daemon killed via `Stop-Process -Force`/`taskkill /F`/SIGKILL leaves no
+/// chance to run cleanup code, so `daemon-status.json`'s last heartbeat can
+/// read as "fresh" (within DAEMON_STALE_MS) for up to that whole window even
+/// though the process is already gone -- narrowing the window (60s -> 20s,
+/// see DAEMON_STALE_MS's own history) only shrinks the race, it can't close
+/// it. Live-hit this session even at 20s: kill the daemon, immediately
+/// re-run spool, get "registered with the shared daemon" back with the pid
+/// from the stale status file no longer existing as a real process. Since
+/// daemon-status.json already carries its writer's own pid, verify it
+/// against the real process table before trusting the timestamp -- a
+/// timestamp alone can never distinguish "still alive" from "died a moment
+/// ago, heartbeat just hasn't gone stale yet." Only called on the already-
+/// slow boot/register path (never the hot per-dispatch path), so the extra
+/// process-table query cost is negligible here.
 fn is_daemon_fresh() -> bool {
     let Ok(raw) = fs::read_to_string(daemon_status_path()) else { return false };
     let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else { return false };
     let Some(ts) = v.get("ts").and_then(|t| t.as_u64()) else { return false };
-    now_ms().saturating_sub(ts) < DAEMON_STALE_MS
+    if now_ms().saturating_sub(ts) >= DAEMON_STALE_MS { return false; }
+    let Some(pid) = v.get("pid").and_then(|p| p.as_u64()) else { return false };
+    pid_is_alive(pid)
+}
+
+#[cfg(windows)]
+fn pid_is_alive(pid: u64) -> bool {
+    let output = std::process::Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
+        .output();
+    match output {
+        Ok(o) => {
+            let s = String::from_utf8_lossy(&o.stdout);
+            // tasklist prints a matching CSV row ("name","pid",...) when the
+            // pid exists, or an "INFO: No tasks..." line (no comma) when it
+            // does not -- a comma in the first line is the cheap discriminator.
+            s.lines().next().map(|l| l.contains(',')).unwrap_or(false)
+        }
+        // tasklist itself failing to run is a host-environment problem, not
+        // evidence the daemon is dead -- fail open (trust the timestamp
+        // alone, the pre-existing behavior) rather than false-negative every
+        // boot attempt on a host where tasklist is unavailable/blocked.
+        Err(_) => true,
+    }
+}
+
+#[cfg(not(windows))]
+fn pid_is_alive(pid: u64) -> bool {
+    // kill(pid, 0) checks existence/permission without sending a real signal
+    // -- the POSIX-standard liveness probe, zero new dependencies needed.
+    std::process::Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(true)
 }
 
 fn spawn_detached_daemon() -> anyhow::Result<()> {
