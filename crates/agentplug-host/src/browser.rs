@@ -45,6 +45,15 @@ struct BrowserConfig {
     chrome_ready_deadline_ms: Option<u64>,
     #[serde(default)]
     eval_timeout_grace_ms: Option<u64>,
+    // Live-found (user-reported): Chrome launched with a hardcoded
+    // --headless=new on every dispatch, no way to opt into a visible window
+    // even though this project's own stated preference is headful Chrome.
+    // Default false (headful) -- the opposite of the previous hardcoded
+    // behavior -- matching the explicit stated preference; a project that
+    // genuinely wants headless (CI, no display attached) sets
+    // {"headless": true} in .gm/browser-config.json.
+    #[serde(default)]
+    headless: Option<bool>,
 }
 
 impl BrowserConfig {
@@ -58,12 +67,14 @@ impl BrowserConfig {
                 cdp_poll_interval_ms: None,
                 chrome_ready_deadline_ms: None,
                 eval_timeout_grace_ms: None,
+                headless: None,
             })
     }
     fn cdp_poll_timeout(&self) -> Duration { Duration::from_millis(self.cdp_poll_timeout_ms.unwrap_or(1000)) }
     fn cdp_poll_interval(&self) -> Duration { Duration::from_millis(self.cdp_poll_interval_ms.unwrap_or(250)) }
     fn chrome_ready_deadline(&self) -> Duration { Duration::from_millis(self.chrome_ready_deadline_ms.unwrap_or(30_000)) }
     fn eval_timeout_grace(&self) -> u64 { self.eval_timeout_grace_ms.unwrap_or(6000) }
+    fn headless(&self) -> bool { self.headless.unwrap_or(false) }
 }
 
 fn which(cmd: &str) -> Option<PathBuf> {
@@ -244,15 +255,17 @@ pub fn run(body: &str, cwd: &Path, session_id: &str) -> Value {
     }
 
     let port = free_port();
-    let mut chrome_child = match Command::new(&chrome)
-        .arg(format!("--user-data-dir={}", profile_dir.display()))
+    let mut cmd = Command::new(&chrome);
+    cmd.arg(format!("--user-data-dir={}", profile_dir.display()))
         .arg(format!("--remote-debugging-port={port}"))
         .arg("--remote-debugging-address=127.0.0.1")
         .arg("--no-first-run")
         .arg("--no-default-browser-check")
-        .arg("--disable-default-apps")
-        .arg("--disable-gpu")
-        .arg("--headless=new")
+        .arg("--disable-default-apps");
+    if browser_cfg.headless() {
+        cmd.arg("--disable-gpu").arg("--headless=new");
+    }
+    let mut chrome_child = match cmd
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())

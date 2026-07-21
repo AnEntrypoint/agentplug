@@ -920,6 +920,19 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
     let runner_update_poll_interval = daemon_cfg.runner_update_poll_interval();
     let mut last_runner_update_poll = Instant::now();
 
+    // Live-found (daemon-warm-pass-scales-badly-with-registry-size):
+    // sync_instruction_source_if_configured runs a real `git fetch` +
+    // `git reset --hard` subprocess for any root with a configured
+    // .gm/instructions/source.json -- unconditionally, every single tick,
+    // for every such root. On this host's registry (73+ roots at time of
+    // writing) even a handful of configured roots meant real network I/O
+    // on every loop iteration, contributing to repeated daemon
+    // unresponsiveness/death under load. Rate-limit to the same cadence as
+    // the plugin/runner update polls (plugin_update_poll_interval) instead
+    // of re-syncing every tick -- a config that rarely changes upstream
+    // does not need fetching dozens of times a minute.
+    let mut last_instruction_source_sync: HashMap<PathBuf, Instant> = HashMap::new();
+
     loop {
         if last_heartbeat.elapsed() >= heartbeat_interval {
             last_heartbeat = Instant::now();
@@ -999,8 +1012,15 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
                     eprintln!("[agentplug daemon] failed to compile/install plugin {plugin_name} for {}: {e:#}", root.display());
                 }
             }
-            if let Err(e) = sync_instruction_source_if_configured(root) {
-                eprintln!("[agentplug daemon] instruction source-repo sync failed for {}: {e:#}", root.display());
+            let due = last_instruction_source_sync
+                .get(root)
+                .map(|t| t.elapsed() >= plugin_update_poll_interval)
+                .unwrap_or(true);
+            if due {
+                last_instruction_source_sync.insert(root.clone(), Instant::now());
+                if let Err(e) = sync_instruction_source_if_configured(root) {
+                    eprintln!("[agentplug daemon] instruction source-repo sync failed for {}: {e:#}", root.display());
+                }
             }
         }
         for plugin_name in ["gm", "libsql", "bert", "treesitter"] {
@@ -1009,43 +1029,68 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
             }
         }
 
-        let mut any_work = false;
-        for root_chunk in known_roots.chunks(MAX_CONCURRENT_PROJECTS) {
-            // Pull each chunked root's ProjectPlugins out of the shared map
-            // (inserting a fresh one if new) so each thread below gets an
-            // exclusively-owned &mut for the duration of this chunk -- no
-            // aliasing, no lock contention between the up-to-4 threads.
-            let mut chunk_projects: Vec<(PathBuf, ProjectPlugins)> = root_chunk
-                .iter()
-                .map(|root| {
-                    let p = projects.remove(root).unwrap_or_else(|| ProjectPlugins::new(root.clone()));
-                    (root.clone(), p)
-                })
-                .collect();
-            // thread::scope's own contract: every scope.spawn'd closure's
-            // borrow of chunk_projects's elements must be joined (guaranteed
-            // by scope() itself not returning until all handles finish)
-            // BEFORE chunk_projects can be touched again outside the scope
-            // -- so the did-work flags come back OUT of the scope via the
-            // handles' return values (owned bools, not borrows), and
-            // chunk_projects itself (still holding every ProjectPlugins,
-            // mutated in place by its thread) is read again only after
-            // scope() has returned.
+        // Live-found (live-witness-cross-project-concurrency-claim): the
+        // previous `for root_chunk in known_roots.chunks(MAX_CONCURRENT_PROJECTS)`
+        // was a SEQUENTIAL outer loop over fixed-size chunks -- 4 roots ran
+        // concurrently WITHIN one chunk, but chunk 2 could not start until
+        // chunk 1's thread::scope fully joined. On a registry with more than
+        // MAX_CONCURRENT_PROJECTS roots (this host: 74+ registered projects
+        // in practice), a single slow dispatch anywhere in chunk 1 starved
+        // every root in every later chunk, not just the 3 others sharing its
+        // chunk -- live-witnessed directly: registered a 74th project, fired
+        // a 15-20s busy-loop exec_js against the 1st-registered project
+        // (chunk 1) concurrently with a trivial health dispatch against the
+        // 74th (chunk 19), and the health response took 25-31 SECONDS --
+        // essentially the full duration of the unrelated chunk-1 dispatch,
+        // not the near-instant response true global bounded concurrency
+        // would give. Fixed: pull ALL known_roots' ProjectPlugins up front,
+        // then run them through a genuine bounded-concurrency pool -- an
+        // index cursor behind a Mutex, MAX_CONCURRENT_PROJECTS worker
+        // threads each looping "claim the next un-dispatched root, dispatch
+        // it, repeat" until the cursor is exhausted. A slow root now only
+        // ever occupies ONE of the 4 worker slots; the other 3 keep pulling
+        // fresh roots from the shared cursor instead of sitting idle inside
+        // a chunk boundary waiting for the slow one's chunk-mates to finish.
+        let all_projects: Vec<(PathBuf, ProjectPlugins)> = known_roots
+            .iter()
+            .map(|root| {
+                let p = projects.remove(root).unwrap_or_else(|| ProjectPlugins::new(root.clone()));
+                (root.clone(), p)
+            })
+            .collect();
+        let worker_count = MAX_CONCURRENT_PROJECTS.min(all_projects.len().max(1));
+        // Genuine work-stealing queue, no unsafe: each (root, ProjectPlugins)
+        // pair is MOVED into the shared queue, so a worker that pops one
+        // holds exclusive ownership -- no aliasing question at all, unlike
+        // an index-into-shared-Vec scheme. Completed pairs are pushed to
+        // `done` (also behind a Mutex) as workers finish, then drained back
+        // out after the scope joins. A worker with an empty queue simply
+        // exits its loop rather than blocking, since the total work list is
+        // fully known up front (this is one tick's fixed root set, not an
+        // open-ended stream).
+        let queue = std::sync::Mutex::new(all_projects);
+        let done = std::sync::Mutex::new(Vec::<(PathBuf, ProjectPlugins, bool)>::new());
+        {
             let plugin_modules_ref: &PluginModules = &plugin_modules;
-            let did_work_flags: Vec<bool> = std::thread::scope(|scope| {
-                let handles: Vec<_> = chunk_projects
-                    .iter_mut()
-                    .map(|(root, project)| {
-                        let root: &Path = root.as_path();
-                        scope.spawn(move || dispatch_project(root, project, plugin_modules_ref))
-                    })
-                    .collect();
-                handles.into_iter().map(|h| h.join().unwrap_or(false)).collect()
+            let queue_ref = &queue;
+            let done_ref = &done;
+            std::thread::scope(|scope| {
+                let mut handles = Vec::with_capacity(worker_count);
+                for _ in 0..worker_count {
+                    handles.push(scope.spawn(move || loop {
+                        let next = { queue_ref.lock().unwrap_or_else(|e| e.into_inner()).pop() };
+                        let Some((root, mut project)) = next else { break };
+                        let did_work = dispatch_project(root.as_path(), &mut project, plugin_modules_ref);
+                        done_ref.lock().unwrap_or_else(|e| e.into_inner()).push((root, project, did_work));
+                    }));
+                }
+                for h in handles { let _ = h.join(); }
             });
-            for ((root, project), did_work) in chunk_projects.into_iter().zip(did_work_flags) {
-                any_work = any_work || did_work;
-                projects.insert(root, project);
-            }
+        }
+        let mut any_work = false;
+        for (root, project, did_work) in done.into_inner().unwrap_or_else(|e| e.into_inner()) {
+            any_work = any_work || did_work;
+            projects.insert(root, project);
         }
         let evict_before = Instant::now() - Duration::from_millis(PLUGIN_IDLE_EVICT_MS);
         let to_evict: Vec<PathBuf> = projects.iter().filter(|(_, p)| p.last_active < evict_before).map(|(root, _)| root.clone()).collect();
