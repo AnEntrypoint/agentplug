@@ -7,6 +7,8 @@ use serde_json::{json, Value};
 use wait_timeout::ChildExt;
 
 const RESULT_SENTINEL: &str = "__GM_RESULT__";
+const META_SENTINEL: &str = "__GM_META__";
+const PROFILE_SENTINEL: &str = "__GM_PROFILE__";
 
 /// Ported from rs-plugkit's gm-runner/src/exec_js.rs -- same subprocess
 /// dispatch + sentinel-based return-value capture, so agentplug-host's
@@ -30,7 +32,25 @@ pub fn run(code: &str, opts: &Value, cwd: &Path) -> Value {
     };
 
     let is_js_lang = lang == "nodejs" || lang == "js";
-    let (cmd, args, script_file) = match build_command(lang, code) {
+    let want_profile = opts.get("profile").and_then(|v| v.as_bool()).unwrap_or(false) && is_js_lang;
+    let profile_skipped = if opts.get("profile").and_then(|v| v.as_bool()).unwrap_or(false) && !is_js_lang {
+        Some(json!({
+            "reason": format!("profile requested but lang={lang} is not js/nodejs; CPU profiling only supported on the node surface"),
+            "lang": lang,
+        }))
+    } else {
+        None
+    };
+    let want_mem = opts.get("mem").and_then(|v| v.as_bool()).unwrap_or(false) && is_js_lang && !want_profile;
+    let mode = if want_profile {
+        ExecMode::Profile
+    } else if want_mem {
+        ExecMode::Mem
+    } else {
+        ExecMode::Default
+    };
+
+    let (cmd, args, script_file) = match build_command_mode(lang, code, mode, opts) {
         Some(v) => v,
         None => return json!({"ok": false, "error": format!("unsupported lang: {lang}")}),
     };
@@ -106,49 +126,176 @@ pub fn run(code: &str, opts: &Value, cwd: &Path) -> Value {
         let _ = std::fs::remove_file(f);
     }
 
-    let mut stdout = String::from_utf8_lossy(&stdout_buf).into_owned();
-    let mut result_field: Option<Value> = None;
+    let stdout_raw = String::from_utf8_lossy(&stdout_buf).into_owned();
+    let stderr = String::from_utf8_lossy(&stderr_buf).into_owned();
 
-    if is_js_lang {
-        if let Some(idx) = stdout.rfind(RESULT_SENTINEL) {
-            let tail = &stdout[idx + RESULT_SENTINEL.len()..];
-            let line_end = tail.find('\n').unwrap_or(tail.len());
-            let json_str = &tail[..line_end];
-            if let Ok(parsed) = serde_json::from_str::<Value>(json_str) {
-                result_field = Some(parsed);
+    match mode {
+        ExecMode::Profile => {
+            let (clean_stdout, parsed) = extract_sentinel(&stdout_raw, PROFILE_SENTINEL);
+            let ok = exit_code == 0 && parsed.as_ref().map(|p| p.get("user_error").map(|e| e.is_null()).unwrap_or(true)).unwrap_or(false);
+            let mut v = json!({
+                "ok": ok,
+                "stdout": clean_stdout,
+                "stderr": stderr,
+                "exit_code": exit_code,
+                "timed_out": false,
+                "duration_ms": duration_ms,
+                "result": parsed.as_ref().and_then(|p| p.get("result")).cloned().unwrap_or(Value::Null),
+                "profile": parsed.as_ref().and_then(|p| p.get("profile")).cloned().unwrap_or(json!({"timeframe": null, "culprits": []})),
+                "profile_error": parsed.as_ref().and_then(|p| p.get("profile_error")).cloned().unwrap_or_else(|| json!("profile sentinel not found in stdout")),
+                "mem": parsed.as_ref().and_then(|p| p.get("mem")).cloned().unwrap_or(Value::Null),
+                "wall_vs_cpu": parsed.as_ref().and_then(|p| p.get("wall_vs_cpu")).cloned().unwrap_or(Value::Null),
+            });
+            if let Some(u) = parsed.as_ref().and_then(|p| p.get("user_error")) {
+                if !u.is_null() {
+                    v["user_error"] = u.clone();
+                }
             }
-            let mut cleaned = String::new();
-            cleaned.push_str(&stdout[..idx]);
-            if let Some(rest_start) = tail.get(line_end + 1..) {
-                cleaned.push_str(rest_start);
+            v
+        }
+        ExecMode::Mem => {
+            let (clean_stdout, parsed) = extract_sentinel(&stdout_raw, META_SENTINEL);
+            let has_error = parsed.as_ref().and_then(|p| p.get("error")).map(|e| !e.is_null()).unwrap_or(false);
+            let ok = exit_code == 0 && parsed.is_some() && !has_error;
+            let mut v = json!({
+                "ok": ok,
+                "stdout": clean_stdout,
+                "stderr": stderr,
+                "exit_code": exit_code,
+                "timed_out": false,
+                "duration_ms": duration_ms,
+                "result": parsed.as_ref().and_then(|p| p.get("result")).cloned().unwrap_or(Value::Null),
+                "mem": parsed.as_ref().and_then(|p| p.get("mem")).cloned().unwrap_or(Value::Null),
+                "wall_ms": parsed.as_ref().and_then(|p| p.get("wall_ms")).cloned().unwrap_or(Value::Null),
+            });
+            if has_error {
+                v["error"] = parsed.as_ref().and_then(|p| p.get("error")).cloned().unwrap_or(Value::Null);
             }
-            if cleaned.ends_with('\n') {
-                cleaned.pop();
+            v
+        }
+        ExecMode::Default => {
+            let mut stdout = stdout_raw;
+            let mut result_field: Option<Value> = None;
+            if is_js_lang {
+                if let Some(idx) = stdout.rfind(RESULT_SENTINEL) {
+                    let tail = &stdout[idx + RESULT_SENTINEL.len()..];
+                    let line_end = tail.find('\n').unwrap_or(tail.len());
+                    let json_str = &tail[..line_end];
+                    if let Ok(parsed) = serde_json::from_str::<Value>(json_str) {
+                        result_field = Some(parsed);
+                    }
+                    let mut cleaned = String::new();
+                    cleaned.push_str(&stdout[..idx]);
+                    if let Some(rest_start) = tail.get(line_end + 1..) {
+                        cleaned.push_str(rest_start);
+                    }
+                    if cleaned.ends_with('\n') {
+                        cleaned.pop();
+                    }
+                    stdout = cleaned;
+                }
             }
-            stdout = cleaned;
+
+            let mut v = json!({
+                "ok": exit_code == 0,
+                "stdout": stdout,
+                "stderr": stderr,
+                "exit_code": exit_code,
+                "timed_out": false,
+                "duration_ms": duration_ms,
+            });
+            if let Some(r) = result_field {
+                v["result"] = r;
+            }
+            if let Some(skipped) = profile_skipped {
+                v["profile_skipped"] = skipped;
+            }
+            v
         }
     }
+}
 
-    let mut v = json!({
-        "ok": exit_code == 0,
-        "stdout": stdout,
-        "stderr": String::from_utf8_lossy(&stderr_buf),
-        "exit_code": exit_code,
-        "timed_out": false,
-        "duration_ms": duration_ms,
-    });
-    if let Some(r) = result_field {
-        v["result"] = r;
+fn extract_sentinel(stdout: &str, sentinel: &str) -> (String, Option<Value>) {
+    match stdout.find(sentinel) {
+        Some(idx) => {
+            let tail = &stdout[idx + sentinel.len()..];
+            let parsed = serde_json::from_str::<Value>(tail).ok();
+            (stdout[..idx].to_string(), parsed)
+        }
+        None => (stdout.to_string(), None),
     }
-    v
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum ExecMode {
+    Default,
+    Mem,
+    Profile,
 }
 
 pub(crate) fn build_command(lang: &str, code: &str) -> Option<(String, Vec<String>, Option<std::path::PathBuf>)> {
+    build_command_mode(lang, code, ExecMode::Default, &json!({}))
+}
+
+fn build_command_mode(
+    lang: &str,
+    code: &str,
+    mode: ExecMode,
+    opts: &Value,
+) -> Option<(String, Vec<String>, Option<std::path::PathBuf>)> {
     match lang {
         "nodejs" | "js" => {
-            let wrapped = format!(
-                "(async () => {{\n  try {{\n    const __r = await (async () => {{\n{code}\n}})();\n    try {{ console.log('{RESULT_SENTINEL}' + JSON.stringify(__r === undefined ? null : __r)); }}\n    catch (__se) {{ console.log('{RESULT_SENTINEL}' + JSON.stringify({{ __unserializable: String(__se && __se.message || __se) }})); }}\n  }} catch (__e) {{\n    console.error(String(__e && __e.stack || __e));\n    process.exitCode = 1;\n  }}\n}})();\n"
-            );
+            let wrapped = match mode {
+                ExecMode::Default => format!(
+                    "(async () => {{\n  try {{\n    const __r = await (async () => {{\n{code}\n}})();\n    try {{ console.log('{RESULT_SENTINEL}' + JSON.stringify(__r === undefined ? null : __r)); }}\n    catch (__se) {{ console.log('{RESULT_SENTINEL}' + JSON.stringify({{ __unserializable: String(__se && __se.message || __se) }})); }}\n  }} catch (__e) {{\n    console.error(String(__e && __e.stack || __e));\n    process.exitCode = 1;\n  }}\n}})();\n"
+                ),
+                ExecMode::Mem => format!(
+                    "const {{ performance: __perf }} = require('perf_hooks');\n\
+                     (async () => {{\n\
+                     \x20 const __mb = process.memoryUsage(); const __w0 = __perf.now();\n\
+                     \x20 let __r = null, __err = null;\n\
+                     \x20 try {{ __r = await (async () => {{\n{code}\n}})(); }} catch (e) {{ __err = {{ name: e && e.name || 'Error', message: String(e && e.message || e), stack: String(e && e.stack || '') }}; }}\n\
+                     \x20 const __wallMs = Math.round((__perf.now() - __w0) * 1000) / 1000; const __ma = process.memoryUsage();\n\
+                     \x20 const __mem = {{ rss_mb: Math.round(__ma.rss/10485.76)/100, heapUsed_mb: Math.round(__ma.heapUsed/10485.76)/100, heapUsed_delta_mb: Math.round((__ma.heapUsed-__mb.heapUsed)/10485.76)/100, external_mb: Math.round(__ma.external/10485.76)/100 }};\n\
+                     \x20 process.stdout.write('{META_SENTINEL}' + JSON.stringify({{ result: __r === undefined ? null : __r, error: __err, mem: __mem, wall_ms: __wallMs }}));\n\
+                     \x20 if (__err) process.exitCode = 1;\n\
+                     }})();\n"
+                ),
+                ExecMode::Profile => {
+                    let sample_interval = opts.get("sampleIntervalUs").and_then(|v| v.as_i64()).filter(|v| *v > 0).unwrap_or(100);
+                    let top_n = opts.get("profileTopN").and_then(|v| v.as_i64()).filter(|v| *v > 0).unwrap_or(20);
+                    format!(
+                        "{AGGREGATE_CPU_PROFILE_SRC}\n\
+                         const __inspector = require('inspector');\n\
+                         const {{ performance: __perf }} = require('perf_hooks');\n\
+                         const __session = new __inspector.Session();\n\
+                         __session.connect();\n\
+                         const __post = (m, p) => new Promise((res, rej) => __session.post(m, p || {{}}, (e, r) => e ? rej(e) : res(r)));\n\
+                         (async () => {{\n\
+                         \x20 let __profile = null, __profileError = null, __userResult = null, __userError = null, __wallMs = 0;\n\
+                         \x20 const __memBefore = process.memoryUsage();\n\
+                         \x20 try {{\n\
+                         \x20\x20  await __post('Profiler.enable');\n\
+                         \x20\x20  await __post('Profiler.setSamplingInterval', {{ interval: {sample_interval} }});\n\
+                         \x20\x20  await __post('Profiler.start');\n\
+                         \x20\x20  const __w0 = __perf.now();\n\
+                         \x20\x20  try {{ __userResult = await (async () => {{\n{code}\n}})(); }} catch (ue) {{ __userError = String(ue && ue.stack || ue); }}\n\
+                         \x20\x20  __wallMs = Math.round((__perf.now() - __w0) * 1000) / 1000;\n\
+                         \x20\x20  const __r = await __post('Profiler.stop');\n\
+                         \x20\x20  __profile = __r && __r.profile || null;\n\
+                         \x20 }} catch (pe) {{ __profileError = String(pe && pe.message || pe); }}\n\
+                         \x20 const __memAfter = process.memoryUsage();\n\
+                         \x20 const __agg = __profile ? aggregateCpuProfile(__profile, {top_n}, false) : {{ timeframe: null, culprits: [] }};\n\
+                         \x20 const __cpuTotalUs = __agg.timeframe ? __agg.timeframe.total_us : 0;\n\
+                         \x20 const __wallUs = Math.round(__wallMs * 1000);\n\
+                         \x20 const __mem = {{ rss_mb: Math.round(__memAfter.rss/10485.76)/100, heapUsed_mb: Math.round(__memAfter.heapUsed/10485.76)/100, heapUsed_delta_mb: Math.round((__memAfter.heapUsed-__memBefore.heapUsed)/10485.76)/100, external_mb: Math.round(__memAfter.external/10485.76)/100 }};\n\
+                         \x20 const __wallVsCpu = {{ wall_us: __wallUs, cpu_total_sampled_us: __cpuTotalUs, offcpu_us: Math.max(0, __wallUs - __cpuTotalUs), note: 'offcpu_us = inner wall minus on-CPU sampled JS self time = IO/async/GPU/idle the CPU sampler is blind to' }};\n\
+                         \x20 process.stdout.write('{PROFILE_SENTINEL}' + JSON.stringify({{ result: __userResult, user_error: __userError, profile: __agg, profile_error: __profileError, mem: __mem, wall_vs_cpu: __wallVsCpu }}));\n\
+                         \x20 __session.disconnect();\n\
+                         }})();\n"
+                    )
+                }
+            };
             Some((resolve_node_cmd(), vec!["-e".to_string(), wrapped], None))
         }
         "python" | "py" => Some(("python".to_string(), vec!["-c".to_string(), code.to_string()], None)),
@@ -162,6 +309,50 @@ pub(crate) fn build_command(lang: &str, code: &str) -> Option<(String, Vec<Strin
         _ => None,
     }
 }
+
+const AGGREGATE_CPU_PROFILE_SRC: &str = r#"function aggregateCpuProfile(profile, topN, isBrowserCtx) {
+  if (!profile || !Array.isArray(profile.nodes) || !Array.isArray(profile.samples)) {
+    return { timeframe: null, culprits: [] };
+  }
+  const byId = new Map();
+  for (const node of profile.nodes) byId.set(node.id, node);
+  const deltas = Array.isArray(profile.timeDeltas) ? profile.timeDeltas : [];
+  const selfUs = new Map();
+  const sampleCount = profile.samples.length;
+  for (let i = 0; i < profile.samples.length; i++) {
+    const node = byId.get(profile.samples[i]);
+    if (!node) continue;
+    const delta = deltas[i + 1] || deltas[i] || 0;
+    selfUs.set(node.id, (selfUs.get(node.id) || 0) + Math.abs(delta));
+  }
+  const totalUs = Array.from(selfUs.values()).reduce((a, b) => a + b, 0);
+  const acc = new Map();
+  for (const [id, us] of selfUs.entries()) {
+    const node = byId.get(id);
+    if (!node || !node.callFrame) continue;
+    const cf = node.callFrame;
+    const fn = cf.functionName || '(anonymous)';
+    const loc = `${cf.url || ''}:${cf.lineNumber != null ? cf.lineNumber + 1 : 0}:${cf.columnNumber != null ? cf.columnNumber + 1 : 0}`;
+    const key = `${fn}@${loc}`;
+    const prior = acc.get(key) || { location: loc, function: fn, self_us: 0, hits: 0 };
+    prior.self_us += us;
+    prior.hits += 1;
+    acc.set(key, prior);
+  }
+  const culprits = Array.from(acc.values())
+    .map(c => ({ ...c, self_pct: totalUs > 0 ? Math.round((c.self_us / totalUs) * 10000) / 100 : 0 }))
+    .sort((a, b) => b.self_us - a.self_us)
+    .slice(0, topN);
+  return {
+    timeframe: {
+      start_us: typeof profile.startTime === 'number' ? profile.startTime : 0,
+      end_us: typeof profile.endTime === 'number' ? profile.endTime : 0,
+      total_us: totalUs,
+      sample_count: sampleCount,
+    },
+    culprits,
+  };
+}"#;
 
 fn resolve_node_cmd() -> String {
     for candidate in ["node", "bun"] {
