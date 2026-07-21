@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use wasmtime::{Engine, Module};
 
-use agentplug_host::{build_engine, install_dir, now_ms, read_project_plugin_list, ProjectPlugins, PLUGIN_IDLE_EVICT_MS};
+use agentplug_host::{build_engine, install_dir, now_ms, read_project_plugin_list, GmFairnessGuard, ProjectPlugins, PLUGIN_IDLE_EVICT_MS};
 
 use crate::download::{ensure_plugin_installed, installed_runner_version, record_runner_version};
 
@@ -701,6 +701,23 @@ fn dispatch_project(root: &Path, project: &mut ProjectPlugins, plugin_modules: &
                     // converts any panic into a real error response instead,
                     // so the caller gets a definitive (if unhappy) answer
                     // rather than an unbounded silent hang.
+                    // Per-project fairness cap on the shared `gm` pool (see
+                    // GmFairnessGuard's doc comment): loaded fresh from this
+                    // project's own .gm/daemon-project-config.json on every
+                    // dispatch, never cached, same precedent as
+                    // BrowserConfig::load. This is an ADDITIONAL gate on top
+                    // of the pool's own slot checkout inside
+                    // project.dispatch -- it never grants more concurrency
+                    // than the pool has, it only ever restricts how many of
+                    // this ONE project's own dispatches may be mid-flight
+                    // against that pool at once. The guard blocks (if this
+                    // project is at its own configured limit) BEFORE taking
+                    // a pool slot, so a fairness-capped project waits here
+                    // rather than occupying a global slot it isn't entitled
+                    // to hold concurrently. Held across catch_unwind so a
+                    // wasm-side panic still releases the slot via Drop
+                    // during unwind, never leaking it.
+                    let _fairness_guard = GmFairnessGuard::acquire(root);
                     let dispatch_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         project.dispatch("gm", &verb, &body)
                     }));

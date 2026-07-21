@@ -379,6 +379,97 @@ impl ProjectPlugins {
     }
 }
 
+/// Per-project fairness cap on the shared `gm` pool, read fresh from
+/// `<project>/.gm/daemon-project-config.json` on every dispatch -- same
+/// precedent as `BrowserConfig::load(cwd)` in agentplug-host's browser.rs
+/// (cheap file read, never cached, since the file can change between
+/// dispatches and this is not a hot per-tick loop like the daemon's own
+/// lifecycle timing).
+///
+/// This is deliberately NOT the same file as the machine-wide
+/// `~/.agentplug/daemon-config.json` (`gm_concurrency` there sets the ACTUAL
+/// total pool size, machine-scoped, one daemon process, ambiguous to
+/// override per-project). This file can only ever LOWER one project's own
+/// share of that shared pool -- it has no field capable of raising the
+/// total, by construction (there is no "total slots" field here at all,
+/// only a per-project ceiling on concurrent checkouts).
+#[derive(serde::Deserialize, Default)]
+struct ProjectDaemonConfig {
+    #[serde(default)]
+    gm_concurrency_limit: Option<usize>,
+}
+
+impl ProjectDaemonConfig {
+    fn load(root: &Path) -> Self {
+        let path = root.join(".gm").join("daemon-project-config.json");
+        std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|s| serde_json::from_str::<ProjectDaemonConfig>(&s).ok())
+            .unwrap_or_default()
+    }
+}
+
+/// Process-wide in-flight `gm`-dispatch counter, keyed by project root.
+/// Populated only when a project has actually configured its own
+/// `gm_concurrency_limit` -- an unconfigured project never touches this map
+/// at all (see `GmFairnessGuard::acquire`), so the common case (no
+/// `.gm/daemon-project-config.json`) pays zero cost beyond the one cheap
+/// file-read-that-fails in `ProjectDaemonConfig::load`.
+static GM_INFLIGHT_BY_PROJECT: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
+
+fn gm_inflight_map() -> &'static Mutex<HashMap<PathBuf, usize>> {
+    GM_INFLIGHT_BY_PROJECT.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// RAII guard for one project's fairness-limited `gm` dispatch slot.
+/// Acquiring blocks (short poll loop) while this project is already at its
+/// own configured `gm_concurrency_limit`; the slot is released on Drop so a
+/// panic unwinding through `catch_unwind` in `dispatch_project` still
+/// decrements the counter (Drop runs during unwind), never leaking a held
+/// slot that would permanently wedge that project at its own cap.
+pub struct GmFairnessGuard {
+    root: PathBuf,
+    limited: bool,
+}
+
+impl GmFairnessGuard {
+    /// Blocks until this project's in-flight `gm` count is below its own
+    /// configured `gm_concurrency_limit`, then reserves a slot and returns.
+    /// A project with no limit configured (no file, or field absent) never
+    /// enters the wait loop or touches the shared map at all -- byte-identical
+    /// to pre-existing behavior, exactly the "default must not slow anything
+    /// down" requirement this gate is built to.
+    pub fn acquire(root: &Path) -> Self {
+        let limit = match ProjectDaemonConfig::load(root).gm_concurrency_limit {
+            Some(n) if n > 0 => n,
+            _ => return Self { root: root.to_path_buf(), limited: false },
+        };
+        loop {
+            {
+                let mut map = gm_inflight_map().lock().unwrap();
+                let count = map.entry(root.to_path_buf()).or_insert(0);
+                if *count < limit {
+                    *count += 1;
+                    return Self { root: root.to_path_buf(), limited: true };
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+    }
+}
+
+impl Drop for GmFairnessGuard {
+    fn drop(&mut self) {
+        if !self.limited {
+            return;
+        }
+        let mut map = gm_inflight_map().lock().unwrap();
+        if let Some(count) = map.get_mut(&self.root) {
+            *count = count.saturating_sub(1);
+        }
+    }
+}
+
 /// Discovers which plugins a project wants loaded: `<root>/.agentplug/plugins.txt`,
 /// one plugin name per line (e.g. "gm", "bert"). Missing file = no plugins
 /// requested yet (caller decides the default, typically just "gm").
