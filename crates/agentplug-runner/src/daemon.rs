@@ -40,8 +40,56 @@ fn read_registry() -> Vec<PathBuf> {
         .collect()
 }
 
-const REGISTRY_POLL_INTERVAL: Duration = Duration::from_secs(5);
-// 2x the daemon's own HEARTBEAT_INTERVAL (10s) plus slack, not the looser
+/// Live-found (vendor-daemon-lifecycle-timing-config-to-gm): every daemon-
+/// lifecycle Duration below (REGISTRY_POLL_INTERVAL, HEARTBEAT_INTERVAL,
+/// PLUGIN_UPDATE_POLL_INTERVAL, RUNNER_UPDATE_POLL_INTERVAL) was a hardcoded
+/// const, unreachable to configure. Unlike browser-config.json (a genuine
+/// per-project setting, since the browser verb operates within one
+/// project's cwd), these apply machine-wide -- the daemon is a SINGLE
+/// SHARED process across every registered project (confirmed via
+/// shared_process:true in .status.json), so a per-project override would be
+/// ambiguous: which of N registered projects' config should win for a
+/// setting that governs the one shared daemon process? The correct scope is
+/// install_dir() (~/.agentplug), the same machine-wide root every other
+/// genuinely-shared daemon state already lives under (daemon-registry.txt,
+/// daemon-owner.lock, plugins/). Read once at daemon startup (these govern
+/// the daemon's OWN loop timing, not a per-dispatch value, so re-reading
+/// per-tick would be wasted work); every field optional, falling back to
+/// the exact pre-existing literal when absent so an unconfigured machine
+/// behaves byte-identically to before this change.
+#[derive(serde::Deserialize, Clone, Copy)]
+struct DaemonConfig {
+    #[serde(default)]
+    registry_poll_interval_secs: Option<u64>,
+    #[serde(default)]
+    heartbeat_interval_secs: Option<u64>,
+    #[serde(default)]
+    plugin_update_poll_interval_secs: Option<u64>,
+    #[serde(default)]
+    runner_update_poll_interval_secs: Option<u64>,
+}
+
+impl DaemonConfig {
+    fn load() -> Self {
+        let path = install_dir().join("daemon-config.json");
+        fs::read_to_string(&path)
+            .ok()
+            .and_then(|s| serde_json::from_str::<DaemonConfig>(&s).ok())
+            .unwrap_or(DaemonConfig {
+                registry_poll_interval_secs: None,
+                heartbeat_interval_secs: None,
+                plugin_update_poll_interval_secs: None,
+                runner_update_poll_interval_secs: None,
+            })
+    }
+    fn registry_poll_interval(&self) -> Duration { Duration::from_secs(self.registry_poll_interval_secs.unwrap_or(5)) }
+    fn heartbeat_interval(&self) -> Duration { Duration::from_secs(self.heartbeat_interval_secs.unwrap_or(10)) }
+    fn plugin_update_poll_interval(&self) -> Duration { Duration::from_secs(self.plugin_update_poll_interval_secs.unwrap_or(600)) }
+    fn runner_update_poll_interval(&self) -> Duration { Duration::from_secs(self.runner_update_poll_interval_secs.unwrap_or(600)) }
+}
+
+// 2x the daemon's own default heartbeat_interval (10s, now configurable via
+// DaemonConfig, see above) plus slack, not the looser
 // 60s this was originally set to -- a genuinely-alive daemon's ts is never
 // more than ~10-12s stale (one missed tick at worst), so 60s left a wide
 // window where a status file from a daemon killed seconds ago still reads
@@ -825,11 +873,14 @@ pub fn run_daemon() -> anyhow::Result<()> {
 fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
     write_daemon_heartbeat(0, 0);
 
+    let daemon_cfg = DaemonConfig::load();
+    let registry_poll_interval = daemon_cfg.registry_poll_interval();
+    let heartbeat_interval = daemon_cfg.heartbeat_interval();
+
     let mut projects: HashMap<PathBuf, ProjectPlugins> = HashMap::new();
-    let mut last_registry_poll = Instant::now() - REGISTRY_POLL_INTERVAL;
+    let mut last_registry_poll = Instant::now() - registry_poll_interval;
     let mut last_heartbeat = Instant::now();
     let mut known_roots: Vec<PathBuf> = Vec::new();
-    const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 
     // WASM linear memory is architecturally monotonic (memory.grow is the
     // only size-changing instruction, no shrink exists in the spec) -- once
@@ -858,7 +909,7 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
     const SHARED_PLUGIN_RELEASE_IDLE_MS: u64 = 2 * 60 * 1000;
     let mut last_shared_release = Instant::now();
 
-    const PLUGIN_UPDATE_POLL_INTERVAL: Duration = Duration::from_secs(600);
+    let plugin_update_poll_interval = daemon_cfg.plugin_update_poll_interval();
     let mut last_plugin_update_poll = Instant::now();
 
     // Same cadence as the wasm-guest poll -- the runner's own executable
@@ -866,11 +917,11 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
     // Per fsm-framework/runner-self-update: closes the "agent had to
     // manually kill/rebuild/redeploy the daemon" gap this session hit
     // repeatedly for daemon.rs fixes.
-    const RUNNER_UPDATE_POLL_INTERVAL: Duration = Duration::from_secs(600);
+    let runner_update_poll_interval = daemon_cfg.runner_update_poll_interval();
     let mut last_runner_update_poll = Instant::now();
 
     loop {
-        if last_heartbeat.elapsed() >= HEARTBEAT_INTERVAL {
+        if last_heartbeat.elapsed() >= heartbeat_interval {
             last_heartbeat = Instant::now();
             // Closes the residual TOCTOU window the startup check above
             // can't fully cover (two processes racing the exact same
@@ -899,7 +950,7 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
             return Ok(());
         }
 
-        if last_registry_poll.elapsed() >= REGISTRY_POLL_INTERVAL {
+        if last_registry_poll.elapsed() >= registry_poll_interval {
             last_registry_poll = Instant::now();
             known_roots = read_registry();
         }
@@ -1030,7 +1081,7 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
         // wasm it first downloaded forever -- no published fix ever reaches it.
         // Releasing the shared Store is what actually makes a refreshed wasm
         // take effect: the module is re-read from disk on next instantiation.
-        if !any_work && last_plugin_update_poll.elapsed() >= PLUGIN_UPDATE_POLL_INTERVAL {
+        if !any_work && last_plugin_update_poll.elapsed() >= plugin_update_poll_interval {
             last_plugin_update_poll = Instant::now();
             for plugin_name in plugin_modules.modules.keys().cloned().collect::<Vec<_>>() {
                 match crate::download::refresh_plugin_if_stale(&plugin_name) {
@@ -1054,7 +1105,7 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
         // the new process, so it exits the loop (and the function) here
         // rather than looping once more and re-claiming what it just handed
         // off.
-        if !any_work && last_runner_update_poll.elapsed() >= RUNNER_UPDATE_POLL_INTERVAL {
+        if !any_work && last_runner_update_poll.elapsed() >= runner_update_poll_interval {
             last_runner_update_poll = Instant::now();
             match crate::download::stage_runner_self_update() {
                 Ok(Some((staged, version))) => {
