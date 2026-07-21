@@ -98,6 +98,34 @@ fn parse_body(body: &str) -> (Option<String>, String) {
     (None, body.to_string())
 }
 
+/// `capture\n<script>` / `profile\n<script>` / `trace\n<script>` mode
+/// prefixes, documented in AGENTS.md/SKILL.md's exec_js/browser profiling
+/// contract but never implemented in the native agentplug-host browser
+/// path (only the retired JS wrapper had them). Stripped before parse_body
+/// sees the remaining url=/bare-URL/script body, so the two prefix systems
+/// compose (e.g. "profile\nurl=https://...\nscript").
+#[derive(Clone, Copy, PartialEq)]
+enum BrowserMode {
+    Default,
+    Capture,
+    Profile,
+    Trace,
+}
+
+fn strip_mode_prefix(body: &str) -> (BrowserMode, &str) {
+    let trimmed = body.trim_start();
+    for (prefix, mode) in [("capture\n", BrowserMode::Capture), ("profile\n", BrowserMode::Profile), ("trace\n", BrowserMode::Trace)] {
+        if let Some(rest) = trimmed.strip_prefix(prefix) {
+            return (mode, rest);
+        }
+    }
+    (BrowserMode::Default, body)
+}
+
+fn browser_profiles_dir(cwd: &Path) -> PathBuf {
+    cwd.join(".gm").join("browser-profiles")
+}
+
 pub fn run(body: &str, cwd: &Path, session_id: &str) -> Value {
     let Some(chrome) = find_chrome() else {
         return json!({"ok": false, "stdout": "", "exit_code": 1,
@@ -125,7 +153,8 @@ pub fn run(body: &str, cwd: &Path, session_id: &str) -> Value {
         }
         _ => (body.to_string(), 120_000),
     };
-    let (start_url, script) = parse_body(&inner_body);
+    let (mode, after_mode) = strip_mode_prefix(&inner_body);
+    let (start_url, script) = parse_body(after_mode);
 
     let tmp = std::env::temp_dir();
     let stamp = format!("{}-{}", std::process::id(), sanitize(session_id));
@@ -134,6 +163,14 @@ pub fn run(body: &str, cwd: &Path, session_id: &str) -> Value {
     let script_path = tmp.join(format!("agentplug-cdp-script-{stamp}.js"));
     let result_path = tmp.join(format!("agentplug-cdp-result-{stamp}.json"));
     let _ = std::fs::create_dir_all(&profile_dir);
+    let artifact_path = if mode != BrowserMode::Default {
+        let dir = browser_profiles_dir(cwd);
+        let _ = std::fs::create_dir_all(&dir);
+        let ext = match mode { BrowserMode::Trace => "trace.json", _ => "profile.json" };
+        Some(dir.join(format!("{}-{}.{}", mode_label(mode), unix_ms(), ext)))
+    } else {
+        None
+    };
     if let Ok(mut f) = std::fs::File::create(&helper_path) {
         let _ = f.write_all(CDP_EVAL_JS.as_bytes());
     }
@@ -178,6 +215,8 @@ pub fn run(body: &str, cwd: &Path, session_id: &str) -> Value {
         "scriptFile": script_path.to_string_lossy(),
         "resultFile": result_path.to_string_lossy(),
         "timeoutMs": timeout_ms,
+        "mode": mode_label(mode),
+        "artifactFile": artifact_path.as_ref().map(|p| p.to_string_lossy().into_owned()),
     })
     .to_string();
 
@@ -228,14 +267,60 @@ pub fn run(body: &str, cwd: &Path, session_id: &str) -> Value {
 
     let cdp_error = result_value.get("__cdpError").and_then(|v| v.as_str());
     let ok = exit_code == 0 && !timed_out && cdp_error.is_none();
-    json!({
+    let mut out = json!({
         "ok": ok,
-        "result": if cdp_error.is_some() { Value::Null } else { result_value.clone() },
         "stderr": String::from_utf8_lossy(&stderr_buf).into_owned(),
         "exit_code": exit_code,
         "timed_out": timed_out,
         "duration_ms": t0.elapsed().as_millis() as u64,
-    })
+    });
+    if cdp_error.is_some() {
+        out["result"] = Value::Null;
+        return out;
+    }
+    // Non-default modes get a {result, <mode-key>} envelope from
+    // cdp_eval.js (mirrors exec_js's opts.mem/opts.profile envelope shape);
+    // default mode is the bare returned value, unchanged.
+    match mode {
+        BrowserMode::Default => {
+            out["result"] = result_value;
+        }
+        BrowserMode::Capture => {
+            out["result"] = result_value.get("result").cloned().unwrap_or(Value::Null);
+            out["debug"] = result_value.get("debug").cloned().unwrap_or(json!({"console": [], "network": [], "performance": null}));
+        }
+        BrowserMode::Profile => {
+            out["result"] = result_value.get("result").cloned().unwrap_or(Value::Null);
+            out["profile"] = result_value.get("profile").cloned().unwrap_or(json!({"timeframe": null, "culprits": []}));
+            if let Some(p) = &artifact_path {
+                out["profile_file"] = json!(p.to_string_lossy());
+            }
+        }
+        BrowserMode::Trace => {
+            out["result"] = result_value.get("result").cloned().unwrap_or(Value::Null);
+            out["trace"] = result_value.get("trace").cloned().unwrap_or(json!({"wall_us": 0, "gpu_us": 0, "viz_us": 0, "cc_us": 0, "by_category": {}}));
+            if let Some(p) = &artifact_path {
+                out["trace_file"] = json!(p.to_string_lossy());
+            }
+        }
+    }
+    out
+}
+
+fn mode_label(mode: BrowserMode) -> &'static str {
+    match mode {
+        BrowserMode::Default => "default",
+        BrowserMode::Capture => "capture",
+        BrowserMode::Profile => "profile",
+        BrowserMode::Trace => "trace",
+    }
+}
+
+fn unix_ms() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0)
 }
 
 fn sanitize(s: &str) -> String {
