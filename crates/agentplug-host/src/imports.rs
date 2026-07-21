@@ -439,8 +439,9 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
             let verb = read_guest_string(&mut caller, verb_ptr, verb_len);
             let body = read_guest_string(&mut caller, body_ptr, body_len);
 
-            let sibling_cell = { caller.data().siblings.lock().unwrap().get(&plugin).cloned() };
-            let Some(sibling_cell) = sibling_cell else {
+            let caller_siblings = caller.data().siblings();
+            let sibling_pool = { caller_siblings.lock().unwrap().get(&plugin).cloned() };
+            let Some(sibling_pool) = sibling_pool else {
                 return write_guest_json(
                     &mut caller,
                     serde_json::json!({"ok": false, "error": "unknown_plugin", "plugin": plugin}),
@@ -455,10 +456,10 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
             // store/data.rs:213) the first time gm.wasm's recall path called
             // into bert via host_plugin_call.
             let caller_root = caller.data().cwd();
-            let mut guard = sibling_cell.lock().unwrap();
+            let mut guard = sibling_pool.acquire();
             let result = match guard.as_mut() {
                 None => Err(anyhow::anyhow!("plugin_not_loaded_yet")),
-                Some(handle) => crate::registry::dispatch_on(&mut handle.store, handle.instance, &verb, &body, &caller_root),
+                Some(handle) => crate::registry::dispatch_on(&mut handle.store, handle.instance, &verb, &body, &caller_root, caller_siblings.clone()),
             };
             drop(guard);
 
@@ -484,15 +485,16 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
             // Same fix as host_plugin_call: drive bert's own Store, never
             // `caller` (this plugin's Store) -- see SiblingHandle's doc
             // comment for the wasmtime cross-store panic this replaced.
-            let sibling_cell = { caller.data().siblings.lock().unwrap().get("bert").cloned() };
-            let Some(sibling_cell) = sibling_cell else {
+            let caller_siblings = caller.data().siblings();
+            let sibling_pool = { caller_siblings.lock().unwrap().get("bert").cloned() };
+            let Some(sibling_pool) = sibling_pool else {
                 return -1;
             };
             let caller_root = caller.data().cwd();
-            let mut guard = sibling_cell.lock().unwrap();
+            let mut guard = sibling_pool.acquire();
             let result = match guard.as_mut() {
                 None => Err(anyhow::anyhow!("bert not loaded yet")),
-                Some(handle) => crate::registry::dispatch_on(&mut handle.store, handle.instance, "embed", &body, &caller_root).and_then(|resp| {
+                Some(handle) => crate::registry::dispatch_on(&mut handle.store, handle.instance, "embed", &body, &caller_root, caller_siblings.clone()).and_then(|resp| {
                     let v: serde_json::Value = serde_json::from_str(&resp)?;
                     let arr = v.get("embedding").and_then(|e| e.as_array()).ok_or_else(|| anyhow::anyhow!("no embedding field"))?;
                     Ok::<Vec<f32>, anyhow::Error>(arr.iter().filter_map(|x| x.as_f64()).map(|x| x as f32).collect())

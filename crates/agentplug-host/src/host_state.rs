@@ -6,6 +6,8 @@ use wasmtime::{Instance, Store};
 use wasmtime_wasi::p1::WasiP1Ctx;
 use wasmtime_wasi::{DirPerms, FilePerms, WasiCtxBuilder};
 
+use crate::registry::SharedPluginPool;
+
 /// A sibling plugin's own Store+Instance pair. `host_plugin_call` must drive
 /// the TARGET plugin's calls through the target's own Store, never the
 /// calling plugin's `Caller` -- wasmtime's `Instance::get_typed_func`/`call`
@@ -19,13 +21,16 @@ pub struct SiblingHandle {
     pub instance: Instance,
 }
 
-/// One HostState per (project, plugin) instantiation. `siblings` is shared
-/// (Arc<Mutex<..>>) across every plugin instance for the SAME project, so
-/// `host_plugin_call` on any one of them can look up any other -- e.g. gm.wasm's
-/// HostState and bert.wasm's HostState for the same project both point at the
-/// same underlying sibling map, populated as each plugin is instantiated.
-/// Each entry owns its OWN Store (see SiblingHandle) so cross-plugin calls
-/// never reuse the calling plugin's Store.
+/// One HostState per (project, plugin) instantiation -- except for shared
+/// plugins (see is_stateless_shared_plugin in registry.rs), where a single
+/// pool of HostStates is reused across every project. `siblings()`/
+/// `set_siblings()` expose the CURRENT calling project's sibling pool map,
+/// refreshed fresh on every dispatch by `registry::dispatch_on` (mirroring
+/// `cwd`/`set_cwd`), so `host_plugin_call` on any plugin instance can look up
+/// any other already-loaded plugin FOR THE PROJECT THAT IS CURRENTLY
+/// DISPATCHING, never whichever project happened to instantiate this Store
+/// first. Each sibling entry owns its OWN Store (see SiblingHandle) so
+/// cross-plugin calls never reuse the calling plugin's Store.
 pub struct HostState {
     // Mutex, not a plain PathBuf: a SHARED plugin instance (see
     // is_stateless_shared_plugin) reuses this same HostState across every
@@ -44,16 +49,23 @@ pub struct HostState {
     // callback), unlike `siblings`' entries which each need their OWN Store.
     // Populated by ProjectPlugins::load_plugin right after instantiation.
     pub self_instance: Arc<Mutex<Option<wasmtime::Instance>>>,
-    pub siblings: Arc<Mutex<HashMap<String, Arc<Mutex<Option<SiblingHandle>>>>>>,
+    // Mutex around the Arc itself (not just the inner HashMap), mirroring
+    // `cwd` above: a SHARED plugin instance (see is_stateless_shared_plugin
+    // in registry.rs) reuses this same HostState across every project's
+    // dispatch, so the map this points at must be swappable per-call, not
+    // fixed at whichever project's `load_plugin` happened to instantiate
+    // this Store first. Before this fix the Arc itself never changed after
+    // construction, so `host_plugin_call` on a shared instance always
+    // resolved siblings against the FIRST project to instantiate it --
+    // correct by accident only because every default-config project loads
+    // the same 4 plugins in the same order. `registry::dispatch_on` calls
+    // `set_siblings` fresh on every dispatch, exactly like `set_cwd`.
+    siblings: Mutex<Arc<Mutex<HashMap<String, Arc<SharedPluginPool>>>>>,
     pub wasi: WasiP1Ctx,
 }
 
 impl HostState {
-    pub fn new(
-        cwd: PathBuf,
-        plugin_name: String,
-        siblings: Arc<Mutex<HashMap<String, Arc<Mutex<Option<SiblingHandle>>>>>>,
-    ) -> Self {
+    pub fn new(cwd: PathBuf, plugin_name: String) -> Self {
         let mut builder = WasiCtxBuilder::new();
         builder.inherit_stderr();
         // Preopened at whichever project instantiates this Store FIRST --
@@ -79,7 +91,13 @@ impl HostState {
             );
         }
         let wasi = builder.build_p1();
-        Self { cwd: Mutex::new(cwd), plugin_name, self_instance: Arc::new(Mutex::new(None)), siblings, wasi }
+        Self {
+            cwd: Mutex::new(cwd),
+            plugin_name,
+            self_instance: Arc::new(Mutex::new(None)),
+            siblings: Mutex::new(Arc::new(Mutex::new(HashMap::new()))),
+            wasi,
+        }
     }
 
     /// Same as `new`, but preopens the whole host filesystem root as WASI
@@ -100,23 +118,32 @@ impl HostState {
     /// paths (see `posix_guest_path` in registry.rs), covers every project
     /// without per-call preopen churn (which wasmtime-wasi does not support
     /// post-instantiation anyway).
-    pub fn new_with_fs_root(
-        cwd: PathBuf,
-        plugin_name: String,
-        siblings: Arc<Mutex<HashMap<String, Arc<Mutex<Option<SiblingHandle>>>>>>,
-        fs_root: &std::path::Path,
-    ) -> Self {
+    pub fn new_with_fs_root(cwd: PathBuf, plugin_name: String, fs_root: &std::path::Path) -> Self {
         let mut builder = WasiCtxBuilder::new();
         builder.inherit_stderr();
         if let Err(e) = builder.preopened_dir(fs_root, "/", DirPerms::all(), FilePerms::all()) {
             eprintln!("[agentplug] WARNING: failed to preopen fs root {} for WASI ({}): {e}", fs_root.display(), plugin_name);
         }
         let wasi = builder.build_p1();
-        Self { cwd: Mutex::new(cwd), plugin_name, self_instance: Arc::new(Mutex::new(None)), siblings, wasi }
+        Self {
+            cwd: Mutex::new(cwd),
+            plugin_name,
+            self_instance: Arc::new(Mutex::new(None)),
+            siblings: Mutex::new(Arc::new(Mutex::new(HashMap::new()))),
+            wasi,
+        }
     }
 
     pub fn set_cwd(&self, cwd: PathBuf) {
         *self.cwd.lock().unwrap() = cwd;
+    }
+
+    pub fn set_siblings(&self, new: Arc<Mutex<HashMap<String, Arc<SharedPluginPool>>>>) {
+        *self.siblings.lock().unwrap() = new;
+    }
+
+    pub fn siblings(&self) -> Arc<Mutex<HashMap<String, Arc<SharedPluginPool>>>> {
+        self.siblings.lock().unwrap().clone()
     }
 
     pub fn cwd(&self) -> PathBuf {

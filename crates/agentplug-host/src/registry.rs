@@ -39,36 +39,131 @@ pub const PLUGIN_IDLE_EVICT_MS: u64 = 30 * 60 * 1000;
 /// fixed at first instantiation would silently CANTOPEN every other
 /// project's absolute db path. See that constructor's doc comment.
 ///
-/// "gm": previously the sole holdout -- gm.wasm's own orchestrator/mod.rs
-/// used to bake its project root into a wasm-side `PROJECT_ROOT:
-/// OnceLock<PathBuf>`, resolved once via a `git rev-parse` subprocess on
-/// first `gm_dir()` call and cached for that instance's lifetime, which
-/// would have silently misdirected a second project's work onto the first
-/// project's `.gm/` directory if shared. Fixed in rs-plugkit (commit
-/// a0ddeb6): `gm_dir()` now calls `resolve_project_root_with_retry()` fresh
-/// on every invocation instead of caching, routed through the new
-/// `host_cwd` import this host now exposes (see imports.rs) -- correct
-/// per-call regardless of which project's dispatch is currently running.
-/// libsql's own db-path caller-side threading (rs-plugkit commit 30562b1)
-/// was the second half of this same fix: gm.wasm's internal libsql calls
-/// now forward a real absolute path derived from host_cwd on every call
-/// instead of a bare project-ambiguous name, since libsql itself is now
-/// ALSO a shared, per-call-stateless instance (see "libsql" above and
+/// "gm": genuinely stateless the same way -- its real state lives in flat
+/// files under `<project>/.gm/` (prd.yml, mutables.yml, exec-spool/), never
+/// in wasm-side memory, so sharing one instance across projects is correct
+/// by the same rule as bert/treesitter/libsql. Previously the sole holdout
+/// -- gm.wasm's own orchestrator/mod.rs used to bake its project root into
+/// a wasm-side `PROJECT_ROOT: OnceLock<PathBuf>`, resolved once via a
+/// `git rev-parse` subprocess on first `gm_dir()` call and cached for that
+/// instance's lifetime, which would have silently misdirected a second
+/// project's work onto the first project's `.gm/` directory if shared.
+/// Fixed in rs-plugkit (commit a0ddeb6): `gm_dir()` now calls
+/// `resolve_project_root_with_retry()` fresh on every invocation instead
+/// of caching, routed through the new `host_cwd` import this host now
+/// exposes (see imports.rs) -- correct per-call regardless of which
+/// project's dispatch is currently running. libsql's own db-path
+/// caller-side threading (rs-plugkit commit 30562b1) was the second half
+/// of this same fix: gm.wasm's internal libsql calls now forward a real
+/// absolute path derived from host_cwd on every call instead of a bare
+/// project-ambiguous name, since libsql itself is now ALSO a shared,
+/// per-call-stateless instance (see "libsql" above and
 /// agentplug-libsql's own db.rs).
+///
+/// Sharing is correct; it is NOT free concurrency. `ProjectPlugins::dispatch`
+/// holds the shared plugin's Mutex for the full duration of the wasm call,
+/// so a long synchronous `exec_js`/`browser` dispatch against ANY project
+/// serializes every OTHER project's `gm` dispatch behind it for that same
+/// duration, regardless of the outer daemon loop's own worker-pool
+/// concurrency (live-witnessed: an unrelated project's 15s busy-loop
+/// dispatch delayed a concurrent health check on a different project by
+/// 18-21s). That is a real liveness gap in the shared-single-instance
+/// design, not something this flag can fix by itself -- the fix has to
+/// avoid holding the lock for the wasm call's entire wall-clock duration
+/// (e.g. release it around the actual blocking I/O inside exec_js/browser,
+/// or move those two verbs off the shared instance specifically while
+/// state-only verbs stay shared), not revert `gm` to per-project instances,
+/// which would just reintroduce N-times state duplication for a plugin
+/// whose state is supposed to live in flat files, not wasm memory.
 fn is_stateless_shared_plugin(plugin_name: &str) -> bool {
     matches!(plugin_name, "bert" | "treesitter" | "libsql" | "gm")
 }
 
-type SharedPluginMap = Mutex<HashMap<String, Arc<Mutex<Option<SiblingHandle>>>>>;
+/// Process-wide ceiling on how many live `gm` Stores may exist at once.
+/// Set exactly once, early in daemon startup (`set_gm_pool_size`), from
+/// `DaemonConfig::gm_concurrency()` -- before that call, or on a non-daemon
+/// entry point that never calls it, `gm_pool_size()` falls back to 4 (the
+/// pre-existing effective concurrency ceiling, matching the old
+/// `MAX_CONCURRENT_PROJECTS` default). bert/treesitter/libsql are NOT
+/// pooled -- exactly one instance each, unchanged -- because bert alone
+/// costs ~133MB of resident tensors per instance and no live contention was
+/// ever found for any of the three; only `gm`'s exec_js/browser dispatches
+/// are long enough to block unrelated projects behind a single shared Mutex
+/// (see the doc comment above and the 18-21s live-witnessed stall).
+static GM_POOL_SIZE: OnceLock<usize> = OnceLock::new();
+
+/// Configure the `gm` pool size. Must be called before the first `gm`
+/// dispatch to take effect (a `OnceLock` can only be set once); a call after
+/// the pool already lazily-initialized at the default is a no-op returning
+/// false. Intended call site: once, at daemon startup, right after
+/// `DaemonConfig::load()`.
+pub fn set_gm_pool_size(n: usize) -> bool {
+    GM_POOL_SIZE.set(n.max(1)).is_ok()
+}
+
+fn gm_pool_size() -> usize {
+    *GM_POOL_SIZE.get_or_init(|| 4)
+}
+
+/// A shared plugin's live instance slots. Most plugins (bert/treesitter/
+/// libsql) run exactly one slot; `gm` runs `gm_pool_size()` slots so up to
+/// that many exec_js/browser (or any other verb) dispatches can be
+/// genuinely concurrent instead of collapsing to serial execution behind
+/// one Mutex. Each slot lazily instantiates its own Store on first real use,
+/// same as the pre-existing single-slot design.
+pub struct SharedPluginPool {
+    slots: Vec<Arc<Mutex<Option<SiblingHandle>>>>,
+}
+
+impl SharedPluginPool {
+    pub fn new(size: usize) -> Self {
+        Self { slots: (0..size.max(1)).map(|_| Arc::new(Mutex::new(None))).collect() }
+    }
+
+    /// Picks a free slot (a `try_lock`-scan round-robin), falling back to a
+    /// blocking `lock()` on slot 0 if every slot is currently busy -- under
+    /// contention this serializes exactly like the old single-slot design
+    /// used to unconditionally, so pool exhaustion degrades to the
+    /// pre-existing behavior rather than introducing a new failure mode.
+    /// Returns the OWNED lock guard so the caller holds it for the
+    /// dispatch's duration without re-locking.
+    pub fn acquire(&self) -> std::sync::MutexGuard<'_, Option<SiblingHandle>> {
+        for slot in &self.slots {
+            if let Ok(guard) = slot.try_lock() {
+                return guard;
+            }
+        }
+        self.slots[0].lock().unwrap()
+    }
+
+    fn any_instantiated(&self) -> bool {
+        self.slots.iter().any(|s| s.lock().unwrap().is_some())
+    }
+
+    fn release_all(&self) -> bool {
+        let mut released = false;
+        for slot in &self.slots {
+            let mut guard = slot.lock().unwrap();
+            if guard.is_some() {
+                *guard = None;
+                released = true;
+            }
+        }
+        released
+    }
+}
+
+type SharedPluginMap = Mutex<HashMap<String, Arc<SharedPluginPool>>>;
 static SHARED_PLUGINS: OnceLock<SharedPluginMap> = OnceLock::new();
 
-fn shared_plugin_cell(plugin_name: &str) -> Arc<Mutex<Option<SiblingHandle>>> {
+fn shared_plugin_pool(plugin_name: &str) -> Arc<SharedPluginPool> {
+    let pool_size = if plugin_name == "gm" { gm_pool_size() } else { 1 };
     SHARED_PLUGINS
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
         .unwrap()
         .entry(plugin_name.to_string())
-        .or_insert_with(|| Arc::new(Mutex::new(None)))
+        .or_insert_with(|| Arc::new(SharedPluginPool::new(pool_size)))
         .clone()
 }
 
@@ -97,13 +192,7 @@ pub fn release_shared_plugin(plugin_name: &str) -> bool {
     if !is_stateless_shared_plugin(plugin_name) {
         return false;
     }
-    let cell = shared_plugin_cell(plugin_name);
-    let mut guard = cell.lock().unwrap();
-    if guard.is_some() {
-        *guard = None;
-        return true;
-    }
-    false
+    shared_plugin_pool(plugin_name).release_all()
 }
 
 /// Runs a verb dispatch against an already-instantiated plugin's OWN Store.
@@ -113,7 +202,14 @@ pub fn release_shared_plugin(plugin_name: &str) -> bool {
 /// produced wasmtime's "object used with the wrong store" panic
 /// (store/data.rs:213) the first time host_plugin_call tried to drive a
 /// sibling Instance using the calling plugin's Caller.
-pub fn dispatch_on(store: &mut Store<HostState>, instance: wasmtime::Instance, verb: &str, body: &str, caller_root: &Path) -> anyhow::Result<String> {
+pub fn dispatch_on(
+    store: &mut Store<HostState>,
+    instance: wasmtime::Instance,
+    verb: &str,
+    body: &str,
+    caller_root: &Path,
+    caller_siblings: Arc<Mutex<HashMap<String, Arc<SharedPluginPool>>>>,
+) -> anyhow::Result<String> {
     // A shared instance (see is_stateless_shared_plugin) reuses the same
     // HostState across every project's dispatch -- refresh cwd to the
     // CALLING project's root immediately before every dispatch so
@@ -122,6 +218,12 @@ pub fn dispatch_on(store: &mut Store<HostState>, instance: wasmtime::Instance, v
     // Cheap and correct for a per-project (non-shared) instance too, since
     // caller_root is always that instance's own root in that case.
     store.data().set_cwd(caller_root.to_path_buf());
+    // Same fix, same reason, for `siblings`: a shared instance's HostState
+    // must point at the CALLING project's own siblings map for THIS call,
+    // never whichever project's map got baked in at first instantiation
+    // (see is_stateless_shared_plugin's / HostState's doc comments for the
+    // custom-plugins.txt-subset bug this closes).
+    store.data().set_siblings(caller_siblings);
     let plugin_name = store.data().plugin_name.clone();
     let alloc = instance.get_typed_func::<u32, u32>(&mut *store, "plugkit_alloc")?;
     let memory = instance.get_memory(&mut *store, "memory").ok_or_else(|| anyhow::anyhow!("plugin {plugin_name} has no exported memory"))?;
@@ -178,21 +280,19 @@ fn host_fs_root() -> PathBuf {
     }
 }
 
-fn instantiate_plugin(
-    engine: &Engine,
-    root: PathBuf,
-    plugin_name: &str,
-    module: &Module,
-    siblings: Arc<Mutex<HashMap<String, Arc<Mutex<Option<SiblingHandle>>>>>>,
-) -> anyhow::Result<SiblingHandle> {
+fn instantiate_plugin(engine: &Engine, root: PathBuf, plugin_name: &str, module: &Module) -> anyhow::Result<SiblingHandle> {
     let mut linker: Linker<HostState> = Linker::new(engine);
     register_wasi(&mut linker)?;
     register_env_imports(&mut linker)?;
 
+    // `siblings` is NOT baked in here -- see Bug 2 in the module-level doc
+    // comment above and HostState::set_siblings. It starts as an empty map
+    // and gets pointed at the CALLING project's real siblings map fresh on
+    // every dispatch_on call, exactly like `cwd`.
     let host_state = if plugin_name == "libsql" {
-        HostState::new_with_fs_root(root, plugin_name.to_string(), siblings, &host_fs_root())
+        HostState::new_with_fs_root(root, plugin_name.to_string(), &host_fs_root())
     } else {
-        HostState::new(root, plugin_name.to_string(), siblings)
+        HostState::new(root, plugin_name.to_string())
     };
     let self_instance_cell = host_state.self_instance.clone();
     let mut store = Store::new(engine, host_state);
@@ -202,15 +302,20 @@ fn instantiate_plugin(
 }
 
 /// Every plugin instance loaded for one project. `siblings` is the shared
-/// name->handle map every plugin's HostState points at, so any plugin's
-/// `host_plugin_call` can reach any other already-loaded plugin for this
-/// SAME project -- the mediator: agentplug-runner owns this map, plugins
-/// never see each other directly. Each SiblingHandle owns its OWN Store, so
-/// `ProjectPlugins` itself no longer keeps a separate stores/instances map --
-/// `siblings` IS the canonical storage, avoiding two owners for one Store.
+/// name->pool map every plugin's HostState is pointed at (freshly, per
+/// call -- see `dispatch_on`), so any plugin's `host_plugin_call` can reach
+/// any other already-loaded plugin for this SAME project -- the mediator:
+/// agentplug-runner owns this map, plugins never see each other directly.
+/// Every entry (shared or per-project) is a `SharedPluginPool` -- shared
+/// plugins (bert/treesitter/libsql/gm) use the process-wide pool from
+/// `shared_plugin_pool`; a genuinely per-project plugin gets its own
+/// size-1 pool, so both cases share one storage/lookup shape. Each
+/// SiblingHandle owns its OWN Store, so `ProjectPlugins` itself no longer
+/// keeps a separate stores/instances map -- `siblings` IS the canonical
+/// storage, avoiding two owners for one Store.
 pub struct ProjectPlugins {
     pub root: PathBuf,
-    siblings: Arc<Mutex<HashMap<String, Arc<Mutex<Option<SiblingHandle>>>>>>,
+    siblings: Arc<Mutex<HashMap<String, Arc<SharedPluginPool>>>>,
     pub last_active: Instant,
 }
 
@@ -220,52 +325,57 @@ impl ProjectPlugins {
     }
 
     pub fn is_loaded(&self, plugin_name: &str) -> bool {
-        self.siblings.lock().unwrap().get(plugin_name).map(|c| c.lock().unwrap().is_some()).unwrap_or(false)
+        self.siblings.lock().unwrap().get(plugin_name).map(|p| p.any_instantiated()).unwrap_or(false)
     }
 
     /// Instantiates `module` under `plugin_name` for this project. Modules
     /// are compiled ONCE per plugin (shared `Module`, keyed by plugin name,
     /// owned by the caller -- typically agentplug-runner's global registry).
     ///
-    /// Stateless plugins (see `is_stateless_shared_plugin`) get ONE process-wide
-    /// instance reused by every project instead of one instantiation per
-    /// project -- this project's siblings map just points at the same shared
-    /// cell everyone else uses. `dispatch`/`dispatch_on` refresh the shared
-    /// Store's HostState.cwd to the calling project's root before every
-    /// call, so a shared instance still resolves files/db paths/git ops
-    /// against the RIGHT project even though the Store itself is reused.
-    /// Any future plugin that is NOT safely shareable this way keeps the
-    /// original expensive-compile/cheap-instantiate-per-project split
-    /// rs-plugkit's gm-runner daemon.rs already established.
+    /// Stateless plugins (see `is_stateless_shared_plugin`) get a
+    /// process-wide pool reused by every project instead of one
+    /// instantiation per project -- this project's siblings map just points
+    /// at the same shared pool everyone else uses (`gm_pool_size()` slots
+    /// for `gm`, exactly 1 for bert/treesitter/libsql). `dispatch`/
+    /// `dispatch_on` refresh whichever slot's Store gets acquired to the
+    /// calling project's own cwd + siblings map before every call, so a
+    /// shared instance still resolves files/db paths/git ops/cross-plugin
+    /// calls against the RIGHT project even though the Store itself is
+    /// reused. Any future plugin that is NOT safely shareable this way
+    /// keeps the original expensive-compile/cheap-instantiate-per-project
+    /// split rs-plugkit's gm-runner daemon.rs already established (a size-1
+    /// pool scoped to just this project).
     pub fn load_plugin(&mut self, engine: &Engine, plugin_name: &str, module: &Module) -> anyhow::Result<()> {
         if is_stateless_shared_plugin(plugin_name) {
-            let cell = shared_plugin_cell(plugin_name);
-            if cell.lock().unwrap().is_none() {
-                let instantiated = instantiate_plugin(engine, self.root.clone(), plugin_name, module, self.siblings.clone())?;
-                *cell.lock().unwrap() = Some(instantiated);
+            let pool = shared_plugin_pool(plugin_name);
+            {
+                let mut guard = pool.acquire();
+                if guard.is_none() {
+                    *guard = Some(instantiate_plugin(engine, self.root.clone(), plugin_name, module)?);
+                }
             }
-            self.siblings.lock().unwrap().insert(plugin_name.to_string(), cell);
+            self.siblings.lock().unwrap().insert(plugin_name.to_string(), pool);
             return Ok(());
         }
 
-        let instantiated = instantiate_plugin(engine, self.root.clone(), plugin_name, module, self.siblings.clone())?;
-        let cell = self
+        let instantiated = instantiate_plugin(engine, self.root.clone(), plugin_name, module)?;
+        let pool = self
             .siblings
             .lock()
             .unwrap()
             .entry(plugin_name.to_string())
-            .or_insert_with(|| Arc::new(Mutex::new(None)))
+            .or_insert_with(|| Arc::new(SharedPluginPool::new(1)))
             .clone();
-        *cell.lock().unwrap() = Some(instantiated);
+        *pool.acquire() = Some(instantiated);
         Ok(())
     }
 
     pub fn dispatch(&mut self, plugin_name: &str, verb: &str, body: &str) -> anyhow::Result<String> {
         self.last_active = Instant::now();
-        let cell = self.siblings.lock().unwrap().get(plugin_name).cloned().ok_or_else(|| anyhow::anyhow!("plugin {plugin_name} not loaded"))?;
-        let mut guard = cell.lock().unwrap();
+        let pool = self.siblings.lock().unwrap().get(plugin_name).cloned().ok_or_else(|| anyhow::anyhow!("plugin {plugin_name} not loaded"))?;
+        let mut guard = pool.acquire();
         let handle = guard.as_mut().ok_or_else(|| anyhow::anyhow!("plugin {plugin_name} not loaded"))?;
-        dispatch_on(&mut handle.store, handle.instance, verb, body, &self.root)
+        dispatch_on(&mut handle.store, handle.instance, verb, body, &self.root, self.siblings.clone())
     }
 }
 

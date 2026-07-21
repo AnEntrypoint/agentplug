@@ -67,6 +67,25 @@ struct DaemonConfig {
     plugin_update_poll_interval_secs: Option<u64>,
     #[serde(default)]
     runner_update_poll_interval_secs: Option<u64>,
+    // How many project-worker threads run concurrently (was a hardcoded
+    // `const MAX_CONCURRENT_PROJECTS: usize = 4`). Each worker pulls the
+    // next root off the shared queue and may block for the duration of a
+    // slow exec_js/browser dispatch, so this is the real ceiling on how
+    // many projects can be mid-dispatch at once.
+    #[serde(default)]
+    max_concurrent_projects: Option<usize>,
+    // How many concurrent calls into the shared `gm` plugin are allowed at
+    // once. `gm` is genuinely stateless (its real state lives in each
+    // project's own `.gm/` flat files, never in wasm memory), so more than
+    // one live Store is always safe -- this just bounds how many worker
+    // threads can be mid-gm-call simultaneously before the next one queues.
+    // Defaults to max_concurrent_projects: a fast instruction/phase-status/
+    // transition call rarely contends regardless, and a slow exec_js/browser
+    // call should be able to run on every worker at once without queuing
+    // behind an unrelated project's own slow call -- see is_stateless_shared_plugin's
+    // doc comment in agentplug-host/src/registry.rs for the full history.
+    #[serde(default)]
+    gm_concurrency: Option<usize>,
 }
 
 impl DaemonConfig {
@@ -80,12 +99,16 @@ impl DaemonConfig {
                 heartbeat_interval_secs: None,
                 plugin_update_poll_interval_secs: None,
                 runner_update_poll_interval_secs: None,
+                max_concurrent_projects: None,
+                gm_concurrency: None,
             })
     }
     fn registry_poll_interval(&self) -> Duration { Duration::from_secs(self.registry_poll_interval_secs.unwrap_or(5)) }
     fn heartbeat_interval(&self) -> Duration { Duration::from_secs(self.heartbeat_interval_secs.unwrap_or(10)) }
     fn plugin_update_poll_interval(&self) -> Duration { Duration::from_secs(self.plugin_update_poll_interval_secs.unwrap_or(600)) }
     fn runner_update_poll_interval(&self) -> Duration { Duration::from_secs(self.runner_update_poll_interval_secs.unwrap_or(600)) }
+    fn max_concurrent_projects(&self) -> usize { self.max_concurrent_projects.unwrap_or(4).max(1) }
+    fn gm_concurrency(&self) -> usize { self.gm_concurrency.unwrap_or_else(|| self.max_concurrent_projects()).max(1) }
 }
 
 // 2x the daemon's own default heartbeat_interval (10s, now configurable via
@@ -876,6 +899,15 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
     let daemon_cfg = DaemonConfig::load();
     let registry_poll_interval = daemon_cfg.registry_poll_interval();
     let heartbeat_interval = daemon_cfg.heartbeat_interval();
+    // Must run before the first `gm` dispatch/load_plugin call anywhere in
+    // this process -- the pool size is a OnceLock internal to
+    // agentplug-host's registry module, so this is the one and only place
+    // it is ever configured. A call after some other path already
+    // lazily-initialized the pool at its 4-slot default is a harmless no-op
+    // (set_gm_pool_size returns false); this is the very first thing
+    // run_daemon_body does, before any project registry read or plugin
+    // load, so that race is not reachable in practice.
+    agentplug_host::set_gm_pool_size(daemon_cfg.gm_concurrency());
 
     let mut projects: HashMap<PathBuf, ProjectPlugins> = HashMap::new();
     let mut last_registry_poll = Instant::now() - registry_poll_interval;
@@ -990,7 +1022,7 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
         // map (each root maps to at most one thread per chunk), so this
         // never needs a Mutex around the map itself -- the borrow checker
         // enforces the disjointness via retain_mut-style partition below.
-        const MAX_CONCURRENT_PROJECTS: usize = 4;
+        let max_concurrent_projects = daemon_cfg.max_concurrent_projects();
 
         // Compile-ahead pass, sequential on the main thread, BEFORE any
         // worker thread spawns: PluginModules::get_or_compile needs &mut
@@ -1058,7 +1090,7 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
                 (root.clone(), p)
             })
             .collect();
-        let worker_count = MAX_CONCURRENT_PROJECTS.min(all_projects.len().max(1));
+        let worker_count = max_concurrent_projects.min(all_projects.len().max(1));
         // Genuine work-stealing queue, no unsafe: each (root, ProjectPlugins)
         // pair is MOVED into the shared queue, so a worker that pops one
         // holds exclusive ownership -- no aliasing question at all, unlike
