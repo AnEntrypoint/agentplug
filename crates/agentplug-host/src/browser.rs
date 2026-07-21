@@ -267,6 +267,32 @@ fn kill_session(mut session: BrowserSession) {
     let _ = session.child.wait();
 }
 
+/// Kills EVERY live session across EVERY project, process-wide -- for the
+/// daemon's own voluntary self-update handoff (`attempt_self_update_handoff`
+/// in agentplug-runner's daemon.rs), which hands ownership to a freshly
+/// spawned process with its own EMPTY `SESSIONS` registry. Without this, a
+/// session's Chrome process (a real OS child, unaffected by the handoff on
+/// its own) survives as an orphan the NEW process has no record of -- alive,
+/// but unreachable via `session list`/`session close`, invisible to the
+/// idle-timeout reaper (which only ever reaps what it can see), and never
+/// cleaned up short of someone manually killing chrome.exe. A crash/hard
+/// exit still orphans sessions the same way (unavoidable -- nothing runs on
+/// a process that's already gone), but a VOLUNTARY exit like a self-update
+/// handoff has no such excuse: it can and must close what it knows about
+/// first. Live-witnessed the orphan this closes: a self-update handoff
+/// during this feature's own testing left a `chrome.exe` running with zero
+/// tracking in the new daemon process.
+pub fn close_all_sessions() {
+    let mut map = sessions_map().lock().unwrap_or_else(|e| e.into_inner());
+    let keys: Vec<String> = map.keys().cloned().collect();
+    for k in keys {
+        if let Some(session) = map.remove(&k) {
+            eprintln!("[agentplug browser] closing session {} for handoff/shutdown", session.session_id);
+            kill_session(session);
+        }
+    }
+}
+
 /// Opportunistic idle-timeout reap, run on every `run()` call (no dedicated
 /// timer thread, matching agentplug-runner daemon.rs's PLUGIN_IDLE_EVICT_MS
 /// precedent of checking per-tick rather than on its own timer). Only reaps

@@ -1282,6 +1282,12 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
             // HEARTBEAT_INTERVAL instead of running both daemons forever.
             let lost_race = !holds_heartbeat_authority();
             if lost_race {
+                // Same orphan risk as the self-update handoff path above: this
+                // process may already be mid-run with live browser sessions in
+                // its own SESSIONS registry, and the winning daemon has no way
+                // to discover or manage them. Close what we know about before
+                // yielding -- see close_all_sessions's doc comment.
+                agentplug_host::close_all_sessions();
                 eprintln!("[agentplug daemon] another daemon claimed heartbeat authority -- exiting");
                 return Ok(());
             }
@@ -1298,6 +1304,7 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
         // 542MB. Check before doing work too, so an orphan exits at the next
         // loop top rather than only at the next heartbeat it may never reach.
         if !holds_heartbeat_authority() {
+            agentplug_host::close_all_sessions();
             eprintln!("[agentplug daemon] heartbeat authority held by another daemon -- exiting before serving further work");
             return Ok(());
         }
@@ -1495,6 +1502,17 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
                 Ok(Some((staged, version))) => {
                     eprintln!("[agentplug daemon] staged self-update to {version} at {}", staged.display());
                     if attempt_self_update_handoff(&staged, &version) {
+                        // Close every live browser session BEFORE exiting -- the new
+                        // process takes ownership with its own empty SESSIONS
+                        // registry, so any session left open here becomes an
+                        // untracked orphan chrome.exe the new process can never see
+                        // via session list/close, and the idle reaper can't reap
+                        // what it doesn't know exists. A crash/hard exit still
+                        // orphans sessions unavoidably, but this is a VOLUNTARY
+                        // exit with time to clean up first -- see
+                        // close_all_sessions's own doc comment for the live-hit
+                        // this closes.
+                        agentplug_host::close_all_sessions();
                         eprintln!("[agentplug daemon] handed off to version {version} -- exiting");
                         return Ok(());
                     }
