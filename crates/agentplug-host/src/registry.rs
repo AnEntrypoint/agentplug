@@ -377,6 +377,41 @@ impl ProjectPlugins {
         let handle = guard.as_mut().ok_or_else(|| anyhow::anyhow!("plugin {plugin_name} not loaded"))?;
         dispatch_on(&mut handle.store, handle.instance, verb, body, &self.root, self.siblings.clone())
     }
+
+    /// A `Send + 'static` handle carrying exactly what a dispatch needs
+    /// (root + the shared siblings map, both already `Arc`-backed) without
+    /// borrowing `self` -- lets a caller spawn the actual `dispatch_on` call
+    /// onto its own OS thread (see `background-convert` in
+    /// agentplug-runner's daemon.rs) while this `ProjectPlugins` itself stays
+    /// owned by the daemon's worker-pool bookkeeping and is free to be handed
+    /// to a DIFFERENT thread for the project's next queued request. Calling
+    /// `dispatch` through this handle is functionally identical to
+    /// `ProjectPlugins::dispatch` (same pool acquire/dispatch_on path) --
+    /// it just doesn't touch `last_active` itself, since the spawning caller
+    /// already bumped it before detaching.
+    pub fn dispatch_handle(&self) -> DispatchHandle {
+        DispatchHandle { root: self.root.clone(), siblings: self.siblings.clone() }
+    }
+}
+
+/// See `ProjectPlugins::dispatch_handle`. Cloning is cheap (two `Arc`
+/// clones); every clone reaches the exact same underlying pool slots as the
+/// `ProjectPlugins` it was taken from, so a dispatch run through a handle
+/// participates in the same `GmFairnessGuard`/pool-slot accounting as one run
+/// through `ProjectPlugins::dispatch` directly.
+#[derive(Clone)]
+pub struct DispatchHandle {
+    root: PathBuf,
+    siblings: Arc<Mutex<HashMap<String, Arc<SharedPluginPool>>>>,
+}
+
+impl DispatchHandle {
+    pub fn dispatch(&self, plugin_name: &str, verb: &str, body: &str) -> anyhow::Result<String> {
+        let pool = self.siblings.lock().unwrap().get(plugin_name).cloned().ok_or_else(|| anyhow::anyhow!("plugin {plugin_name} not loaded"))?;
+        let mut guard = pool.acquire();
+        let handle = guard.as_mut().ok_or_else(|| anyhow::anyhow!("plugin {plugin_name} not loaded"))?;
+        dispatch_on(&mut handle.store, handle.instance, verb, body, &self.root, self.siblings.clone())
+    }
 }
 
 /// Per-project fairness cap on the shared `gm` pool, read fresh from

@@ -1,11 +1,12 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use wasmtime::{Engine, Module};
 
-use agentplug_host::{build_engine, install_dir, now_ms, read_project_plugin_list, GmFairnessGuard, ProjectPlugins, PLUGIN_IDLE_EVICT_MS};
+use agentplug_host::{build_engine, install_dir, now_ms, read_project_plugin_list, DispatchHandle, GmFairnessGuard, ProjectPlugins, PLUGIN_IDLE_EVICT_MS};
 
 use crate::download::{ensure_plugin_installed, installed_runner_version, record_runner_version};
 
@@ -585,6 +586,115 @@ impl PluginModules {
     }
 }
 
+/// Key identifying one in-flight gm-spool dispatch: the project root, the
+/// verb name, and the request's own numeric filename stem (the same "task
+/// id" the calling agent already knows, since it wrote `in/<verb>/<task>.txt`
+/// itself). Unique across the whole daemon process -- two different projects
+/// or two different verbs never collide even if their task-id timestamps
+/// happen to coincide.
+type InFlightKey = (PathBuf, String, String);
+
+/// Per-in-flight-dispatch state the `background-convert` verb flips.
+/// `AtomicBool` (not a plain bool behind the outer Mutex) so the worker's
+/// poll loop can check it without re-locking IN_FLIGHT on every poll tick --
+/// only the registry insert/remove itself needs the outer lock.
+struct InFlightHandle {
+    detach: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// Process-wide registry of gm-spool dispatches currently running on their
+/// own spawned thread, keyed by `(root, verb, task)`. An entry exists from
+/// the moment a request's spawned thread starts until either (a) the worker's
+/// poll loop observes the thread finished and removes it (normal fast path),
+/// or (b) a `background-convert` fires, at which point the worker's poll loop
+/// removes it itself right after flipping `detach` (the thread is now fully
+/// independent -- nothing needs to find it again, it writes its own response
+/// file when done). `background-convert`'s job is purely "does this key exist
+/// and if so flip its flag," so the registry only ever needs to answer
+/// membership + flag-flip, never anything about the thread itself.
+static IN_FLIGHT: OnceLock<Mutex<HashMap<InFlightKey, InFlightHandle>>> = OnceLock::new();
+
+fn in_flight_map() -> &'static Mutex<HashMap<InFlightKey, InFlightHandle>> {
+    IN_FLIGHT.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Native (host-side, never routed to gm.wasm) handler for the
+/// `background-convert` verb. Body: `{"verb": "<original verb>", "task":
+/// "<original request's numeric filename stem>"}`. Looks the key up in
+/// IN_FLIGHT for the CALLING project's own root (background-convert can only
+/// ever target a dispatch belonging to the same project it's dispatched
+/// against, matching the ABI's existing per-project spool-dir scoping) and,
+/// if found, flips its detach flag and removes it from the registry -- the
+/// worker thread waiting on that dispatch observes the flag on its next poll
+/// tick (bounded by the poll interval, not blocking on the original
+/// dispatch's own duration) and abandons its join, returning to the queue
+/// immediately. Responds fast either way: this function never blocks on the
+/// original dispatch's own completion.
+fn handle_background_convert(root: &Path, body: &str) -> String {
+    #[derive(serde::Deserialize)]
+    struct Req {
+        verb: String,
+        task: String,
+    }
+    let req: Req = match serde_json::from_str(body) {
+        Ok(r) => r,
+        Err(e) => {
+            return serde_json::json!({"ok": false, "error": format!("background-convert body must be {{verb, task}}: {e}")}).to_string();
+        }
+    };
+    let key: InFlightKey = (root.to_path_buf(), req.verb.clone(), req.task.clone());
+    let mut map = in_flight_map().lock().unwrap_or_else(|e| e.into_inner());
+    match map.remove(&key) {
+        Some(handle) => {
+            handle.detach.store(true, std::sync::atomic::Ordering::SeqCst);
+            serde_json::json!({"ok": true, "converted": true, "verb": req.verb, "task": req.task}).to_string()
+        }
+        None => {
+            // Either genuinely never existed (wrong verb/task/root) or
+            // already finished (the worker's poll loop already joined it and
+            // removed the entry before this request arrived) -- both read as
+            // "nothing left to convert," which is the correct, clear,
+            // non-crashing answer either way per the confirmed spec's race
+            // handling (item 4).
+            serde_json::json!({"ok": false, "error": "already_completed", "verb": req.verb, "task": req.task}).to_string()
+        }
+    }
+}
+
+/// Runs one gm-spool dispatch (`plugin.dispatch("gm", verb, body)`, wrapped
+/// in the same `catch_unwind` + `GmFairnessGuard` protection the previous
+/// inline call had) to completion and writes its response to the standard
+/// `out/<verb>-<task>.json` (+ `.ready`) path -- identical output shape
+/// whether this runs synchronously-joined by the original worker or fully
+/// detached after a `background-convert`. Takes a `DispatchHandle` (not
+/// `&mut ProjectPlugins`) specifically so it can be moved onto its own OS
+/// thread: see `ProjectPlugins::dispatch_handle`'s doc comment for why this
+/// is `Send + 'static`-safe without needing `unsafe`.
+fn run_gm_dispatch_to_file(root: &Path, handle: &DispatchHandle, verb: &str, task: &str, body: &str, out_dir: &Path) {
+    let _fairness_guard = GmFairnessGuard::acquire(root);
+    let dispatch_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handle.dispatch("gm", verb, body)));
+    let out_body = match dispatch_result {
+        Ok(Ok(s)) if !s.is_empty() => s,
+        Ok(Ok(_)) => serde_json::json!({"ok": false, "error": "empty dispatch result", "verb": verb}).to_string(),
+        Ok(Err(e)) => serde_json::json!({"ok": false, "error": format!("{e:#}"), "verb": verb}).to_string(),
+        Err(panic_payload) => {
+            let msg = panic_payload
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| panic_payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "panic with non-string payload".to_string());
+            eprintln!("[agentplug daemon] verb {verb} PANICKED for {}: {msg}", root.display());
+            serde_json::json!({"ok": false, "error": format!("dispatch panicked: {msg}"), "verb": verb}).to_string()
+        }
+    };
+    let out_name = format!("{verb}-{task}.json");
+    let tmp = out_dir.join(format!("{out_name}.tmp.{}", std::process::id()));
+    if fs::write(&tmp, &out_body).is_ok() {
+        let _ = fs::rename(&tmp, out_dir.join(&out_name));
+        let _ = fs::write(out_dir.join(format!("{out_name}.ready")), b"");
+    }
+}
+
 /// Drains one project's ENTIRE pending spool work (both the gm spool ABI
 /// and the generic plugin-dispatch surface) fully sequentially, one request
 /// file at a time, in the exact claim-rename -> read -> dispatch -> respond
@@ -595,6 +705,27 @@ impl PluginModules {
 /// DIFFERENT projects overlap. Returns true iff at least one request file
 /// was actually processed (feeds the outer loop's any_work bookkeeping for
 /// heartbeat/idle-eviction/self-recycle timing, unchanged from before).
+///
+/// Each gm-spool request's actual `project.dispatch("gm", ...)` call now
+/// runs on its OWN spawned thread from the moment it starts (never inline on
+/// this function's own thread) -- this worker then does a bounded-poll join
+/// (`JoinHandle::is_finished()`, ~50ms sleep between checks) instead of a
+/// blocking `.join()`. On ordinary fast completion this is functionally
+/// identical to the old inline call (same total wall time, negligible poll
+/// overhead) and the response is written exactly as before. If a
+/// `background-convert` request flips this dispatch's `detach` flag before it
+/// finishes, this loop notices on its next poll tick, removes the IN_FLIGHT
+/// entry, and returns WITHOUT joining -- the spawned thread keeps running
+/// completely independently (Rust threads run to completion regardless of
+/// whether/when anything joins them) and writes its own response file via
+/// `run_gm_dispatch_to_file` when it eventually finishes. This is what lets
+/// the worker return to the outer queue-pulling loop immediately on
+/// background-convert, and lets a SECOND call into `dispatch_project` for
+/// this SAME root (next time some worker pulls it off the queue) proceed
+/// concurrently against the still-running detached dispatch -- both go
+/// through the same `ProjectPlugins`/pool-slot-checkout machinery
+/// (`SharedPluginPool`/`GmFairnessGuard`), which already supports genuine
+/// concurrent checkouts for one project (see their own doc comments).
 fn dispatch_project(root: &Path, project: &mut ProjectPlugins, plugin_modules: &PluginModules) -> bool {
     let mut did_work = false;
 
@@ -629,6 +760,35 @@ fn dispatch_project(root: &Path, project: &mut ProjectPlugins, plugin_modules: &
         list
     };
 
+    // Claim EVERY request file across EVERY verb dir up front, in one pass,
+    // before spawning or polling anything -- this is the fix for a real bug
+    // live-witnessed this session: the previous shape claimed one file, then
+    // ran an inline bounded-poll loop on it (blocking THIS iteration of the
+    // outer for-loop) before moving to the NEXT verb_entry/file_entry. A
+    // `background-convert` targeting an exec_js request sitting in a LATER
+    // verb directory (verb dirs are not claimed in a fixed order --
+    // fs::read_dir order is unspecified) could sit unclaimed for the ENTIRE
+    // duration of that inline poll loop, since the claim-rename for
+    // background-convert's own file never even runs until this dispatch_project
+    // call reaches that verb_entry. Measured: exec_js (20s sleep) and a
+    // background-convert targeting it, written ~300ms apart, both resolved
+    // within the same ~50ms window ~80s later -- background-convert's
+    // response (`already_completed`) landed AFTER exec_js's real result,
+    // proving it was never claimed until the NEXT dispatch_project sweep for
+    // this root, defeating the whole "does not hold up the queue" goal. Fix:
+    // claim-and-collect every file first (fast, no blocking work happens
+    // during collection), answer every `background-convert` immediately from
+    // that same collected batch (so it can target ANY task claimed in this
+    // same batch, including one collected moments earlier in this same
+    // pass), THEN spawn every gm-verb dispatch, THEN poll all of them
+    // together -- background-convert requests are handled before any gm
+    // dispatch's poll loop can block anything.
+    struct ClaimedRequest {
+        verb: String,
+        task: String,
+        body: String,
+    }
+    let mut claimed: Vec<ClaimedRequest> = Vec::new();
     if let Ok(entries) = fs::read_dir(&in_dir) {
         for verb_entry in entries.flatten() {
             if !verb_entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
@@ -658,86 +818,216 @@ fn dispatch_project(root: &Path, project: &mut ProjectPlugins, plugin_modules: &
                 let task = file_path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
                 let body = fs::read_to_string(&claim_path).unwrap_or_default();
                 let _ = fs::remove_file(&claim_path);
+                claimed.push(ClaimedRequest { verb: verb.clone(), task, body });
+            }
+        }
+    }
 
-                // Load every plugin this project has requested that isn't
-                // already loaded -- gm dispatches to "gm" by default; a
-                // project opting into libsql/bert/treesitter (via
-                // .agentplug/plugins.txt) gets those instantiated too, so
-                // gm.wasm's own host_plugin_call/host_vec_embed finds them.
-                for plugin_name in &requested_plugins {
-                    if project.is_loaded(plugin_name) {
-                        continue;
-                    }
-                    let Some(module) = plugin_modules.modules.get(plugin_name) else {
-                        eprintln!("[agentplug daemon] plugin {plugin_name} not yet compiled for {}: dispatch this thread's own get_or_compile could not run against the shared PluginModules from a worker thread -- see plugin_modules.get_or_compile() call in run_daemon's pre-chunk warm pass", root.display());
-                        continue;
-                    };
-                    if let Err(e) = project.load_plugin(&plugin_modules.engine, plugin_name, module) {
-                        eprintln!("[agentplug daemon] failed to instantiate plugin {plugin_name} for {}: {e:#}", root.display());
-                    }
-                }
+    // Split the claimed batch into gm-verb requests and background-convert
+    // requests, WITHOUT answering background-convert yet -- see the critical
+    // ordering fix below the plugin-load block for why.
+    let mut gm_requests: Vec<ClaimedRequest> = Vec::with_capacity(claimed.len());
+    let mut bg_convert_requests: Vec<ClaimedRequest> = Vec::new();
+    for req in claimed {
+        if req.verb == "background-convert" {
+            bg_convert_requests.push(req);
+        } else {
+            gm_requests.push(req);
+        }
+    }
 
-                // The "gm" plugin is the dispatch entrypoint for the
-                // existing spool ABI -- fail loud with the real reason
-                // instead of a dispatch that was always going to fail if
-                // "gm" itself never loaded (network hiccup, plugin not yet
-                // published for this platform).
-                let out_name = format!("{verb}-{task}.json");
-                let out_body = if !project.is_loaded("gm") {
-                    serde_json::json!({"ok": false, "error": "gm plugin failed to load for this project (see daemon stderr for the compile/install/instantiate failure)", "verb": verb}).to_string()
-                } else {
-                    // A panic inside project.dispatch (a wasmtime trap that
-                    // escapes as a Rust panic rather than surfacing through
-                    // the Result, or a poisoned-Mutex unwrap somewhere in the
-                    // call chain) previously unwound straight through this
-                    // function with no catch -- the request file was ALREADY
-                    // claimed+deleted (rename above, then remove_file) before
-                    // this point, so the panic silently ate the request:
-                    // no response ever written, no error surfaced, the
-                    // caller left polling forever against a file that will
-                    // never appear. Live-hit this session with a jit-hook
-                    // gate (fsm-framework-jit-hook-concreting) whose
-                    // host_exec_js call triggered exactly this. catch_unwind
-                    // converts any panic into a real error response instead,
-                    // so the caller gets a definitive (if unhappy) answer
-                    // rather than an unbounded silent hang.
-                    // Per-project fairness cap on the shared `gm` pool (see
-                    // GmFairnessGuard's doc comment): loaded fresh from this
-                    // project's own .gm/daemon-project-config.json on every
-                    // dispatch, never cached, same precedent as
-                    // BrowserConfig::load. This is an ADDITIONAL gate on top
-                    // of the pool's own slot checkout inside
-                    // project.dispatch -- it never grants more concurrency
-                    // than the pool has, it only ever restricts how many of
-                    // this ONE project's own dispatches may be mid-flight
-                    // against that pool at once. The guard blocks (if this
-                    // project is at its own configured limit) BEFORE taking
-                    // a pool slot, so a fairness-capped project waits here
-                    // rather than occupying a global slot it isn't entitled
-                    // to hold concurrently. Held across catch_unwind so a
-                    // wasm-side panic still releases the slot via Drop
-                    // during unwind, never leaking it.
-                    let _fairness_guard = GmFairnessGuard::acquire(root);
-                    let dispatch_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        project.dispatch("gm", &verb, &body)
-                    }));
-                    match dispatch_result {
-                        Ok(Ok(s)) if !s.is_empty() => s,
-                        Ok(Ok(_)) => serde_json::json!({"ok": false, "error": "empty dispatch result", "verb": verb}).to_string(),
-                        Ok(Err(e)) => serde_json::json!({"ok": false, "error": format!("{e:#}"), "verb": verb}).to_string(),
-                        Err(panic_payload) => {
-                            let msg = panic_payload.downcast_ref::<&str>().map(|s| s.to_string())
-                                .or_else(|| panic_payload.downcast_ref::<String>().cloned())
-                                .unwrap_or_else(|| "panic with non-string payload".to_string());
-                            eprintln!("[agentplug daemon] verb {verb} PANICKED for {}: {msg}", root.display());
-                            serde_json::json!({"ok": false, "error": format!("dispatch panicked: {msg}"), "verb": verb}).to_string()
-                        }
-                    }
-                };
+    // Answers a batch of background-convert requests by writing their
+    // response files -- factored out since it must run from BOTH the
+    // "gm not loaded" early-exit path and the normal spawn path below, and
+    // (when gm_requests is empty) with no gm-verb branch at all. Always
+    // called AFTER any IN_FLIGHT registration for this same batch's
+    // gm_requests has already happened (see call sites), so a
+    // background-convert targeting a request claimed in this exact same
+    // batch finds a real entry instead of racing its own registration.
+    let answer_bg_converts = |reqs: Vec<ClaimedRequest>| {
+        for req in reqs {
+            let out_body = handle_background_convert(root, &req.body);
+            let out_name = format!("{}-{}.json", req.verb, req.task);
+            let tmp = out_dir.join(format!("{out_name}.tmp.{}", std::process::id()));
+            if fs::write(&tmp, &out_body).is_ok() {
+                let _ = fs::rename(&tmp, out_dir.join(&out_name));
+                let _ = fs::write(out_dir.join(format!("{out_name}.ready")), b"");
+            }
+        }
+    };
+
+    if gm_requests.is_empty() {
+        // No gm-verb requests in this batch (this call only claimed
+        // background-convert file(s), e.g. one targeting a dispatch spawned
+        // in a PREVIOUS dispatch_project call for this same root -- already
+        // either finished or still running independently after its own
+        // earlier detach). Nothing to register first; answer directly.
+        answer_bg_converts(bg_convert_requests);
+    } else {
+        // Load every plugin this project has requested that isn't already
+        // loaded -- gm dispatches to "gm" by default; a project opting into
+        // libsql/bert/treesitter (via .agentplug/plugins.txt) gets those
+        // instantiated too, so gm.wasm's own host_plugin_call/host_vec_embed
+        // finds them. Done once for the whole batch, not per request.
+        for plugin_name in &requested_plugins {
+            if project.is_loaded(plugin_name) {
+                continue;
+            }
+            let Some(module) = plugin_modules.modules.get(plugin_name) else {
+                eprintln!("[agentplug daemon] plugin {plugin_name} not yet compiled for {}: dispatch this thread's own get_or_compile could not run against the shared PluginModules from a worker thread -- see plugin_modules.get_or_compile() call in run_daemon's pre-chunk warm pass", root.display());
+                continue;
+            };
+            if let Err(e) = project.load_plugin(&plugin_modules.engine, plugin_name, module) {
+                eprintln!("[agentplug daemon] failed to instantiate plugin {plugin_name} for {}: {e:#}", root.display());
+            }
+        }
+
+        // The "gm" plugin is the dispatch entrypoint for the existing spool
+        // ABI -- fail loud with the real reason instead of a dispatch that
+        // was always going to fail if "gm" itself never loaded (network
+        // hiccup, plugin not yet published for this platform).
+        if !project.is_loaded("gm") {
+            for req in &gm_requests {
+                let out_name = format!("{}-{}.json", req.verb, req.task);
+                let out_body = serde_json::json!({"ok": false, "error": "gm plugin failed to load for this project (see daemon stderr for the compile/install/instantiate failure)", "verb": req.verb}).to_string();
                 let tmp = out_dir.join(format!("{out_name}.tmp.{}", std::process::id()));
                 if fs::write(&tmp, &out_body).is_ok() {
                     let _ = fs::rename(&tmp, out_dir.join(&out_name));
                     let _ = fs::write(out_dir.join(format!("{out_name}.ready")), b"");
+                }
+            }
+            // No IN_FLIGHT entries were ever registered for this batch's
+            // gm_requests (they failed before spawning), so answer directly
+            // -- same as the empty-gm_requests case above.
+            answer_bg_converts(bg_convert_requests);
+        } else {
+            // Spawn EVERY gm-verb request in the batch onto its own thread,
+            // registering its IN_FLIGHT entry BEFORE the thread is even
+            // spawned -- critical ordering fix for a real race live-witnessed
+            // this session: a `background-convert` claimed in THIS SAME
+            // batch must never be answered before the request it targets
+            // has an IN_FLIGHT entry to find, or it reads "already_completed"
+            // for a dispatch that hasn't even started yet (a false negative
+            // indistinguishable from the genuine already-finished case, but
+            // for the opposite reason -- live-witnessed repeatedly this
+            // session: exec_js and a background-convert targeting it,
+            // written under 150ms apart, landing in the SAME claimed batch,
+            // background-convert answered "already_completed" after only
+            // ~100ms even though the exec_js dispatch went on to genuinely
+            // run for its full real duration afterward). Registering the map
+            // entry here, synchronously, before bg_convert_requests is ever
+            // answered below, closes that window entirely: by the time ANY
+            // background-convert in this batch is answered, every
+            // gm_request's IN_FLIGHT entry already exists, regardless of
+            // claim order within the batch.
+            struct Spawned {
+                key: InFlightKey,
+                join_handle: Option<std::thread::JoinHandle<()>>,
+                detach_flag: Arc<std::sync::atomic::AtomicBool>,
+            }
+            let mut spawned: Vec<Spawned> = Vec::with_capacity(gm_requests.len());
+            for req in gm_requests {
+                let dispatch_handle = project.dispatch_handle();
+                let detach_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let key: InFlightKey = (root.to_path_buf(), req.verb.clone(), req.task.clone());
+                in_flight_map().lock().unwrap_or_else(|e| e.into_inner()).insert(key.clone(), InFlightHandle { detach: detach_flag.clone() });
+
+                let thread_root = root.to_path_buf();
+                let thread_verb = req.verb.clone();
+                let thread_task = req.task.clone();
+                let thread_body = req.body.clone();
+                let thread_out_dir = out_dir.clone();
+                let join_handle = std::thread::spawn(move || {
+                    run_gm_dispatch_to_file(&thread_root, &dispatch_handle, &thread_verb, &thread_task, &thread_body, &thread_out_dir);
+                });
+                spawned.push(Spawned { key, join_handle: Some(join_handle), detach_flag });
+            }
+
+            // NOW answer every background-convert claimed in THIS batch --
+            // every gm_request above already has its IN_FLIGHT entry
+            // (inserted synchronously before its thread was even spawned),
+            // so a background-convert targeting a request claimed in this
+            // exact same batch finds it reliably, never racing its own
+            // registration.
+            answer_bg_converts(bg_convert_requests);
+
+            // Round-robin bounded-poll: `is_finished()` (stable since Rust
+            // 1.61) is non-blocking, so every spawned request in this batch
+            // gets checked on the same ~50ms cadence regardless of position
+            // -- request 2 is no longer starved behind request 1's own poll
+            // loop the way the previous single-request-inline shape starved
+            // it. Loop drains until every entry has either been joined
+            // (finished normally) or detached (background-convert fired for
+            // it) -- whichever comes first, per entry, independently.
+            //
+            // Also re-scans in_dir/background-convert on EVERY tick of this
+            // same loop -- not just the one snapshot taken before this batch
+            // was spawned. Live-witnessed bug this fixes: a
+            // `background-convert` request written to disk AFTER this
+            // dispatch_project call already took its initial fs::read_dir
+            // snapshot (pass 1 above) is invisible to that snapshot. Without
+            // re-scanning here, THIS call keeps polling its own spawned
+            // batch to completion/timeout with no way to ever notice that
+            // later-arriving file -- the earliest it could be seen is the
+            // NEXT dispatch_project call for this root, which cannot start
+            // until this one returns, by which point a fast dispatch has
+            // usually already finished (measured: multiple end-to-end runs
+            // where background-convert consistently reported
+            // "already_completed" because it was answered a whole
+            // dispatch_project-call-cycle late). Re-scanning here means a
+            // background-convert arriving any time during this same
+            // dispatch_project call is claimed and answered within one poll
+            // tick (~50ms), while the batch's own dispatches are still
+            // mid-flight, which is what actually delivers "converts fast,
+            // does not wait for the dispatch."
+            let bg_convert_dir = in_dir.join("background-convert");
+            while spawned.iter().any(|s| s.join_handle.is_some()) {
+                for s in spawned.iter_mut() {
+                    let Some(jh) = s.join_handle.as_ref() else { continue };
+                    if jh.is_finished() {
+                        let jh = s.join_handle.take().unwrap();
+                        let _ = jh.join();
+                        in_flight_map().lock().unwrap_or_else(|e| e.into_inner()).remove(&s.key);
+                    } else if s.detach_flag.load(std::sync::atomic::Ordering::SeqCst) {
+                        // background-convert fired for this entry (already
+                        // answered below/in pass 1, and already removed from
+                        // IN_FLIGHT by handle_background_convert itself): do
+                        // NOT join. Drop the JoinHandle without joining --
+                        // the spawned thread keeps running fully
+                        // independently (it already owns everything it
+                        // needs: root, dispatch handle, verb, body, out_dir)
+                        // and writes its own response file via
+                        // run_gm_dispatch_to_file when it eventually
+                        // finishes. Rust threads run to completion
+                        // regardless of whether/when anything joins them, so
+                        // this is safe.
+                        s.join_handle = None;
+                    }
+                }
+                if spawned.iter().any(|s| s.join_handle.is_some()) {
+                    if let Ok(files) = fs::read_dir(&bg_convert_dir) {
+                        for file_entry in files.flatten() {
+                            let file_path = file_entry.path();
+                            if file_path.extension().and_then(|e| e.to_str()) != Some("txt") {
+                                continue;
+                            }
+                            let claim_path = file_path.with_extension(format!("txt.claim.{}", std::process::id()));
+                            if fs::rename(&file_path, &claim_path).is_err() {
+                                continue;
+                            }
+                            let bc_task = file_path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+                            let bc_body = fs::read_to_string(&claim_path).unwrap_or_default();
+                            let _ = fs::remove_file(&claim_path);
+                            let out_body = handle_background_convert(root, &bc_body);
+                            let out_name = format!("background-convert-{bc_task}.json");
+                            let tmp = out_dir.join(format!("{out_name}.tmp.{}", std::process::id()));
+                            if fs::write(&tmp, &out_body).is_ok() {
+                                let _ = fs::rename(&tmp, out_dir.join(&out_name));
+                                let _ = fs::write(out_dir.join(format!("{out_name}.ready")), b"");
+                            }
+                        }
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
                 }
             }
         }
