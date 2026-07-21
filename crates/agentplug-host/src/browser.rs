@@ -7,15 +7,20 @@ use serde_json::{json, Value};
 use wait_timeout::ChildExt;
 
 // Drives a real Chrome via the DevTools protocol instead of shelling out to the
-// playwriter CLI, whose relay process crashes with a UV_HANDLE_CLOSING native
-// assertion (STATUS_STACK_BUFFER_OVERRUN) on Windows on every session dispatch.
-// The flow that works on this host, proven end to end: launch Chrome headless
-// with --remote-debugging-port, poll its /json/version HTTP endpoint for the
-// DevTools websocket, then run the script in-page via Runtime.evaluate over
-// that websocket. Chrome exposes CDP over HTTP+WS with no external dependency;
-// the one piece needing a websocket client is the eval, which a bundled node
-// helper (node has a native WebSocket) performs -- node is already a required
-// runtime for this environment. No playwriter, no relay, no crash.
+// playwriter CLI, whose relay process crashes with a real, live-reproducible
+// Windows libuv assertion on every eval dispatch: "Assertion failed:
+// !(handle->flags & UV_HANDLE_CLOSING), file src\win\async.c, line 76"
+// (re-confirmed live, twice, on playwriter 0.4.0 -- not a stale/misdiagnosed
+// finding; the crash is specific to this Windows async-handle-teardown
+// class, not evidence against playwriter's broad cross-platform userbase
+// elsewhere). The flow that works on this host, proven end to end: launch
+// Chrome headless with --remote-debugging-port, poll its /json/version HTTP
+// endpoint for the DevTools websocket, then run the script in-page via
+// Runtime.evaluate over that websocket. Chrome exposes CDP over HTTP+WS with
+// no external dependency; the one piece needing a websocket client is the
+// eval, which a bundled node helper (node has a native WebSocket) performs --
+// node is already a required runtime for this environment. No playwriter, no
+// relay, no crash.
 
 const CDP_EVAL_JS: &str = include_str!("cdp_eval.js");
 
@@ -126,6 +131,23 @@ fn browser_profiles_dir(cwd: &Path) -> PathBuf {
     cwd.join(".gm").join("browser-profiles")
 }
 
+/// Live-found (browser-profile-not-persisted-locally-to-project): Chrome's
+/// --user-data-dir previously lived under std::env::temp_dir() and was
+/// std::fs::remove_dir_all'd at the end of EVERY dispatch -- zero session
+/// persistence (cookies, localStorage, login state, cache) across
+/// dispatches, and the profile lived outside the project entirely, contrary
+/// to the "locally profiled to the project" requirement. Fixed: the Chrome
+/// user-data-dir now lives under <project>/.gm/browser-chrome-profile-
+/// <session_id>/ (distinct from browser_profiles_dir above, which holds
+/// CPU/trace ARTIFACT files from the profile/trace modes, not the live
+/// Chrome profile) and is NEVER deleted after a dispatch -- only a fresh
+/// dispatch under the SAME session_id reuses it, so state genuinely
+/// persists across a debugging session. `sanitize` keeps the directory name
+/// filesystem-safe the same way the old temp-dir stamp already did.
+fn browser_chrome_profile_dir(cwd: &Path, session_id: &str) -> PathBuf {
+    cwd.join(".gm").join(format!("browser-chrome-profile-{}", sanitize(session_id)))
+}
+
 pub fn run(body: &str, cwd: &Path, session_id: &str) -> Value {
     let Some(chrome) = find_chrome() else {
         return json!({"ok": false, "stdout": "", "exit_code": 1,
@@ -158,11 +180,11 @@ pub fn run(body: &str, cwd: &Path, session_id: &str) -> Value {
 
     let tmp = std::env::temp_dir();
     let stamp = format!("{}-{}", std::process::id(), sanitize(session_id));
-    let profile_dir = tmp.join(format!("agentplug-chrome-{stamp}"));
+    let profile_dir = browser_chrome_profile_dir(cwd, session_id);
+    let _ = std::fs::create_dir_all(&profile_dir);
     let helper_path = tmp.join(format!("agentplug-cdp-eval-{stamp}.mjs"));
     let script_path = tmp.join(format!("agentplug-cdp-script-{stamp}.js"));
     let result_path = tmp.join(format!("agentplug-cdp-result-{stamp}.json"));
-    let _ = std::fs::create_dir_all(&profile_dir);
     let artifact_path = if mode != BrowserMode::Default {
         let dir = browser_profiles_dir(cwd);
         let _ = std::fs::create_dir_all(&dir);
@@ -263,7 +285,11 @@ pub fn run(body: &str, cwd: &Path, session_id: &str) -> Value {
     let _ = chrome_child.kill();
     let _ = chrome_child.wait();
     cleanup(&[&helper_path, &script_path, &result_path]);
-    let _ = std::fs::remove_dir_all(&profile_dir);
+    // profile_dir is now the persistent per-session Chrome profile under
+    // .gm/browser-chrome-profile-<session_id>/ -- deliberately NOT removed
+    // here (see browser_chrome_profile_dir's doc comment); it survives so
+    // the next dispatch under the same session_id reuses cookies/
+    // localStorage/cache instead of starting cold every time.
 
     let cdp_error = result_value.get("__cdpError").and_then(|v| v.as_str());
     let ok = exit_code == 0 && !timed_out && cdp_error.is_none();
