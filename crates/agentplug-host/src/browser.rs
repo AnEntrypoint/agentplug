@@ -24,6 +24,48 @@ use wait_timeout::ChildExt;
 
 const CDP_EVAL_JS: &str = include_str!("cdp_eval.js");
 
+/// Live-found (vendor-browser-timing-config-to-gm): every CDP timing
+/// constant below was a hardcoded literal, unreachable to a project wanting
+/// to tune it (a slower CI runner needing a longer chrome-ready deadline, a
+/// project wanting a tighter poll interval, etc) -- agentplug-runner is a
+/// native binary, not the wasm guest, so it needs its OWN .gm/-reading
+/// mechanism for this (the existing pattern: daemon.rs's
+/// instruction_source_config_path reads .gm/instructions/source.json
+/// per-project the same way). Read from <project>/.gm/browser-config.json
+/// when present; every field is optional and falls back to the exact
+/// pre-existing literal, so an unconfigured project behaves byte-identically
+/// to before this change.
+#[derive(serde::Deserialize)]
+struct BrowserConfig {
+    #[serde(default)]
+    cdp_poll_timeout_ms: Option<u64>,
+    #[serde(default)]
+    cdp_poll_interval_ms: Option<u64>,
+    #[serde(default)]
+    chrome_ready_deadline_ms: Option<u64>,
+    #[serde(default)]
+    eval_timeout_grace_ms: Option<u64>,
+}
+
+impl BrowserConfig {
+    fn load(cwd: &Path) -> Self {
+        let path = cwd.join(".gm").join("browser-config.json");
+        std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|s| serde_json::from_str::<BrowserConfig>(&s).ok())
+            .unwrap_or(BrowserConfig {
+                cdp_poll_timeout_ms: None,
+                cdp_poll_interval_ms: None,
+                chrome_ready_deadline_ms: None,
+                eval_timeout_grace_ms: None,
+            })
+    }
+    fn cdp_poll_timeout(&self) -> Duration { Duration::from_millis(self.cdp_poll_timeout_ms.unwrap_or(1000)) }
+    fn cdp_poll_interval(&self) -> Duration { Duration::from_millis(self.cdp_poll_interval_ms.unwrap_or(250)) }
+    fn chrome_ready_deadline(&self) -> Duration { Duration::from_millis(self.chrome_ready_deadline_ms.unwrap_or(30_000)) }
+    fn eval_timeout_grace(&self) -> u64 { self.eval_timeout_grace_ms.unwrap_or(6000) }
+}
+
 fn which(cmd: &str) -> Option<PathBuf> {
     let path_var = std::env::var_os("PATH")?;
     let names: Vec<String> = if cfg!(windows) {
@@ -71,17 +113,17 @@ fn free_port() -> u16 {
         .unwrap_or(9222)
 }
 
-fn cdp_ready(port: u16, deadline: Instant) -> bool {
+fn cdp_ready(port: u16, deadline: Instant, cfg: &BrowserConfig) -> bool {
     while Instant::now() < deadline {
         let url = format!("http://127.0.0.1:{port}/json/version");
-        if let Ok(resp) = ureq::get(&url).timeout(Duration::from_millis(1000)).call() {
+        if let Ok(resp) = ureq::get(&url).timeout(cfg.cdp_poll_timeout()).call() {
             if let Ok(body) = resp.into_string() {
                 if body.contains("webSocketDebuggerUrl") {
                     return true;
                 }
             }
         }
-        std::thread::sleep(Duration::from_millis(250));
+        std::thread::sleep(cfg.cdp_poll_interval());
     }
     false
 }
@@ -159,6 +201,7 @@ pub fn run(body: &str, cwd: &Path, session_id: &str) -> Value {
     };
 
     let t0 = Instant::now();
+    let browser_cfg = BrowserConfig::load(cwd);
     // The guest hands the raw spool dispatch JSON ({"body": "...", "timeoutMs": N})
     // as `body`, not the browser script directly -- extract the actual script and
     // timeout from that envelope before parsing prefixes. A bare string body (no
@@ -223,12 +266,12 @@ pub fn run(body: &str, cwd: &Path, session_id: &str) -> Value {
         }
     };
 
-    if !cdp_ready(port, Instant::now() + Duration::from_millis(30_000)) {
+    if !cdp_ready(port, Instant::now() + browser_cfg.chrome_ready_deadline(), &browser_cfg) {
         let _ = chrome_child.kill();
         let _ = chrome_child.wait();
         cleanup(&[&helper_path, &script_path, &result_path]);
         return json!({"ok": false, "stdout": "", "exit_code": 1,
-            "stderr": "chrome CDP endpoint did not become ready within 30s"});
+            "stderr": format!("chrome CDP endpoint did not become ready within {}ms", browser_cfg.chrome_ready_deadline().as_millis())});
     }
 
     let cfg = json!({
@@ -261,7 +304,7 @@ pub fn run(body: &str, cwd: &Path, session_id: &str) -> Value {
         }
     };
 
-    let timed_out = match child.wait_timeout(Duration::from_millis(timeout_ms + 6000)) {
+    let timed_out = match child.wait_timeout(Duration::from_millis(timeout_ms + browser_cfg.eval_timeout_grace())) {
         Ok(Some(_)) => false,
         Ok(None) => {
             let _ = child.kill();
