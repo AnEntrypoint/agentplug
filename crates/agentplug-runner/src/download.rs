@@ -89,6 +89,59 @@ fn plugin_asset_spec(plugin_name: &str) -> Option<PluginAssetSpec> {
     }
 }
 
+/// Resolves the LATEST release tag for `repo` WITHOUT touching
+/// api.github.com: probes `releases/latest/download/<asset>` (a plain
+/// github.com web endpoint, NOT subject to the REST API's unauthenticated
+/// 60-requests/hour/IP limit) with redirect-following disabled, and parses
+/// the tag out of the first-hop Location header, whose shape is always
+/// `https://github.com/<repo>/releases/download/<tag>/<asset>`. The
+/// redirect fires even for an asset name that does not exist in the release
+/// (the 404 would only happen at the SECOND hop, which is never followed
+/// here), so this resolves the tag reliably regardless of asset layout.
+///
+/// Live-found (plugin-install-rate-limit-lockout): the previous
+/// implementation resolved "latest" via an unauthenticated
+/// `api.github.com/repos/<repo>/releases/latest` call. Combined with the
+/// daemon retrying a failing plugin install on every ~200ms main-loop tick
+/// (see PluginModules::get_or_compile's backoff note in daemon.rs), that
+/// exhausted the API's 60/hour/IP budget within minutes of boot and then
+/// permanently locked out EVERY plugin install on the machine --
+/// live-witnessed as `API rate limit exceeded for <ip>` on all three
+/// plugin-bin repos while bert/libsql/treesitter sat missing from
+/// ~/.agentplug/plugins/, which is what broke embed_text (no bert sibling
+/// for host_vec_embed => memorize-fire refused NULL-embedding inserts,
+/// recall fell back to LIKE search) and codesearch (no libsql sibling =>
+/// libsql_ok=false, fallback_kv mode, zero chunks ever indexed).
+fn resolve_latest_tag_via_redirect(repo: &str, probe_asset: &str) -> anyhow::Result<String> {
+    let url = format!("https://github.com/{repo}/releases/latest/download/{probe_asset}");
+    let agent = ureq::AgentBuilder::new().redirects(0).build();
+    // With redirects disabled a 3xx comes back as Ok in current ureq, but
+    // guard the Error::Status shape too so a ureq behavior difference never
+    // silently drops the Location header this whole function exists to read.
+    let location = match agent.get(&url).call() {
+        Ok(resp) => resp.header("location").map(|s| s.to_string()),
+        Err(ureq::Error::Status(_, resp)) => resp.header("location").map(|s| s.to_string()),
+        Err(e) => return Err(e.into()),
+    };
+    let location = location
+        .ok_or_else(|| anyhow::anyhow!("no Location header from {url} -- repo has no releases?"))?;
+    parse_tag_from_release_location(&location)
+        .ok_or_else(|| anyhow::anyhow!("could not parse release tag from redirect {location} (from {url})"))
+}
+
+/// Pure tag extraction from a `releases/download` redirect Location --
+/// factored out of resolve_latest_tag_via_redirect for direct unit testing.
+fn parse_tag_from_release_location(location: &str) -> Option<String> {
+    let marker = "/releases/download/";
+    let idx = location.find(marker)?;
+    let tag = location[idx + marker.len()..].split('/').next().unwrap_or("");
+    if tag.is_empty() {
+        None
+    } else {
+        Some(tag.to_string())
+    }
+}
+
 pub fn plugin_wasm_path(plugin_name: &str) -> PathBuf {
     install_dir().join("plugins").join(format!("{plugin_name}.wasm"))
 }
@@ -127,10 +180,16 @@ pub fn installed_runner_version() -> Option<String> {
 }
 
 pub fn fetch_latest_runner_version() -> anyhow::Result<Option<String>> {
-    let url = format!("https://api.github.com/repos/{RUNNER_BIN_REPO}/releases/latest");
-    let resp = ureq::get(&url).set("User-Agent", "agentplug-runner").call()?;
-    let body: serde_json::Value = serde_json::from_str(&resp.into_string()?)?;
-    Ok(body.get("tag_name").and_then(|v| v.as_str()).map(|s| s.to_string()))
+    // Redirect-probe instead of api.github.com -- same rate-limit-immunity
+    // reasoning as resolve_latest_tag_via_redirect's doc comment; this poll
+    // only fires every runner_update_poll_interval (600s default) but it
+    // shares the same per-IP API budget the plugin-install loop was
+    // exhausting, so it failed alongside them once the limit was hit.
+    // Returns the raw tag (e.g. "v0.1.0"), byte-identical to the API's
+    // tag_name field this replaced -- record_runner_version / the
+    // releases/download/{tag} URL construction both depend on that.
+    let Some(asset) = runner_asset_name() else { return Ok(None) };
+    Ok(Some(resolve_latest_tag_via_redirect(RUNNER_BIN_REPO, &format!("{asset}.sha256"))?))
 }
 
 /// Downloads+verifies a newer runner build to `<current-exe-path>.new`,
@@ -182,10 +241,14 @@ pub fn fetch_latest_plugin_version(plugin_name: &str) -> anyhow::Result<Option<S
     let Some(spec) = plugin_asset_spec(plugin_name) else {
         anyhow::bail!("unknown plugin {plugin_name} -- not registered in agentplug-runner's plugin_asset_spec map");
     };
-    let url = format!("https://api.github.com/repos/{}/releases/latest", spec.repo);
-    let resp = ureq::get(&url).set("User-Agent", "agentplug-runner").call()?;
-    let body: serde_json::Value = serde_json::from_str(&resp.into_string()?)?;
-    Ok(body.get("tag_name").and_then(|v| v.as_str()).map(|s| s.trim_start_matches('v').to_string()))
+    // Redirect-probe instead of api.github.com -- see
+    // resolve_latest_tag_via_redirect's doc comment for the live-hit
+    // rate-limit lockout this replaces. The probe asset name only shapes the
+    // redirect's Location string, never a 404 (the redirect fires before any
+    // asset-existence check), so the plugkit-slim/plugkit split needs no
+    // fallback here -- the tag comes out identical either way.
+    let tag = resolve_latest_tag_via_redirect(spec.repo, &format!("{}.wasm.sha256", spec.asset_basename))?;
+    Ok(Some(tag.trim_start_matches('v').to_string()))
 }
 
 pub fn installed_plugin_version(plugin_name: &str) -> Option<String> {
@@ -243,7 +306,7 @@ pub fn ensure_plugin_installed(plugin_name: &str, explicit_version: Option<&str>
         }
         Err(e) => return Err(e.into()),
     };
-    let effective_basename = if sha_resp.get_url().contains("plugkit-slim") { "plugkit-slim" } else { "plugkit" };
+    let effective_basename = effective_wasm_basename(sha_resp.get_url(), spec.asset_basename);
     let wasm_url = format!("{base}/{effective_basename}.wasm");
     let sha_line = sha_resp.into_string()?;
     let expected_sha = sha_line.split_whitespace().next().ok_or_else(|| anyhow::anyhow!("empty sha256 sidecar for {effective_basename} at {base}"))?.to_string();
@@ -251,4 +314,89 @@ pub fn ensure_plugin_installed(plugin_name: &str, explicit_version: Option<&str>
     download_and_verify(&wasm_url, &dest, &expected_sha)?;
     fs::write(&version_file, &version)?;
     Ok(dest)
+}
+
+/// Which `<basename>.wasm` to download once the sha256 sidecar fetch has
+/// resolved: pure decision, extracted for direct unit testing.
+///
+/// Live-found (plugin-wasm-url-coerced-to-plugkit): this used to read
+/// `if sha_final_url.contains("plugkit-slim") { "plugkit-slim" } else
+/// { "plugkit" }` -- written for gm's slim-vs-fat fallback but executed for
+/// EVERY plugin, so bert/libsql/treesitter (whose sha sidecar fetch had
+/// just SUCCEEDED under their own basename) then requested
+/// `<their-repo>/releases/download/vX/plugkit.wasm`, a guaranteed 404 --
+/// live-witnessed: agentplug-bert-bin/v0.1.0/bert.wasm.sha256 = HTTP 200,
+/// same-release plugkit.wasm = HTTP 404. Net effect: the three non-gm
+/// default plugins could NEVER install, which is the direct cause of
+/// embed_text failing under the native runner (no bert sibling for
+/// host_vec_embed -- and plugkit-slim.wasm deliberately carries no baked-in
+/// bert weights, so the wasm-side fallback that saved the retired JS host
+/// cannot engage either) and of codesearch's permanent libsql_ok=false
+/// fallback_kv mode (no libsql sibling). The "plugkit" coercion is only
+/// correct for the one plugin whose slim sidecar 404'd and fell back to the
+/// fat one; every other plugin keeps its own basename.
+fn effective_wasm_basename(sha_final_url: &str, spec_basename: &'static str) -> &'static str {
+    if sha_final_url.contains("plugkit-slim") {
+        "plugkit-slim"
+    } else if spec_basename == "plugkit-slim" {
+        "plugkit"
+    } else {
+        spec_basename
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Defect regression: a non-gm plugin whose sha sidecar resolved under
+    /// its own name must download ITS OWN wasm, never plugkit.wasm (the
+    /// pre-fix coercion that 404'd every bert/libsql/treesitter install).
+    #[test]
+    fn non_gm_plugin_keeps_its_own_basename() {
+        let url = "https://github.com/AnEntrypoint/agentplug-bert-bin/releases/download/v0.1.0/bert.wasm.sha256";
+        assert_eq!(effective_wasm_basename(url, "bert"), "bert");
+        let url = "https://github.com/AnEntrypoint/agentplug-libsql-bin/releases/download/v0.1.0/libsql.wasm.sha256";
+        assert_eq!(effective_wasm_basename(url, "libsql"), "libsql");
+        let url = "https://github.com/AnEntrypoint/agentplug-treesitter-bin/releases/download/v0.1.0/treesitter.wasm.sha256";
+        assert_eq!(effective_wasm_basename(url, "treesitter"), "treesitter");
+    }
+
+    /// gm's slim asset resolves to plugkit-slim -- including when redirects
+    /// were followed all the way to the CDN host, where the asset name only
+    /// survives inside the querystring (the shape ureq's get_url() actually
+    /// returns for a followed release-asset download).
+    #[test]
+    fn gm_slim_basename_detected_even_in_cdn_querystring_url() {
+        let direct = "https://github.com/AnEntrypoint/plugkit-bin/releases/download/v0.1.950/plugkit-slim.wasm.sha256";
+        assert_eq!(effective_wasm_basename(direct, "plugkit-slim"), "plugkit-slim");
+        let cdn = "https://release-assets.githubusercontent.com/github-production-release-asset/123?rscd=attachment%3B+filename%3Dplugkit-slim.wasm.sha256";
+        assert_eq!(effective_wasm_basename(cdn, "plugkit-slim"), "plugkit-slim");
+    }
+
+    /// gm's slim sidecar 404'd and the fat plugkit sidecar answered: only
+    /// THIS case coerces to plugkit.
+    #[test]
+    fn gm_fat_fallback_coerces_to_plugkit() {
+        let fat = "https://github.com/AnEntrypoint/plugkit-bin/releases/download/v0.1.900/plugkit.wasm.sha256";
+        assert_eq!(effective_wasm_basename(fat, "plugkit-slim"), "plugkit");
+    }
+
+    /// Tag extraction from the latest/download redirect's first-hop
+    /// Location header -- the api.github.com-free version resolution path.
+    #[test]
+    fn parses_tag_from_release_location() {
+        assert_eq!(
+            parse_tag_from_release_location(
+                "https://github.com/AnEntrypoint/agentplug-bert-bin/releases/download/v0.1.0/bert.wasm.sha256"
+            ),
+            Some("v0.1.0".to_string())
+        );
+        assert_eq!(
+            parse_tag_from_release_location("https://github.com/x/y/releases/download/v2.3.4-rc1/asset"),
+            Some("v2.3.4-rc1".to_string())
+        );
+        assert_eq!(parse_tag_from_release_location("https://github.com/x/y/releases/latest"), None);
+        assert_eq!(parse_tag_from_release_location("https://github.com/x/y/releases/download/"), None);
+    }
 }

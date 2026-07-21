@@ -563,11 +563,30 @@ fn write_daemon_heartbeat(project_count: usize, plugin_module_count: usize) {
 struct PluginModules {
     engine: Engine,
     modules: HashMap<String, Module>,
+    // Live-found (plugin-install-retry-every-tick): a plugin whose
+    // download/compile kept failing was re-attempted by the compile-ahead
+    // pass on EVERY ~200ms main-loop tick -- each attempt a fresh network
+    // round-trip (previously an unauthenticated api.github.com call, which
+    // is how the 60/hour/IP rate limit got exhausted within minutes of boot
+    // and then kept every plugin install locked out indefinitely; see
+    // resolve_latest_tag_via_redirect in download.rs) plus a five-times-a-
+    // second error line in the log. A failed attempt now backs off
+    // PLUGIN_INSTALL_RETRY_BACKOFF before the next try, and the in-window
+    // skip is silent (the plugin simply stays un-compiled; a dispatch that
+    // actually needs it still surfaces the per-dispatch "not yet compiled"
+    // message it always did).
+    failed_at: HashMap<String, Instant>,
 }
+
+/// How long a failed plugin install/compile waits before the compile-ahead
+/// pass re-attempts it. Long enough that a genuinely broken source (no
+/// network, missing release) is polite to both the log and the remote;
+/// short enough that a transient failure self-heals within a minute.
+const PLUGIN_INSTALL_RETRY_BACKOFF: Duration = Duration::from_secs(60);
 
 impl PluginModules {
     fn new() -> anyhow::Result<Self> {
-        Ok(Self { engine: build_engine()?, modules: HashMap::new() })
+        Ok(Self { engine: build_engine()?, modules: HashMap::new(), failed_at: HashMap::new() })
     }
 
     /// Split borrow (engine immutable, modules mutable) so a caller holding
@@ -576,13 +595,35 @@ impl PluginModules {
     /// the whole struct, making `plugin_modules.engine` inaccessible while
     /// the returned Module reference is still alive at the call site.
     fn get_or_compile(&mut self, plugin_name: &str) -> anyhow::Result<()> {
-        if !self.modules.contains_key(plugin_name) {
+        if self.modules.contains_key(plugin_name) {
+            return Ok(());
+        }
+        if let Some(at) = self.failed_at.get(plugin_name) {
+            if at.elapsed() < PLUGIN_INSTALL_RETRY_BACKOFF {
+                // Still inside the backoff window: skip silently rather than
+                // erroring, so the per-tick call sites don't log the same
+                // failure five times a second (the real error was already
+                // logged when the attempt actually ran).
+                return Ok(());
+            }
+        }
+        let attempt = (|| -> anyhow::Result<()> {
             let wasm_path = ensure_plugin_installed(plugin_name, None)?;
             eprintln!("[agentplug daemon] compiling {plugin_name}.wasm (shared across every project that uses it)...");
             let module = Module::from_file(&self.engine, &wasm_path)?;
             self.modules.insert(plugin_name.to_string(), module);
+            Ok(())
+        })();
+        match attempt {
+            Ok(()) => {
+                self.failed_at.remove(plugin_name);
+                Ok(())
+            }
+            Err(e) => {
+                self.failed_at.insert(plugin_name.to_string(), Instant::now());
+                Err(e)
+            }
         }
-        Ok(())
     }
 }
 
