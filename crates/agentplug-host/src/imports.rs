@@ -606,7 +606,19 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
             } else {
                 trimmed.split_whitespace().map(String::from).collect()
             };
-            let cwd = if cwd_arg.is_empty() { caller.data().cwd() } else { PathBuf::from(&cwd_arg) };
+            let cwd = if cwd_arg.is_empty() {
+                caller.data().cwd()
+            } else {
+                let p = PathBuf::from(&cwd_arg);
+                // A relative cwd_arg (e.g. a bare submodule name like "agentplug",
+                // the shape gm's own git verb docs use) previously resolved against
+                // this DAEMON PROCESS's own cwd rather than the calling project's
+                // root, since PathBuf::from() never joins a relative path against
+                // anything -- on Windows this produced a nonexistent/invalid
+                // directory (OS error 267) whenever the daemon's own cwd differed
+                // from the calling project (always true for the shared daemon).
+                if p.is_absolute() { p } else { caller.data().cwd().join(p) }
+            };
             let mut git_cmd = std::process::Command::new("git");
             git_cmd.args(&argv).current_dir(&cwd).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
             #[cfg(windows)]
