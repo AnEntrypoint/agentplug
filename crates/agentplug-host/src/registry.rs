@@ -104,10 +104,11 @@ fn is_stateless_shared_plugin(plugin_name: &str) -> bool {
 /// `DaemonConfig::gm_concurrency()` -- before that call, or on a non-daemon
 /// entry point that never calls it, `gm_pool_size()` falls back to 4 (the
 /// pre-existing effective concurrency ceiling, matching the old
-/// `MAX_CONCURRENT_PROJECTS` default). bert/treesitter/libsql are NOT
-/// pooled -- exactly one instance each, unchanged -- because bert alone
-/// costs ~133MB of resident tensors per instance and no live contention was
-/// ever found for any of the three; only `gm`'s exec_js/browser dispatches
+/// `MAX_CONCURRENT_PROJECTS` default). bert/treesitter/libsql default to
+/// exactly one instance each (see SIDE_PLUGIN_POOL_SIZE below for why, and
+/// how to raise it) -- because bert alone costs ~133MB of resident tensors
+/// per instance and no live contention was ever found for any of the three
+/// under this host's own workloads; only `gm`'s exec_js/browser dispatches
 /// are long enough to block unrelated projects behind a single shared Mutex
 /// (see the doc comment above and the 18-21s live-witnessed stall).
 static GM_POOL_SIZE: OnceLock<usize> = OnceLock::new();
@@ -123,6 +124,32 @@ pub fn set_gm_pool_size(n: usize) -> bool {
 
 fn gm_pool_size() -> usize {
     *GM_POOL_SIZE.get_or_init(|| 4)
+}
+
+/// Process-wide ceiling on how many live Stores exist for each of
+/// bert/treesitter/libsql (the non-"gm" stateless-shared plugins). Unlike
+/// `gm`, these have never had a live-witnessed contention incident on this
+/// host's own workloads (see the doc comment above `is_stateless_shared_plugin`),
+/// so the default stays 1 -- unlike bumping the default itself, this is a
+/// genuine escape hatch: a deployment that DOES see real cross-project
+/// `codesearch`/`recall`/`embed` contention (host_plugin_call/host_vec_embed
+/// serialize behind a size-1 pool, bounded by SharedPluginPool::acquire's
+/// 20s ACQUIRE_TIMEOUT_MS before surfacing `plugin_pool_busy_timeout`) can
+/// raise it without a code change, at the documented cost of N times bert's
+/// ~133MB resident tensors per extra slot. Configured the same way as
+/// GM_POOL_SIZE: set once at daemon startup from DaemonConfig, falls back to
+/// 1 (byte-identical to the pre-existing hardcoded behavior) if never set.
+static SIDE_PLUGIN_POOL_SIZE: OnceLock<usize> = OnceLock::new();
+
+/// Configure the bert/treesitter/libsql pool size. Same one-shot-before-
+/// first-use contract as `set_gm_pool_size`. Intended call site: once, at
+/// daemon startup, right after `DaemonConfig::load()`.
+pub fn set_side_plugin_pool_size(n: usize) -> bool {
+    SIDE_PLUGIN_POOL_SIZE.set(n.max(1)).is_ok()
+}
+
+fn side_plugin_pool_size() -> usize {
+    *SIDE_PLUGIN_POOL_SIZE.get_or_init(|| 1)
 }
 
 /// A shared plugin's live instance slots. Most plugins (bert/treesitter/
@@ -198,7 +225,7 @@ type SharedPluginMap = Mutex<HashMap<String, Arc<SharedPluginPool>>>;
 static SHARED_PLUGINS: OnceLock<SharedPluginMap> = OnceLock::new();
 
 fn shared_plugin_pool(plugin_name: &str) -> Arc<SharedPluginPool> {
-    let pool_size = if plugin_name == "gm" { gm_pool_size() } else { 1 };
+    let pool_size = if plugin_name == "gm" { gm_pool_size() } else { side_plugin_pool_size() };
     SHARED_PLUGINS
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()

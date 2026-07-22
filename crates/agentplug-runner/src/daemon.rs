@@ -87,6 +87,16 @@ struct DaemonConfig {
     // doc comment in agentplug-host/src/registry.rs for the full history.
     #[serde(default)]
     gm_concurrency: Option<usize>,
+    // How many live Stores exist for EACH of bert/treesitter/libsql (the
+    // non-"gm" stateless-shared plugins). Defaults to 1 (byte-identical to
+    // the pre-existing hardcoded behavior) -- see
+    // registry.rs::SIDE_PLUGIN_POOL_SIZE's own doc comment for when raising
+    // this is warranted (genuine cross-project codesearch/recall/embed
+    // contention, bounded today by a 20s pool-acquire timeout rather than
+    // hanging, but still real added latency under concurrent multi-project
+    // load).
+    #[serde(default)]
+    side_plugin_concurrency: Option<usize>,
 }
 
 impl DaemonConfig {
@@ -102,6 +112,7 @@ impl DaemonConfig {
                 runner_update_poll_interval_secs: None,
                 max_concurrent_projects: None,
                 gm_concurrency: None,
+                side_plugin_concurrency: None,
             })
     }
     fn registry_poll_interval(&self) -> Duration { Duration::from_secs(self.registry_poll_interval_secs.unwrap_or(5)) }
@@ -110,6 +121,7 @@ impl DaemonConfig {
     fn runner_update_poll_interval(&self) -> Duration { Duration::from_secs(self.runner_update_poll_interval_secs.unwrap_or(600)) }
     fn max_concurrent_projects(&self) -> usize { self.max_concurrent_projects.unwrap_or(4).max(1) }
     fn gm_concurrency(&self) -> usize { self.gm_concurrency.unwrap_or_else(|| self.max_concurrent_projects()).max(1) }
+    fn side_plugin_concurrency(&self) -> usize { self.side_plugin_concurrency.unwrap_or(1).max(1) }
 }
 
 // 2x the daemon's own default heartbeat_interval (10s, now configurable via
@@ -556,6 +568,66 @@ fn write_daemon_heartbeat(project_count: usize, plugin_module_count: usize) {
     );
 }
 
+/// Live count of registered projects, updated by the main loop after every
+/// `thread::scope` batch completes -- read by the heartbeat ticker thread so
+/// its independently-written heartbeats still carry a real (if momentarily
+/// lagging) `active_projects` figure instead of a permanently-stale 0.
+static HEARTBEAT_PROJECT_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static HEARTBEAT_PLUGIN_MODULE_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Set once by the main loop when the heartbeat ticker thread (see
+/// `spawn_heartbeat_ticker`) observes that authority has been lost to another
+/// process -- the ticker itself can never safely call `close_all_sessions()`
+/// or return from `run_daemon_body` (those touch/own state the MAIN thread's
+/// loop owns), so it only raises this flag; the main loop polls it cheaply at
+/// the top of every iteration (and right after every dispatch batch) and
+/// performs the actual shutdown itself. `Relaxed` is sufficient: this is a
+/// single one-way latch (false->true, never reset within a process lifetime),
+/// not synchronizing access to any other data.
+static HEARTBEAT_AUTHORITY_LOST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn heartbeat_authority_lost() -> bool {
+    HEARTBEAT_AUTHORITY_LOST.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Fix for the real liveness bug documented at this function's former single
+/// call site (now split, see below): the heartbeat write and the authority
+/// re-check used to run ONLY at the top of the main loop, which cannot return
+/// there until the current tick's `thread::scope` block has joined every
+/// worker thread -- so one worker occupying a slot for up to
+/// `DISPATCH_CALL_DEADLINE_SECS` (40s) delayed the heartbeat write for that
+/// same duration, exactly the class of incident the doc comment on the old
+/// single call site described (a daemon stuck mid-call 12+ seconds without
+/// heartbeating while burning a full core, until a competing daemon claimed
+/// authority and took over).
+///
+/// This spawns a genuinely independent OS thread that owns heartbeat timing
+/// entirely -- it never touches `projects`/`plugin_modules`/worker threads,
+/// only the filesystem (`write_daemon_heartbeat`) and the same
+/// filesystem-arbitrated ownership primitives (`holds_heartbeat_authority`)
+/// the old inline check used, both of which were already safe to call from
+/// any thread (no shared mutable state beyond what the OS file operations
+/// themselves already arbitrate atomically). On losing authority it raises
+/// `HEARTBEAT_AUTHORITY_LOST` and returns -- the main loop notices on its own
+/// next check and performs the actual (session-owning) shutdown.
+fn spawn_heartbeat_ticker(heartbeat_interval: Duration) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || loop {
+        std::thread::sleep(heartbeat_interval);
+        if heartbeat_authority_lost() {
+            return;
+        }
+        if !holds_heartbeat_authority() {
+            eprintln!("[agentplug daemon] heartbeat ticker: authority lost to another daemon -- signaling main loop to exit");
+            HEARTBEAT_AUTHORITY_LOST.store(true, std::sync::atomic::Ordering::Relaxed);
+            return;
+        }
+        write_daemon_heartbeat(
+            HEARTBEAT_PROJECT_COUNT.load(std::sync::atomic::Ordering::Relaxed),
+            HEARTBEAT_PLUGIN_MODULE_COUNT.load(std::sync::atomic::Ordering::Relaxed),
+        );
+    })
+}
+
 /// One compiled Module per DISTINCT plugin name, shared across every
 /// project -- the expensive Cranelift compile happens once regardless of
 /// how many projects use the "bert" plugin. Instantiation (cheap) happens
@@ -960,19 +1032,19 @@ fn dispatch_project(root: &Path, project: &mut ProjectPlugins, plugin_modules: &
             // (finished normally) or detached (background-convert fired for
             // it) -- whichever comes first, per entry, independently.
             //
-            // Also re-scans in_dir/background-convert on EVERY tick of this
-            // same loop -- not just the one snapshot taken before this batch
-            // was spawned. Live-witnessed bug this fixes: a
-            // `background-convert` request written to disk AFTER this
-            // dispatch_project call already took its initial fs::read_dir
-            // snapshot (pass 1 above) is invisible to that snapshot. Without
-            // re-scanning here, THIS call keeps polling its own spawned
-            // batch to completion/timeout with no way to ever notice that
-            // later-arriving file -- the earliest it could be seen is the
-            // NEXT dispatch_project call for this root, which cannot start
-            // until this one returns, by which point a fast dispatch has
-            // usually already finished (measured: multiple end-to-end runs
-            // where background-convert consistently reported
+            // Also re-scans in_dir on EVERY tick of this same loop -- not
+            // just the one snapshot taken before this batch was spawned.
+            // Live-witnessed bug this fixes for background-convert
+            // specifically: a `background-convert` request written to disk
+            // AFTER this dispatch_project call already took its initial
+            // fs::read_dir snapshot (pass 1 above) is invisible to that
+            // snapshot. Without re-scanning here, THIS call keeps polling its
+            // own spawned batch to completion/timeout with no way to ever
+            // notice that later-arriving file -- the earliest it could be
+            // seen is the NEXT dispatch_project call for this root, which
+            // cannot start until this one returns, by which point a fast
+            // dispatch has usually already finished (measured: multiple
+            // end-to-end runs where background-convert consistently reported
             // "already_completed" because it was answered a whole
             // dispatch_project-call-cycle late). Re-scanning here means a
             // background-convert arriving any time during this same
@@ -980,6 +1052,22 @@ fn dispatch_project(root: &Path, project: &mut ProjectPlugins, plugin_modules: &
             // tick (~50ms), while the batch's own dispatches are still
             // mid-flight, which is what actually delivers "converts fast,
             // does not wait for the dispatch."
+            //
+            // Generalized to every OTHER gm-verb dir too, not just
+            // background-convert -- the identical starvation shape applies
+            // to an ordinary request (e.g. `phase-status`) written to this
+            // SAME project's spool while a slow, unrelated dispatch (e.g.
+            // `codesearch`/`exec_js`) from the initial claim-snapshot is
+            // still mid-flight: without this, that new request sits
+            // unclaimed on disk until the NEXT dispatch_project call for
+            // this root, which (per the heartbeat-decoupling fix above)
+            // could itself be delayed behind this very batch. Newly-claimed
+            // ordinary requests are spawned into this SAME `spawned` vector
+            // (their IN_FLIGHT entry registered first, matching the
+            // ordering fix above) so they get the identical round-robin
+            // poll treatment as the batch's original members -- serviced
+            // within this call, never starved behind an unrelated slow
+            // sibling in the same batch.
             let bg_convert_dir = in_dir.join("background-convert");
             while spawned.iter().any(|s| s.join_handle.is_some()) {
                 for s in spawned.iter_mut() {
@@ -1027,6 +1115,60 @@ fn dispatch_project(root: &Path, project: &mut ProjectPlugins, plugin_modules: &
                             }
                         }
                     }
+
+                    // Generalized re-scan: every OTHER verb dir under in_dir
+                    // (never background-convert, already handled above, and
+                    // never re-reading verb dirs that don't exist yet) gets
+                    // the same treatment -- claim any newly-arrived request,
+                    // register its IN_FLIGHT entry, spawn its own thread, and
+                    // fold it into `spawned` so the SAME while-loop condition
+                    // above continues polling it alongside the batch's
+                    // original members. This only needs `project` (already
+                    // exclusively held by this worker thread for this root)
+                    // and requires "gm" to already be loaded, which it is --
+                    // this whole else-branch only runs once gm_requests was
+                    // non-empty and gm loaded successfully.
+                    if let Ok(verb_dirs) = fs::read_dir(&in_dir) {
+                        for verb_entry in verb_dirs.flatten() {
+                            if !verb_entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                                continue;
+                            }
+                            let verb = verb_entry.file_name().to_string_lossy().into_owned();
+                            if verb == "background-convert" {
+                                continue;
+                            }
+                            let Ok(files) = fs::read_dir(verb_entry.path()) else { continue };
+                            for file_entry in files.flatten() {
+                                let file_path = file_entry.path();
+                                if file_path.extension().and_then(|e| e.to_str()) != Some("txt") {
+                                    continue;
+                                }
+                                let claim_path = file_path.with_extension(format!("txt.claim.{}", std::process::id()));
+                                if fs::rename(&file_path, &claim_path).is_err() {
+                                    continue;
+                                }
+                                let task = file_path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+                                let body = fs::read_to_string(&claim_path).unwrap_or_default();
+                                let _ = fs::remove_file(&claim_path);
+
+                                let dispatch_handle = project.dispatch_handle();
+                                let detach_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                                let key: InFlightKey = (root.to_path_buf(), verb.clone(), task.clone());
+                                in_flight_map().lock().unwrap_or_else(|e| e.into_inner()).insert(key.clone(), InFlightHandle { detach: detach_flag.clone() });
+
+                                let thread_root = root.to_path_buf();
+                                let thread_verb = verb.clone();
+                                let thread_task = task.clone();
+                                let thread_body = body;
+                                let thread_out_dir = out_dir.clone();
+                                let join_handle = std::thread::spawn(move || {
+                                    run_gm_dispatch_to_file(&thread_root, &dispatch_handle, &thread_verb, &thread_task, &thread_body, &thread_out_dir);
+                                });
+                                spawned.push(Spawned { key, join_handle: Some(join_handle), detach_flag });
+                            }
+                        }
+                    }
+
                     std::thread::sleep(Duration::from_millis(50));
                 }
             }
@@ -1240,10 +1382,10 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
     // run_daemon_body does, before any project registry read or plugin
     // load, so that race is not reachable in practice.
     agentplug_host::set_gm_pool_size(daemon_cfg.gm_concurrency());
+    agentplug_host::set_side_plugin_pool_size(daemon_cfg.side_plugin_concurrency());
 
     let mut projects: HashMap<PathBuf, ProjectPlugins> = HashMap::new();
     let mut last_registry_poll = Instant::now() - registry_poll_interval;
-    let mut last_heartbeat = Instant::now();
     let mut known_roots: Vec<PathBuf> = Vec::new();
 
     // WASM linear memory is architecturally monotonic (memory.grow is the
@@ -1311,38 +1453,19 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
     // does not need fetching dozens of times a minute.
     let mut last_instruction_source_sync: HashMap<PathBuf, Instant> = HashMap::new();
 
-    loop {
-        if last_heartbeat.elapsed() >= heartbeat_interval {
-            last_heartbeat = Instant::now();
-            // Closes the residual TOCTOU window the startup check above
-            // can't fully cover (two processes racing the exact same
-            // microsecond-scale check-then-write): re-check every heartbeat
-            // tick too, so a true double-spawn self-corrects within one
-            // HEARTBEAT_INTERVAL instead of running both daemons forever.
-            let lost_race = !holds_heartbeat_authority();
-            if lost_race {
-                // Same orphan risk as the self-update handoff path above: this
-                // process may already be mid-run with live browser sessions in
-                // its own SESSIONS registry, and the winning daemon has no way
-                // to discover or manage them. Close what we know about before
-                // yielding -- see close_all_sessions's doc comment.
-                agentplug_host::close_all_sessions();
-                eprintln!("[agentplug daemon] another daemon claimed heartbeat authority -- exiting");
-                return Ok(());
-            }
-            write_daemon_heartbeat(projects.len(), plugin_modules.modules.len());
-        }
+    // Independent ticker thread: writes the heartbeat and re-checks
+    // ownership authority on its own timer, never blocked by the main loop's
+    // `thread::scope` worker-pool join (see spawn_heartbeat_ticker's doc
+    // comment for the incident this replaces). The main loop only ever
+    // POLLS `heartbeat_authority_lost()` -- a single relaxed atomic load,
+    // negligible cost -- and performs the actual shutdown itself once it's
+    // set, since closing browser sessions and returning from this function
+    // are main-thread-owned actions the ticker must never perform directly.
+    let _heartbeat_ticker = spawn_heartbeat_ticker(heartbeat_interval);
+    write_daemon_heartbeat(0, 0);
 
-        // The authority re-check above only runs inside the heartbeat branch,
-        // so a daemon stuck in one long synchronous wasm call (a full index
-        // pass, a batch of ~3s bert embeds) blows past HEARTBEAT_INTERVAL, a
-        // newer daemon claims authority meanwhile, and the busy one keeps
-        // serving nobody until it happens to return. Live-hit: pid 18820 held
-        // no heartbeat (pid 22420 did) yet burned a full core -- CPU 158.1s to
-        // 170.0s across a 12s sample -- and 2,827MB, versus the live daemon's
-        // 542MB. Check before doing work too, so an orphan exits at the next
-        // loop top rather than only at the next heartbeat it may never reach.
-        if !holds_heartbeat_authority() {
+    loop {
+        if heartbeat_authority_lost() {
             agentplug_host::close_all_sessions();
             eprintln!("[agentplug daemon] heartbeat authority held by another daemon -- exiting before serving further work");
             return Ok(());
@@ -1476,6 +1599,18 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
         for (root, project, did_work) in done.into_inner().unwrap_or_else(|e| e.into_inner()) {
             any_work = any_work || did_work;
             projects.insert(root, project);
+        }
+        // Keep the heartbeat ticker's own reported active_projects/
+        // compiled_plugin_modules figures reasonably fresh -- it can only
+        // ever read these atomics (it must never touch `projects`/
+        // `plugin_modules` directly, both main-thread-owned), so the main
+        // loop is responsible for publishing them after every batch.
+        HEARTBEAT_PROJECT_COUNT.store(projects.len(), std::sync::atomic::Ordering::Relaxed);
+        HEARTBEAT_PLUGIN_MODULE_COUNT.store(plugin_modules.modules.len(), std::sync::atomic::Ordering::Relaxed);
+        if heartbeat_authority_lost() {
+            agentplug_host::close_all_sessions();
+            eprintln!("[agentplug daemon] heartbeat authority held by another daemon -- exiting after finishing in-flight batch");
+            return Ok(());
         }
         let evict_before = Instant::now() - Duration::from_millis(PLUGIN_IDLE_EVICT_MS);
         let to_evict: Vec<PathBuf> = projects.iter().filter(|(_, p)| p.last_active < evict_before).map(|(root, _)| root.clone()).collect();
