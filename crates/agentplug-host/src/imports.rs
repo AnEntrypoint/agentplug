@@ -212,6 +212,26 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
         |mut caller: Caller<'_, HostState>, level: u32, msg_ptr: u32, msg_len: u32| -> u32 {
             let msg = read_guest_string(&mut caller, msg_ptr, msg_len);
             let plugin = caller.data().plugin_name.clone();
+            // rs-plugkit's emit_event()/log_deviation_push() send structured events as a
+            // literal "evt: {json}" line via this same host_log import (level 1) -- gmsniff's
+            // per-project fallback tailer parses ".gm/exec-spool/.watcher.log" for lines
+            // starting with that exact prefix. The retired JS wrapper appended those lines to
+            // .watcher.log directly; this Rust host previously only eprintln!'d everything
+            // (stderr, discarded on process exit, and wrapped in a "[agentplug:...]" prefix
+            // that broke the "evt: " line-start match even if stderr had been captured) --
+            // silently killing all gm-log/watcher-log observability the moment a project's
+            // watcher was agentplug-driven instead of JS-wrapper-driven.
+            if let Some(evt_line) = msg.strip_prefix("evt: ") {
+                let cwd = caller.data().cwd.lock().unwrap().clone();
+                let log_path = cwd.join(".gm").join("exec-spool").join(".watcher.log");
+                if let Some(parent) = log_path.parent() {
+                    let _ = fs::create_dir_all(parent);
+                }
+                if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(&log_path) {
+                    use std::io::Write;
+                    let _ = writeln!(f, "evt: {evt_line}");
+                }
+            }
             eprintln!("[agentplug:{plugin} L{level}] {msg}");
             1
         },
