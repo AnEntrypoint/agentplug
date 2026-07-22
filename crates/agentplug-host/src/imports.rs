@@ -562,19 +562,41 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
                 return -1;
             };
             let caller_root = caller.data().cwd();
-            let mut guard = match sibling_pool.acquire() {
-                Some(g) => g,
-                None => return -1,
-            };
-            let result = match guard.as_mut() {
-                None => Err(anyhow::anyhow!("bert not loaded yet")),
-                Some(handle) => crate::registry::dispatch_on(&mut handle.store, handle.instance, "embed", &body, &caller_root, caller_siblings.clone()).and_then(|resp| {
-                    let v: serde_json::Value = serde_json::from_str(&resp)?;
-                    let arr = v.get("embedding").and_then(|e| e.as_array()).ok_or_else(|| anyhow::anyhow!("no embedding field"))?;
-                    Ok::<Vec<f32>, anyhow::Error>(arr.iter().filter_map(|x| x.as_f64()).map(|x| x as f32).collect())
-                }),
-            };
-            drop(guard);
+            // Pool contention under real host load (concurrent projects
+            // sharing the size-1 bert slot) can exhaust acquire()'s own
+            // 20s bound; a single hard failure here surfaced as
+            // memorize-fire's "embed_text failed" with zero recourse.
+            // Retry the acquire+dispatch bounded before giving up, so
+            // transient contention degrades to a slower call instead of
+            // an outright failure.
+            const EMBED_RETRY_ATTEMPTS: u32 = 3;
+            const EMBED_RETRY_BACKOFF_MS: u64 = 500;
+            let mut result: anyhow::Result<Vec<f32>> = Err(anyhow::anyhow!("embed not attempted"));
+            for attempt in 0..EMBED_RETRY_ATTEMPTS {
+                let guard = match sibling_pool.acquire() {
+                    Some(g) => g,
+                    None => {
+                        result = Err(anyhow::anyhow!("bert pool acquire timed out"));
+                        continue;
+                    }
+                };
+                let mut guard = guard;
+                result = match guard.as_mut() {
+                    None => Err(anyhow::anyhow!("bert not loaded yet")),
+                    Some(handle) => crate::registry::dispatch_on(&mut handle.store, handle.instance, "embed", &body, &caller_root, caller_siblings.clone()).and_then(|resp| {
+                        let v: serde_json::Value = serde_json::from_str(&resp)?;
+                        let arr = v.get("embedding").and_then(|e| e.as_array()).ok_or_else(|| anyhow::anyhow!("no embedding field"))?;
+                        Ok::<Vec<f32>, anyhow::Error>(arr.iter().filter_map(|x| x.as_f64()).map(|x| x as f32).collect())
+                    }),
+                };
+                drop(guard);
+                if result.is_ok() {
+                    break;
+                }
+                if attempt + 1 < EMBED_RETRY_ATTEMPTS {
+                    std::thread::sleep(std::time::Duration::from_millis(EMBED_RETRY_BACKOFF_MS));
+                }
+            }
 
             match result {
                 Ok(values) => {
