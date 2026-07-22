@@ -1,9 +1,28 @@
 use std::fs;
 use std::path::PathBuf;
+use std::process::Stdio;
+use std::time::Duration;
 
+use wait_timeout::ChildExt;
 use wasmtime::{Caller, Linker, Memory};
 
 use crate::host_state::HostState;
+
+// `git log`/`git status`/etc are dispatched synchronously from inside a wasm
+// host-import call, itself running while the calling plugin's single pool
+// slot (see registry.rs's SharedPluginPool, size 1 for bert/libsql, N for
+// gm) is held -- an unbounded git subprocess (pack-refs lock contention, AV
+// interference on Windows holding a file handle, a genuinely pathological
+// repo) blocks that entire dispatch forever with nothing upstream able to
+// notice or recover, wedging every other request for the same project (and,
+// for a size-1 shared plugin, every OTHER project) behind it. code_index.rs's
+// own INDEX_WALL_BUDGET_MS only checks BETWEEN files in its indexing loop, so
+// it never gets a chance to fire while a single host_git call is stuck.
+// Bounded the same way browser.rs already bounds its node-helper subprocess
+// (wait_timeout + kill-on-expiry) -- git commands here are always
+// read-only/local (log/status/diff/rev-parse), so a killed-and-abandoned
+// child leaves no repo-state cleanup to do.
+const GIT_SUBPROCESS_TIMEOUT_MS: u64 = 15_000;
 
 fn guest_memory(caller: &mut Caller<'_, HostState>) -> Memory {
     caller
@@ -456,7 +475,15 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
             // store/data.rs:213) the first time gm.wasm's recall path called
             // into bert via host_plugin_call.
             let caller_root = caller.data().cwd();
-            let mut guard = sibling_pool.acquire();
+            let mut guard = match sibling_pool.acquire() {
+                Some(g) => g,
+                None => {
+                    return write_guest_json(
+                        &mut caller,
+                        serde_json::json!({"ok": false, "error": "plugin_pool_busy_timeout", "plugin": plugin}),
+                    );
+                }
+            };
             let result = match guard.as_mut() {
                 None => Err(anyhow::anyhow!("plugin_not_loaded_yet")),
                 Some(handle) => crate::registry::dispatch_on(&mut handle.store, handle.instance, &verb, &body, &caller_root, caller_siblings.clone()),
@@ -491,7 +518,10 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
                 return -1;
             };
             let caller_root = caller.data().cwd();
-            let mut guard = sibling_pool.acquire();
+            let mut guard = match sibling_pool.acquire() {
+                Some(g) => g,
+                None => return -1,
+            };
             let result = match guard.as_mut() {
                 None => Err(anyhow::anyhow!("bert not loaded yet")),
                 Some(handle) => crate::registry::dispatch_on(&mut handle.store, handle.instance, "embed", &body, &caller_root, caller_siblings.clone()).and_then(|resp| {
@@ -534,20 +564,39 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
             };
             let cwd = if cwd_arg.is_empty() { caller.data().cwd() } else { PathBuf::from(&cwd_arg) };
             let mut git_cmd = std::process::Command::new("git");
-            git_cmd.args(&argv).current_dir(&cwd);
+            git_cmd.args(&argv).current_dir(&cwd).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
             #[cfg(windows)]
             {
                 use std::os::windows::process::CommandExt;
                 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
                 git_cmd.creation_flags(CREATE_NO_WINDOW);
             }
-            let output = git_cmd.output();
-            let v = match output {
-                Ok(out) => serde_json::json!({
-                    "stdout": String::from_utf8_lossy(&out.stdout),
-                    "stderr": String::from_utf8_lossy(&out.stderr),
-                    "exit_code": out.status.code().unwrap_or(-1),
-                }),
+            let v = match git_cmd.spawn() {
+                Ok(mut child) => match child.wait_timeout(Duration::from_millis(GIT_SUBPROCESS_TIMEOUT_MS)) {
+                    Ok(Some(status)) => {
+                        let mut stdout = Vec::new();
+                        let mut stderr = Vec::new();
+                        if let Some(mut o) = child.stdout.take() { let _ = std::io::Read::read_to_end(&mut o, &mut stdout); }
+                        if let Some(mut e) = child.stderr.take() { let _ = std::io::Read::read_to_end(&mut e, &mut stderr); }
+                        serde_json::json!({
+                            "stdout": String::from_utf8_lossy(&stdout),
+                            "stderr": String::from_utf8_lossy(&stderr),
+                            "exit_code": status.code().unwrap_or(-1),
+                        })
+                    }
+                    Ok(None) => {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        serde_json::json!({
+                            "stdout": "", "stderr": format!("git {argv:?} timed out after {GIT_SUBPROCESS_TIMEOUT_MS}ms, killed"),
+                            "exit_code": -1,
+                        })
+                    }
+                    Err(e) => {
+                        let _ = child.kill();
+                        serde_json::json!({"stdout": "", "stderr": format!("wait_timeout failed: {e}"), "exit_code": -1})
+                    }
+                },
                 Err(e) => serde_json::json!({"stdout": "", "stderr": e.to_string(), "exit_code": 1}),
             };
             write_guest_json(&mut caller, v)

@@ -121,19 +121,40 @@ impl SharedPluginPool {
     }
 
     /// Picks a free slot (a `try_lock`-scan round-robin), falling back to a
-    /// blocking `lock()` on slot 0 if every slot is currently busy -- under
-    /// contention this serializes exactly like the old single-slot design
-    /// used to unconditionally, so pool exhaustion degrades to the
-    /// pre-existing behavior rather than introducing a new failure mode.
-    /// Returns the OWNED lock guard so the caller holds it for the
-    /// dispatch's duration without re-locking.
-    pub fn acquire(&self) -> std::sync::MutexGuard<'_, Option<SiblingHandle>> {
+    /// BOUNDED poll on slot 0 if every slot is currently busy -- under
+    /// ordinary contention this serializes exactly like the old
+    /// unconditional-blocking-lock design, so the common case is unchanged.
+    /// Returns `None` only if slot 0 is still held after
+    /// `ACQUIRE_TIMEOUT_MS`, i.e. genuinely wedged (a stuck host_git/
+    /// host_plugin_call/candle forward-pass with no internal timeout of its
+    /// own -- see host_git's GIT_SUBPROCESS_TIMEOUT_MS doc comment for the
+    /// class of bug this backstops). Before this bound existed, a single
+    /// wedged call on a size-1 shared pool (bert/libsql: exactly one slot,
+    /// process-wide, serving every project) hung every OTHER project's call
+    /// into that same plugin forever, with no recovery short of killing the
+    /// whole daemon process -- live-reproduced against codesearch's
+    /// code_index::index() -> embed_texts_batch -> host_plugin_call("bert")
+    /// path. Returning `None` on timeout lets callers (host_plugin_call,
+    /// host_vec_embed) surface a typed "pool busy" error instead of hanging,
+    /// exactly the same shape they already use for "plugin_not_loaded_yet".
+    pub fn acquire(&self) -> Option<std::sync::MutexGuard<'_, Option<SiblingHandle>>> {
         for slot in &self.slots {
             if let Ok(guard) = slot.try_lock() {
-                return guard;
+                return Some(guard);
             }
         }
-        self.slots[0].lock().unwrap()
+        const ACQUIRE_TIMEOUT_MS: u64 = 20_000;
+        const POLL_INTERVAL_MS: u64 = 25;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(ACQUIRE_TIMEOUT_MS);
+        loop {
+            if let Ok(guard) = self.slots[0].try_lock() {
+                return Some(guard);
+            }
+            if std::time::Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(POLL_INTERVAL_MS));
+        }
     }
 
     fn any_instantiated(&self) -> bool {
@@ -349,7 +370,7 @@ impl ProjectPlugins {
         if is_stateless_shared_plugin(plugin_name) {
             let pool = shared_plugin_pool(plugin_name);
             {
-                let mut guard = pool.acquire();
+                let mut guard = pool.acquire().ok_or_else(|| anyhow::anyhow!("plugin {plugin_name} pool busy (timeout acquiring slot for load)"))?;
                 if guard.is_none() {
                     *guard = Some(instantiate_plugin(engine, self.root.clone(), plugin_name, module)?);
                 }
@@ -366,14 +387,14 @@ impl ProjectPlugins {
             .entry(plugin_name.to_string())
             .or_insert_with(|| Arc::new(SharedPluginPool::new(1)))
             .clone();
-        *pool.acquire() = Some(instantiated);
+        *pool.acquire().ok_or_else(|| anyhow::anyhow!("plugin {plugin_name} pool busy (timeout acquiring slot for load)"))? = Some(instantiated);
         Ok(())
     }
 
     pub fn dispatch(&mut self, plugin_name: &str, verb: &str, body: &str) -> anyhow::Result<String> {
         self.last_active = Instant::now();
         let pool = self.siblings.lock().unwrap().get(plugin_name).cloned().ok_or_else(|| anyhow::anyhow!("plugin {plugin_name} not loaded"))?;
-        let mut guard = pool.acquire();
+        let mut guard = pool.acquire().ok_or_else(|| anyhow::anyhow!("plugin {plugin_name} pool busy (timeout acquiring slot)"))?;
         let handle = guard.as_mut().ok_or_else(|| anyhow::anyhow!("plugin {plugin_name} not loaded"))?;
         dispatch_on(&mut handle.store, handle.instance, verb, body, &self.root, self.siblings.clone())
     }
@@ -408,7 +429,7 @@ pub struct DispatchHandle {
 impl DispatchHandle {
     pub fn dispatch(&self, plugin_name: &str, verb: &str, body: &str) -> anyhow::Result<String> {
         let pool = self.siblings.lock().unwrap().get(plugin_name).cloned().ok_or_else(|| anyhow::anyhow!("plugin {plugin_name} not loaded"))?;
-        let mut guard = pool.acquire();
+        let mut guard = pool.acquire().ok_or_else(|| anyhow::anyhow!("plugin {plugin_name} pool busy (timeout acquiring slot)"))?;
         let handle = guard.as_mut().ok_or_else(|| anyhow::anyhow!("plugin {plugin_name} not loaded"))?;
         dispatch_on(&mut handle.store, handle.instance, verb, body, &self.root, self.siblings.clone())
     }
