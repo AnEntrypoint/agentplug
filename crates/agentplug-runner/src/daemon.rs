@@ -1095,12 +1095,37 @@ fn dispatch_project(root: &Path, project: &mut ProjectPlugins, plugin_modules: &
                     }
                 }
 
-                let result = project.dispatch(&plugin_name, &verb, &body);
+                // catch_unwind, matching run_gm_dispatch_to_file's existing
+                // protection: an epoch-interrupt trap can surface as a Rust
+                // panic from deep inside a host-import callback (e.g.
+                // write_guest_bytes's plugkit_alloc call, itself invoked
+                // while the guest's OWN deadline has already elapsed) rather
+                // than a clean Err from project.dispatch's top-level Result --
+                // wasmtime's trap unwinds through whatever Rust frame is on
+                // the stack when the epoch check fires, which is not always
+                // the outermost dispatch_fn.call. Without this, that panic
+                // was silently swallowing the worker thread inside
+                // thread::scope (the `let _ = h.join();` above discards a
+                // panicked handle's Err), never reaching the client as any
+                // response at all -- this project's dispatch loop for THIS
+                // request then hung the caller until try_dispatch_via_daemon's
+                // own 30s poll timeout, even though the daemon process itself
+                // survived and kept serving other work.
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| project.dispatch(&plugin_name, &verb, &body)));
                 let out_name = format!("{plugin_name}-{verb}-{task}.json");
                 let out_body = match result {
-                    Ok(s) if !s.is_empty() => s,
-                    Ok(_) => serde_json::json!({"ok": false, "error": "empty dispatch result"}).to_string(),
-                    Err(e) => serde_json::json!({"ok": false, "error": format!("{e:#}")}).to_string(),
+                    Ok(Ok(s)) if !s.is_empty() => s,
+                    Ok(Ok(_)) => serde_json::json!({"ok": false, "error": "empty dispatch result"}).to_string(),
+                    Ok(Err(e)) => serde_json::json!({"ok": false, "error": format!("{e:#}")}).to_string(),
+                    Err(panic_payload) => {
+                        let msg = panic_payload
+                            .downcast_ref::<&str>()
+                            .map(|s| s.to_string())
+                            .or_else(|| panic_payload.downcast_ref::<String>().cloned())
+                            .unwrap_or_else(|| "panic with non-string payload".to_string());
+                        eprintln!("[agentplug daemon] plugin {plugin_name} verb {verb} PANICKED for {}: {msg}", root.display());
+                        serde_json::json!({"ok": false, "error": format!("dispatch panicked: {msg}"), "verb": verb}).to_string()
+                    }
                 };
                 write_pd_out(&out_name, &out_body);
             }
@@ -1258,6 +1283,10 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
     // repeatedly for daemon.rs fixes.
     let runner_update_poll_interval = daemon_cfg.runner_update_poll_interval();
     let mut last_runner_update_poll = Instant::now();
+    // Carries a staged-but-not-yet-handed-off self-update across ticks -- see
+    // the split staging/handoff block below for why this must survive a busy
+    // tick instead of being re-derived each time.
+    let mut pending_self_update: Option<(PathBuf, String)> = None;
 
     // Live-found (daemon-warm-pass-scales-badly-with-registry-size):
     // sync_instruction_source_if_configured runs a real `git fetch` +
@@ -1489,36 +1518,66 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
             }
         }
 
-        // Only when genuinely idle, same reasoning as the plugin-update poll
-        // above: a self-update handoff briefly needs to spawn+wait+release,
-        // which must never interrupt an in-flight dispatch. On success this
-        // process's job is done -- it has voluntarily released ownership to
-        // the new process, so it exits the loop (and the function) here
-        // rather than looping once more and re-claiming what it just handed
-        // off.
-        if !any_work && last_runner_update_poll.elapsed() >= runner_update_poll_interval {
+        // Staging (download+verify to `<exe>.new`) is deliberately NOT gated
+        // on `!any_work` -- it never touches the running process, so it's
+        // safe under any load. A daemon under sustained multi-project
+        // dispatch traffic can have `any_work` true on effectively every
+        // tick forever (any single project's request satisfies it), which
+        // previously starved this entire block -- including the staging
+        // download itself -- indefinitely: a busy daemon could poll for
+        // months and never even check for a new version, let alone hand off.
+        // Live-witnessed this session: a staged `.new` sat unapplied through
+        // multiple `bun x gm-plugkit@latest spool` reboots on a daemon that
+        // never had a quiet tick. Splitting "stage" (always attempted, once
+        // per interval) from "handoff" (still `!any_work`-gated below) means
+        // the version check and download always keep making progress, and
+        // the handoff itself still waits for a genuinely idle moment so it
+        // never interrupts in-flight dispatch.
+        if last_runner_update_poll.elapsed() >= runner_update_poll_interval {
             last_runner_update_poll = Instant::now();
             match crate::download::stage_runner_self_update() {
                 Ok(Some((staged, version))) => {
                     eprintln!("[agentplug daemon] staged self-update to {version} at {}", staged.display());
-                    if attempt_self_update_handoff(&staged, &version) {
-                        // Close every live browser session BEFORE exiting -- the new
-                        // process takes ownership with its own empty SESSIONS
-                        // registry, so any session left open here becomes an
-                        // untracked orphan chrome.exe the new process can never see
-                        // via session list/close, and the idle reaper can't reap
-                        // what it doesn't know exists. A crash/hard exit still
-                        // orphans sessions unavoidably, but this is a VOLUNTARY
-                        // exit with time to clean up first -- see
-                        // close_all_sessions's own doc comment for the live-hit
-                        // this closes.
-                        agentplug_host::close_all_sessions();
-                        eprintln!("[agentplug daemon] handed off to version {version} -- exiting");
-                        return Ok(());
-                    }
+                    pending_self_update = Some((staged, version));
                 }
                 Ok(None) => {}
                 Err(e) => eprintln!("[agentplug daemon] runner self-update check failed: {e}"),
+            }
+        }
+
+        // Only when genuinely idle: a self-update handoff briefly needs to
+        // spawn+wait+release, which must never interrupt an in-flight
+        // dispatch. On success this process's job is done -- it has
+        // voluntarily released ownership to the new process, so it exits the
+        // loop (and the function) here rather than looping once more and
+        // re-claiming what it just handed off. `pending_self_update` persists
+        // across ticks (set above, only cleared here) so a version staged
+        // during a busy tick is still handed off on the FIRST idle tick that
+        // follows, rather than being re-downloaded or lost.
+        if !any_work {
+            if let Some((staged, version)) = pending_self_update.take() {
+                if attempt_self_update_handoff(&staged, &version) {
+                    // Close every live browser session BEFORE exiting -- the new
+                    // process takes ownership with its own empty SESSIONS
+                    // registry, so any session left open here becomes an
+                    // untracked orphan chrome.exe the new process can never see
+                    // via session list/close, and the idle reaper can't reap
+                    // what it doesn't know exists. A crash/hard exit still
+                    // orphans sessions unavoidably, but this is a VOLUNTARY
+                    // exit with time to clean up first -- see
+                    // close_all_sessions's own doc comment for the live-hit
+                    // this closes.
+                    agentplug_host::close_all_sessions();
+                    eprintln!("[agentplug daemon] handed off to version {version} -- exiting");
+                    return Ok(());
+                }
+                // Handoff attempt failed (new process never confirmed ready in
+                // time) -- do not silently drop the staged binary; the next
+                // stage_runner_self_update() call will see installed_runner_version()
+                // still behind and simply re-stage/re-verify, so falling
+                // through here (pending_self_update now None) just means one
+                // extra download next interval instead of a permanently lost
+                // update attempt.
             }
         }
 

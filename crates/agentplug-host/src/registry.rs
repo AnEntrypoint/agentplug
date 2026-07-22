@@ -10,6 +10,26 @@ use crate::imports::{register_env_imports, register_wasi};
 
 pub const PLUGIN_IDLE_EVICT_MS: u64 = 30 * 60 * 1000;
 
+/// How often the background thread in lib.rs's `start_epoch_ticker` calls
+/// `Engine::increment_epoch`. Every guest-call deadline (see
+/// `epoch_ticks_for_seconds`) is expressed in units of this interval, so
+/// changing it changes what one "tick" means everywhere a deadline is armed.
+pub const EPOCH_TICK_INTERVAL_MS: u64 = 1_000;
+
+/// Ticks needed to cover `secs` wall-clock seconds, given the ticker cadence
+/// above -- rounds up so a caller asking for e.g. 30s never gets a deadline
+/// that fires early due to integer truncation.
+pub fn epoch_ticks_for_seconds(secs: u64) -> u64 {
+    (secs * 1000).div_ceil(EPOCH_TICK_INTERVAL_MS)
+}
+
+/// Deadline for one `dispatch_on` guest call (see its `set_epoch_deadline`
+/// call below) -- deliberately above `SharedPluginPool::ACQUIRE_TIMEOUT_MS`
+/// (20s) and `host_git`'s `GIT_SUBPROCESS_TIMEOUT_MS` (15s), the two other
+/// bounds in this hang class, so a call that legitimately needed the full
+/// pool-acquire wait still has room to run before this bound also fires.
+pub const DISPATCH_CALL_DEADLINE_SECS: u64 = 40;
+
 /// Plugins with no per-project state (pure function of input -> output,
 /// nothing keyed by project root) get ONE process-wide instance shared by
 /// every project instead of one instantiation per project.
@@ -246,6 +266,22 @@ pub fn dispatch_on(
     // custom-plugins.txt-subset bug this closes).
     store.data().set_siblings(caller_siblings);
     let plugin_name = store.data().plugin_name.clone();
+    // A deadline set once at instantiation does NOT refill itself -- it is a
+    // fixed epoch value computed from current+delta at set-time, and once
+    // exceeded, every future epoch-instrumented call on this Store traps
+    // immediately unless re-armed (wasmtime-46 store.rs `set_epoch_deadline`
+    // doc comment). This Store is reused across many calls (SharedPluginPool
+    // slots persist across dispatches for bert/libsql/gm/treesitter), so the
+    // deadline must be re-armed here, before ANY epoch-instrumented call this
+    // function makes -- including the plugkit_alloc calls below, which are
+    // themselves guest wasm exports and therefore also epoch-checked. Arming
+    // only right before dispatch_fn.call left those earlier alloc calls
+    // running against whatever deadline the PREVIOUS dispatch on this same
+    // Store left behind, which could already be exceeded -- live-witnessed
+    // as a `plugkit_alloc call trapped` panic surfacing from write_guest_bytes
+    // (a different call site reusing the same Store) after a prior call on
+    // this slot had genuinely exceeded its deadline.
+    store.set_epoch_deadline(epoch_ticks_for_seconds(DISPATCH_CALL_DEADLINE_SECS));
     let alloc = instance.get_typed_func::<u32, u32>(&mut *store, "plugkit_alloc")?;
     let memory = instance.get_memory(&mut *store, "memory").ok_or_else(|| anyhow::anyhow!("plugin {plugin_name} has no exported memory"))?;
 
@@ -264,7 +300,16 @@ pub fn dispatch_on(
     let dispatch_fn = instance
         .get_typed_func::<(u32, u32, u32, u32), u64>(&mut *store, "plugin_call")
         .or_else(|_| instance.get_typed_func::<(u32, u32, u32, u32), u64>(&mut *store, "dispatch_verb"))?;
-    let packed = dispatch_fn.call(&mut *store, (verb_ptr, verb.len() as u32, body_ptr, body.len() as u32))?;
+    let call_result = dispatch_fn.call(&mut *store, (verb_ptr, verb.len() as u32, body_ptr, body.len() as u32));
+    let packed = match call_result {
+        Ok(p) => p,
+        Err(e) => {
+            if matches!(e.downcast_ref::<wasmtime::Trap>(), Some(wasmtime::Trap::Interrupt)) {
+                return Err(anyhow::anyhow!("plugin_call_deadline_exceeded: {plugin_name} exceeded {DISPATCH_CALL_DEADLINE_SECS}s executing verb {verb}"));
+            }
+            return Err(e.into());
+        }
+    };
 
     let ptr = (packed & 0xffff_ffff) as u32;
     let len = (packed >> 32) as u32;
@@ -317,6 +362,14 @@ fn instantiate_plugin(engine: &Engine, root: PathBuf, plugin_name: &str, module:
     };
     let self_instance_cell = host_state.self_instance.clone();
     let mut store = Store::new(engine, host_state);
+    // wasmtime's default epoch deadline is 0, i.e. "already elapsed" -- a
+    // Store with epoch_interruption enabled (see build_engine) that never
+    // calls set_epoch_deadline traps on its very first guest call. Arming a
+    // real deadline here covers instantiate-time work (e.g. any eager guest
+    // init) and any call path that reaches this Store before dispatch_on's
+    // own per-call re-arm runs; dispatch_on re-arms fresh before every
+    // subsequent call since this one-time arm does not refill itself.
+    store.set_epoch_deadline(epoch_ticks_for_seconds(DISPATCH_CALL_DEADLINE_SECS));
     let instance = linker.instantiate(&mut store, module)?;
     *self_instance_cell.lock().unwrap() = Some(instance);
     Ok(SiblingHandle { store, instance })

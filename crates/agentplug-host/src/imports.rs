@@ -4,7 +4,7 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use wait_timeout::ChildExt;
-use wasmtime::{Caller, Linker, Memory};
+use wasmtime::{AsContextMut, Caller, Linker, Memory};
 
 use crate::host_state::HostState;
 
@@ -54,11 +54,35 @@ fn write_guest_bytes(caller: &mut Caller<'_, HostState>, bytes: &[u8]) -> u64 {
     let alloc = instance
         .get_typed_func::<u32, u32>(&mut *caller, "plugkit_alloc")
         .expect("plugkit_alloc export missing on wasm module");
-    let ptr = alloc.call(&mut *caller, bytes.len() as u32).expect("plugkit_alloc call trapped");
-    let memory = guest_memory(caller);
-    memory.write(&mut *caller, ptr as usize, bytes).expect("failed writing into guest linear memory");
-    let len = bytes.len() as u64;
-    (ptr as u64 & 0xffff_ffff) | (len << 32)
+    // This runs INSIDE an already-in-flight guest call (e.g. marshaling a
+    // slow host_exec_js's result back after the call itself blocked past
+    // this Store's epoch deadline) -- the deadline armed at dispatch_on's
+    // own entry can legitimately have already elapsed by the time control
+    // reaches here, and this alloc call is itself an epoch-checked guest
+    // export. A raw .expect() here previously panicked with a wasmtime trap
+    // string instead of degrading like every other deadline-exceeded path;
+    // `0` is this function's own documented empty/none sentinel (see
+    // docs/ABI.md's wire-format section), so a caller already treats it as
+    // "no data" rather than crashing on an unexpected return shape. Re-arming
+    // here (not just at dispatch_on's own entry) means the NEXT call on this
+    // reused Store starts from a fresh budget instead of inheriting this
+    // exceeded one.
+    match alloc.call(&mut *caller, bytes.len() as u32) {
+        Ok(ptr) => {
+            let memory = guest_memory(caller);
+            if memory.write(&mut *caller, ptr as usize, bytes).is_err() {
+                return 0;
+            }
+            let len = bytes.len() as u64;
+            (ptr as u64 & 0xffff_ffff) | (len << 32)
+        }
+        Err(e) => {
+            if matches!(e.downcast_ref::<wasmtime::Trap>(), Some(wasmtime::Trap::Interrupt)) {
+                caller.as_context_mut().set_epoch_deadline(crate::registry::epoch_ticks_for_seconds(crate::registry::DISPATCH_CALL_DEADLINE_SECS));
+            }
+            0
+        }
+    }
 }
 
 fn write_guest_json(caller: &mut Caller<'_, HostState>, v: serde_json::Value) -> u64 {
