@@ -1287,6 +1287,16 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
     // the split staging/handoff block below for why this must survive a busy
     // tick instead of being re-derived each time.
     let mut pending_self_update: Option<(PathBuf, String)> = None;
+    // Same split as pending_self_update above, one level down: a plugin
+    // refresh whose download has already completed (verified wasm sitting on
+    // disk with an updated .version file) but whose live-swap (evicting the
+    // cached Module + releasing the shared Store) hasn't happened yet because
+    // the tick it finished on wasn't idle. Persists across ticks so the swap
+    // still lands on the first idle tick that follows, rather than being
+    // silently skipped (the old all-or-nothing gate below never even
+    // reached the swap on a busy tick, so nothing carried forward -- this
+    // does).
+    let mut pending_plugin_swaps: Vec<(String, String)> = Vec::new();
 
     // Live-found (daemon-warm-pass-scales-badly-with-registry-size):
     // sync_instruction_source_if_configured runs a real `git fetch` +
@@ -1501,20 +1511,51 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
         // wasm it first downloaded forever -- no published fix ever reaches it.
         // Releasing the shared Store is what actually makes a refreshed wasm
         // take effect: the module is re-read from disk on next instantiation.
-        if !any_work && last_plugin_update_poll.elapsed() >= plugin_update_poll_interval {
+        //
+        // Split the same way as the runner self-update block below (see its
+        // comment for the live-witnessed starvation this pattern fixes): the
+        // version check + download + sha256-verify + atomic rename never
+        // touches the running process (refresh_plugin_if_stale writes to a
+        // fresh path and only overwrites the on-disk .wasm/.version files),
+        // so it is safe to run on every poll interval regardless of load --
+        // previously this whole block, including the network check itself,
+        // was gated on `!any_work`, so a daemon serving continuous
+        // back-to-back project dispatch traffic (any_work true on
+        // effectively every tick, same as the runner-update case) never even
+        // checked for a newer gm/bert/libsql/treesitter release. Only the
+        // live-swap (evicting the cached Module + releasing the shared
+        // Store, which DOES touch state a concurrent dispatch could be
+        // reading) stays idle-gated, queued in pending_plugin_swaps until a
+        // genuinely quiet tick.
+        if last_plugin_update_poll.elapsed() >= plugin_update_poll_interval {
             last_plugin_update_poll = Instant::now();
             for plugin_name in plugin_modules.modules.keys().cloned().collect::<Vec<_>>() {
                 match crate::download::refresh_plugin_if_stale(&plugin_name) {
                     Ok(Some(new_version)) => {
-                        plugin_modules.modules.remove(&plugin_name);
-                        agentplug_host::release_shared_plugin(&plugin_name);
                         eprintln!(
-                            "[agentplug daemon] refreshed plugin {plugin_name} to {new_version} -- released its Store; next call re-instantiates from the new wasm"
+                            "[agentplug daemon] downloaded+verified plugin {plugin_name} update to {new_version} -- queued for live-swap on next idle tick"
                         );
+                        pending_plugin_swaps.push((plugin_name, new_version));
                     }
                     Ok(None) => {}
                     Err(e) => eprintln!("[agentplug daemon] plugin update check for {plugin_name} failed: {e}"),
                 }
+            }
+        }
+
+        // Idle-gated half of the split above: only swap in a downloaded
+        // update when nothing is concurrently dispatching against the
+        // plugin's cached Module/Store. Drains the whole queue on the first
+        // idle tick rather than one-per-tick, since by this point every
+        // entry is already downloaded+verified on disk -- the swap itself is
+        // just a HashMap remove + Store drop, cheap enough to do all at once.
+        if !any_work && !pending_plugin_swaps.is_empty() {
+            for (plugin_name, new_version) in pending_plugin_swaps.drain(..) {
+                plugin_modules.modules.remove(&plugin_name);
+                agentplug_host::release_shared_plugin(&plugin_name);
+                eprintln!(
+                    "[agentplug daemon] refreshed plugin {plugin_name} to {new_version} -- released its Store; next call re-instantiates from the new wasm"
+                );
             }
         }
 
