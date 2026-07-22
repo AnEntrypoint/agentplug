@@ -80,21 +80,32 @@ pub const DISPATCH_CALL_DEADLINE_SECS: u64 = 40;
 /// per-call-stateless instance (see "libsql" above and
 /// agentplug-libsql's own db.rs).
 ///
-/// Sharing is correct; it is NOT free concurrency. `ProjectPlugins::dispatch`
-/// holds the shared plugin's Mutex for the full duration of the wasm call,
-/// so a long synchronous `exec_js`/`browser` dispatch against ANY project
-/// serializes every OTHER project's `gm` dispatch behind it for that same
-/// duration, regardless of the outer daemon loop's own worker-pool
-/// concurrency (live-witnessed: an unrelated project's 15s busy-loop
-/// dispatch delayed a concurrent health check on a different project by
-/// 18-21s). That is a real liveness gap in the shared-single-instance
-/// design, not something this flag can fix by itself -- the fix has to
-/// avoid holding the lock for the wasm call's entire wall-clock duration
-/// (e.g. release it around the actual blocking I/O inside exec_js/browser,
-/// or move those two verbs off the shared instance specifically while
-/// state-only verbs stay shared), not revert `gm` to per-project instances,
-/// which would just reintroduce N-times state duplication for a plugin
-/// whose state is supposed to live in flat files, not wasm memory.
+/// Sharing is correct; it is NOT free concurrency by itself. Each acquired
+/// slot's Mutex is held for the full duration of the wasm call, so a long
+/// synchronous `exec_js`/`browser` dispatch against ANY project serializes
+/// every OTHER project's `gm` dispatch behind it FOR THAT SLOT, for the same
+/// duration -- unavoidable, since the wasm guest call itself (not some
+/// separable I/O step around it) is the blocking work; there is no "release
+/// the lock around blocking I/O" seam to open inside a synchronous guest
+/// call. What removes the liveness gap is having enough slots that a live
+/// call never needs to wait for someone else's slot: `SharedPluginPool` now
+/// runs `gm_pool_size()` (default 4, matching `max_concurrent_projects`,
+/// raisable via `~/.agentplug/daemon-config.json`'s `gm_concurrency`, wired
+/// at daemon startup by `set_gm_pool_size`) concurrent slots for `gm`
+/// specifically, instead of one -- as many worker threads as there are slots
+/// can be genuinely mid-`gm`-call at once with zero queuing between them
+/// (live-witnessed, this session: a `phase-status` on one project's queue
+/// resolved in ~127ms while a concurrently-submitted `exec_js` was in-flight
+/// on the same project). The residual bound is explicit, not silently
+/// eliminated: a caller past the `gm_pool_size()`th concurrent long dispatch
+/// still round-robins onto a busy slot and queues behind it for that slot's
+/// full remaining wall-clock duration (bounded at 20s by
+/// `SharedPluginPool::acquire`'s `ACQUIRE_TIMEOUT_MS` before it surfaces a
+/// typed "pool busy" error instead of hanging) -- raise `gm_concurrency` to
+/// widen that ceiling for a workload that regularly exceeds it. Reverting
+/// `gm` to per-project instances is still the wrong direction regardless:
+/// that would reintroduce N-times state duplication for a plugin whose
+/// state is supposed to live in flat files, not wasm memory.
 fn is_stateless_shared_plugin(plugin_name: &str) -> bool {
     matches!(plugin_name, "bert" | "treesitter" | "libsql" | "gm")
 }

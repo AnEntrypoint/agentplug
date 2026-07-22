@@ -130,7 +130,12 @@ pub fn fetch_latest_runner_version() -> anyhow::Result<Option<String>> {
     let url = format!("https://api.github.com/repos/{RUNNER_BIN_REPO}/releases/latest");
     let resp = ureq::get(&url).set("User-Agent", "agentplug-runner").call()?;
     let body: serde_json::Value = serde_json::from_str(&resp.into_string()?)?;
-    Ok(body.get("tag_name").and_then(|v| v.as_str()).map(|s| s.to_string()))
+    // Stripped to match fetch_latest_plugin_version's convention below and
+    // daemon.rs's fresh-boot record_runner_version(CARGO_PKG_VERSION) writer
+    // (bare, no `v`) -- installed_runner_version() and every comparison
+    // against it must see the SAME bare format regardless of which writer
+    // (fresh boot vs self-update takeover) produced the on-disk marker.
+    Ok(body.get("tag_name").and_then(|v| v.as_str()).map(|s| s.trim_start_matches('v').to_string()))
 }
 
 /// Downloads+verifies a newer runner build to `<current-exe-path>.new`,
@@ -152,7 +157,10 @@ pub fn stage_runner_self_update() -> anyhow::Result<Option<(PathBuf, String)>> {
     let staged = current_exe.with_extension(
         current_exe.extension().map(|e| format!("{}.new", e.to_string_lossy())).unwrap_or_else(|| "new".to_string())
     );
-    let base = format!("https://github.com/{RUNNER_BIN_REPO}/releases/download/{latest}");
+    // `latest` is now bare (v-stripped, see fetch_latest_runner_version) but
+    // the GitHub release download path requires the `v`-prefixed tag, same
+    // as ensure_plugin_installed's own "download/v{version}" convention.
+    let base = format!("https://github.com/{RUNNER_BIN_REPO}/releases/download/v{latest}");
     let sha_line = ureq::get(&format!("{base}/{asset}.sha256")).call()?.into_string()?;
     let expected_sha = sha_line.split_whitespace().next()
         .ok_or_else(|| anyhow::anyhow!("empty sha256 sidecar for {asset} at {base}"))?.to_string();
