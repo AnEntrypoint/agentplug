@@ -484,7 +484,22 @@ impl ProjectPlugins {
 
     pub fn dispatch(&mut self, plugin_name: &str, verb: &str, body: &str) -> anyhow::Result<String> {
         self.last_active = Instant::now();
-        let pool = self.siblings.lock().unwrap().get(plugin_name).cloned().ok_or_else(|| anyhow::anyhow!("plugin {plugin_name} not loaded"))?;
+        // A registered-but-momentarily-absent plugin pool (a concurrent loader thread
+        // still mid-registration on the shared siblings map, or a transient eviction/
+        // reload race) previously surfaced as a hard "plugin X not loaded" error with
+        // zero recourse -- live-witnessed clearing on every bare caller-side retry this
+        // session, the same shape as host_vec_embed's bert-pool-contention bug fixed
+        // separately. Retry the pool lookup bounded before surfacing the error, same
+        // pattern as that fix.
+        const DISPATCH_LOOKUP_RETRY_ATTEMPTS: u32 = 3;
+        const DISPATCH_LOOKUP_RETRY_BACKOFF_MS: u64 = 200;
+        let mut pool = None;
+        for attempt in 0..DISPATCH_LOOKUP_RETRY_ATTEMPTS {
+            pool = self.siblings.lock().unwrap().get(plugin_name).cloned();
+            if pool.is_some() || attempt + 1 == DISPATCH_LOOKUP_RETRY_ATTEMPTS { break; }
+            std::thread::sleep(std::time::Duration::from_millis(DISPATCH_LOOKUP_RETRY_BACKOFF_MS));
+        }
+        let pool = pool.ok_or_else(|| anyhow::anyhow!("plugin {plugin_name} not loaded"))?;
         let mut guard = pool.acquire().ok_or_else(|| anyhow::anyhow!("plugin {plugin_name} pool busy (timeout acquiring slot)"))?;
         let handle = guard.as_mut().ok_or_else(|| anyhow::anyhow!("plugin {plugin_name} not loaded"))?;
         dispatch_on(&mut handle.store, handle.instance, verb, body, &self.root, self.siblings.clone())
@@ -519,7 +534,16 @@ pub struct DispatchHandle {
 
 impl DispatchHandle {
     pub fn dispatch(&self, plugin_name: &str, verb: &str, body: &str) -> anyhow::Result<String> {
-        let pool = self.siblings.lock().unwrap().get(plugin_name).cloned().ok_or_else(|| anyhow::anyhow!("plugin {plugin_name} not loaded"))?;
+        // Same bounded-retry rationale as ProjectPlugins::dispatch above.
+        const DISPATCH_LOOKUP_RETRY_ATTEMPTS: u32 = 3;
+        const DISPATCH_LOOKUP_RETRY_BACKOFF_MS: u64 = 200;
+        let mut pool = None;
+        for attempt in 0..DISPATCH_LOOKUP_RETRY_ATTEMPTS {
+            pool = self.siblings.lock().unwrap().get(plugin_name).cloned();
+            if pool.is_some() || attempt + 1 == DISPATCH_LOOKUP_RETRY_ATTEMPTS { break; }
+            std::thread::sleep(std::time::Duration::from_millis(DISPATCH_LOOKUP_RETRY_BACKOFF_MS));
+        }
+        let pool = pool.ok_or_else(|| anyhow::anyhow!("plugin {plugin_name} not loaded"))?;
         let mut guard = pool.acquire().ok_or_else(|| anyhow::anyhow!("plugin {plugin_name} pool busy (timeout acquiring slot)"))?;
         let handle = guard.as_mut().ok_or_else(|| anyhow::anyhow!("plugin {plugin_name} not loaded"))?;
         dispatch_on(&mut handle.store, handle.instance, verb, body, &self.root, self.siblings.clone())
