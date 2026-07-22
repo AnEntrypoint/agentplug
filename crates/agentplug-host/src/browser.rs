@@ -120,12 +120,37 @@ fn which(cmd: &str) -> Option<PathBuf> {
     })
 }
 
+/// Live-found (chrome-discovery-misses-macos): this list only ever checked
+/// `/usr/bin/google-chrome`+chromium (Linux) or the Windows Program Files
+/// paths -- a standard macOS install at
+/// `/Applications/Google Chrome.app/Contents/MacOS/Google Chrome` was never
+/// a candidate, so `find_chrome()` fell straight through to the `which()`
+/// PATH lookup below, which fails too (installing Chrome.app does not put
+/// anything on PATH), and every browser dispatch on an otherwise-correctly-
+/// provisioned Mac failed with "no Chrome found; install Google Chrome or
+/// Chromium". Fixed by adding the standard system-wide and per-user
+/// macOS app-bundle paths (plus Chromium.app for parity with the Linux
+/// chromium fallback) as additional candidates -- the existing Linux/
+/// Windows/PATH checks are untouched since this same binary is built and
+/// run on those platforms too.
 fn find_chrome() -> Option<PathBuf> {
     let candidates = if cfg!(windows) {
         vec![
             PathBuf::from(r"C:\Program Files\Google\Chrome\Application\chrome.exe"),
             PathBuf::from(r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"),
         ]
+    } else if cfg!(target_os = "macos") {
+        let mut v = vec![
+            PathBuf::from("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
+            PathBuf::from("/Applications/Chromium.app/Contents/MacOS/Chromium"),
+        ];
+        if let Some(home) = std::env::var_os("HOME") {
+            v.push(
+                PathBuf::from(home)
+                    .join("Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
+            );
+        }
+        v
     } else {
         vec![
             PathBuf::from("/usr/bin/google-chrome"),
@@ -184,10 +209,13 @@ fn parse_body(body: &str) -> (Option<String>, String) {
 /// `capture\n<script>` / `profile\n<script>` / `trace\n<script>` mode
 /// prefixes, documented in AGENTS.md/SKILL.md's exec_js/browser profiling
 /// contract but never implemented in the native agentplug-host browser
-/// path (only the retired JS wrapper had them). Stripped before parse_body
-/// sees the remaining url=/bare-URL/script body, so the two prefix systems
-/// compose (e.g. "profile\nurl=https://...\nscript").
+/// path (only the retired JS wrapper had them). Stripped (alongside
+/// `strip_timeout_prefix`, in a loop so the two compose in either order)
+/// before parse_body sees the remaining url=/bare-URL/script body, so all
+/// three prefix systems compose (e.g. "profile\nurl=https://...\nscript",
+/// or "timeout=30000\nurl=https://...\nscript", or both stacked together).
 #[derive(Clone, Copy, PartialEq)]
+#[cfg_attr(test, derive(Debug))]
 enum BrowserMode {
     Default,
     Capture,
@@ -203,6 +231,41 @@ fn strip_mode_prefix(body: &str) -> (BrowserMode, &str) {
         }
     }
     (BrowserMode::Default, body)
+}
+
+/// Live-found (timeout-prefix-stacking-syntax-error): `timeout=<ms>` was
+/// documented as a stackable dispatch prefix (e.g.
+/// `timeout=30000\nurl=http://host/\n<script>`) but NOTHING in this file
+/// ever recognized it -- `strip_mode_prefix` only knows capture/profile/
+/// trace, and `parse_body` only recognizes `url=`/a bare `http(s)://` URL
+/// as literally the body's first token. So a body starting with
+/// `timeout=...` fell through every check and the ENTIRE remaining text --
+/// including the real `url=...` line after it -- was handed to Node as the
+/// script verbatim. `url=http://x/` is not valid JS as a bare statement:
+/// it tokenizes as the assignment expression `url = http` (the `//` that
+/// follows is lexed as a line comment, eating `/x/` and the rest of the
+/// line) immediately followed by a stray `:` left over from `http:`, which
+/// V8 rejects with exactly the reported `SyntaxError: Unexpected token
+/// ':'` -- instantly, since no `startUrl` was ever extracted, so
+/// `evalOnly` never even reaches its `Page.navigate` branch. Fixed by
+/// giving `timeout=` its own prefix-stripper, called in a loop alongside
+/// `strip_mode_prefix` in `run()` below so mode and timeout compose in
+/// EITHER order before `parse_body` ever sees the (now-correctly-located)
+/// `url=`/script remainder -- matching how mode already composed with
+/// url=, just extended to cover this second, previously entirely
+/// unimplemented prefix.
+fn strip_timeout_prefix(body: &str) -> (Option<u64>, &str) {
+    let trimmed = body.trim_start();
+    if let Some(rest) = trimmed.strip_prefix("timeout=") {
+        let (num, remainder) = match rest.find('\n') {
+            Some(nl) => (&rest[..nl], &rest[nl + 1..]),
+            None => (rest, ""),
+        };
+        if let Ok(ms) = num.trim().parse::<u64>() {
+            return (Some(ms), remainder);
+        }
+    }
+    (None, body)
 }
 
 fn browser_profiles_dir(cwd: &Path) -> PathBuf {
@@ -740,8 +803,33 @@ pub fn run(body: &str, cwd: &Path, session_id: &str) -> Value {
         SessionCommand::None => {}
     }
 
-    let (mode, after_mode) = strip_mode_prefix(&inner_body);
-    let (start_url, script) = parse_body(after_mode);
+    // Mode (capture/profile/trace) and timeout= are both outer stackable
+    // prefixes that must compose with EACH OTHER in either order, and with
+    // the url=/bare-URL prefix parse_body handles next -- loop stripping
+    // whichever matches until neither does, rather than the old fixed
+    // single-shot mode-then-url order that silently swallowed a stacked
+    // `timeout=` line whole (see strip_timeout_prefix's doc comment for the
+    // exact syntax-error mechanism this fixes).
+    let mut mode = BrowserMode::Default;
+    let mut timeout_override: Option<u64> = None;
+    let mut rest: &str = &inner_body;
+    loop {
+        let (m, after_mode) = strip_mode_prefix(rest);
+        if m != BrowserMode::Default {
+            mode = m;
+            rest = after_mode;
+            continue;
+        }
+        let (t, after_timeout) = strip_timeout_prefix(rest);
+        if let Some(ms) = t {
+            timeout_override = Some(ms);
+            rest = after_timeout;
+            continue;
+        }
+        break;
+    }
+    let (start_url, script) = parse_body(rest);
+    let timeout_ms = timeout_override.unwrap_or(timeout_ms);
 
     let tmp = std::env::temp_dir();
     let stamp = format!("{}-{}", std::process::id(), sanitize(session_id));
@@ -970,5 +1058,188 @@ fn sanitize(s: &str) -> String {
 fn cleanup(paths: &[&Path]) {
     for p in paths {
         let _ = std::fs::remove_file(p);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Bug 1 regression test: on macOS, find_chrome() must locate the
+    /// standard app-bundle install even with no `chrome`/`google-chrome`
+    /// on PATH. This runs the real function against the real filesystem
+    /// (no mocking) -- on a macOS CI/dev box with Chrome installed at the
+    /// standard location, this previously returned None and every browser
+    /// dispatch failed with "no Chrome found".
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn find_chrome_locates_macos_app_bundle() {
+        let found = find_chrome();
+        assert!(
+            found.is_some(),
+            "find_chrome() should locate a macOS Chrome/Chromium install; got None"
+        );
+        let path = found.unwrap();
+        assert!(path.exists(), "resolved chrome path {:?} does not exist", path);
+    }
+
+    /// Bug 2 regression test: stacking `timeout=<ms>` in front of `url=`
+    /// must extract BOTH correctly, not swallow the url= line into the
+    /// script. This is the exact repro from the live-hit bug report.
+    #[test]
+    fn timeout_then_url_prefix_stack_parses_correctly() {
+        let body = "timeout=30000\nurl=http://x/\nreturn 1+1;";
+        let mut mode = BrowserMode::Default;
+        let mut timeout_override: Option<u64> = None;
+        let mut rest: &str = body;
+        loop {
+            let (m, after_mode) = strip_mode_prefix(rest);
+            if m != BrowserMode::Default {
+                mode = m;
+                rest = after_mode;
+                continue;
+            }
+            let (t, after_timeout) = strip_timeout_prefix(rest);
+            if let Some(ms) = t {
+                timeout_override = Some(ms);
+                rest = after_timeout;
+                continue;
+            }
+            break;
+        }
+        let (start_url, script) = parse_body(rest);
+
+        assert_eq!(mode, BrowserMode::Default);
+        assert_eq!(timeout_override, Some(30000));
+        assert_eq!(start_url, Some("http://x/".to_string()));
+        assert_eq!(script, "return 1+1;");
+    }
+
+    /// The single-prefix case (`url=` alone, no `timeout=`) must keep
+    /// working byte-identically to before this fix.
+    #[test]
+    fn url_prefix_alone_still_works() {
+        let body = "url=http://x/\nreturn 1+1;";
+        let (mode, after_mode) = strip_mode_prefix(body);
+        assert_eq!(mode, BrowserMode::Default);
+        let (t, after_timeout) = strip_timeout_prefix(after_mode);
+        assert_eq!(t, None);
+        let (start_url, script) = parse_body(after_timeout);
+        assert_eq!(start_url, Some("http://x/".to_string()));
+        assert_eq!(script, "return 1+1;");
+    }
+
+    /// mode + timeout + url all stacked, mode first: composition must be
+    /// fully order-independent between the two outer prefixes.
+    #[test]
+    fn mode_then_timeout_then_url_all_compose() {
+        let body = "capture\ntimeout=5000\nurl=http://x/\nreturn 42;";
+        let mut mode = BrowserMode::Default;
+        let mut timeout_override: Option<u64> = None;
+        let mut rest: &str = body;
+        loop {
+            let (m, after_mode) = strip_mode_prefix(rest);
+            if m != BrowserMode::Default {
+                mode = m;
+                rest = after_mode;
+                continue;
+            }
+            let (t, after_timeout) = strip_timeout_prefix(rest);
+            if let Some(ms) = t {
+                timeout_override = Some(ms);
+                rest = after_timeout;
+                continue;
+            }
+            break;
+        }
+        let (start_url, script) = parse_body(rest);
+
+        assert_eq!(mode, BrowserMode::Capture);
+        assert_eq!(timeout_override, Some(5000));
+        assert_eq!(start_url, Some("http://x/".to_string()));
+        assert_eq!(script, "return 42;");
+    }
+
+    /// timeout + mode stacked, timeout first: same as above but reversed
+    /// order, proving the loop (not a fixed mode-then-timeout sequence)
+    /// is what makes this compose.
+    #[test]
+    fn timeout_then_mode_then_url_all_compose() {
+        let body = "timeout=5000\ncapture\nurl=http://x/\nreturn 42;";
+        let mut mode = BrowserMode::Default;
+        let mut timeout_override: Option<u64> = None;
+        let mut rest: &str = body;
+        loop {
+            let (m, after_mode) = strip_mode_prefix(rest);
+            if m != BrowserMode::Default {
+                mode = m;
+                rest = after_mode;
+                continue;
+            }
+            let (t, after_timeout) = strip_timeout_prefix(rest);
+            if let Some(ms) = t {
+                timeout_override = Some(ms);
+                rest = after_timeout;
+                continue;
+            }
+            break;
+        }
+        let (start_url, script) = parse_body(rest);
+
+        assert_eq!(mode, BrowserMode::Capture);
+        assert_eq!(timeout_override, Some(5000));
+        assert_eq!(start_url, Some("http://x/".to_string()));
+        assert_eq!(script, "return 42;");
+    }
+
+    /// End-to-end live verification through the REAL public entry point,
+    /// driving a REAL Chrome process over CDP: the exact stacked-prefix
+    /// dispatch body that used to fail instantly with `SyntaxError:
+    /// Unexpected token ':'` must now navigate and evaluate correctly.
+    /// Requires Chrome + node on the host, same as any real dispatch;
+    /// skips itself (rather than failing) if either is absent so this
+    /// doesn't break CI runners without a browser.
+    #[test]
+    fn run_end_to_end_timeout_and_url_stack() {
+        if which("node").is_none() {
+            eprintln!("skipping run_end_to_end_timeout_and_url_stack: node not on PATH");
+            return;
+        }
+        if find_chrome().is_none() {
+            eprintln!("skipping run_end_to_end_timeout_and_url_stack: no Chrome found");
+            return;
+        }
+        let tmp = std::env::temp_dir().join(format!("agentplug-browser-test-{}", unix_ms()));
+        std::fs::create_dir_all(tmp.join(".gm")).unwrap();
+        // Force headless so this doesn't pop a visible window in CI/dev.
+        std::fs::write(
+            tmp.join(".gm").join("browser-config.json"),
+            r#"{"headless": true}"#,
+        )
+        .unwrap();
+
+        let envelope = json!({
+            "body": "timeout=30000\nurl=data:text/plain,hello\nreturn 1+1;",
+            "timeoutMs": 3000,
+        })
+        .to_string();
+
+        let result = run(&envelope, &tmp, "test-timeout-url-stack");
+
+        // Close whatever Chrome session this test launched so it doesn't
+        // linger as an orphaned process after the test process exits.
+        let _ = session_close(&tmp, "test-timeout-url-stack", true);
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        assert_eq!(
+            result.get("ok").and_then(|v| v.as_bool()),
+            Some(true),
+            "expected ok:true, got {result:?}"
+        );
+        assert_eq!(
+            result.get("result").and_then(|v| v.as_i64()),
+            Some(2),
+            "expected result:2 (1+1), got {result:?}"
+        );
     }
 }
