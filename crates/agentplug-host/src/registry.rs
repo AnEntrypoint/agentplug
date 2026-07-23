@@ -242,8 +242,7 @@ impl ProjectPlugins {
         }
         let pool = pool.ok_or_else(|| anyhow::anyhow!("plugin {plugin_name} not loaded"))?;
         let mut guard = pool.acquire().ok_or_else(|| anyhow::anyhow!("plugin {plugin_name} pool busy (timeout acquiring slot)"))?;
-        let handle = guard.as_mut().ok_or_else(|| anyhow::anyhow!("plugin {plugin_name} not loaded"))?;
-        dispatch_on(&mut handle.store, handle.instance, verb, body, &self.root, self.siblings.clone())
+        dispatch_and_evict_on_error(&mut guard, verb, body, &self.root, &self.siblings, plugin_name)
     }
 
     pub fn dispatch_handle(&self) -> DispatchHandle {
@@ -269,9 +268,24 @@ impl DispatchHandle {
         }
         let pool = pool.ok_or_else(|| anyhow::anyhow!("plugin {plugin_name} not loaded"))?;
         let mut guard = pool.acquire().ok_or_else(|| anyhow::anyhow!("plugin {plugin_name} pool busy (timeout acquiring slot)"))?;
-        let handle = guard.as_mut().ok_or_else(|| anyhow::anyhow!("plugin {plugin_name} not loaded"))?;
-        dispatch_on(&mut handle.store, handle.instance, verb, body, &self.root, self.siblings.clone())
+        dispatch_and_evict_on_error(&mut guard, verb, body, &self.root, &self.siblings, plugin_name)
     }
+}
+
+fn dispatch_and_evict_on_error(
+    guard: &mut std::sync::MutexGuard<'_, Option<SiblingHandle>>,
+    verb: &str,
+    body: &str,
+    root: &Path,
+    siblings: &Arc<Mutex<HashMap<String, Arc<SharedPluginPool>>>>,
+    plugin_name: &str,
+) -> anyhow::Result<String> {
+    let handle = guard.as_mut().ok_or_else(|| anyhow::anyhow!("plugin {plugin_name} not loaded"))?;
+    let result = dispatch_on(&mut handle.store, handle.instance, verb, body, root, siblings.clone());
+    if result.is_err() {
+        **guard = None;
+    }
+    result
 }
 
 #[derive(serde::Deserialize, Default)]
