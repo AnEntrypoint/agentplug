@@ -500,7 +500,10 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
                     }
                     dim as i32
                 }
-                Err(_) => -1,
+                Err(e) => {
+                    eprintln!("[agentplug:host_vec_embed] failed after {EMBED_RETRY_ATTEMPTS} attempts: {e}");
+                    -1
+                }
             }
         },
     )?;
