@@ -8,47 +8,8 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 use wait_timeout::ChildExt;
 
-// Drives a real Chrome via the DevTools protocol instead of shelling out to the
-// playwriter CLI, whose relay process crashes with a real, live-reproducible
-// Windows libuv assertion on every eval dispatch: "Assertion failed:
-// !(handle->flags & UV_HANDLE_CLOSING), file src\win\async.c, line 76"
-// (re-confirmed live, twice, on playwriter 0.4.0 -- not a stale/misdiagnosed
-// finding; the crash is specific to this Windows async-handle-teardown
-// class, not evidence against playwriter's broad cross-platform userbase
-// elsewhere). The flow that works on this host, proven end to end: launch
-// Chrome headless with --remote-debugging-port, poll its /json/version HTTP
-// endpoint for the DevTools websocket, then run the script in-page via
-// Runtime.evaluate over that websocket. Chrome exposes CDP over HTTP+WS with
-// no external dependency; the one piece needing a websocket client is the
-// eval, which a bundled node helper (node has a native WebSocket) performs --
-// node is already a required runtime for this environment. No playwriter, no
-// relay, no crash.
-//
-// Live-found (browser-session-process-not-persisted): a fresh Chrome used to
-// launch AND get unconditionally killed at the end of EVERY single dispatch,
-// so only the on-disk --user-data-dir profile persisted across dispatches --
-// the live process/visible window never did, meaning "open the browser so we
-// can see it" flashed open and immediately closed. Fixed: a process-wide
-// SESSIONS registry (below) now keeps a launched Chrome child + its CDP port
-// alive across dispatches sharing the same (cwd, session_id) key, reusing it
-// on every subsequent dispatch instead of relaunching. The Chrome process now
-// only dies via an explicit `session close`/`session reset`, the opportunistic
-// idle-timeout reaper, or the whole agentplug-runner daemon exiting (normal
-// OS child-process teardown).
-
 const CDP_EVAL_JS: &str = include_str!("cdp_eval.js");
 
-/// Live-found (vendor-browser-timing-config-to-gm): every CDP timing
-/// constant below was a hardcoded literal, unreachable to a project wanting
-/// to tune it (a slower CI runner needing a longer chrome-ready deadline, a
-/// project wanting a tighter poll interval, etc) -- agentplug-runner is a
-/// native binary, not the wasm guest, so it needs its OWN .gm/-reading
-/// mechanism for this (the existing pattern: daemon.rs's
-/// instruction_source_config_path reads .gm/instructions/source.json
-/// per-project the same way). Read from <project>/.gm/browser-config.json
-/// when present; every field is optional and falls back to the exact
-/// pre-existing literal, so an unconfigured project behaves byte-identically
-/// to before this change.
 #[derive(serde::Deserialize)]
 struct BrowserConfig {
     #[serde(default)]
@@ -59,20 +20,8 @@ struct BrowserConfig {
     chrome_ready_deadline_ms: Option<u64>,
     #[serde(default)]
     eval_timeout_grace_ms: Option<u64>,
-    // Live-found (user-reported): Chrome launched with a hardcoded
-    // --headless=new on every dispatch, no way to opt into a visible window
-    // even though this project's own stated preference is headful Chrome.
-    // Default false (headful) -- the opposite of the previous hardcoded
-    // behavior -- matching the explicit stated preference; a project that
-    // genuinely wants headless (CI, no display attached) sets
-    // {"headless": true} in .gm/browser-config.json.
     #[serde(default)]
     headless: Option<bool>,
-    // Live-found (browser-session-process-not-persisted): sessions now keep
-    // their Chrome process alive indefinitely across dispatches unless
-    // explicitly closed, so an idle-timeout reaper is needed to avoid
-    // accumulating abandoned Chrome processes across a long-lived daemon.
-    // Default 30 minutes when absent.
     #[serde(default)]
     session_idle_timeout_ms: Option<u64>,
 }
@@ -181,20 +130,6 @@ fn parse_body(body: &str) -> (Option<String>, String) {
     (None, body.to_string())
 }
 
-/// `capture\n<script>` / `profile\n<script>` / `trace\n<script>` mode
-/// prefixes, documented in AGENTS.md/SKILL.md's exec_js/browser profiling
-/// contract but never implemented in the native agentplug-host browser
-/// path (only the retired JS wrapper had them). Stripped before parse_body
-/// sees the remaining url=/bare-URL/script body, so the two prefix systems
-/// compose (e.g. "profile\nurl=https://...\nscript").
-// Screenshot and Dom variants close a live-found documented-but-unimplemented
-// gap: browser.md's served prose documents `screenshot\n<expression>` (writes
-// a PNG to .gm/witness/, returns its path) and `dom=<selector>\n` (returns
-// matched element info) as real body-shape prefixes, but this enum + its
-// strip_mode_prefix parser previously had zero handling for either -- the
-// prose-conformance PRD item's own static check is what surfaced this,
-// exactly the "prose promises a capability, zero implementing code" class
-// the item was built to catch structurally.
 #[derive(Clone, Copy, PartialEq)]
 enum BrowserMode {
     Default,
@@ -205,10 +140,6 @@ enum BrowserMode {
     Dom,
 }
 
-/// `dom=<selector>\n<rest>` carries its own selector argument inline (unlike
-/// capture/profile/trace's bare `<word>\n` prefix), so it needs its own strip
-/// path returning the selector alongside the mode. Returns (mode, selector,
-/// remaining body) -- selector is empty for every non-Dom mode.
 fn strip_mode_prefix(body: &str) -> (BrowserMode, String, &str) {
     let trimmed = body.trim_start();
     for (prefix, mode) in [
@@ -231,15 +162,6 @@ fn strip_mode_prefix(body: &str) -> (BrowserMode, String, &str) {
     (BrowserMode::Default, String::new(), body)
 }
 
-/// `timeout=<ms>\n<rest>` -- documented in browser.md's Body shapes list
-/// ("timeout=<ms>\n<expression>", composing with url=/capture/etc as the
-/// OUTERMOST prefix per the prose's own stacking order) but, confirmed live
-/// via the prose-conformance script this fix was found by, never actually
-/// parsed anywhere in this file -- `timeout_ms` previously only ever came
-/// from the outer spool-dispatch JSON envelope's `timeoutMs` field, with no
-/// way for an in-body `timeout=` prefix to override it as documented.
-/// Returns `Some(parsed_ms)` and the remainder past the prefix, or `None`
-/// (envelope timeout wins unchanged) if the prefix is absent.
 fn strip_timeout_prefix(body: &str) -> (Option<u64>, &str) {
     let trimmed = body.trim_start();
     let Some(rest) = trimmed.strip_prefix("timeout=") else { return (None, body) };
@@ -255,28 +177,10 @@ fn browser_profiles_dir(cwd: &Path) -> PathBuf {
     cwd.join(".gm").join("browser-profiles")
 }
 
-/// Live-found (browser-profile-not-persisted-locally-to-project): Chrome's
-/// --user-data-dir previously lived under std::env::temp_dir() and was
-/// std::fs::remove_dir_all'd at the end of EVERY dispatch -- zero session
-/// persistence (cookies, localStorage, login state, cache) across
-/// dispatches, and the profile lived outside the project entirely, contrary
-/// to the "locally profiled to the project" requirement. Fixed: the Chrome
-/// user-data-dir now lives under <project>/.gm/browser-chrome-profile-
-/// <session_id>/ (distinct from browser_profiles_dir above, which holds
-/// CPU/trace ARTIFACT files from the profile/trace modes, not the live
-/// Chrome profile) and is NEVER deleted after a dispatch -- only a fresh
-/// dispatch under the SAME session_id reuses it, so state genuinely
-/// persists across a debugging session. As of the SESSIONS registry below,
-/// the live Chrome PROCESS itself also now persists across dispatches, not
-/// just this on-disk directory -- this dir survives even a `session close`
-/// (only the process is killed) so the next `session new` under the same id
-/// still gets a warm profile. `sanitize` keeps the directory name
-/// filesystem-safe the same way the old temp-dir stamp already did.
 fn browser_chrome_profile_dir(cwd: &Path, session_id: &str) -> PathBuf {
     cwd.join(".gm").join(format!("browser-chrome-profile-{}", sanitize(session_id)))
 }
 
-/// A live, registry-tracked Chrome process for one `(cwd, session_id)` key.
 struct BrowserSession {
     cwd: PathBuf,
     session_id: String,
@@ -285,11 +189,6 @@ struct BrowserSession {
     last_used: Instant,
 }
 
-/// Process-wide registry of live Chrome sessions, keyed by a String formed
-/// from `(cwd, session_id)` so two different projects reusing the same bare
-/// session_id never collide/share a Chrome process. Mirrors the house
-/// pattern in agentplug-runner's daemon.rs (`static IN_FLIGHT: OnceLock<
-/// Mutex<HashMap<...>>>`).
 static SESSIONS: OnceLock<Mutex<HashMap<String, BrowserSession>>> = OnceLock::new();
 
 fn sessions_map() -> &'static Mutex<HashMap<String, BrowserSession>> {
@@ -300,10 +199,6 @@ fn session_key(cwd: &Path, session_id: &str) -> String {
     format!("{}\u{0}{}", cwd.display(), session_id)
 }
 
-/// Non-blocking liveness check: `try_wait() == Ok(None)` means still running.
-/// A session whose process already exited on its own (user closed the
-/// window manually, Chrome crashed) is treated as dead so callers fall
-/// through to a fresh relaunch instead of reusing a corpse entry.
 fn session_is_alive(child: &mut Child) -> bool {
     matches!(child.try_wait(), Ok(None))
 }
@@ -314,13 +209,6 @@ fn kill_session(mut session: BrowserSession) {
     let _ = std::fs::remove_file(pid_sidecar_path(&browser_chrome_profile_dir(&session.cwd, &session.session_id)));
 }
 
-/// Sidecar file recording the OS pid of the Chrome process launched into a
-/// given profile dir, so a LATER process (this same binary restarted after a
-/// crash, or a fresh daemon after a lost-heartbeat race) can identify and
-/// reap an orphan even though its own in-memory `SESSIONS` registry starts
-/// empty. Written at launch, removed on any clean kill path
-/// (`kill_session`); a leftover file with a since-reused or dead pid is
-/// exactly the crash-orphan signal `reap_os_orphans` looks for.
 fn pid_sidecar_path(profile_dir: &Path) -> PathBuf {
     profile_dir.join("chrome.pid")
 }
@@ -333,25 +221,14 @@ fn pid_is_alive(pid: u32) -> bool {
     match output {
         Ok(o) => {
             let s = String::from_utf8_lossy(&o.stdout);
-            // tasklist prints a matching CSV row ("name","pid",...) when the
-            // pid exists, or an "INFO: No tasks..." line (no comma) when it
-            // does not -- a comma in the first line is the cheap
-            // discriminator (same pattern as agentplug-runner's daemon.rs
-            // is_daemon_fresh liveness check).
             s.lines().next().map(|l| l.contains(',')).unwrap_or(false)
         }
-        // tasklist itself failing to run is a host-environment problem, not
-        // evidence the pid is dead -- fail open (treat as alive, i.e. do
-        // NOT kill) rather than false-positive-reap a process tasklist
-        // merely couldn't be asked about.
         Err(_) => true,
     }
 }
 
 #[cfg(not(windows))]
 fn pid_is_alive(pid: u32) -> bool {
-    // kill(pid, 0) checks existence/permission without sending a real
-    // signal -- the POSIX-standard liveness probe, zero new dependencies.
     Command::new("kill")
         .args(["-0", &pid.to_string()])
         .status()
@@ -359,35 +236,6 @@ fn pid_is_alive(pid: u32) -> bool {
         .unwrap_or(true)
 }
 
-/// Real OS-level orphan reaper, run opportunistically on every `run()` call
-/// (same no-dedicated-timer-thread pattern as `reap_idle_sessions`), scoped
-/// to this cwd's OWN `.gm/browser-chrome-profile-*` directories only.
-///
-/// Closes the gap this file's own module doc + browser.md both name: a
-/// crash or hard kill (SIGKILL / Windows TerminateProcess / an OOM-killer
-/// hit / the whole agentplug-runner process itself being force-killed)
-/// leaves a live Chrome child running with NO chance for `close_all_sessions`
-/// or `kill_session` to run first -- the in-memory `SESSIONS` registry that
-/// tracked it is gone the moment the owning process dies, so a subsequent
-/// process (this same daemon restarted, or the next dispatch's `run()` in a
-/// freshly-booted daemon after a lost-heartbeat exit) starts with an EMPTY
-/// registry and has no way to know that chrome.exe is still alive, using the
-/// port, holding the profile-dir lock. Previously nothing ever reaped this
-/// case -- only `reap_idle_sessions` (needs a registry entry to time out) and
-/// `close_all_sessions` (only runs on a VOLUNTARY exit that has time to call
-/// it) existed, neither of which fires for a crash.
-///
-/// Mechanism: every launched Chrome writes its pid to
-/// `<profile_dir>/chrome.pid` at launch (see `launch_chrome`) and removes it
-/// on any clean `kill_session`. On each `run()` call, scan this cwd's
-/// `.gm/browser-chrome-profile-*` dirs; for each one NOT already claimed by
-/// a live entry in `SESSIONS` (i.e. this process has no in-memory record of
-/// owning it), read the sidecar pid and check real OS liveness. A dead pid
-/// (or unreadable sidecar) just gets the stale sidecar file removed --
-/// nothing to reap. A LIVE pid with no owning session is the genuine orphan:
-/// kill it (real OS process, not merely a registry entry -- see
-/// `kill(pid)`/`taskkill` below) and remove the sidecar so the profile dir
-/// is clean for the next `session new`/relaunch.
 fn reap_os_orphans(cwd: &Path) {
     let dir = browser_profiles_root_for_orphan_scan(cwd);
     let Ok(entries) = std::fs::read_dir(&dir) else { return };
@@ -408,22 +256,9 @@ fn reap_os_orphans(cwd: &Path) {
             continue;
         }
         if claimed_dirs.contains(&path) {
-            // A live session in THIS process already owns this profile dir
-            // -- nothing to reap regardless of what the sidecar says.
             continue;
         }
         let sidecar = pid_sidecar_path(&path);
-        // Grace period, keyed off the sidecar file's own mtime rather than a
-        // wall-clock timestamp payload: a chrome that is still mid-launch in
-        // ANOTHER process (a self-update handoff briefly overlapping the old
-        // and new daemon, both scanning the same .gm/ tree) has just written
-        // this file but has not yet had a chance to become CDP-ready and get
-        // inserted into ITS OWN process's SESSIONS map -- to this scanning
-        // process it looks identical to a real orphan (live pid, unclaimed
-        // dir) unless freshly-written sidecars are given a moment to either
-        // finish launching (and get genuinely claimed elsewhere) or fail.
-        // Matches browser.md's documented "just-launched browser has a grace
-        // period before any reaper can touch it" contract.
         const ORPHAN_REAP_GRACE: Duration = Duration::from_secs(15);
         if let Ok(meta) = std::fs::metadata(&sidecar) {
             if let Ok(age) = meta.modified().and_then(|m| m.elapsed().map_err(|e| std::io::Error::other(e))) {
@@ -453,17 +288,8 @@ fn browser_profiles_root_for_orphan_scan(cwd: &Path) -> PathBuf {
     cwd.join(".gm")
 }
 
-/// Bounded liveness re-check against the SAME page context an eval just
-/// timed out on, run over the same CDP mechanism (`cdp_eval.js`'s node
-/// helper) rather than reimplementing a CDP websocket client in Rust.
-/// Trivial script (`1+1`), short fixed deadline (not the caller's own
-/// timeout -- this IS the "is it actually wedged" probe, so it must resolve
-/// quickly regardless of how long the original eval's timeout was) --
-/// returns true only if the page answers with the expected result, false
-/// for any timeout/crash/error, which is exactly the "renderer is wedged"
-/// signal `run()`'s eval-timeout handler escalates on.
 fn session_liveness_recheck(port: u16, browser_cfg: &BrowserConfig) -> bool {
-    let Some(node) = which("node") else { return true }; // fail open: can't check, don't punish the session for it
+    let Some(node) = which("node") else { return true };
     let tmp = std::env::temp_dir();
     let stamp = format!("{}-livecheck-{}", std::process::id(), unix_ms());
     let helper_path = tmp.join(format!("agentplug-cdp-eval-{stamp}.mjs"));
@@ -499,11 +325,6 @@ fn session_liveness_recheck(port: u16, browser_cfg: &BrowserConfig) -> bool {
             let grace = Duration::from_millis(recheck_timeout_ms + browser_cfg.eval_timeout_grace());
             match child.wait_timeout(grace) {
                 Ok(Some(status)) if status.success() => {
-                    // Default-mode cdp_eval.js writes the bare returned value
-                    // to resultFile (no {result:...} envelope -- that
-                    // envelope shape is only used by capture/profile/trace
-                    // modes), so the expected success payload here is the
-                    // bare number 2, not a wrapped object.
                     let v: Option<Value> = std::fs::read_to_string(&result_path)
                         .ok()
                         .and_then(|s| serde_json::from_str::<Value>(&s).ok());
@@ -516,7 +337,7 @@ fn session_liveness_recheck(port: u16, browser_cfg: &BrowserConfig) -> bool {
                 }
             }
         }
-        Err(_) => true, // spawn failure is this recheck's own problem, not evidence the browser is wedged
+        Err(_) => true,
     };
     cleanup(&[&helper_path, &script_path, &result_path]);
     alive
@@ -532,21 +353,6 @@ fn kill_pid(pid: u32) {
     let _ = Command::new("kill").args(["-9", &pid.to_string()]).output();
 }
 
-/// Kills EVERY live session across EVERY project, process-wide -- for the
-/// daemon's own voluntary self-update handoff (`attempt_self_update_handoff`
-/// in agentplug-runner's daemon.rs), which hands ownership to a freshly
-/// spawned process with its own EMPTY `SESSIONS` registry. Without this, a
-/// session's Chrome process (a real OS child, unaffected by the handoff on
-/// its own) survives as an orphan the NEW process has no record of -- alive,
-/// but unreachable via `session list`/`session close`, invisible to the
-/// idle-timeout reaper (which only ever reaps what it can see), and never
-/// cleaned up short of someone manually killing chrome.exe. A crash/hard
-/// exit still orphans sessions the same way (unavoidable -- nothing runs on
-/// a process that's already gone), but a VOLUNTARY exit like a self-update
-/// handoff has no such excuse: it can and must close what it knows about
-/// first. Live-witnessed the orphan this closes: a self-update handoff
-/// during this feature's own testing left a `chrome.exe` running with zero
-/// tracking in the new daemon process.
 pub fn close_all_sessions() {
     let mut map = sessions_map().lock().unwrap_or_else(|e| e.into_inner());
     let keys: Vec<String> = map.keys().cloned().collect();
@@ -558,11 +364,6 @@ pub fn close_all_sessions() {
     }
 }
 
-/// Opportunistic idle-timeout reap, run on every `run()` call (no dedicated
-/// timer thread, matching agentplug-runner daemon.rs's PLUGIN_IDLE_EVICT_MS
-/// precedent of checking per-tick rather than on its own timer). Only reaps
-/// entries belonging to THIS cwd -- other projects' sessions are untouched
-/// by a dispatch against this one.
 fn reap_idle_sessions(cwd: &Path, cfg: &BrowserConfig) {
     let timeout = cfg.session_idle_timeout();
     let mut map = sessions_map().lock().unwrap_or_else(|e| e.into_inner());
@@ -584,9 +385,6 @@ fn reap_idle_sessions(cwd: &Path, cfg: &BrowserConfig) {
     }
 }
 
-/// `session new` -- explicit reset-and-relaunch: kills any existing live
-/// session for this key first (if present), then launches a fresh Chrome
-/// and registers it, WITHOUT running any script.
 fn session_new(cwd: &Path, session_id: &str, cfg: &BrowserConfig) -> Value {
     let key = session_key(cwd, session_id);
     {
@@ -614,9 +412,6 @@ fn session_new(cwd: &Path, session_id: &str, cfg: &BrowserConfig) -> Value {
     }
 }
 
-/// `session list` -- live sessions for THIS cwd only, lazily pruning any
-/// entry whose process has since died (opportunistic cleanup alongside the
-/// timeout reaper, not a replacement for it).
 fn session_list(cwd: &Path) -> Value {
     let mut map = sessions_map().lock().unwrap_or_else(|e| e.into_inner());
     let keys_for_cwd: Vec<String> = map
@@ -643,9 +438,6 @@ fn session_list(cwd: &Path) -> Value {
     json!({"ok": true, "stdout": "", "exit_code": 0, "stderr": "", "sessions": out})
 }
 
-/// `session close <id>` / `session reset <id>` -- explicit kill+remove of a
-/// named session for this cwd. `require_found`=true (`close`) errors if the
-/// id wasn't present; `require_found`=false (`reset`) is idempotent.
 fn session_close(cwd: &Path, target_session_id: &str, require_found: bool) -> Value {
     let key = session_key(cwd, target_session_id);
     let removed = {
@@ -666,8 +458,6 @@ fn session_close(cwd: &Path, target_session_id: &str, require_found: bool) -> Va
     }
 }
 
-/// New outermost body-prefix layer, parsed BEFORE strip_mode_prefix/
-/// parse_body so it composes cleanly (these commands never carry a script).
 enum SessionCommand<'a> {
     New,
     List,
@@ -695,11 +485,6 @@ fn parse_session_command(body: &str) -> SessionCommand<'_> {
     SessionCommand::None
 }
 
-/// Extracted launch sequence (find Chrome, pick a free port, spawn with the
-/// persistent profile dir, wait for CDP readiness) shared by the session-
-/// registry's cache-miss path in `run()` and by `session_new`'s explicit
-/// relaunch. Returns the spawned+CDP-ready child and its port, or a
-/// human-readable error string.
 fn launch_chrome(cwd: &Path, session_id: &str, browser_cfg: &BrowserConfig) -> Result<(Child, u16), String> {
     let chrome = find_chrome().ok_or_else(|| "no Chrome found; install Google Chrome or Chromium".to_string())?;
     let profile_dir = browser_chrome_profile_dir(cwd, session_id);
@@ -723,12 +508,6 @@ fn launch_chrome(cwd: &Path, session_id: &str, browser_cfg: &BrowserConfig) -> R
         .spawn()
         .map_err(|e| format!("chrome launch failed: {e}"))?;
 
-    // Written so a LATER process (this daemon restarted after a crash, or a
-    // fresh daemon after a lost-heartbeat exit) can identify this exact OS
-    // process as an orphan via `reap_os_orphans`, even though its own
-    // in-memory SESSIONS registry has no record of it. Removed on any clean
-    // `kill_session`; a leftover file with a still-live pid is precisely the
-    // crash-orphan signature the reaper looks for.
     let _ = std::fs::write(pid_sidecar_path(&profile_dir), chrome_child.id().to_string());
 
     if !cdp_ready(port, Instant::now() + browser_cfg.chrome_ready_deadline(), browser_cfg) {
@@ -754,10 +533,6 @@ pub fn run(body: &str, cwd: &Path, session_id: &str) -> Value {
     reap_idle_sessions(cwd, &browser_cfg);
     reap_os_orphans(cwd);
 
-    // The guest hands the raw spool dispatch JSON ({"body": "...", "timeoutMs": N})
-    // as `body`, not the browser script directly -- extract the actual script and
-    // timeout from that envelope before parsing prefixes. A bare string body (no
-    // JSON envelope) is used as-is.
     let (inner_body, timeout_ms): (String, u64) = match serde_json::from_str::<Value>(body) {
         Ok(Value::Object(obj)) => {
             let b = obj
@@ -771,9 +546,6 @@ pub fn run(body: &str, cwd: &Path, session_id: &str) -> Value {
         _ => (body.to_string(), 120_000),
     };
 
-    // New outermost prefix layer: session-management commands short-circuit
-    // straight to their own JSON envelope, never running a script or
-    // touching strip_mode_prefix/parse_body.
     match parse_session_command(&inner_body) {
         SessionCommand::New => return session_new(cwd, session_id, &browser_cfg),
         SessionCommand::List => return session_list(cwd),
@@ -796,13 +568,6 @@ pub fn run(body: &str, cwd: &Path, session_id: &str) -> Value {
     let helper_path = tmp.join(format!("agentplug-cdp-eval-{stamp}.mjs"));
     let script_path = tmp.join(format!("agentplug-cdp-script-{stamp}.js"));
     let result_path = tmp.join(format!("agentplug-cdp-result-{stamp}.json"));
-    // Screenshot's artifact is a PNG under .gm/witness/ (matching the
-    // documented location -- prose says "writes a PNG and returns its
-    // path", and .gm/witness/ is this repo's own convention for that class
-    // of artifact per gm's own gate-condition doc, distinct from
-    // browser_profiles_dir which holds profile/trace JSON captures). Dom
-    // mode returns structured element data inline in `result`, no artifact
-    // file at all.
     let artifact_path = match mode {
         BrowserMode::Default | BrowserMode::Dom => None,
         BrowserMode::Screenshot => {
@@ -824,10 +589,6 @@ pub fn run(body: &str, cwd: &Path, session_id: &str) -> Value {
         let _ = f.write_all(script.as_bytes());
     }
 
-    // Reuse a live session's Chrome + port if one exists for this (cwd,
-    // session_id) key; otherwise launch fresh and register it BEFORE
-    // evaluating the script, so a script that itself crashes/hangs never
-    // leaves the registry inconsistent.
     let key = session_key(cwd, session_id);
     let port = {
         let mut map = sessions_map().lock().unwrap_or_else(|e| e.into_inner());
@@ -892,11 +653,6 @@ pub fn run(body: &str, cwd: &Path, session_id: &str) -> Value {
     let mut child = match spawn {
         Ok(c) => c,
         Err(e) => {
-            // The session's Chrome is a registry-owned, cross-dispatch
-            // resource now -- a node-helper spawn failure is this
-            // dispatch's own problem, never a reason to tear down a
-            // process other dispatches under the same session_id still
-            // expect to find alive.
             cleanup(&[&helper_path, &script_path, &result_path]);
             return json!({"ok": false, "stdout": "", "exit_code": 1,
                 "stderr": format!("node cdp helper spawn failed: {e}")});
@@ -913,25 +669,6 @@ pub fn run(body: &str, cwd: &Path, session_id: &str) -> Value {
         Err(_) => false,
     };
 
-    // Live-found (headless-chrome-elimination investigation): a timeout here
-    // previously killed ONLY the transient node cdp-eval helper -- the
-    // actual Chrome process stayed registered in SESSIONS and got reused on
-    // the very next dispatch even when the timeout's real cause was a wedged
-    // page/renderer (not a slow-but-fine one), because a hung Chrome tab
-    // still answers a top-level CDP `/json/version` HTTP probe (that's
-    // Chrome's own always-alive browser process, not the wedged renderer) --
-    // so a single re-poll here can't distinguish "helper was just slow" from
-    // "renderer is wedged." The escalation this fixes: an eval that timed
-    // out gets ONE bounded re-check against the SAME page context it was
-    // just driving (a trivial `1+1` Runtime.evaluate over the session's own
-    // CDP port, not merely the version endpoint) with a short deadline; if
-    // that also fails to answer, the renderer is genuinely wedged (not just
-    // last-eval-slow) and the session is killed + evicted from SESSIONS so
-    // the next dispatch launches a fresh Chrome instead of reusing a corpse
-    // that will time out on every future eval too. A responsive re-check
-    // means the timeout really was this one script (e.g. an intentional
-    // `await new Promise(()=>{})`), so the Chrome process is left alone and
-    // reused normally.
     if timed_out && !session_liveness_recheck(port, &browser_cfg) {
         eprintln!(
             "[agentplug browser] eval timeout AND page unresponsive to a follow-up probe -- session '{}' (port {}) is wedged, killing and evicting so the next dispatch gets a fresh Chrome",
@@ -958,12 +695,6 @@ pub fn run(body: &str, cwd: &Path, session_id: &str) -> Value {
         .unwrap_or(Value::Null);
 
     cleanup(&[&helper_path, &script_path, &result_path]);
-    // Neither the session's Chrome process nor its persistent profile dir
-    // (.gm/browser-chrome-profile-<session_id>/) is torn down here anymore --
-    // the process now lives in the SESSIONS registry and survives across
-    // dispatches under the same session_id until an explicit `session
-    // close`/`session reset`, the idle-timeout reaper, or daemon exit kills
-    // it (see the SESSIONS registry doc comments above).
 
     let cdp_error = result_value.get("__cdpError").and_then(|v| v.as_str());
     let ok = exit_code == 0 && !timed_out && cdp_error.is_none();
@@ -978,9 +709,6 @@ pub fn run(body: &str, cwd: &Path, session_id: &str) -> Value {
         out["result"] = Value::Null;
         return out;
     }
-    // Non-default modes get a {result, <mode-key>} envelope from
-    // cdp_eval.js (mirrors exec_js's opts.mem/opts.profile envelope shape);
-    // default mode is the bare returned value, unchanged.
     match mode {
         BrowserMode::Default => {
             out["result"] = result_value;

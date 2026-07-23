@@ -6,21 +6,7 @@ use std::path::PathBuf;
 use agentplug_host::{build_engine, ProjectPlugins};
 use wasmtime::Module;
 
-/// Same command surface gm-runner's own main.rs exposes (bootstrap/spool/
-/// dispatch/progress/version) plus `plugin <name> [version]` -- a project's
-/// gm-plugkit installer or cli.js can spawn `agentplug-runner spool` exactly
-/// where it previously spawned `gm-runner spool`, zero ABI change on the
-/// spool-dir side.
 fn main() -> anyhow::Result<()> {
-    // A panic unwinds and exits WITHOUT running any of the daemon loop's normal exit
-    // paths (the heartbeat-authority-lost branch, which does call close_all_sessions),
-    // so a crashed daemon leaves every Chrome session it opened orphaned -- live-hit
-    // this session: an Instant-subtraction underflow panic on every boot right after a
-    // machine reboot (fixed separately in daemon.rs) meant no daemon instance survived
-    // long enough to clean up, and open sessions piled up across repeated crash-boot
-    // cycles until the machine itself had to be rebooted again. This hook is the
-    // durable safeguard against that class recurring for ANY future panic, not just
-    // this one root cause -- best-effort, must not itself panic or block exit.
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         agentplug_host::close_all_sessions();
@@ -49,17 +35,6 @@ fn main() -> anyhow::Result<()> {
             let spool_dir = cwd.join(".gm").join("exec-spool");
             std::fs::create_dir_all(&spool_dir)?;
 
-            // No eager gm.wasm download here -- that used to block this
-            // entire invocation for minutes on a cold cache (gm.wasm is a
-            // real ~137MB artifact), violating the gm skill's own
-            // documented "spool is fire-and-forget, does not wait"
-            // contract, live-witnessed this session as a 20s+ hang on a
-            // command that should return near-instantly. The daemon's own
-            // loop (daemon.rs::PluginModules::get_or_compile) already
-            // downloads "gm" lazily on first real dispatch need for a
-            // registered project, the exact same lazy pattern already
-            // proven correct for libsql/bert/treesitter -- register and
-            // hand off, don't block on it here too.
             daemon::register_project(&cwd)?;
             if daemon::ensure_daemon_running()? {
                 eprintln!(
@@ -68,37 +43,6 @@ fn main() -> anyhow::Result<()> {
                 );
                 return Ok(());
             }
-            // ensure_daemon_running()'s bounded wait (~6s) can time out while
-            // the actual winning daemon is still mid-PluginModules::new()
-            // (wasm engine build + compile of gm/bert/libsql/treesitter,
-            // witnessed this session taking well over 6s under load) and
-            // hasn't written its first heartbeat yet. Previously every OTHER
-            // spool invocation that timed out fell straight through to a
-            // standalone long-lived watcher that NEVER calls
-            // claim_ownership()/run_daemon() at all -- not a race the atomic
-            // guard was ever positioned to prevent, since it's a separate
-            // process that never contests the lock. Two (or more) such
-            // standalone watchers then coexisted indefinitely, each serving
-            // its own project -- the "multiple agentplug-runner processes"
-            // symptom, live-witnessed this session. Fix: attempt to become
-            // the ONE shared daemon here too via run_daemon() before ever
-            // falling back to a private one-shot instance. If this process
-            // wins the atomic claim, it becomes the real long-lived daemon
-            // (serving this project and any other that finds it) and never
-            // returns. If it loses (the real winner finished compiling and
-            // claimed first while we were building our own engine or
-            // waiting), run_daemon() returns Ok(()) immediately with zero
-            // plugin state touched -- exactly like the earlier bounded-wait
-            // loss -- so retry the shared-daemon path once more now that the
-            // real winner should be visible. This does NOT fully eliminate a
-            // standalone watcher spawning below (run_spool_watcher_single_process
-            // is still a long-lived loop, not a one-shot) -- it narrows the
-            // window in which one can be spawned at all: a standalone watcher
-            // now only starts if the shared daemon is STILL unclaimed after
-            // this process itself tried and failed to become it, meaning two
-            // consecutive compile-plus-wait cycles both missed the real
-            // daemon, a materially rarer case than the original single
-            // bounded wait.
             eprintln!("[agentplug] shared daemon not yet visible, attempting to become it before falling back");
             daemon::run_daemon()?;
 
@@ -133,17 +77,6 @@ fn main() -> anyhow::Result<()> {
             let body = args.get(4).cloned().unwrap_or_else(|| "{}".to_string());
             let cwd = std::env::current_dir()?;
 
-            // Route through the shared daemon when reachable -- a plain
-            // one-shot instantiate-per-call (the fallback below) is fine
-            // for stateless plugins (bert:embed, treesitter:parse) but
-            // fundamentally wrong for a stateful one like libsql, where an
-            // "open" in one process must still be visible to a later
-            // "exec"/"query": each standalone subprocess gets its own
-            // empty in-memory connection table, so open-then-query across
-            // two separate `dispatch` invocations always fails
-            // "no dbs open" even though the plugin itself is correct. The
-            // daemon keeps one persistent ProjectPlugins per (root, plugin)
-            // across calls, which is the only place this can genuinely work.
             if let Some(out) = daemon::try_dispatch_via_daemon(&cwd, &plugin, &verb, &body) {
                 println!("{out}");
                 return Ok(());
@@ -171,9 +104,6 @@ fn main() -> anyhow::Result<()> {
     }
 }
 
-/// Fallback path when the shared daemon is unavailable (lock contention
-/// timeout) -- a dedicated per-project process serving just the "gm" plugin,
-/// same spool polling loop shape as gm-runner's own run_spool_watcher.
 fn run_spool_watcher_single_process(project: &mut ProjectPlugins, spool_dir: &std::path::Path) -> anyhow::Result<()> {
     use std::fs;
     use std::time::Duration;

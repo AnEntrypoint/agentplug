@@ -10,10 +10,6 @@ const RESULT_SENTINEL: &str = "__GM_RESULT__";
 const META_SENTINEL: &str = "__GM_META__";
 const PROFILE_SENTINEL: &str = "__GM_PROFILE__";
 
-/// Ported from rs-plugkit's gm-runner/src/exec_js.rs -- same subprocess
-/// dispatch + sentinel-based return-value capture, so agentplug-host's
-/// host_exec_js has real backing instead of the not_implemented stub every
-/// other still-missing host import uses.
 pub fn run(code: &str, opts: &Value, cwd: &Path) -> Value {
     let lang = opts.get("lang").and_then(|v| v.as_str()).unwrap_or("nodejs");
     let timeout_ms = match opts.get("timeoutMs").and_then(|v| v.as_i64()) {
@@ -81,23 +77,6 @@ pub fn run(code: &str, opts: &Value, cwd: &Path) -> Value {
         }
     };
 
-    // Every call still waits the FULL declared timeout_ms as a genuinely
-    // short synchronous call, unchanged from before -- no silent
-    // auto-slicing. The only change: on hitting that timeout with the
-    // child STILL running, instead of unconditionally killing it (the old
-    // behavior, which discarded a job that might have been one dispatch
-    // away from finishing), hand it off ALIVE into task.rs's existing
-    // background registry (same one host_task_proc serves) and return
-    // in_progress:true + its task_id -- the calling agent explicitly
-    // decides next, via `task-output {id}` (keep it running, check
-    // progress -- the queue is NOT blocked on it, this worker already
-    // returned) or `task-stop {id}` (kill it). Never silently continues
-    // running past a timeout with no signal, and never silently discards a
-    // near-complete job by hard-killing on the very call that names the
-    // decision point -- the agent is the one who upgrades-to-background or
-    // closes, per exec-js-time-sliced-lifecycle-control's checkpoint
-    // contract, live-hit this session as a 150s+ cargo check leaving the
-    // agent with zero visibility and zero choice until it finally returned.
     let still_running = matches!(child.wait_timeout(Duration::from_millis(timeout_ms)), Ok(None));
     if still_running {
         let task_id = crate::task::adopt_running(child, lang, t0, timeout_ms);
@@ -363,10 +342,6 @@ fn resolve_node_cmd() -> String {
     "node".to_string()
 }
 
-// System32\bash.exe on Windows is the WSL launcher stub, not a real POSIX
-// shell -- it either hangs waiting on a WSL distro or behaves unlike Git
-// Bash. Prefer Git Bash's real bash.exe explicitly, falling back to `which`
-// only if the well-known Git-for-Windows path isn't present.
 fn resolve_bash_cmd() -> String {
     if cfg!(windows) {
         let git_bash = std::path::Path::new("C:\\Program Files\\Git\\bin\\bash.exe");

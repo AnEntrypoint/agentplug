@@ -11,9 +11,6 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
     hasher.finalize().iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Streams `url` into `dest`, verified against `expected_sha256_hex` before
-/// the atomic rename lands -- identical discipline to gm-runner's own
-/// download_and_verify (a checksum mismatch never lands a corrupt artifact).
 pub fn download_and_verify(url: &str, dest: &Path, expected_sha256_hex: &str) -> anyhow::Result<()> {
     let resp = ureq::get(url).call()?;
     let mut reader = resp.into_reader();
@@ -43,38 +40,11 @@ pub fn download_and_verify(url: &str, dest: &Path, expected_sha256_hex: &str) ->
     Ok(())
 }
 
-/// Every known plugin's release repo -- the mapping from a plugin name (as
-/// it appears in a project's `.agentplug/plugins.txt`) to the GitHub repo
-/// its `<name>.wasm` + `<name>.wasm.sha256` + `<name>.manifest.json` release
-/// assets live in. New plugins register here; this is the one place
-/// agentplug-runner needs to know a plugin exists before it can fetch it.
-///
-/// "gm" is special-cased below (see `PluginAssetSpec`) rather than listed
-/// here: it is NOT yet a real agentplug-native plugin release -- there is
-/// no AnEntrypoint/agentplug-gm-bin repo. The actual gm wasm (built by
-/// rs-plugkit's own long-standing cascade, asset name `plugkit.wasm`, not
-/// `gm.wasm`) still ships from AnEntrypoint/plugkit-bin. Routing "gm"
-/// through the generic `{name}.wasm` convention here 404s permanently --
-/// live-witnessed this session as `plugin gm not loaded` on every dispatch
-/// once the daemon tried to auto-serve gm's own spool.
 struct PluginAssetSpec {
     repo: &'static str,
     asset_basename: &'static str,
 }
 
-/// agentplug-runner always loads "bert" as one of its 4 default plugins
-/// (daemon.rs's default plugin list), and agentplug-host's `host_vec_embed`
-/// import genuinely routes to that shared bert instance -- so gm.wasm's own
-/// `embed.rs::init_ctx()` probe (`probe_host_embed()`) always succeeds under
-/// agentplug, meaning gm.wasm's baked-in bert weights (embed.rs's
-/// `include_bytes!("weights/bge-small-en-v1.5.safetensors")`, 133MB) are
-/// provably dead data: never deserialized into candle tensors, but still
-/// copied into the wasm instance's linear memory at Instantiate time as a
-/// static data segment. `plugkit-slim.wasm` (same AnEntrypoint/plugkit-bin
-/// release, ~3MB, no baked-in weights) is the exact fix -- gm's own JS
-/// wrapper (gm-plugkit/bootstrap.js hasNativeEmbedRunner) already applies
-/// this same slim-when-a-real-embed-answerer-exists logic; agentplug-runner
-/// needs the equivalent since it never routes through that JS bootstrap.
 fn gm_asset_basename() -> &'static str {
     "plugkit-slim"
 }
@@ -97,13 +67,6 @@ fn plugin_version_path(plugin_name: &str) -> PathBuf {
     install_dir().join("plugins").join(format!("{plugin_name}.version"))
 }
 
-/// The runner EXECUTABLE's own self-update, separate from the wasm-guest
-/// update path above (that one hot-reloads gm/bert/libsql/treesitter IN this
-/// process; this one replaces the process itself). Same source repo and
-/// asset-naming convention bin/install.js's agentplugRunnerAssetName() uses
-/// (must stay byte-identical to agentplug's own release.yml matrix), so a
-/// tag published for the JS installer to pick up is the SAME tag this poll
-/// detects -- one release, two independent consumers.
 const RUNNER_BIN_REPO: &str = "AnEntrypoint/agentplug-bin";
 
 fn runner_asset_name() -> Option<&'static str> {
@@ -130,23 +93,9 @@ pub fn fetch_latest_runner_version() -> anyhow::Result<Option<String>> {
     let url = format!("https://api.github.com/repos/{RUNNER_BIN_REPO}/releases/latest");
     let resp = ureq::get(&url).set("User-Agent", "agentplug-runner").call()?;
     let body: serde_json::Value = serde_json::from_str(&resp.into_string()?)?;
-    // Stripped to match fetch_latest_plugin_version's convention below and
-    // daemon.rs's fresh-boot record_runner_version(CARGO_PKG_VERSION) writer
-    // (bare, no `v`) -- installed_runner_version() and every comparison
-    // against it must see the SAME bare format regardless of which writer
-    // (fresh boot vs self-update takeover) produced the on-disk marker.
     Ok(body.get("tag_name").and_then(|v| v.as_str()).map(|s| s.trim_start_matches('v').to_string()))
 }
 
-/// Downloads+verifies a newer runner build to `<current-exe-path>.new`,
-/// never overwriting the running exe directly -- Windows refuses to write to
-/// its own currently-mapped executable file (a hard OS-level lock, not a
-/// permissions issue), so the running process can only ever stage the
-/// replacement alongside itself. Returns the staged path and its version tag
-/// on success; `Ok(None)` means already current (no newer tag) or this
-/// platform has no published runner binary (never an error -- a host CI
-/// doesn't build for is expected to silently skip self-update, exactly like
-/// the wasm-guest plugin poll's own None-on-unpublished-platform behavior).
 pub fn stage_runner_self_update() -> anyhow::Result<Option<(PathBuf, String)>> {
     let Some(asset) = runner_asset_name() else { return Ok(None) };
     let Some(latest) = fetch_latest_runner_version()? else { return Ok(None) };
@@ -157,9 +106,6 @@ pub fn stage_runner_self_update() -> anyhow::Result<Option<(PathBuf, String)>> {
     let staged = current_exe.with_extension(
         current_exe.extension().map(|e| format!("{}.new", e.to_string_lossy())).unwrap_or_else(|| "new".to_string())
     );
-    // `latest` is now bare (v-stripped, see fetch_latest_runner_version) but
-    // the GitHub release download path requires the `v`-prefixed tag, same
-    // as ensure_plugin_installed's own "download/v{version}" convention.
     let base = format!("https://github.com/{RUNNER_BIN_REPO}/releases/download/v{latest}");
     let sha_line = ureq::get(&format!("{base}/{asset}.sha256")).call()?.into_string()?;
     let expected_sha = sha_line.split_whitespace().next()
@@ -175,11 +121,6 @@ pub fn stage_runner_self_update() -> anyhow::Result<Option<(PathBuf, String)>> {
     Ok(Some((staged, latest)))
 }
 
-/// Records the version now actually running -- called by the NEW process
-/// once it has confirmed itself healthy and taken over ownership (never by
-/// the download step itself, which only stages a candidate; writing the
-/// version marker before the candidate has proven it can actually serve
-/// would let a broken build masquerade as "installed" and never get retried).
 pub fn record_runner_version(version: &str) -> anyhow::Result<()> {
     fs::create_dir_all(install_dir())?;
     fs::write(runner_version_path(), version)?;
@@ -239,10 +180,6 @@ pub fn ensure_plugin_installed(plugin_name: &str, explicit_version: Option<&str>
 
     let base = format!("https://github.com/{}/releases/download/v{version}", spec.repo);
 
-    // plugkit-slim.wasm ships from the same release as plugkit.wasm starting
-    // v0.1.915 -- an older/pinned version tag may predate that, so a 404 on
-    // the slim sha256 sidecar falls back to the fat asset_basename rather
-    // than hard-failing the whole plugin install.
     let sha_url = format!("{base}/{}.wasm.sha256", spec.asset_basename);
     let sha_resp = match ureq::get(&sha_url).call() {
         Ok(resp) => resp,

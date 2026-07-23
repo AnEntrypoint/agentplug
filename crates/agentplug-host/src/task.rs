@@ -35,12 +35,6 @@ fn next_id(counter_seed: u64) -> String {
     format!("task-{:x}", counter_seed)
 }
 
-/// Drain any output a still-running child has buffered, and reap it if it has
-/// exited, updating the registry entry in place. A task-manager built on the
-/// daemon's own poll loop has no dedicated reader thread per child, so output
-/// is pulled opportunistically on every list/output/stop call -- the child's
-/// pipes are non-blocking-drained here rather than blocking the poll loop on a
-/// read that a long-running task would never let return.
 fn poll_entry(entry: &mut TaskEntry) {
     if entry.finished_ms.is_some() {
         return;
@@ -85,14 +79,6 @@ fn entry_summary(id: &str, entry: &TaskEntry) -> Value {
     })
 }
 
-/// Adopts an ALREADY-RUNNING child (one exec_js's own time-sliced wait loop
-/// started synchronously, then decided to hand off past its first
-/// checkpoint -- see exec_js.rs's SLICE_MS loop) into this SAME registry
-/// spawn() populates, so the resulting id is polled through the identical
-/// task-output/task-list/task-stop verbs regardless of which path created
-/// it. `started` is the ORIGINAL Instant the child was spawned at (not
-/// "now"), so timeout_ms bookkeeping in poll_entry still measures from the
-/// child's true start, not from the moment of hand-off.
 pub fn adopt_running(child: std::process::Child, lang: &str, started: std::time::Instant, timeout_ms: u64) -> String {
     let started_ms = now_ms().saturating_sub(started.elapsed().as_millis() as u64);
     let id = next_id(started_ms ^ (child.id() as u64));
@@ -210,11 +196,6 @@ fn stop(params: &Value) -> Value {
     json!({"ok": true, "id": id, "stopped": true})
 }
 
-/// Services the `host_task_proc` import for the daemon: spawns background
-/// children into a process registry and reports on them across dispatches,
-/// replacing the not_implemented stub. Mirrors the JS wrapper's task surface
-/// (spawn/list/stop/output). Actions unknown to this manager return a typed
-/// error rather than a silent success.
 pub fn handle(action: &str, params: &Value, cwd: &Path) -> Value {
     match action {
         "spawn" => spawn(params, cwd),

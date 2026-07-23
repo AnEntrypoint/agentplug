@@ -8,20 +8,6 @@ use wasmtime::{AsContextMut, Caller, Linker, Memory};
 
 use crate::host_state::HostState;
 
-// `git log`/`git status`/etc are dispatched synchronously from inside a wasm
-// host-import call, itself running while the calling plugin's single pool
-// slot (see registry.rs's SharedPluginPool, size 1 for bert/libsql, N for
-// gm) is held -- an unbounded git subprocess (pack-refs lock contention, AV
-// interference on Windows holding a file handle, a genuinely pathological
-// repo) blocks that entire dispatch forever with nothing upstream able to
-// notice or recover, wedging every other request for the same project (and,
-// for a size-1 shared plugin, every OTHER project) behind it. code_index.rs's
-// own INDEX_WALL_BUDGET_MS only checks BETWEEN files in its indexing loop, so
-// it never gets a chance to fire while a single host_git call is stuck.
-// Bounded the same way browser.rs already bounds its node-helper subprocess
-// (wait_timeout + kill-on-expiry) -- git commands here are always
-// read-only/local (log/status/diff/rev-parse), so a killed-and-abandoned
-// child leaves no repo-state cleanup to do.
 const GIT_SUBPROCESS_TIMEOUT_MS: u64 = 15_000;
 
 fn guest_memory(caller: &mut Caller<'_, HostState>) -> Memory {
@@ -54,19 +40,6 @@ fn write_guest_bytes(caller: &mut Caller<'_, HostState>, bytes: &[u8]) -> u64 {
     let alloc = instance
         .get_typed_func::<u32, u32>(&mut *caller, "plugkit_alloc")
         .expect("plugkit_alloc export missing on wasm module");
-    // This runs INSIDE an already-in-flight guest call (e.g. marshaling a
-    // slow host_exec_js's result back after the call itself blocked past
-    // this Store's epoch deadline) -- the deadline armed at dispatch_on's
-    // own entry can legitimately have already elapsed by the time control
-    // reaches here, and this alloc call is itself an epoch-checked guest
-    // export. A raw .expect() here previously panicked with a wasmtime trap
-    // string instead of degrading like every other deadline-exceeded path;
-    // `0` is this function's own documented empty/none sentinel (see
-    // docs/ABI.md's wire-format section), so a caller already treats it as
-    // "no data" rather than crashing on an unexpected return shape. Re-arming
-    // here (not just at dispatch_on's own entry) means the NEXT call on this
-    // reused Store starts from a fresh budget instead of inheriting this
-    // exceeded one.
     match alloc.call(&mut *caller, bytes.len() as u32) {
         Ok(ptr) => {
             let memory = guest_memory(caller);
@@ -94,13 +67,6 @@ pub fn register_wasi(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Same `env`-module surface every plugkit-core-derived wasm module already
-/// expects (fs/log/env/time/fetch/kv/exec_js/browser/git -- ported verbatim
-/// from rs-plugkit's wasm_host.rs), plus `host_plugin_call`: the one new
-/// import that makes cross-plugin routing possible. Every OTHER plugin
-/// (bert, libsql, tree-sitter) gets this exact same import set too -- a
-/// plugin is free to ignore imports it doesn't need, but the host always
-/// offers the full surface so any plugin can, in principle, call any other.
 pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
     linker.func_wrap(
         "env",
@@ -178,21 +144,12 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
             let full = caller.data().cwd().join(&path);
             match fs::metadata(&full) {
                 Ok(md) => {
-                    // mtimeMs lets the guest do a stat-only change check (the
-                    // codeinsight digest / per-file skip) without reading and
-                    // hashing file content -- the cheap-skip the reference
-                    // codebasesearch impl relies on. 0 when the platform can't
-                    // report a modified time.
                     let mtime_ms = md
                         .modified()
                         .ok()
                         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                         .map(|d| d.as_millis() as u64)
                         .unwrap_or(0);
-                    // Both spellings: fs_stat's public shape uses camelCase
-                    // (isDirectory/isFile), but the codeinsight guest reads
-                    // snake_case `mtime_ms` for its stat-only skip, so emit both
-                    // and let each consumer pick the one it expects.
                     let v = serde_json::json!({"isDirectory": md.is_dir(), "isFile": md.is_file(), "size": md.len(), "mtimeMs": mtime_ms, "mtime_ms": mtime_ms});
                     write_guest_json(&mut caller, v)
                 }
@@ -212,15 +169,6 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
         |mut caller: Caller<'_, HostState>, level: u32, msg_ptr: u32, msg_len: u32| -> u32 {
             let msg = read_guest_string(&mut caller, msg_ptr, msg_len);
             let plugin = caller.data().plugin_name.clone();
-            // rs-plugkit's emit_event()/log_deviation_push() send structured events as a
-            // literal "evt: {json}" line via this same host_log import (level 1) -- gmsniff's
-            // per-project fallback tailer parses ".gm/exec-spool/.watcher.log" for lines
-            // starting with that exact prefix. The retired JS wrapper appended those lines to
-            // .watcher.log directly; this Rust host previously only eprintln!'d everything
-            // (stderr, discarded on process exit, and wrapped in a "[agentplug:...]" prefix
-            // that broke the "evt: " line-start match even if stderr had been captured) --
-            // silently killing all gm-log/watcher-log observability the moment a project's
-            // watcher was agentplug-driven instead of JS-wrapper-driven.
             if let Some(evt_line) = msg.strip_prefix("evt: ") {
                 let cwd = caller.data().cwd.lock().unwrap().clone();
                 let log_path = cwd.join(".gm").join("exec-spool").join(".watcher.log");
@@ -377,13 +325,6 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
                     }
                     if let Ok(content) = fs::read_to_string(&path) {
                         if q.is_empty() || content.to_lowercase().contains(&q) {
-                            // Guest-side readers (code_index::load_manifests and
-                            // every other fv_query consumer) index each row by
-                            // `key`/`value`. Returning the bare content string
-                            // made every one of those lookups yield None, so a
-                            // fully-populated namespace read back as empty --
-                            // 114 valid manifests loaded as 0 chunks, dropping
-                            // codesearch to mode:fallback_kv with no hits.
                             let key = path.file_stem().and_then(|s| s.to_str()).unwrap_or_default().to_string();
                             results.push(serde_json::json!({"key": key, "value": content}));
                         }
@@ -411,18 +352,6 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
         },
     )?;
 
-    // Three imports genuinely missing from this file's initial port of
-    // rs-plugkit's wasm_host.rs -- plugkit.wasm (the "gm" plugin) declares
-    // ALL THREE unconditionally at compile time, so a host missing even one
-    // fails `WebAssembly.instantiate`/wasmtime's linker.instantiate with a
-    // hard "unknown import" error, not a graceful per-call fallback.
-    // host_vec_search must stay DECLARED because gm.wasm imports it
-    // unconditionally at compile time -- a missing import breaks every dispatch,
-    // not just vector calls. But it is no longer CALLED by any guest code path:
-    // the guest now runs vector search in-process against libsql (vec_search_local
-    // in rs-plugkit verbs.rs), so this import is dead. It returns a typed error
-    // only to satisfy the ABI for a call that can never arrive; there is no stub
-    // behind a live subsystem here.
     linker.func_wrap(
         "env",
         "host_vec_search",
@@ -431,14 +360,6 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
             write_guest_json(&mut caller, serde_json::json!({"ok": false, "error": "host_vec_search_unused_guest_runs_libsql_directly"}))
         },
     )?;
-    // host_task_proc was a not_implemented stub, so task-spawn/task-stop were
-    // non-functional under the native runtime -- the whole background-process
-    // subsystem was unreachable (task-list worked only because it reads an
-    // empty registry). Wired to a real native process registry (crate::task)
-    // that spawns detached children, drains their output opportunistically on
-    // each list/output/stop, and reaps on exit or timeout. Reuses exec_js's
-    // build_command for the lang->command mapping so task and exec_js resolve
-    // languages identically.
     linker.func_wrap(
         "env",
         "host_task_proc",
@@ -455,15 +376,6 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
             write_guest_json(&mut caller, result)
         },
     )?;
-    // host_browser_exec was a documented capability gap -- agentplug-host had
-    // no browser module, so every browser-verb dispatch returned a typed
-    // not_implemented failure and the whole browser subsystem was advertised in
-    // `health` yet non-functional under the native runtime. Ported the same
-    // self-contained module gm-runner uses (crate::browser::run, which shells
-    // out to the playwriter CLI rather than embedding chromium, so it needs no
-    // new deps -- serde_json/directories/wait-timeout were already present).
-    // The guest passes body / cwd / session_id; prefer the passed cwd, falling
-    // back to the host's own cwd when the guest sends an empty string.
     linker.func_wrap(
         "env",
         "host_browser_exec",
@@ -481,12 +393,6 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
         },
     )?;
 
-    // The single new import over the existing gm-runner wasm_host.rs surface:
-    // routes to another loaded plugin for the SAME project. Looks up the
-    // sibling by name in the shared registry, calls its `plugin_call` export,
-    // marshals args in and the result back through the CALLING plugin's
-    // memory (never the callee's -- the caller is the one that can read the
-    // response afterward).
     linker.func_wrap(
         "env",
         "host_plugin_call",
@@ -511,13 +417,6 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
                 );
             };
 
-            // Drive the call through the SIBLING's own Store, never `caller`
-            // (the CALLING plugin's Store) -- wasmtime::Instance methods
-            // require a StoreContextMut matching the store the Instance was
-            // instantiated in. Reusing `caller` here previously panicked
-            // ("object used with the wrong store", wasmtime-46
-            // store/data.rs:213) the first time gm.wasm's recall path called
-            // into bert via host_plugin_call.
             let caller_root = caller.data().cwd();
             let mut guard = match sibling_pool.acquire() {
                 Some(g) => g,
@@ -553,22 +452,12 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
             let text = read_guest_string(&mut caller, text_ptr, text_len);
             let body = serde_json::json!({"text": text}).to_string();
 
-            // Same fix as host_plugin_call: drive bert's own Store, never
-            // `caller` (this plugin's Store) -- see SiblingHandle's doc
-            // comment for the wasmtime cross-store panic this replaced.
             let caller_siblings = caller.data().siblings();
             let sibling_pool = { caller_siblings.lock().unwrap().get("bert").cloned() };
             let Some(sibling_pool) = sibling_pool else {
                 return -1;
             };
             let caller_root = caller.data().cwd();
-            // Pool contention under real host load (concurrent projects
-            // sharing the size-1 bert slot) can exhaust acquire()'s own
-            // 20s bound; a single hard failure here surfaced as
-            // memorize-fire's "embed_text failed" with zero recourse.
-            // Retry the acquire+dispatch bounded before giving up, so
-            // transient contention degrades to a slower call instead of
-            // an outright failure.
             const EMBED_RETRY_ATTEMPTS: u32 = 3;
             const EMBED_RETRY_BACKOFF_MS: u64 = 500;
             let mut result: anyhow::Result<Vec<f32>> = Err(anyhow::anyhow!("embed not attempted"));
@@ -632,13 +521,6 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
                 caller.data().cwd()
             } else {
                 let p = PathBuf::from(&cwd_arg);
-                // A relative cwd_arg (e.g. a bare submodule name like "agentplug",
-                // the shape gm's own git verb docs use) previously resolved against
-                // this DAEMON PROCESS's own cwd rather than the calling project's
-                // root, since PathBuf::from() never joins a relative path against
-                // anything -- on Windows this produced a nonexistent/invalid
-                // directory (OS error 267) whenever the daemon's own cwd differed
-                // from the calling project (always true for the shared daemon).
                 if p.is_absolute() { p } else { caller.data().cwd().join(p) }
             };
             let mut git_cmd = std::process::Command::new("git");
