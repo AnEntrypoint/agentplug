@@ -12,6 +12,21 @@ use wasmtime::Module;
 /// where it previously spawned `gm-runner spool`, zero ABI change on the
 /// spool-dir side.
 fn main() -> anyhow::Result<()> {
+    // A panic unwinds and exits WITHOUT running any of the daemon loop's normal exit
+    // paths (the heartbeat-authority-lost branch, which does call close_all_sessions),
+    // so a crashed daemon leaves every Chrome session it opened orphaned -- live-hit
+    // this session: an Instant-subtraction underflow panic on every boot right after a
+    // machine reboot (fixed separately in daemon.rs) meant no daemon instance survived
+    // long enough to clean up, and open sessions piled up across repeated crash-boot
+    // cycles until the machine itself had to be rebooted again. This hook is the
+    // durable safeguard against that class recurring for ANY future panic, not just
+    // this one root cause -- best-effort, must not itself panic or block exit.
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        agentplug_host::close_all_sessions();
+        default_hook(info);
+    }));
+
     let args: Vec<String> = std::env::args().collect();
     let cmd = args.get(1).map(|s| s.as_str()).unwrap_or("");
 

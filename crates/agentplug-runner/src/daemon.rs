@@ -1385,7 +1385,14 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
     agentplug_host::set_side_plugin_pool_size(daemon_cfg.side_plugin_concurrency());
 
     let mut projects: HashMap<PathBuf, ProjectPlugins> = HashMap::new();
-    let mut last_registry_poll = Instant::now() - registry_poll_interval;
+    // Was `Instant::now() - registry_poll_interval` (fire the first poll immediately by
+    // pre-dating the timer) -- underflows/panics on every boot, since Instant::now() at
+    // process start is necessarily younger than registry_poll_interval since the process's
+    // own monotonic-clock epoch, live-reproduced this session. first_registry_poll_pending
+    // preserves the original immediate-first-poll intent without any Instant arithmetic
+    // that could underflow.
+    let mut last_registry_poll = Instant::now();
+    let mut first_registry_poll_pending = true;
     let mut known_roots: Vec<PathBuf> = Vec::new();
 
     // WASM linear memory is architecturally monotonic (memory.grow is the
@@ -1471,7 +1478,8 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
             return Ok(());
         }
 
-        if last_registry_poll.elapsed() >= registry_poll_interval {
+        if first_registry_poll_pending || last_registry_poll.elapsed() >= registry_poll_interval {
+            first_registry_poll_pending = false;
             last_registry_poll = Instant::now();
             known_roots = read_registry();
         }
@@ -1612,7 +1620,17 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
             eprintln!("[agentplug daemon] heartbeat authority held by another daemon -- exiting after finishing in-flight batch");
             return Ok(());
         }
-        let evict_before = Instant::now() - Duration::from_millis(PLUGIN_IDLE_EVICT_MS);
+        // checked_sub, not bare `-`: on a freshly-started process (this loop's very first
+        // iteration, right after boot) Instant::now() can be younger than PLUGIN_IDLE_EVICT_MS
+        // since the process's own monotonic-clock epoch, and the bare subtraction underflows
+        // -- live-reproduced as a real panic ("overflow when subtracting duration from
+        // instant", std::time.rs) crashing the daemon on every boot attempt right after a
+        // machine reboot (freshly-started process, evict window wider than process uptime).
+        // None() means nothing is old enough to evict yet -- correct behavior when the
+        // process itself hasn't lived PLUGIN_IDLE_EVICT_MS -- so fall back to Instant::now()
+        // (the eviction filter below then finds zero eligible projects, same net effect as
+        // properly having "no evict_before cutoff yet").
+        let evict_before = Instant::now().checked_sub(Duration::from_millis(PLUGIN_IDLE_EVICT_MS)).unwrap_or_else(Instant::now);
         let to_evict: Vec<PathBuf> = projects.iter().filter(|(_, p)| p.last_active < evict_before).map(|(root, _)| root.clone()).collect();
         for root in to_evict {
             eprintln!("[agentplug daemon] evicting idle project {}", root.display());
