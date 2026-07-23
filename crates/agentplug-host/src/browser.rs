@@ -187,22 +187,68 @@ fn parse_body(body: &str) -> (Option<String>, String) {
 /// path (only the retired JS wrapper had them). Stripped before parse_body
 /// sees the remaining url=/bare-URL/script body, so the two prefix systems
 /// compose (e.g. "profile\nurl=https://...\nscript").
+// Screenshot and Dom variants close a live-found documented-but-unimplemented
+// gap: browser.md's served prose documents `screenshot\n<expression>` (writes
+// a PNG to .gm/witness/, returns its path) and `dom=<selector>\n` (returns
+// matched element info) as real body-shape prefixes, but this enum + its
+// strip_mode_prefix parser previously had zero handling for either -- the
+// prose-conformance PRD item's own static check is what surfaced this,
+// exactly the "prose promises a capability, zero implementing code" class
+// the item was built to catch structurally.
 #[derive(Clone, Copy, PartialEq)]
 enum BrowserMode {
     Default,
     Capture,
     Profile,
     Trace,
+    Screenshot,
+    Dom,
 }
 
-fn strip_mode_prefix(body: &str) -> (BrowserMode, &str) {
+/// `dom=<selector>\n<rest>` carries its own selector argument inline (unlike
+/// capture/profile/trace's bare `<word>\n` prefix), so it needs its own strip
+/// path returning the selector alongside the mode. Returns (mode, selector,
+/// remaining body) -- selector is empty for every non-Dom mode.
+fn strip_mode_prefix(body: &str) -> (BrowserMode, String, &str) {
     let trimmed = body.trim_start();
-    for (prefix, mode) in [("capture\n", BrowserMode::Capture), ("profile\n", BrowserMode::Profile), ("trace\n", BrowserMode::Trace)] {
+    for (prefix, mode) in [
+        ("capture\n", BrowserMode::Capture),
+        ("profile\n", BrowserMode::Profile),
+        ("trace\n", BrowserMode::Trace),
+        ("screenshot\n", BrowserMode::Screenshot),
+    ] {
         if let Some(rest) = trimmed.strip_prefix(prefix) {
-            return (mode, rest);
+            return (mode, String::new(), rest);
         }
     }
-    (BrowserMode::Default, body)
+    if let Some(rest) = trimmed.strip_prefix("dom=") {
+        let (selector, remainder) = match rest.find('\n') {
+            Some(nl) => (rest[..nl].trim().to_string(), &rest[nl + 1..]),
+            None => (rest.trim().to_string(), ""),
+        };
+        return (BrowserMode::Dom, selector, remainder);
+    }
+    (BrowserMode::Default, String::new(), body)
+}
+
+/// `timeout=<ms>\n<rest>` -- documented in browser.md's Body shapes list
+/// ("timeout=<ms>\n<expression>", composing with url=/capture/etc as the
+/// OUTERMOST prefix per the prose's own stacking order) but, confirmed live
+/// via the prose-conformance script this fix was found by, never actually
+/// parsed anywhere in this file -- `timeout_ms` previously only ever came
+/// from the outer spool-dispatch JSON envelope's `timeoutMs` field, with no
+/// way for an in-body `timeout=` prefix to override it as documented.
+/// Returns `Some(parsed_ms)` and the remainder past the prefix, or `None`
+/// (envelope timeout wins unchanged) if the prefix is absent.
+fn strip_timeout_prefix(body: &str) -> (Option<u64>, &str) {
+    let trimmed = body.trim_start();
+    let Some(rest) = trimmed.strip_prefix("timeout=") else { return (None, body) };
+    let Some(nl) = rest.find('\n') else { return (None, body) };
+    let (num_str, remainder) = (&rest[..nl], &rest[nl + 1..]);
+    match num_str.trim().parse::<u64>() {
+        Ok(ms) => (Some(ms), remainder),
+        Err(_) => (None, body),
+    }
 }
 
 fn browser_profiles_dir(cwd: &Path) -> PathBuf {
@@ -740,7 +786,9 @@ pub fn run(body: &str, cwd: &Path, session_id: &str) -> Value {
         SessionCommand::None => {}
     }
 
-    let (mode, after_mode) = strip_mode_prefix(&inner_body);
+    let (timeout_override, after_timeout) = strip_timeout_prefix(&inner_body);
+    let timeout_ms = timeout_override.unwrap_or(timeout_ms);
+    let (mode, dom_selector, after_mode) = strip_mode_prefix(after_timeout);
     let (start_url, script) = parse_body(after_mode);
 
     let tmp = std::env::temp_dir();
@@ -748,13 +796,26 @@ pub fn run(body: &str, cwd: &Path, session_id: &str) -> Value {
     let helper_path = tmp.join(format!("agentplug-cdp-eval-{stamp}.mjs"));
     let script_path = tmp.join(format!("agentplug-cdp-script-{stamp}.js"));
     let result_path = tmp.join(format!("agentplug-cdp-result-{stamp}.json"));
-    let artifact_path = if mode != BrowserMode::Default {
-        let dir = browser_profiles_dir(cwd);
-        let _ = std::fs::create_dir_all(&dir);
-        let ext = match mode { BrowserMode::Trace => "trace.json", _ => "profile.json" };
-        Some(dir.join(format!("{}-{}.{}", mode_label(mode), unix_ms(), ext)))
-    } else {
-        None
+    // Screenshot's artifact is a PNG under .gm/witness/ (matching the
+    // documented location -- prose says "writes a PNG and returns its
+    // path", and .gm/witness/ is this repo's own convention for that class
+    // of artifact per gm's own gate-condition doc, distinct from
+    // browser_profiles_dir which holds profile/trace JSON captures). Dom
+    // mode returns structured element data inline in `result`, no artifact
+    // file at all.
+    let artifact_path = match mode {
+        BrowserMode::Default | BrowserMode::Dom => None,
+        BrowserMode::Screenshot => {
+            let dir = cwd.join(".gm").join("witness");
+            let _ = std::fs::create_dir_all(&dir);
+            Some(dir.join(format!("{}-{}.png", mode_label(mode), unix_ms())))
+        }
+        _ => {
+            let dir = browser_profiles_dir(cwd);
+            let _ = std::fs::create_dir_all(&dir);
+            let ext = match mode { BrowserMode::Trace => "trace.json", _ => "profile.json" };
+            Some(dir.join(format!("{}-{}.{}", mode_label(mode), unix_ms(), ext)))
+        }
     };
     if let Ok(mut f) = std::fs::File::create(&helper_path) {
         let _ = f.write_all(CDP_EVAL_JS.as_bytes());
@@ -816,6 +877,7 @@ pub fn run(body: &str, cwd: &Path, session_id: &str) -> Value {
         "timeoutMs": timeout_ms,
         "mode": mode_label(mode),
         "artifactFile": artifact_path.as_ref().map(|p| p.to_string_lossy().into_owned()),
+        "domSelector": dom_selector,
     })
     .to_string();
 
@@ -941,6 +1003,30 @@ pub fn run(body: &str, cwd: &Path, session_id: &str) -> Value {
                 out["trace_file"] = json!(p.to_string_lossy());
             }
         }
+        BrowserMode::Screenshot => {
+            out["result"] = result_value.get("result").cloned().unwrap_or(Value::Null);
+            let screenshot_error = result_value.get("screenshot_error").cloned();
+            if let Some(p) = &artifact_path {
+                if screenshot_error.is_none() {
+                    out["screenshot_path"] = json!(p.to_string_lossy());
+                }
+            }
+            if let Some(e) = screenshot_error {
+                if !e.is_null() {
+                    out["screenshot_error"] = e;
+                }
+            }
+        }
+        BrowserMode::Dom => {
+            out["selector"] = json!(dom_selector);
+            out["match_count"] = result_value.get("match_count").cloned().unwrap_or(json!(0));
+            out["elements"] = result_value.get("elements").cloned().unwrap_or(json!([]));
+            if let Some(e) = result_value.get("error") {
+                if !e.is_null() {
+                    out["result"] = json!({ "error": e });
+                }
+            }
+        }
     }
     out
 }
@@ -951,6 +1037,8 @@ fn mode_label(mode: BrowserMode) -> &'static str {
         BrowserMode::Capture => "capture",
         BrowserMode::Profile => "profile",
         BrowserMode::Trace => "trace",
+        BrowserMode::Screenshot => "screenshot",
+        BrowserMode::Dom => "dom",
     }
 }
 

@@ -255,6 +255,73 @@ async function main() {
       process.exit(0);
     }
 
+    if (mode === 'screenshot') {
+      const res = await evalOnly(sess, script, startUrl, timeoutMs);
+      if (res.exceptionDetails) {
+        const msg = res.exceptionDetails.exception?.description || res.exceptionDetails.text || 'evaluate exception';
+        fs.writeFileSync(resultFile, JSON.stringify({ __cdpError: msg }));
+        process.stderr.write(`cdp-eval: exception ${msg}\n`);
+        sess.close();
+        process.exit(1);
+      }
+      const value = res.result && ('value' in res.result) ? res.result.value : null;
+      let screenshotError = null;
+      try {
+        const shot = await sess.send('Page.captureScreenshot', { format: 'png' });
+        if (shot && shot.data && artifactFile) {
+          fs.writeFileSync(artifactFile, Buffer.from(shot.data, 'base64'));
+        } else if (!shot || !shot.data) {
+          screenshotError = 'Page.captureScreenshot returned no image data';
+        }
+      } catch (e) {
+        screenshotError = String(e && e.message || e);
+      }
+      const envelope = { result: value === undefined ? null : value, screenshot_error: screenshotError };
+      fs.writeFileSync(resultFile, JSON.stringify(envelope));
+      sess.close();
+      process.exit(0);
+    }
+
+    if (mode === 'dom') {
+      const selector = cfg.domSelector || '';
+      const domScript = `
+        const __els = Array.from(document.querySelectorAll(${JSON.stringify(selector)})).slice(0, 20);
+        return __els.map((el) => {
+          const rect = el.getBoundingClientRect();
+          const style = window.getComputedStyle(el);
+          const attrs = {};
+          for (const a of el.attributes) attrs[a.name] = a.value;
+          return {
+            tag: el.tagName.toLowerCase(),
+            text: (el.textContent || '').trim().slice(0, 200),
+            attrs,
+            visible: style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0,
+            rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
+          };
+        });
+      `;
+      const wrapped = `(async () => { try { ${domScript} } catch (__e) { return { __domError: String(__e && __e.message || __e) }; } })()`;
+      const res = await sess.send('Runtime.evaluate', { expression: wrapped, awaitPromise: true, returnByValue: true, userGesture: true, timeout: timeoutMs });
+      if (res.exceptionDetails) {
+        const msg = res.exceptionDetails.exception?.description || res.exceptionDetails.text || 'evaluate exception';
+        fs.writeFileSync(resultFile, JSON.stringify({ __cdpError: msg }));
+        process.stderr.write(`cdp-eval: exception ${msg}\n`);
+        sess.close();
+        process.exit(1);
+      }
+      const value = res.result && ('value' in res.result) ? res.result.value : null;
+      let envelope;
+      if (value && value.__domError) {
+        envelope = { match_count: 0, elements: [], error: value.__domError };
+      } else {
+        const elements = Array.isArray(value) ? value : [];
+        envelope = { match_count: elements.length, elements };
+      }
+      fs.writeFileSync(resultFile, JSON.stringify(envelope));
+      sess.close();
+      process.exit(0);
+    }
+
     // default mode, unchanged from before
     const res = await evalOnly(sess, script, startUrl, timeoutMs);
     if (res.exceptionDetails) {
