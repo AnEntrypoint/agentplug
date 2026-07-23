@@ -1706,9 +1706,34 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
             for (plugin_name, new_version) in pending_plugin_swaps.drain(..) {
                 plugin_modules.modules.remove(&plugin_name);
                 agentplug_host::release_shared_plugin(&plugin_name);
-                eprintln!(
-                    "[agentplug daemon] refreshed plugin {plugin_name} to {new_version} -- released its Store; next call re-instantiates from the new wasm"
-                );
+                // Recompile from the freshly-downloaded wasm and refill the
+                // shared pool IMMEDIATELY. Leaving the pool empty here meant
+                // every subsequent dispatch hard-errored "plugin X not
+                // loaded" (dispatch has no re-instantiation path), and a
+                // re-registering project couldn't heal it either: the module
+                // was gone from `plugin_modules.modules`, so its load loop
+                // hit the "not yet compiled" skip — live-witnessed as a
+                // daemon that answered every gm verb with that error for
+                // hours until it was killed. The refill root is non-binding
+                // (dispatch_on re-roots the Store per call).
+                match plugin_modules.get_or_compile(&plugin_name) {
+                    Ok(()) => {
+                        if let Some(module) = plugin_modules.modules.get(&plugin_name) {
+                            let root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+                            match agentplug_host::refill_shared_plugin(&plugin_modules.engine, &plugin_name, module, &root) {
+                                Ok(filled) => eprintln!(
+                                    "[agentplug daemon] refreshed plugin {plugin_name} to {new_version} -- recompiled and re-instantiated {filled} pool slot(s) from the new wasm"
+                                ),
+                                Err(e) => eprintln!(
+                                    "[agentplug daemon] refreshed plugin {plugin_name} to {new_version} but pool refill failed: {e:#} -- next project registration re-instantiates"
+                                ),
+                            }
+                        }
+                    }
+                    Err(e) => eprintln!(
+                        "[agentplug daemon] refreshed plugin {plugin_name} to {new_version} but recompile failed: {e:#} -- next registration retries"
+                    ),
+                }
             }
         }
 
