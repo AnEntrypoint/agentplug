@@ -52,17 +52,14 @@ impl SharedPluginPool {
     }
 
     pub fn acquire(&self) -> Option<std::sync::MutexGuard<'_, Option<SiblingHandle>>> {
-        for slot in &self.slots {
-            if let Ok(guard) = slot.try_lock() {
-                return Some(guard);
-            }
-        }
         const ACQUIRE_TIMEOUT_MS: u64 = 20_000;
         const POLL_INTERVAL_MS: u64 = 25;
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(ACQUIRE_TIMEOUT_MS);
         loop {
-            if let Ok(guard) = self.slots[0].try_lock() {
-                return Some(guard);
+            for slot in &self.slots {
+                if let Ok(guard) = slot.try_lock() {
+                    return Some(guard);
+                }
             }
             if std::time::Instant::now() >= deadline {
                 return None;

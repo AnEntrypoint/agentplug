@@ -59,8 +59,31 @@ struct DaemonConfig {
     side_plugin_concurrency: Option<usize>,
 }
 
+const DAEMON_CONFIG_EXAMPLE: &str = r#"{
+  "registry_poll_interval_secs": 5,
+  "heartbeat_interval_secs": 10,
+  "plugin_update_poll_interval_secs": 600,
+  "runner_update_poll_interval_secs": 600,
+  "max_concurrent_projects": 4,
+  "gm_concurrency": 4,
+  "side_plugin_concurrency": 1
+}
+"#;
+
 impl DaemonConfig {
+    fn scaffold_example_if_absent() {
+        let path = install_dir().join("daemon-config.json");
+        if path.exists() {
+            return;
+        }
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let _ = fs::write(&path, DAEMON_CONFIG_EXAMPLE);
+    }
+
     fn load() -> Self {
+        Self::scaffold_example_if_absent();
         let path = install_dir().join("daemon-config.json");
         fs::read_to_string(&path)
             .ok()
