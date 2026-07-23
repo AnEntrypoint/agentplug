@@ -219,6 +219,20 @@ impl SharedPluginPool {
         self.slots.iter().any(|s| s.lock().unwrap().is_some())
     }
 
+    fn all_instantiated(&self) -> bool {
+        // try_lock: a slot busy mid-dispatch is by definition instantiated.
+        self.slots.iter().all(|s| match s.try_lock() {
+            Ok(g) => g.is_some(),
+            Err(_) => true,
+        })
+    }
+
+    /// The raw slots, for fill-every-empty-slot loads (see `load_plugin` and
+    /// `refill_shared_plugin`).
+    pub(crate) fn slots_for_fill(&self) -> &[Arc<Mutex<Option<SiblingHandle>>>] {
+        &self.slots
+    }
+
     fn release_all(&self) -> bool {
         let mut released = false;
         for slot in &self.slots {
@@ -272,6 +286,32 @@ pub fn release_shared_plugin(plugin_name: &str) -> bool {
         return false;
     }
     shared_plugin_pool(plugin_name).release_all()
+}
+
+/// Re-instantiates every EMPTY slot of a shared plugin's pool from `module`.
+/// The plugin-auto-update swap (daemon: `modules.remove` +
+/// `release_shared_plugin`) empties the whole pool, and `dispatch` hard-errors
+/// on an empty slot with no re-instantiation path of its own — so without an
+/// immediate refill every verb fails "plugin X not loaded" until some project
+/// happens to re-register (and before the fill-all fix in `load_plugin`, even
+/// THAT only refilled one slot). The instantiation `root` is non-binding for
+/// shared plugins: `dispatch_on` refreshes the Store's cwd/siblings to the
+/// CALLING project before every call.
+pub fn refill_shared_plugin(engine: &Engine, plugin_name: &str, module: &Module, root: &Path) -> anyhow::Result<usize> {
+    if !is_stateless_shared_plugin(plugin_name) {
+        return Ok(0);
+    }
+    let pool = shared_plugin_pool(plugin_name);
+    let mut filled = 0usize;
+    for slot in pool.slots_for_fill() {
+        if let Ok(mut guard) = slot.try_lock() {
+            if guard.is_none() {
+                *guard = Some(instantiate_plugin(engine, root.to_path_buf(), plugin_name, module)?);
+                filled += 1;
+            }
+        }
+    }
+    Ok(filled)
 }
 
 /// Runs a verb dispatch against an already-instantiated plugin's OWN Store.
@@ -437,7 +477,14 @@ impl ProjectPlugins {
     }
 
     pub fn is_loaded(&self, plugin_name: &str) -> bool {
-        self.siblings.lock().unwrap().get(plugin_name).map(|p| p.any_instantiated()).unwrap_or(false)
+        // ALL slots, not ANY: a partially-refilled shared pool (post
+        // auto-update-swap, pre fill-all `load_plugin`) previously read as
+        // "loaded" here, so the registration loop skipped the very
+        // `load_plugin` call that would have healed the remaining empty
+        // slots — leaving intermittent per-dispatch "plugin X not loaded"
+        // (whichever concurrent verb drew an empty slot) with no recovery
+        // short of killing the daemon.
+        self.siblings.lock().unwrap().get(plugin_name).map(|p| p.all_instantiated()).unwrap_or(false)
     }
 
     /// Instantiates `module` under `plugin_name` for this project. Modules
@@ -460,10 +507,22 @@ impl ProjectPlugins {
     pub fn load_plugin(&mut self, engine: &Engine, plugin_name: &str, module: &Module) -> anyhow::Result<()> {
         if is_stateless_shared_plugin(plugin_name) {
             let pool = shared_plugin_pool(plugin_name);
-            {
-                let mut guard = pool.acquire().ok_or_else(|| anyhow::anyhow!("plugin {plugin_name} pool busy (timeout acquiring slot for load)"))?;
-                if guard.is_none() {
-                    *guard = Some(instantiate_plugin(engine, self.root.clone(), plugin_name, module)?);
+            // Fill EVERY empty slot, not just the first one acquired. After a
+            // plugin auto-update swap (daemon: modules.remove +
+            // release_shared_plugin) the whole pool is None; `dispatch` has no
+            // re-instantiation path (it hard-errors "plugin X not loaded" on
+            // an empty slot), so a re-registering project that refilled only
+            // ONE slot left every OTHER slot dead — live-witnessed as
+            // intermittent per-dispatch "plugin gm not loaded" where exactly
+            // 1 of N concurrent verbs succeeded (the one that happened to
+            // acquire the single live slot), unrecoverable short of killing
+            // the daemon. try_lock per slot: a slot busy mid-dispatch is by
+            // definition instantiated, so skipping it is correct.
+            for slot in pool.slots_for_fill() {
+                if let Ok(mut guard) = slot.try_lock() {
+                    if guard.is_none() {
+                        *guard = Some(instantiate_plugin(engine, self.root.clone(), plugin_name, module)?);
+                    }
                 }
             }
             self.siblings.lock().unwrap().insert(plugin_name.to_string(), pool);

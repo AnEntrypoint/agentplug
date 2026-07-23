@@ -11,7 +11,7 @@ pub use host_state::HostState;
 pub use imports::{register_env_imports, register_wasi};
 pub use install::{install_dir, plugins_dir, wasmtime_cache_dir};
 pub use registry::{
-    epoch_ticks_for_seconds, read_project_plugin_list, release_shared_plugin, set_gm_pool_size, set_side_plugin_pool_size, DispatchHandle,
+    epoch_ticks_for_seconds, read_project_plugin_list, refill_shared_plugin, release_shared_plugin, set_gm_pool_size, set_side_plugin_pool_size, DispatchHandle,
     GmFairnessGuard, ProjectPlugins, EPOCH_TICK_INTERVAL_MS, PLUGIN_IDLE_EVICT_MS,
 };
 
