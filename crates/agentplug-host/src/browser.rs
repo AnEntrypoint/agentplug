@@ -313,13 +313,18 @@ fn session_liveness_recheck(port: u16, browser_cfg: &BrowserConfig) -> bool {
         "artifactFile": Value::Null,
     })
     .to_string();
-    let spawn = Command::new(&node)
-        .arg(&helper_path)
+    let mut spawn_cmd = Command::new(&node);
+    spawn_cmd.arg(&helper_path)
         .arg(&cfg)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn();
+        .stderr(Stdio::null());
+    #[cfg(windows)]
+    {
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        spawn_cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    let spawn = spawn_cmd.spawn();
     let alive = match spawn {
         Ok(mut child) => {
             let grace = Duration::from_millis(recheck_timeout_ms + browser_cfg.eval_timeout_grace());
@@ -642,13 +647,18 @@ pub fn run(body: &str, cwd: &Path, session_id: &str) -> Value {
     })
     .to_string();
 
-    let spawn = Command::new(&node)
-        .arg(&helper_path)
+    let mut spawn_cmd = Command::new(&node);
+    spawn_cmd.arg(&helper_path)
         .arg(&cfg)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn();
+        .stderr(Stdio::piped());
+    #[cfg(windows)]
+    {
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        spawn_cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    let spawn = spawn_cmd.spawn();
 
     let mut child = match spawn {
         Ok(c) => c,
