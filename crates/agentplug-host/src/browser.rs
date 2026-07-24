@@ -321,6 +321,7 @@ fn session_liveness_recheck(port: u16, browser_cfg: &BrowserConfig) -> bool {
         .stderr(Stdio::null());
     #[cfg(windows)]
     {
+        use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         spawn_cmd.creation_flags(CREATE_NO_WINDOW);
     }
@@ -655,6 +656,7 @@ pub fn run(body: &str, cwd: &Path, session_id: &str) -> Value {
         .stderr(Stdio::piped());
     #[cfg(windows)]
     {
+        use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         spawn_cmd.creation_flags(CREATE_NO_WINDOW);
     }
