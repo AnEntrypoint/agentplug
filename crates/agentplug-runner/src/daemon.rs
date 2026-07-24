@@ -497,17 +497,24 @@ fn handle_background_convert(root: &Path, body: &str) -> String {
 }
 
 fn handle_plugin_refresh_request(root: &Path, body: &str) -> String {
-    let requested_plugin = serde_json::from_str::<serde_json::Value>(body)
-        .ok()
-        .and_then(|v| v.get("plugin").and_then(|p| p.as_str()).map(str::to_string));
+    let parsed = serde_json::from_str::<serde_json::Value>(body).ok();
+    let requested_plugin = parsed.as_ref().and_then(|v| v.get("plugin").and_then(|p| p.as_str()).map(str::to_string));
+    let also_runner = parsed.as_ref().and_then(|v| v.get("runner").and_then(|r| r.as_bool())).unwrap_or(false);
+
     let marker = force_plugin_refresh_marker_path();
     let contents = requested_plugin.as_deref().unwrap_or("").to_string();
     let _ = fs::write(&marker, contents);
+
+    if also_runner {
+        let _ = fs::write(force_runner_refresh_marker_path(), b"");
+    }
+
     serde_json::json!({
         "ok": true,
         "queued": true,
         "plugin": requested_plugin,
-        "note": "the running daemon's plugin-update poll will fire on its next loop tick (sub-second) instead of waiting for the normal interval; re-dispatch health shortly after to observe the new version",
+        "runner_queued": also_runner,
+        "note": "the running daemon's plugin-update (and, if runner:true was passed, runner-binary-update) poll will fire on its next loop tick instead of waiting for the normal interval; re-dispatch health shortly after to observe the new version",
         "root": root.display().to_string(),
     }).to_string()
 }
@@ -521,6 +528,20 @@ fn take_forced_plugin_refresh_request() -> Option<Option<String>> {
     let contents = fs::read_to_string(&marker).ok()?;
     let _ = fs::remove_file(&marker);
     Some(if contents.trim().is_empty() { None } else { Some(contents.trim().to_string()) })
+}
+
+fn force_runner_refresh_marker_path() -> PathBuf {
+    install_dir().join("force-runner-refresh.request")
+}
+
+fn take_forced_runner_refresh_request() -> bool {
+    let marker = force_runner_refresh_marker_path();
+    if marker.exists() {
+        let _ = fs::remove_file(&marker);
+        true
+    } else {
+        false
+    }
 }
 
 fn run_gm_dispatch_to_file(root: &Path, handle: &DispatchHandle, verb: &str, task: &str, body: &str, out_dir: &Path) {
@@ -1073,7 +1094,7 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
             }
         }
 
-        if last_runner_update_poll.elapsed() >= runner_update_poll_interval {
+        if last_runner_update_poll.elapsed() >= runner_update_poll_interval || take_forced_runner_refresh_request() {
             last_runner_update_poll = Instant::now();
             match crate::download::stage_runner_self_update() {
                 Ok(Some((staged, version))) => {
