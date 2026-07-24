@@ -242,8 +242,18 @@ impl ProjectPlugins {
         dispatch_and_evict_on_error(&mut guard, verb, body, &self.root, &self.siblings, plugin_name)
     }
 
+    /// `reload_source` lets the returned handle self-heal an evicted or
+    /// never-registered plugin slot (see `DispatchHandle::dispatch`) instead
+    /// of permanently failing every subsequent dispatch with "not loaded".
+    /// Pass `None` when the caller has no engine/module available (e.g. a
+    /// context that never loads plugins itself) — dispatch then degrades to
+    /// the prior lookup-only behavior.
+    pub fn dispatch_handle_with_reload(&self, reload_source: Option<(Engine, HashMap<String, Module>)>) -> DispatchHandle {
+        DispatchHandle { root: self.root.clone(), siblings: self.siblings.clone(), reload_source }
+    }
+
     pub fn dispatch_handle(&self) -> DispatchHandle {
-        DispatchHandle { root: self.root.clone(), siblings: self.siblings.clone() }
+        DispatchHandle { root: self.root.clone(), siblings: self.siblings.clone(), reload_source: None }
     }
 }
 
@@ -251,20 +261,86 @@ impl ProjectPlugins {
 pub struct DispatchHandle {
     root: PathBuf,
     siblings: Arc<Mutex<HashMap<String, Arc<SharedPluginPool>>>>,
+    reload_source: Option<(Engine, HashMap<String, Module>)>,
 }
 
 impl DispatchHandle {
+    /// Reinstantiate `plugin_name` into its pool slot using the carried
+    /// engine/module set, mirroring `ProjectPlugins::load_plugin`'s own
+    /// instantiate-and-insert shape. No-op (returns Ok) if this handle was
+    /// built without a reload source, or the plugin's module was never
+    /// compiled into it — the caller's existing "not loaded" error still
+    /// surfaces in that case, unchanged from before this fix.
+    fn try_reload(&self, plugin_name: &str) -> anyhow::Result<()> {
+        let Some((engine, modules)) = self.reload_source.as_ref() else { return Ok(()) };
+        let Some(module) = modules.get(plugin_name) else { return Ok(()) };
+        if is_stateless_shared_plugin(plugin_name) {
+            let pool = shared_plugin_pool(plugin_name);
+            {
+                let mut guard = pool.acquire().ok_or_else(|| anyhow::anyhow!("plugin {plugin_name} pool busy (timeout acquiring slot for reload)"))?;
+                if guard.is_none() {
+                    *guard = Some(instantiate_plugin(engine, self.root.clone(), plugin_name, module)?);
+                }
+            }
+            self.siblings.lock().unwrap().insert(plugin_name.to_string(), pool);
+            return Ok(());
+        }
+        let instantiated = instantiate_plugin(engine, self.root.clone(), plugin_name, module)?;
+        let pool = self
+            .siblings
+            .lock()
+            .unwrap()
+            .entry(plugin_name.to_string())
+            .or_insert_with(|| Arc::new(SharedPluginPool::new(1)))
+            .clone();
+        *pool.acquire().ok_or_else(|| anyhow::anyhow!("plugin {plugin_name} pool busy (timeout acquiring slot for reload)"))? = Some(instantiated);
+        Ok(())
+    }
+
     pub fn dispatch(&self, plugin_name: &str, verb: &str, body: &str) -> anyhow::Result<String> {
         const DISPATCH_LOOKUP_RETRY_ATTEMPTS: u32 = 3;
         const DISPATCH_LOOKUP_RETRY_BACKOFF_MS: u64 = 200;
         let mut pool = None;
         for attempt in 0..DISPATCH_LOOKUP_RETRY_ATTEMPTS {
             pool = self.siblings.lock().unwrap().get(plugin_name).cloned();
-            if pool.is_some() || attempt + 1 == DISPATCH_LOOKUP_RETRY_ATTEMPTS { break; }
+            // An empty (evicted) slot looks identical to "registered, ready"
+            // from this HashMap lookup alone -- `any_instantiated()` is the
+            // real signal. A prior dispatch's error-path eviction
+            // (`dispatch_and_evict_on_error` sets the slot to None but keeps
+            // the pool entry) used to leave every later dispatch on this
+            // handle permanently failing with "not loaded" until some other
+            // code path happened to call `load_plugin` again -- self-heal
+            // here instead, same shape as the pre-dispatch reload check
+            // `dispatch_project` already runs for its own non-threaded path.
+            if let Some(p) = &pool {
+                if !p.any_instantiated() {
+                    let _ = self.try_reload(plugin_name);
+                    pool = self.siblings.lock().unwrap().get(plugin_name).cloned();
+                }
+            }
+            if pool.as_ref().map(|p| p.any_instantiated()).unwrap_or(false) || attempt + 1 == DISPATCH_LOOKUP_RETRY_ATTEMPTS { break; }
             std::thread::sleep(std::time::Duration::from_millis(DISPATCH_LOOKUP_RETRY_BACKOFF_MS));
         }
-        let pool = pool.ok_or_else(|| anyhow::anyhow!("plugin {plugin_name} not loaded"))?;
+        if pool.is_none() {
+            let _ = self.try_reload(plugin_name);
+            pool = self.siblings.lock().unwrap().get(plugin_name).cloned();
+        }
+        let mut pool = pool.ok_or_else(|| anyhow::anyhow!("plugin {plugin_name} not loaded"))?;
         let mut guard = pool.acquire().ok_or_else(|| anyhow::anyhow!("plugin {plugin_name} pool busy (timeout acquiring slot)"))?;
+        if guard.is_none() {
+            let _ = self.try_reload(plugin_name);
+            // try_reload only replaces the SHARED pool map entry (stateless
+            // plugins) or inserts fresh (per-project plugins); this guard is
+            // already held on the OLD (possibly stale) pool reference for
+            // the per-project case, so re-acquire is only needed for the
+            // shared case where the pool object itself is unchanged and the
+            // slot was mutated in place by try_reload above.
+            if is_stateless_shared_plugin(plugin_name) && guard.is_none() {
+                drop(guard);
+                pool = self.siblings.lock().unwrap().get(plugin_name).cloned().ok_or_else(|| anyhow::anyhow!("plugin {plugin_name} not loaded"))?;
+                guard = pool.acquire().ok_or_else(|| anyhow::anyhow!("plugin {plugin_name} pool busy (timeout acquiring slot)"))?;
+            }
+        }
         dispatch_and_evict_on_error(&mut guard, verb, body, &self.root, &self.siblings, plugin_name)
     }
 }
