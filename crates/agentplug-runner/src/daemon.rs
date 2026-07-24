@@ -477,6 +477,33 @@ fn handle_background_convert(root: &Path, body: &str) -> String {
     }
 }
 
+fn handle_plugin_refresh_request(root: &Path, body: &str) -> String {
+    let requested_plugin = serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v.get("plugin").and_then(|p| p.as_str()).map(str::to_string));
+    let marker = force_plugin_refresh_marker_path();
+    let contents = requested_plugin.as_deref().unwrap_or("").to_string();
+    let _ = fs::write(&marker, contents);
+    serde_json::json!({
+        "ok": true,
+        "queued": true,
+        "plugin": requested_plugin,
+        "note": "the running daemon's plugin-update poll will fire on its next loop tick (sub-second) instead of waiting for the normal interval; re-dispatch health shortly after to observe the new version",
+        "root": root.display().to_string(),
+    }).to_string()
+}
+
+fn force_plugin_refresh_marker_path() -> PathBuf {
+    install_dir().join("force-plugin-refresh.request")
+}
+
+fn take_forced_plugin_refresh_request() -> Option<Option<String>> {
+    let marker = force_plugin_refresh_marker_path();
+    let contents = fs::read_to_string(&marker).ok()?;
+    let _ = fs::remove_file(&marker);
+    Some(if contents.trim().is_empty() { None } else { Some(contents.trim().to_string()) })
+}
+
 fn run_gm_dispatch_to_file(root: &Path, handle: &DispatchHandle, verb: &str, task: &str, body: &str, out_dir: &Path) {
     let _fairness_guard = GmFairnessGuard::acquire(root);
     let dispatch_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handle.dispatch("gm", verb, body)));
@@ -563,9 +590,12 @@ fn dispatch_project(root: &Path, project: &mut ProjectPlugins, plugin_modules: &
 
     let mut gm_requests: Vec<ClaimedRequest> = Vec::with_capacity(claimed.len());
     let mut bg_convert_requests: Vec<ClaimedRequest> = Vec::new();
+    let mut plugin_refresh_requests: Vec<ClaimedRequest> = Vec::new();
     for req in claimed {
         if req.verb == "background-convert" {
             bg_convert_requests.push(req);
+        } else if req.verb == "plugin-refresh" {
+            plugin_refresh_requests.push(req);
         } else {
             gm_requests.push(req);
         }
@@ -582,6 +612,16 @@ fn dispatch_project(root: &Path, project: &mut ProjectPlugins, plugin_modules: &
             }
         }
     };
+    for req in plugin_refresh_requests {
+        let out_body = handle_plugin_refresh_request(root, &req.body);
+        let out_name = format!("{}-{}.json", req.verb, req.task);
+        let tmp = out_dir.join(format!("{out_name}.tmp.{}", std::process::id()));
+        if fs::write(&tmp, &out_body).is_ok() {
+            let _ = fs::rename(&tmp, out_dir.join(&out_name));
+            let _ = fs::write(out_dir.join(format!("{out_name}.ready")), b"");
+        }
+        did_work = true;
+    }
 
     if gm_requests.is_empty() {
         answer_bg_converts(bg_convert_requests);
@@ -983,9 +1023,14 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
             projects.remove(&root);
         }
 
-        if last_plugin_update_poll.elapsed() >= plugin_update_poll_interval {
+        let forced_refresh_request = take_forced_plugin_refresh_request();
+        if last_plugin_update_poll.elapsed() >= plugin_update_poll_interval || forced_refresh_request.is_some() {
             last_plugin_update_poll = Instant::now();
-            for plugin_name in plugin_modules.modules.keys().cloned().collect::<Vec<_>>() {
+            let targets: Vec<String> = match &forced_refresh_request {
+                Some(Some(name)) => vec![name.clone()],
+                _ => plugin_modules.modules.keys().cloned().collect(),
+            };
+            for plugin_name in targets {
                 match crate::download::refresh_plugin_if_stale(&plugin_name) {
                     Ok(Some(new_version)) => {
                         eprintln!(
