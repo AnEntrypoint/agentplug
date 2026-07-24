@@ -215,8 +215,11 @@ fn pid_sidecar_path(profile_dir: &Path) -> PathBuf {
 
 #[cfg(windows)]
 fn pid_is_alive(pid: u32) -> bool {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     let output = Command::new("tasklist")
         .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
+        .creation_flags(CREATE_NO_WINDOW)
         .output();
     match output {
         Ok(o) => {
@@ -351,7 +354,12 @@ fn session_liveness_recheck(port: u16, browser_cfg: &BrowserConfig) -> bool {
 
 #[cfg(windows)]
 fn kill_pid(pid: u32) {
-    let _ = Command::new("taskkill").args(["/PID", &pid.to_string(), "/F", "/T"]).output();
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let _ = Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/F", "/T"])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output();
 }
 
 #[cfg(not(windows))]
@@ -506,6 +514,12 @@ fn launch_chrome(cwd: &Path, session_id: &str, browser_cfg: &BrowserConfig) -> R
         .arg("--disable-default-apps");
     if browser_cfg.headless() {
         cmd.arg("--disable-gpu").arg("--headless=new");
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
     }
     let mut chrome_child = cmd
         .stdin(Stdio::null())

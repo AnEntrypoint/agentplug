@@ -3,6 +3,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 
 use wasmtime::{Engine, Module};
 
@@ -215,8 +217,10 @@ fn is_daemon_fresh() -> bool {
 
 #[cfg(windows)]
 fn pid_is_alive(pid: u64) -> bool {
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     let output = std::process::Command::new("tasklist")
         .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
+        .creation_flags(CREATE_NO_WINDOW)
         .output();
     match output {
         Ok(o) => {
@@ -302,25 +306,40 @@ fn sync_instruction_source_if_configured(root: &Path) -> anyhow::Result<()> {
     let git_dir_marker = cache_dir.join(".git");
     if !git_dir_marker.exists() {
         fs::create_dir_all(root.join(".gm"))?;
-        let status = std::process::Command::new("git")
-            .args(["clone", "--depth", "1", "--branch", &cfg.branch, &cfg.repo, &cache_dir.to_string_lossy()])
-            .status()?;
-        if !status.success() {
+        let mut clone_cmd = std::process::Command::new("git");
+        clone_cmd.args(["clone", "--depth", "1", "--branch", &cfg.branch, &cfg.repo, &cache_dir.to_string_lossy()]);
+        #[cfg(windows)]
+        {
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            clone_cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+        let output = clone_cmd.output()?;
+        if !output.status.success() {
             anyhow::bail!("git clone of {} (branch {}) failed", cfg.repo, cfg.branch);
         }
         eprintln!("[agentplug daemon] cloned instruction source {} (branch {}) for {}", cfg.repo, cfg.branch, root.display());
         return Ok(());
     }
-    let fetch = std::process::Command::new("git")
-        .args(["-C", &cache_dir.to_string_lossy(), "fetch", "--depth", "1", "origin", &cfg.branch])
-        .status()?;
-    if !fetch.success() {
+    let mut fetch_cmd = std::process::Command::new("git");
+    fetch_cmd.args(["-C", &cache_dir.to_string_lossy(), "fetch", "--depth", "1", "origin", &cfg.branch]);
+    #[cfg(windows)]
+    {
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        fetch_cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    let fetch = fetch_cmd.output()?;
+    if !fetch.status.success() {
         anyhow::bail!("git fetch of {} (branch {}) failed", cfg.repo, cfg.branch);
     }
-    let reset = std::process::Command::new("git")
-        .args(["-C", &cache_dir.to_string_lossy(), "reset", "--hard", &format!("origin/{}", cfg.branch)])
-        .status()?;
-    if !reset.success() {
+    let mut reset_cmd = std::process::Command::new("git");
+    reset_cmd.args(["-C", &cache_dir.to_string_lossy(), "reset", "--hard", &format!("origin/{}", cfg.branch)]);
+    #[cfg(windows)]
+    {
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        reset_cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    let reset = reset_cmd.output()?;
+    if !reset.status.success() {
         anyhow::bail!("git reset of instruction source cache for {} failed", root.display());
     }
     Ok(())
