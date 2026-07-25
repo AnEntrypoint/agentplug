@@ -698,14 +698,7 @@ fn dispatch_project(root: &Path, project: &mut ProjectPlugins, plugin_modules: &
             }
             let mut spawned: Vec<Spawned> = Vec::with_capacity(gm_requests.len());
             for req in gm_requests {
-                // reload_source lets this thread's DispatchHandle self-heal
-                // an evicted plugin (dispatch_and_evict_on_error's error-path
-                // eviction) instead of every dispatch on this handle failing
-                // "plugin gm not loaded" until some other code path happens
-                // to reload it (real bug: agentgui session 2026-07-24 hit
-                // this repeatedly on a shared multi-project daemon where a
-                // browser-verb Chrome-launch timeout evicted `gm` mid-batch).
-                let dispatch_handle = project.dispatch_handle_with_reload(Some((plugin_modules.engine.clone(), plugin_modules.modules.clone())));
+                let self_healing_dispatch_handle = project.dispatch_handle_with_reload(Some((plugin_modules.engine.clone(), plugin_modules.modules.clone())));
                 let detach_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
                 let key: InFlightKey = (root.to_path_buf(), req.verb.clone(), req.task.clone());
                 in_flight_map().lock().unwrap_or_else(|e| e.into_inner()).insert(key.clone(), InFlightHandle { detach: detach_flag.clone() });
@@ -716,7 +709,7 @@ fn dispatch_project(root: &Path, project: &mut ProjectPlugins, plugin_modules: &
                 let thread_body = req.body.clone();
                 let thread_out_dir = out_dir.clone();
                 let join_handle = std::thread::spawn(move || {
-                    run_gm_dispatch_to_file(&thread_root, &dispatch_handle, &thread_verb, &thread_task, &thread_body, &thread_out_dir);
+                    run_gm_dispatch_to_file(&thread_root, &self_healing_dispatch_handle, &thread_verb, &thread_task, &thread_body, &thread_out_dir);
                 });
                 spawned.push(Spawned { key, join_handle: Some(join_handle), detach_flag });
             }
@@ -782,8 +775,7 @@ fn dispatch_project(root: &Path, project: &mut ProjectPlugins, plugin_modules: &
                                 let body = fs::read_to_string(&claim_path).unwrap_or_default();
                                 let _ = fs::remove_file(&claim_path);
 
-                                // Same self-heal rationale as the initial-batch spawn site above.
-                                let dispatch_handle = project.dispatch_handle_with_reload(Some((plugin_modules.engine.clone(), plugin_modules.modules.clone())));
+                                let self_healing_dispatch_handle = project.dispatch_handle_with_reload(Some((plugin_modules.engine.clone(), plugin_modules.modules.clone())));
                                 let detach_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
                                 let key: InFlightKey = (root.to_path_buf(), verb.clone(), task.clone());
                                 in_flight_map().lock().unwrap_or_else(|e| e.into_inner()).insert(key.clone(), InFlightHandle { detach: detach_flag.clone() });
@@ -794,7 +786,7 @@ fn dispatch_project(root: &Path, project: &mut ProjectPlugins, plugin_modules: &
                                 let thread_body = body;
                                 let thread_out_dir = out_dir.clone();
                                 let join_handle = std::thread::spawn(move || {
-                                    run_gm_dispatch_to_file(&thread_root, &dispatch_handle, &thread_verb, &thread_task, &thread_body, &thread_out_dir);
+                                    run_gm_dispatch_to_file(&thread_root, &self_healing_dispatch_handle, &thread_verb, &thread_task, &thread_body, &thread_out_dir);
                                 });
                                 spawned.push(Spawned { key, join_handle: Some(join_handle), detach_flag });
                             }

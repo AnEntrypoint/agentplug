@@ -45,12 +45,7 @@ function cdpSession(wsUrl, timeoutMs) {
         });
       },
       close() { clearTimeout(timer); try { ws.close(); } catch (_) {} },
-      // Set by capture/profile/trace modes to receive id-less CDP
-      // notifications (Runtime.consoleAPICalled, Network.*, Tracing.*) --
-      // the original design only routed id-keyed command responses, which
-      // is why capture/trace need this hook added rather than reusing the
-      // existing pending-map dispatch.
-      onEvent: null,
+      onIdLessNotification: null,
     };
     ws.addEventListener('open', () => { resolve(sessObj); });
     ws.addEventListener('message', (ev) => {
@@ -61,33 +56,15 @@ function cdpSession(wsUrl, timeoutMs) {
         pending.delete(msg.id);
         if (msg.error) rej(new Error(msg.error.message || 'cdp error'));
         else res(msg.result);
-      } else if (msg.method && sessObj.onEvent) {
-        sessObj.onEvent(msg);
+      } else if (msg.method && sessObj.onIdLessNotification) {
+        sessObj.onIdLessNotification(msg);
       }
     });
     ws.addEventListener('error', () => { clearTimeout(timer); reject(new Error('cdp websocket error')); });
   });
 }
 
-// Direct CDP evaluation, replacing the playwriter relay attach+eval that crashes
-// with UV_HANDLE_CLOSING on Windows. Everything up to obtaining Chrome's CDP
-// endpoint is already done by the wrapper (it launches Chrome with
-// --remote-debugging-port and polls /json/version); this drives that endpoint
-// directly over the DevTools websocket, so the crashing relay process is never
-// spawned. Reads {port, startUrl, scriptFile, resultFile, timeoutMs} from argv[2]
-// as JSON, runs the script via Runtime.evaluate (awaitPromise, returnByValue),
-// and writes the returned value to resultFile -- the same result channel the
-// playwriter path used.
-// capture/profile/trace modes -- ported from the retired JS wrapper's
-// equivalent prefix handling, driven here over the same real CDP session
-// instead of playwright. capture wires Runtime.consoleAPICalled +
-// Network.request*/responseReceived + a Page.getResourceTree-adjacent
-// performance snapshot; profile wraps the eval in Profiler.start/stop and
-// aggregates the returned CpuProfile the same way exec_js's opts.profile
-// does; trace opens CDP Tracing and buckets category-tagged events by
-// wall-clock duration (gpu/viz/compositor), the one channel the JS-side
-// CPU sampler used by profile mode is blind to.
-async function evalOnly(sess, script, startUrl, timeoutMs) {
+async function navigateIfNeededThenEvaluateOverCdp(sess, script, startUrl, timeoutMs) {
   if (startUrl) {
     await sess.send('Page.enable', {});
     await sess.send('Page.navigate', { url: startUrl });
@@ -159,7 +136,7 @@ async function main() {
     if (mode === 'capture') {
       const consoleLines = [];
       const networkEvents = [];
-      sess.onEvent = (msg) => {
+      sess.onIdLessNotification = (msg) => {
         if (msg.method === 'Runtime.consoleAPICalled') {
           const args = (msg.params.args || []).map((a) => (a.value !== undefined ? a.value : a.description || a.type));
           consoleLines.push({ type: msg.params.type, args, ts: msg.params.timestamp });
@@ -170,7 +147,7 @@ async function main() {
         }
       };
       await sess.send('Network.enable', {});
-      const res = await evalOnly(sess, script, startUrl, timeoutMs);
+      const res = await navigateIfNeededThenEvaluateOverCdp(sess, script, startUrl, timeoutMs);
       const perf = await sess.send('Runtime.evaluate', { expression: 'JSON.stringify(performance.timing || {})', returnByValue: true }).catch(() => null);
       let performanceSnapshot = null;
       try { performanceSnapshot = perf && perf.result && perf.result.value ? JSON.parse(perf.result.value) : null; } catch (_) {}
@@ -192,7 +169,7 @@ async function main() {
       await sess.send('Profiler.enable', {});
       await sess.send('Profiler.setSamplingInterval', { interval: 100 });
       await sess.send('Profiler.start', {});
-      const res = await evalOnly(sess, script, startUrl, timeoutMs);
+      const res = await navigateIfNeededThenEvaluateOverCdp(sess, script, startUrl, timeoutMs);
       const stopRes = await sess.send('Profiler.stop', {});
       const agg = aggregateCpuProfile(stopRes && stopRes.profile, 20);
       if (res.exceptionDetails) {
@@ -212,19 +189,19 @@ async function main() {
 
     if (mode === 'trace') {
       const traceEvents = [];
-      sess.onEvent = (msg) => {
+      sess.onIdLessNotification = (msg) => {
         if (msg.method === 'Tracing.dataCollected') {
           for (const e of (msg.params.value || [])) traceEvents.push(e);
         }
       };
       await sess.send('Tracing.start', { categories: 'disabled-by-default-devtools.timeline,devtools.timeline,disabled-by-default-devtools.timeline.frame', transferMode: 'ReportEvents' });
       const w0 = Date.now();
-      const res = await evalOnly(sess, script, startUrl, timeoutMs);
+      const res = await navigateIfNeededThenEvaluateOverCdp(sess, script, startUrl, timeoutMs);
       const wallUs = (Date.now() - w0) * 1000;
       const tracingDone = new Promise((resolve) => {
-        const prevOnEvent = sess.onEvent;
-        sess.onEvent = (msg) => {
-          prevOnEvent(msg);
+        const prevOnIdLessNotification = sess.onIdLessNotification;
+        sess.onIdLessNotification = (msg) => {
+          prevOnIdLessNotification(msg);
           if (msg.method === 'Tracing.tracingComplete') resolve();
         };
       });
@@ -256,7 +233,7 @@ async function main() {
     }
 
     if (mode === 'screenshot') {
-      const res = await evalOnly(sess, script, startUrl, timeoutMs);
+      const res = await navigateIfNeededThenEvaluateOverCdp(sess, script, startUrl, timeoutMs);
       if (res.exceptionDetails) {
         const msg = res.exceptionDetails.exception?.description || res.exceptionDetails.text || 'evaluate exception';
         fs.writeFileSync(resultFile, JSON.stringify({ __cdpError: msg }));
@@ -322,8 +299,7 @@ async function main() {
       process.exit(0);
     }
 
-    // default mode, unchanged from before
-    const res = await evalOnly(sess, script, startUrl, timeoutMs);
+    const res = await navigateIfNeededThenEvaluateOverCdp(sess, script, startUrl, timeoutMs);
     if (res.exceptionDetails) {
       const msg = res.exceptionDetails.exception && res.exceptionDetails.exception.description
         ? res.exceptionDetails.exception.description
