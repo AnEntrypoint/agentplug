@@ -33,9 +33,26 @@ async function pickPageTarget(port, startUrl, timeoutMs) {
 function cdpSession(wsUrl, timeoutMs) {
   return new Promise((resolve, reject) => {
     const ws = new WebSocket(wsUrl);
+    let opened = false;
     let nextId = 1;
     const pending = new Map();
     const timer = setTimeout(() => { try { ws.close(); } catch (_) {} reject(new Error('cdp timeout')); }, timeoutMs);
+    // Real gap found+fixed, more severe than it first looks: `timer` above only guards the SESSION-OPEN
+    // phase -- it's cleared the moment `resolve(sessObj)` fires (see the 'open' listener below), so ANY
+    // sess.send() call made after that point has genuinely NO timeout of its own. If Chrome's renderer/
+    // GPU process crashes or the CDP connection otherwise drops mid-evaluation (a real, observed failure
+    // mode: a page crash or GPU process death under load), the resulting hung sess.send() promise never
+    // resolves OR rejects on its own -- live-confirmed via a real fake-CDP-server witness that let a
+    // request go unanswered then closed the socket: pre-fix, the awaiting code hung indefinitely (no
+    // rejection within 12+ real seconds against an 8s "outer" timeoutMs, since that timeoutMs was never
+    // actually wired to send() at all). The ONLY thing that would ever unblock it is the Rust side's
+    // wait_timeout on the WHOLE child process (up to timeoutMs+eval_timeout_grace_ms, itself up to
+    // minutes) -- a real but blunt, slow backstop, with zero diagnostic about why it hung. rejectAllPending
+    // gives every in-flight request a fast, clear failure the instant the socket actually drops.
+    const rejectAllPending = (reason) => {
+      for (const { rej } of pending.values()) rej(new Error(reason));
+      pending.clear();
+    };
     const sessObj = {
       send(method, params) {
         const id = nextId++;
@@ -47,7 +64,7 @@ function cdpSession(wsUrl, timeoutMs) {
       close() { clearTimeout(timer); try { ws.close(); } catch (_) {} },
       onIdLessNotification: null,
     };
-    ws.addEventListener('open', () => { resolve(sessObj); });
+    ws.addEventListener('open', () => { opened = true; resolve(sessObj); });
     ws.addEventListener('message', (ev) => {
       let msg;
       try { msg = JSON.parse(ev.data); } catch (_) { return; }
@@ -60,7 +77,16 @@ function cdpSession(wsUrl, timeoutMs) {
         sessObj.onIdLessNotification(msg);
       }
     });
-    ws.addEventListener('error', () => { clearTimeout(timer); reject(new Error('cdp websocket error')); });
+    ws.addEventListener('error', () => {
+      clearTimeout(timer);
+      if (!opened) { reject(new Error('cdp websocket error')); return; }
+      rejectAllPending('cdp websocket error (connection dropped mid-session)');
+    });
+    ws.addEventListener('close', () => {
+      clearTimeout(timer);
+      if (!opened) { reject(new Error('cdp websocket closed before opening')); return; }
+      rejectAllPending('cdp websocket closed (connection dropped mid-session)');
+    });
   });
 }
 
