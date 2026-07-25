@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
@@ -197,6 +197,13 @@ fn sessions_map() -> &'static Mutex<HashMap<String, BrowserSession>> {
 
 fn session_key(cwd: &Path, session_id: &str) -> String {
     format!("{}\u{0}{}", cwd.display(), session_id)
+}
+
+static SESSION_LIFECYCLE_LOCKS: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
+
+fn session_lifecycle_lock_for_key(key: &str) -> Arc<Mutex<()>> {
+    let mut locks = SESSION_LIFECYCLE_LOCKS.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap_or_else(|e| e.into_inner());
+    locks.entry(key.to_string()).or_insert_with(|| Arc::new(Mutex::new(()))).clone()
 }
 
 fn session_is_alive(child: &mut Child) -> bool {
@@ -397,10 +404,19 @@ fn reap_idle_sessions(cwd: &Path, cfg: &BrowserConfig) {
             kill_session(session);
         }
     }
+    drop(map);
+    evict_session_lifecycle_locks_with_no_active_holder();
+}
+
+fn evict_session_lifecycle_locks_with_no_active_holder() {
+    let mut locks = SESSION_LIFECYCLE_LOCKS.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap_or_else(|e| e.into_inner());
+    locks.retain(|_, arc| Arc::strong_count(arc) > 1);
 }
 
 fn session_new(cwd: &Path, session_id: &str, cfg: &BrowserConfig) -> Value {
     let key = session_key(cwd, session_id);
+    let lifecycle_lock = session_lifecycle_lock_for_key(&key);
+    let _lifecycle_guard = lifecycle_lock.lock().unwrap_or_else(|e| e.into_inner());
     {
         let mut map = sessions_map().lock().unwrap_or_else(|e| e.into_inner());
         if let Some(existing) = map.remove(&key) {
@@ -454,6 +470,8 @@ fn session_list(cwd: &Path) -> Value {
 
 fn session_close(cwd: &Path, target_session_id: &str, require_found: bool) -> Value {
     let key = session_key(cwd, target_session_id);
+    let lifecycle_lock = session_lifecycle_lock_for_key(&key);
+    let _lifecycle_guard_blocks_concurrent_launch_for_this_key = lifecycle_lock.lock().unwrap_or_else(|e| e.into_inner());
     let removed = {
         let mut map = sessions_map().lock().unwrap_or_else(|e| e.into_inner());
         map.remove(&key)
@@ -692,6 +710,8 @@ pub fn run(body: &str, cwd: &Path, session_id: &str) -> Value {
     }
 
     let key = session_key(cwd, session_id);
+    let lifecycle_lock = session_lifecycle_lock_for_key(&key);
+    let _lifecycle_guard_serializes_reuse_check_launch_and_insert = lifecycle_lock.lock().unwrap_or_else(|e| e.into_inner());
     let port = {
         let mut map = sessions_map().lock().unwrap_or_else(|e| e.into_inner());
         let reuse_port = map.get_mut(&key).and_then(|s| {
