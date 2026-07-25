@@ -6,7 +6,7 @@ mod imports;
 mod install;
 mod registry;
 
-pub use browser::close_all_sessions;
+pub use browser::{close_all_sessions, reap_all_known_orphans};
 pub use host_state::HostState;
 pub use imports::{register_env_imports, register_wasi};
 pub use install::{install_dir, plugins_dir, wasmtime_cache_dir};

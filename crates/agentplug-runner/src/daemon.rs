@@ -968,6 +968,13 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
 
     let mut last_instruction_source_sync: HashMap<PathBuf, Instant> = HashMap::new();
 
+    // Fires on the very first loop iteration too (Instant::now() - 5min-ago), same "sweep once at
+    // startup, then on its own cadence" shape as first_registry_poll_pending above -- a freshly-booted
+    // daemon may be inheriting orphans left by a prior crashed/killed daemon instance.
+    let mut last_browser_orphan_sweep = Instant::now()
+        .checked_sub(Duration::from_millis(5 * 60 * 1000))
+        .unwrap_or_else(Instant::now);
+
     let _heartbeat_ticker = spawn_heartbeat_ticker(heartbeat_interval);
     write_daemon_heartbeat(0, 0);
 
@@ -982,6 +989,25 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
             first_registry_poll_pending = false;
             last_registry_poll = Instant::now();
             known_roots = read_registry();
+        }
+
+        // browser-verb-chrome-pileup-direct-launch-workaround (see spoint's own AGENTS.md, which
+        // documented this as an external tooling bug worked around via a direct chromium.launch()
+        // substitute): reap_idle_sessions/reap_os_orphans in browser.rs were previously only ever
+        // invoked from inside a `browser` dispatch's own run(), scoped to THAT dispatch's cwd alone.
+        // Under shared_process:true (one daemon serving many project directories over its lifetime), a
+        // chrome process orphaned in project A's .gm/ is only ever reaped by a FUTURE dispatch that
+        // happens to target project A again -- if the daemon's attention moves on to other projects, or
+        // A's session is never revisited, that orphan is invisible to every reaping pass forever. This
+        // is the actual mechanism behind the documented recurring chrome.exe-pileup class. Sweep across
+        // every known root on its own longer-than-registry-poll cadence (each pass does a directory scan
+        // + a pid_is_alive + a potential taskkill/kill subprocess PER root, too expensive for the tight
+        // 5s registry-poll default) so every project's orphans get reaped regardless of which project is
+        // currently being dispatched to.
+        const BROWSER_ORPHAN_SWEEP_INTERVAL_MS: u64 = 5 * 60 * 1000;
+        if last_browser_orphan_sweep.elapsed() >= Duration::from_millis(BROWSER_ORPHAN_SWEEP_INTERVAL_MS) {
+            last_browser_orphan_sweep = Instant::now();
+            agentplug_host::reap_all_known_orphans(&known_roots);
         }
 
         let max_concurrent_projects = daemon_cfg.max_concurrent_projects();

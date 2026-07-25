@@ -417,6 +417,26 @@ pub fn close_all_sessions() {
     }
 }
 
+/// Sweep idle-session + OS-orphan reaping across EVERY known project root, not just whichever cwd
+/// happens to be the target of the current `browser` dispatch. `reap_idle_sessions`/`reap_os_orphans`
+/// (below) were previously only ever invoked from inside `run()`, scoped to that one dispatch's own
+/// `cwd` -- under `shared_process: true` (one daemon instance serving many different project
+/// directories over its lifetime), a chrome process orphaned in project A's `.gm/` directory is only
+/// ever reaped by a FUTURE `browser` dispatch that happens to target project A again. If the daemon's
+/// attention moves on to other projects (or that project's session is simply never revisited), the
+/// orphan is invisible to every reaping pass forever -- this is the actual mechanism behind the
+/// documented recurring chrome.exe-pileup class (dozens of orphaned processes accumulating across
+/// unrelated project directories on a long-lived shared daemon). Call this periodically from the
+/// daemon's own main loop (independent of dispatch activity) with the full known-roots list so every
+/// project's orphans get swept regardless of which project is currently being dispatched to.
+pub fn reap_all_known_orphans(roots: &[std::path::PathBuf]) {
+    for root in roots {
+        let cfg = BrowserConfig::load(root);
+        reap_idle_sessions(root, &cfg);
+        reap_os_orphans(root);
+    }
+}
+
 fn reap_idle_sessions(cwd: &Path, cfg: &BrowserConfig) {
     let timeout = cfg.session_idle_timeout();
     let mut map = sessions_map().lock().unwrap_or_else(|e| e.into_inner());
