@@ -173,6 +173,38 @@ fn strip_timeout_prefix(body: &str) -> (Option<u64>, &str) {
     }
 }
 
+/// `viewport=WxH\n<rest>` (e.g. `viewport=375x667\n...`) emulates a real
+/// device viewport via CDP Emulation.setDeviceMetricsOverride, applied
+/// before any navigation/script runs -- without this, every browser
+/// dispatch ran at a fixed default window size with no way to exercise
+/// mobile/narrow-viewport-only bugs (e.g. responsive CSS that only engages
+/// below a breakpoint). Stacks with the other prefixes the same way
+/// timeout=/url= do. An optional `@scale` suffix on the height sets
+/// deviceScaleFactor (e.g. `375x667@2` for a 2x-density phone); an optional
+/// trailing `!desktop` after the dimensions disables mobile/touch emulation
+/// for testing a real desktop-sized-but-custom viewport.
+fn strip_viewport_prefix(body: &str) -> (Option<(u32, u32, f64, bool)>, &str) {
+    let trimmed = body.trim_start();
+    let Some(rest) = trimmed.strip_prefix("viewport=") else { return (None, body) };
+    let Some(nl) = rest.find('\n') else { return (None, body) };
+    let (spec, remainder) = (&rest[..nl], &rest[nl + 1..]);
+    let (dims_and_scale, mobile) = match spec.strip_suffix("!desktop") {
+        Some(rest) => (rest, false),
+        None => (spec, true),
+    };
+    let (dims, scale) = match dims_and_scale.split_once('@') {
+        Some((d, s)) => (d, s.trim().parse::<f64>().unwrap_or(1.0)),
+        None => (dims_and_scale, 1.0),
+    };
+    let Some((w, h)) = dims.trim().split_once('x') else { return (None, body) };
+    match (w.trim().parse::<u32>(), h.trim().parse::<u32>()) {
+        (Ok(width), Ok(height)) if width > 0 && height > 0 => {
+            (Some((width, height, scale, mobile)), remainder)
+        }
+        _ => (None, body),
+    }
+}
+
 fn browser_profiles_dir(cwd: &Path) -> PathBuf {
     cwd.join(".gm").join("browser-profiles")
 }
@@ -681,7 +713,8 @@ pub fn run(body: &str, cwd: &Path, session_id: &str) -> Value {
     let (timeout_override, after_timeout) = strip_timeout_prefix(&inner_body);
     let timeout_ms = timeout_override.unwrap_or(timeout_ms);
     let (mode, dom_selector, after_mode) = strip_mode_prefix(after_timeout);
-    let (start_url, script) = parse_body(after_mode);
+    let (viewport, after_viewport) = strip_viewport_prefix(after_mode);
+    let (start_url, script) = parse_body(after_viewport);
 
     let tmp = std::env::temp_dir();
     let stamp = format!("{}-{}", std::process::id(), sanitize(session_id));
@@ -761,6 +794,12 @@ pub fn run(body: &str, cwd: &Path, session_id: &str) -> Value {
         "mode": mode_label(mode),
         "artifactFile": artifact_path.as_ref().map(|p| p.to_string_lossy().into_owned()),
         "domSelector": dom_selector,
+        "viewport": viewport.map(|(width, height, device_scale_factor, mobile)| json!({
+            "width": width,
+            "height": height,
+            "deviceScaleFactor": device_scale_factor,
+            "mobile": mobile,
+        })),
     })
     .to_string();
 

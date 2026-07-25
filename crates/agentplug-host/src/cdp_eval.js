@@ -121,7 +121,7 @@ function aggregateCpuProfile(profile, topN) {
 
 async function main() {
   const cfg = JSON.parse(process.argv[2]);
-  const { port, startUrl, scriptFile, resultFile, timeoutMs, mode, artifactFile } = cfg;
+  const { port, startUrl, scriptFile, resultFile, timeoutMs, mode, artifactFile, viewport } = cfg;
   const script = fs.readFileSync(scriptFile, 'utf-8');
   const target = await pickPageTarget(port, startUrl, Math.min(timeoutMs, 30000));
   if (!target) {
@@ -132,6 +132,26 @@ async function main() {
   const sess = await cdpSession(target.webSocketDebuggerUrl, timeoutMs);
   try {
     await sess.send('Runtime.enable', {});
+
+    // viewport=WxH prefix: emulate a real device viewport (and touch input,
+    // since most mobile layout bugs are also touch-target-sizing bugs) via
+    // CDP Emulation domain, applied before the script body runs and before
+    // any startUrl navigation -- Page.navigate happens inside evalOnly(),
+    // so the override must land here to affect the actual page load, not
+    // just a resize after the fact.
+    if (viewport && viewport.width && viewport.height) {
+      await sess.send('Emulation.setDeviceMetricsOverride', {
+        width: viewport.width,
+        height: viewport.height,
+        deviceScaleFactor: viewport.deviceScaleFactor || 1,
+        mobile: viewport.mobile !== false,
+        screenWidth: viewport.width,
+        screenHeight: viewport.height,
+      });
+      if (viewport.mobile !== false) {
+        await sess.send('Emulation.setTouchEmulationEnabled', { enabled: true, maxTouchPoints: 5 }).catch(() => {});
+      }
+    }
 
     if (mode === 'capture') {
       const consoleLines = [];
