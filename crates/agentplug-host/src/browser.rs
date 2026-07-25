@@ -499,21 +499,52 @@ fn parse_session_command(body: &str) -> SessionCommand<'_> {
     SessionCommand::None
 }
 
-fn launch_chrome(cwd: &Path, session_id: &str, browser_cfg: &BrowserConfig) -> Result<(Child, u16), String> {
-    let chrome = find_chrome().ok_or_else(|| "no Chrome found; install Google Chrome or Chromium".to_string())?;
-    let profile_dir = browser_chrome_profile_dir(cwd, session_id);
-    let _ = std::fs::create_dir_all(&profile_dir);
+fn chrome_launch_log_path(profile_dir: &Path) -> PathBuf {
+    profile_dir.join("chrome-launch.log")
+}
 
-    let port = free_port();
-    let mut cmd = Command::new(&chrome);
+/// Chrome's own stderr line when its SUID/namespace sandbox can't initialize
+/// -- extremely common in containers (Docker/Kubernetes/CI) that don't grant
+/// CAP_SYS_ADMIN or a working user-namespace sandbox. Chrome then exits (or
+/// hangs) before ever opening its CDP port, and since a prior version of this
+/// function redirected stdout/stderr to Stdio::null(), that failure was
+/// completely invisible -- CDP just never became ready, with zero diagnostic
+/// trace anywhere. Capturing the log (below) makes this detectable so we can
+/// auto-retry with --no-sandbox, exactly like a browser automation tool must
+/// in a container -- see https://github.com/puppeteer/puppeteer/blob/main/docs/troubleshooting.md#running-puppeteer-in-docker
+fn chrome_log_indicates_sandbox_denial(log_path: &Path) -> bool {
+    std::fs::read_to_string(log_path)
+        .map(|s| {
+            s.contains("Failed to move to new namespace")
+                || s.contains("Sandbox cannot access executable")
+                || s.contains("SUID sandbox helper binary was found, but is not configured correctly")
+                || s.contains("running as root without --no-sandbox is not supported")
+                || s.contains("No usable sandbox!")
+                || s.contains("--no-sandbox")
+        })
+        .unwrap_or(false)
+}
+
+fn spawn_chrome_once(
+    chrome: &Path,
+    profile_dir: &Path,
+    port: u16,
+    headless: bool,
+    no_sandbox: bool,
+) -> Result<Child, String> {
+    let mut cmd = Command::new(chrome);
     cmd.arg(format!("--user-data-dir={}", profile_dir.display()))
         .arg(format!("--remote-debugging-port={port}"))
         .arg("--remote-debugging-address=127.0.0.1")
         .arg("--no-first-run")
         .arg("--no-default-browser-check")
-        .arg("--disable-default-apps");
-    if browser_cfg.headless() {
+        .arg("--disable-default-apps")
+        .arg("--disable-gpu-process-crash-limit");
+    if headless {
         cmd.arg("--disable-gpu").arg("--headless=new");
+    }
+    if no_sandbox {
+        cmd.arg("--no-sandbox").arg("--disable-setuid-sandbox").arg("--disable-dev-shm-usage");
     }
     #[cfg(windows)]
     {
@@ -521,23 +552,74 @@ fn launch_chrome(cwd: &Path, session_id: &str, browser_cfg: &BrowserConfig) -> R
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
-    let mut chrome_child = cmd
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+    let log_path = chrome_launch_log_path(profile_dir);
+    let log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .map_err(|e| format!("failed to open chrome launch log {}: {e}", log_path.display()))?;
+    let log_file_err = log_file
+        .try_clone()
+        .map_err(|e| format!("failed to clone chrome launch log handle: {e}"))?;
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::from(log_file))
+        .stderr(Stdio::from(log_file_err))
         .spawn()
-        .map_err(|e| format!("chrome launch failed: {e}"))?;
+        .map_err(|e| format!("chrome launch failed: {e}"))
+}
+
+fn launch_chrome(cwd: &Path, session_id: &str, browser_cfg: &BrowserConfig) -> Result<(Child, u16), String> {
+    let chrome = find_chrome().ok_or_else(|| "no Chrome found; install Google Chrome or Chromium".to_string())?;
+    let profile_dir = browser_chrome_profile_dir(cwd, session_id);
+    let _ = std::fs::create_dir_all(&profile_dir);
+    let log_path = chrome_launch_log_path(&profile_dir);
+    let _ = std::fs::remove_file(&log_path);
+
+    let no_sandbox_env = std::env::var("GM_BROWSER_NO_SANDBOX").ok();
+    let mut no_sandbox = matches!(no_sandbox_env.as_deref(), Some("1")) || cfg!(windows);
+    let headless = browser_cfg.headless();
+    let port = free_port();
+    let mut chrome_child = spawn_chrome_once(&chrome, &profile_dir, port, headless, no_sandbox)?;
 
     let _ = std::fs::write(pid_sidecar_path(&profile_dir), chrome_child.id().to_string());
 
     if !cdp_ready(port, Instant::now() + browser_cfg.chrome_ready_deadline(), browser_cfg) {
         let _ = chrome_child.kill();
         let _ = chrome_child.wait();
+
+        // A closed sandbox is the single most common reason CDP never comes
+        // up in a container: Chrome refuses to start with its SUID/namespace
+        // sandbox unavailable, exits immediately, and no CDP port ever opens.
+        // Retry once with --no-sandbox if the log shows that specific denial
+        // and we weren't already using it, instead of failing with a bare
+        // timeout that gives no indication of the real cause.
+        if !no_sandbox && no_sandbox_env.as_deref() != Some("0") && chrome_log_indicates_sandbox_denial(&log_path) {
+            no_sandbox = true;
+            let port2 = free_port();
+            let mut retry_child = spawn_chrome_once(&chrome, &profile_dir, port2, headless, no_sandbox)?;
+            let _ = std::fs::write(pid_sidecar_path(&profile_dir), retry_child.id().to_string());
+            if cdp_ready(port2, Instant::now() + browser_cfg.chrome_ready_deadline(), browser_cfg) {
+                return Ok((retry_child, port2));
+            }
+            let _ = retry_child.kill();
+            let _ = retry_child.wait();
+        }
+
         let _ = std::fs::remove_file(pid_sidecar_path(&profile_dir));
-        return Err(format!(
-            "chrome CDP endpoint did not become ready within {}ms",
-            browser_cfg.chrome_ready_deadline().as_millis()
-        ));
+        let log_tail = std::fs::read_to_string(&log_path)
+            .ok()
+            .map(|s| s.lines().rev().take(5).collect::<Vec<_>>().join(" | "))
+            .filter(|s| !s.is_empty());
+        return Err(match log_tail {
+            Some(tail) => format!(
+                "chrome CDP endpoint did not become ready within {}ms (recent chrome output: {tail})",
+                browser_cfg.chrome_ready_deadline().as_millis()
+            ),
+            None => format!(
+                "chrome CDP endpoint did not become ready within {}ms (chrome produced no output at all -- it may have failed to spawn)",
+                browser_cfg.chrome_ready_deadline().as_millis()
+            ),
+        });
     }
     Ok((chrome_child, port))
 }
