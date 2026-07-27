@@ -173,17 +173,7 @@ fn strip_timeout_prefix(body: &str) -> (Option<u64>, &str) {
     }
 }
 
-/// `viewport=WxH\n<rest>` (e.g. `viewport=375x667\n...`) emulates a real
-/// device viewport via CDP Emulation.setDeviceMetricsOverride, applied
-/// before any navigation/script runs -- without this, every browser
-/// dispatch ran at a fixed default window size with no way to exercise
-/// mobile/narrow-viewport-only bugs (e.g. responsive CSS that only engages
-/// below a breakpoint). Stacks with the other prefixes the same way
-/// timeout=/url= do. An optional `@scale` suffix on the height sets
-/// deviceScaleFactor (e.g. `375x667@2` for a 2x-density phone); an optional
-/// trailing `!desktop` after the dimensions disables mobile/touch emulation
-/// for testing a real desktop-sized-but-custom viewport.
-fn strip_viewport_prefix(body: &str) -> (Option<(u32, u32, f64, bool)>, &str) {
+fn strip_viewport_width_height_scale_mobile_prefix(body: &str) -> (Option<(u32, u32, f64, bool)>, &str) {
     let trimmed = body.trim_start();
     let Some(rest) = trimmed.strip_prefix("viewport=") else { return (None, body) };
     let Some(nl) = rest.find('\n') else { return (None, body) };
@@ -417,19 +407,7 @@ pub fn close_all_sessions() {
     }
 }
 
-/// Sweep idle-session + OS-orphan reaping across EVERY known project root, not just whichever cwd
-/// happens to be the target of the current `browser` dispatch. `reap_idle_sessions`/`reap_os_orphans`
-/// (below) were previously only ever invoked from inside `run()`, scoped to that one dispatch's own
-/// `cwd` -- under `shared_process: true` (one daemon instance serving many different project
-/// directories over its lifetime), a chrome process orphaned in project A's `.gm/` directory is only
-/// ever reaped by a FUTURE `browser` dispatch that happens to target project A again. If the daemon's
-/// attention moves on to other projects (or that project's session is simply never revisited), the
-/// orphan is invisible to every reaping pass forever -- this is the actual mechanism behind the
-/// documented recurring chrome.exe-pileup class (dozens of orphaned processes accumulating across
-/// unrelated project directories on a long-lived shared daemon). Call this periodically from the
-/// daemon's own main loop (independent of dispatch activity) with the full known-roots list so every
-/// project's orphans get swept regardless of which project is currently being dispatched to.
-pub fn reap_all_known_orphans(roots: &[std::path::PathBuf]) {
+pub fn reap_idle_sessions_and_os_orphans_across_every_known_project_root(roots: &[std::path::PathBuf]) {
     for root in roots {
         let cfg = BrowserConfig::load(root);
         reap_idle_sessions(root, &cfg);
@@ -573,16 +551,7 @@ fn chrome_launch_log_path(profile_dir: &Path) -> PathBuf {
     profile_dir.join("chrome-launch.log")
 }
 
-/// Chrome's own stderr line when its SUID/namespace sandbox can't initialize
-/// -- extremely common in containers (Docker/Kubernetes/CI) that don't grant
-/// CAP_SYS_ADMIN or a working user-namespace sandbox. Chrome then exits (or
-/// hangs) before ever opening its CDP port, and since a prior version of this
-/// function redirected stdout/stderr to Stdio::null(), that failure was
-/// completely invisible -- CDP just never became ready, with zero diagnostic
-/// trace anywhere. Capturing the log (below) makes this detectable so we can
-/// auto-retry with --no-sandbox, exactly like a browser automation tool must
-/// in a container -- see https://github.com/puppeteer/puppeteer/blob/main/docs/troubleshooting.md#running-puppeteer-in-docker
-fn chrome_log_indicates_sandbox_denial(log_path: &Path) -> bool {
+fn chrome_stderr_log_indicates_suid_sandbox_init_denial(log_path: &Path) -> bool {
     std::fs::read_to_string(log_path)
         .map(|s| {
             s.contains("Failed to move to new namespace")
@@ -657,13 +626,7 @@ fn launch_chrome(cwd: &Path, session_id: &str, browser_cfg: &BrowserConfig) -> R
         let _ = chrome_child.kill();
         let _ = chrome_child.wait();
 
-        // A closed sandbox is the single most common reason CDP never comes
-        // up in a container: Chrome refuses to start with its SUID/namespace
-        // sandbox unavailable, exits immediately, and no CDP port ever opens.
-        // Retry once with --no-sandbox if the log shows that specific denial
-        // and we weren't already using it, instead of failing with a bare
-        // timeout that gives no indication of the real cause.
-        if !no_sandbox && no_sandbox_env.as_deref() != Some("0") && chrome_log_indicates_sandbox_denial(&log_path) {
+        if !no_sandbox && no_sandbox_env.as_deref() != Some("0") && chrome_stderr_log_indicates_suid_sandbox_init_denial(&log_path) {
             no_sandbox = true;
             let port2 = free_port();
             let mut retry_child = spawn_chrome_once(&chrome, &profile_dir, port2, headless, no_sandbox)?;
@@ -733,7 +696,7 @@ pub fn run(body: &str, cwd: &Path, session_id: &str) -> Value {
     let (timeout_override, after_timeout) = strip_timeout_prefix(&inner_body);
     let timeout_ms = timeout_override.unwrap_or(timeout_ms);
     let (mode, dom_selector, after_mode) = strip_mode_prefix(after_timeout);
-    let (viewport, after_viewport) = strip_viewport_prefix(after_mode);
+    let (viewport, after_viewport) = strip_viewport_width_height_scale_mobile_prefix(after_mode);
     let (start_url, script) = parse_body(after_viewport);
 
     let tmp = std::env::temp_dir();

@@ -242,12 +242,6 @@ impl ProjectPlugins {
         dispatch_and_evict_on_error(&mut guard, verb, body, &self.root, &self.siblings, plugin_name)
     }
 
-    /// `reload_source` lets the returned handle self-heal an evicted or
-    /// never-registered plugin slot (see `DispatchHandle::dispatch`) instead
-    /// of permanently failing every subsequent dispatch with "not loaded".
-    /// Pass `None` when the caller has no engine/module available (e.g. a
-    /// context that never loads plugins itself) — dispatch then degrades to
-    /// the prior lookup-only behavior.
     pub fn dispatch_handle_with_reload(&self, reload_source: Option<(Engine, HashMap<String, Module>)>) -> DispatchHandle {
         DispatchHandle { root: self.root.clone(), siblings: self.siblings.clone(), reload_source }
     }
@@ -265,13 +259,7 @@ pub struct DispatchHandle {
 }
 
 impl DispatchHandle {
-    /// Reinstantiate `plugin_name` into its pool slot using the carried
-    /// engine/module set, mirroring `ProjectPlugins::load_plugin`'s own
-    /// instantiate-and-insert shape. No-op (returns Ok) if this handle was
-    /// built without a reload source, or the plugin's module was never
-    /// compiled into it — the caller's existing "not loaded" error still
-    /// surfaces in that case, unchanged from before this fix.
-    fn try_reload(&self, plugin_name: &str) -> anyhow::Result<()> {
+    fn reinstantiate_plugin_into_pool_slot_if_reload_source_available(&self, plugin_name: &str) -> anyhow::Result<()> {
         let Some((engine, modules)) = self.reload_source.as_ref() else { return Ok(()) };
         let Some(module) = modules.get(plugin_name) else { return Ok(()) };
         if is_stateless_shared_plugin(plugin_name) {
@@ -303,39 +291,24 @@ impl DispatchHandle {
         let mut pool = None;
         for attempt in 0..DISPATCH_LOOKUP_RETRY_ATTEMPTS {
             pool = self.siblings.lock().unwrap().get(plugin_name).cloned();
-            // An empty (evicted) slot looks identical to "registered, ready"
-            // from this HashMap lookup alone -- `any_instantiated()` is the
-            // real signal. A prior dispatch's error-path eviction
-            // (`dispatch_and_evict_on_error` sets the slot to None but keeps
-            // the pool entry) used to leave every later dispatch on this
-            // handle permanently failing with "not loaded" until some other
-            // code path happened to call `load_plugin` again -- self-heal
-            // here instead, same shape as the pre-dispatch reload check
-            // `dispatch_project` already runs for its own non-threaded path.
-            if let Some(p) = &pool {
-                if !p.any_instantiated() {
-                    let _ = self.try_reload(plugin_name);
-                    pool = self.siblings.lock().unwrap().get(plugin_name).cloned();
-                }
+            let evicted_slot_reads_as_registered_but_empty = pool.as_ref().map(|p| !p.any_instantiated()).unwrap_or(false);
+            if evicted_slot_reads_as_registered_but_empty {
+                let _ = self.reinstantiate_plugin_into_pool_slot_if_reload_source_available(plugin_name);
+                pool = self.siblings.lock().unwrap().get(plugin_name).cloned();
             }
             if pool.as_ref().map(|p| p.any_instantiated()).unwrap_or(false) || attempt + 1 == DISPATCH_LOOKUP_RETRY_ATTEMPTS { break; }
             std::thread::sleep(std::time::Duration::from_millis(DISPATCH_LOOKUP_RETRY_BACKOFF_MS));
         }
         if pool.is_none() {
-            let _ = self.try_reload(plugin_name);
+            let _ = self.reinstantiate_plugin_into_pool_slot_if_reload_source_available(plugin_name);
             pool = self.siblings.lock().unwrap().get(plugin_name).cloned();
         }
         let mut pool = pool.ok_or_else(|| anyhow::anyhow!("plugin {plugin_name} not loaded"))?;
         let mut guard = pool.acquire().ok_or_else(|| anyhow::anyhow!("plugin {plugin_name} pool busy (timeout acquiring slot)"))?;
         if guard.is_none() {
-            let _ = self.try_reload(plugin_name);
-            // try_reload only replaces the SHARED pool map entry (stateless
-            // plugins) or inserts fresh (per-project plugins); this guard is
-            // already held on the OLD (possibly stale) pool reference for
-            // the per-project case, so re-acquire is only needed for the
-            // shared case where the pool object itself is unchanged and the
-            // slot was mutated in place by try_reload above.
-            if is_stateless_shared_plugin(plugin_name) && guard.is_none() {
+            let _ = self.reinstantiate_plugin_into_pool_slot_if_reload_source_available(plugin_name);
+            let reload_mutated_the_shared_pool_slot_in_place_not_this_stale_guard = is_stateless_shared_plugin(plugin_name) && guard.is_none();
+            if reload_mutated_the_shared_pool_slot_in_place_not_this_stale_guard {
                 drop(guard);
                 pool = self.siblings.lock().unwrap().get(plugin_name).cloned().ok_or_else(|| anyhow::anyhow!("plugin {plugin_name} not loaded"))?;
                 guard = pool.acquire().ok_or_else(|| anyhow::anyhow!("plugin {plugin_name} pool busy (timeout acquiring slot)"))?;
