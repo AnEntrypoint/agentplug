@@ -117,6 +117,9 @@ pub fn dispatch_on(
     store.data().set_cwd(caller_root.to_path_buf());
     store.data().set_siblings(caller_siblings);
     let plugin_name = store.data().plugin_name.clone();
+    if is_stateless_shared_plugin(&plugin_name) {
+        crate::memory_pressure::note_shared_plugin_dispatch();
+    }
     store.set_epoch_deadline(epoch_ticks_for_seconds(DISPATCH_CALL_DEADLINE_SECS));
     let alloc = instance.get_typed_func::<u32, u32>(&mut *store, "plugkit_alloc")?;
     let memory = instance.get_memory(&mut *store, "memory").ok_or_else(|| anyhow::anyhow!("plugin {plugin_name} has no exported memory"))?;

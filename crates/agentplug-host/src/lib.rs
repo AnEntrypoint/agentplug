@@ -1,6 +1,7 @@
 mod browser;
 mod exec_js;
 mod host_state;
+mod memory_pressure;
 mod task;
 mod imports;
 mod install;
@@ -10,6 +11,7 @@ pub use browser::{close_all_sessions, reap_idle_sessions_and_os_orphans_across_e
 pub use host_state::HostState;
 pub use imports::{register_env_imports, register_wasi};
 pub use install::{install_dir, plugins_dir, wasmtime_cache_dir};
+pub use memory_pressure::{process_private_bytes, reset_shared_dispatch_count, shared_dispatches_since_release};
 pub use registry::{
     epoch_ticks_for_seconds, read_project_plugin_list, release_shared_plugin, set_gm_pool_size, set_side_plugin_pool_size, DispatchHandle,
     GmFairnessGuard, ProjectPlugins, EPOCH_TICK_INTERVAL_MS, PLUGIN_IDLE_EVICT_MS,

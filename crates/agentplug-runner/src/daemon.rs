@@ -56,7 +56,7 @@ pub fn register_project(cwd: &Path) -> anyhow::Result<()> {
 
 /// Render a dispatch error with wasmtime's structured trap code when it has one.
 ///
-/// `describe_dispatch_error(&e)` alone keeps the wasm backtrace but DROPS the `Trap`
+/// `format!("{e:#}")` alone keeps the wasm backtrace but DROPS the `Trap`
 /// variant, so an out-of-bounds access or a failed `memory.grow` reads
 /// identically to a genuine guest panic: a bare hex backtrace with no message.
 /// That is how a four-day-long embedder outage stayed undiagnosed -- the traps
@@ -69,7 +69,7 @@ pub fn register_project(cwd: &Path) -> anyhow::Result<()> {
 fn describe_dispatch_error(e: &anyhow::Error) -> String {
     match e.downcast_ref::<Trap>() {
         Some(trap) => format!("[wasm trap: {trap}] {e:#}"),
-        None => describe_dispatch_error(&e),
+        None => format!("{e:#}"),
     }
 }
 
@@ -100,6 +100,10 @@ struct DaemonConfig {
     gm_concurrency: Option<usize>,
     #[serde(default)]
     side_plugin_concurrency: Option<usize>,
+    #[serde(default)]
+    shared_store_recycle_private_mb: Option<u64>,
+    #[serde(default)]
+    shared_store_recycle_dispatches: Option<u64>,
 }
 
 const DAEMON_CONFIG_EXAMPLE: &str = r#"{
@@ -109,7 +113,9 @@ const DAEMON_CONFIG_EXAMPLE: &str = r#"{
   "runner_update_poll_interval_secs": 600,
   "max_concurrent_projects": 4,
   "gm_concurrency": 4,
-  "side_plugin_concurrency": 1
+  "side_plugin_concurrency": 1,
+  "shared_store_recycle_private_mb": 1600,
+  "shared_store_recycle_dispatches": 2000
 }
 "#;
 
@@ -139,6 +145,8 @@ impl DaemonConfig {
                 max_concurrent_projects: None,
                 gm_concurrency: None,
                 side_plugin_concurrency: None,
+                shared_store_recycle_private_mb: None,
+                shared_store_recycle_dispatches: None,
             })
     }
     fn registry_poll_interval(&self) -> Duration { Duration::from_secs(self.registry_poll_interval_secs.unwrap_or(5)) }
@@ -148,6 +156,39 @@ impl DaemonConfig {
     fn max_concurrent_projects(&self) -> usize { self.max_concurrent_projects.unwrap_or(4).max(1) }
     fn gm_concurrency(&self) -> usize { self.gm_concurrency.unwrap_or_else(|| self.max_concurrent_projects()).max(1) }
     fn side_plugin_concurrency(&self) -> usize { self.side_plugin_concurrency.unwrap_or(1).max(1) }
+    fn shared_store_recycle_private_bytes(&self) -> u64 { self.shared_store_recycle_private_mb.unwrap_or(1600).max(256) * 1024 * 1024 }
+    fn shared_store_recycle_dispatches(&self) -> u64 { self.shared_store_recycle_dispatches.unwrap_or(2000).max(1) }
+}
+
+/// Why the shared plugin Stores should be dropped right now, if they should.
+///
+/// Both triggers exist because they fail in opposite directions. The private-bytes
+/// threshold is the one that actually tracks the retained wasm peak, but it depends
+/// on an OS query that can be unavailable; the dispatch counter needs no syscall at
+/// all and still bounds how far the peak can run between releases.
+///
+/// Neither is gated on the daemon being idle, which is the whole point. The existing
+/// `SHARED_PLUGIN_RELEASE_IDLE_MS` and `SELF_RECYCLE_IDLE_MS` releases both sit behind
+/// `!any_work`, so during a sustained indexing pass -- exactly when the embedder is
+/// growing linear memory fastest -- the daemon is never idle and neither ever runs.
+/// 458 of 472 observed traps fell inside a single 17-minute window under that load.
+fn shared_store_recycle_reason(cfg: &DaemonConfig) -> Option<String> {
+    let dispatches = agentplug_host::shared_dispatches_since_release();
+    if let Some(private_bytes) = agentplug_host::process_private_bytes() {
+        let limit = cfg.shared_store_recycle_private_bytes();
+        if private_bytes >= limit {
+            return Some(format!(
+                "memory pressure: {}MB private commit >= {}MB limit (after {dispatches} shared dispatches)",
+                private_bytes / (1024 * 1024),
+                limit / (1024 * 1024)
+            ));
+        }
+    }
+    let dispatch_limit = cfg.shared_store_recycle_dispatches();
+    if dispatches >= dispatch_limit {
+        return Some(format!("dispatch budget: {dispatches} shared dispatches >= {dispatch_limit} limit"));
+    }
+    None
 }
 
 const DAEMON_STALE_MS: u64 = 20_000;
@@ -1156,6 +1197,23 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
                     eprintln!("[agentplug daemon] handed off to version {version} -- exiting");
                     return Ok(());
                 }
+            }
+        }
+
+        if let Some(reason) = shared_store_recycle_reason(&daemon_cfg) {
+            let mut released: Vec<&str> = Vec::new();
+            for plugin_name in ["bert", "treesitter", "libsql"] {
+                if agentplug_host::release_shared_plugin(plugin_name) {
+                    released.push(plugin_name);
+                }
+            }
+            agentplug_host::reset_shared_dispatch_count();
+            last_shared_release = Instant::now();
+            if !released.is_empty() {
+                eprintln!(
+                    "[agentplug daemon] released shared Stores [{}] under {reason} -- wasm linear memory only grows, so the retained embed peak is only reclaimable by dropping the Store; the compiled Module stays cached in the Engine, so the next call re-instantiates cheaply",
+                    released.join(", ")
+                );
             }
         }
 
