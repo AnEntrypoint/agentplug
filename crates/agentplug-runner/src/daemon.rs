@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 
-use wasmtime::{Engine, Module};
+use wasmtime::{Engine, Module, Trap};
 
 use agentplug_host::{build_engine, install_dir, now_ms, read_project_plugin_list, DispatchHandle, GmFairnessGuard, ProjectPlugins, PLUGIN_IDLE_EVICT_MS};
 
@@ -30,6 +30,25 @@ pub fn register_project(cwd: &Path) -> anyhow::Result<()> {
     let mut f = fs::OpenOptions::new().create(true).append(true).open(&path)?;
     writeln!(f, "{cwd_str}")?;
     Ok(())
+}
+
+/// Render a dispatch error with wasmtime's structured trap code when it has one.
+///
+/// `describe_dispatch_error(&e)` alone keeps the wasm backtrace but DROPS the `Trap`
+/// variant, so an out-of-bounds access or a failed `memory.grow` reads
+/// identically to a genuine guest panic: a bare hex backtrace with no message.
+/// That is how a four-day-long embedder outage stayed undiagnosed -- the traps
+/// were memory exhaustion in a long-lived shared Store, and nothing in the
+/// error text could say so.
+///
+/// wasm linear memory only grows, so a plugin held for the process lifetime
+/// retains every allocation peak it has ever hit; naming the trap is what lets
+/// an operator tell that apart from a logic bug in the guest.
+fn describe_dispatch_error(e: &anyhow::Error) -> String {
+    match e.downcast_ref::<Trap>() {
+        Some(trap) => format!("[wasm trap: {trap}] {e:#}"),
+        None => describe_dispatch_error(&e),
+    }
 }
 
 fn read_registry() -> Vec<PathBuf> {
@@ -550,7 +569,7 @@ fn run_gm_dispatch_to_file(root: &Path, handle: &DispatchHandle, verb: &str, tas
     let out_body = match dispatch_result {
         Ok(Ok(s)) if !s.is_empty() => s,
         Ok(Ok(_)) => serde_json::json!({"ok": false, "error": "empty dispatch result", "verb": verb}).to_string(),
-        Ok(Err(e)) => serde_json::json!({"ok": false, "error": format!("{e:#}"), "verb": verb}).to_string(),
+        Ok(Err(e)) => serde_json::json!({"ok": false, "error": describe_dispatch_error(&e), "verb": verb}).to_string(),
         Err(panic_payload) => {
             let msg = panic_payload
                 .downcast_ref::<&str>()
@@ -860,7 +879,7 @@ fn dispatch_project(root: &Path, project: &mut ProjectPlugins, plugin_modules: &
                 let out_body = match result {
                     Ok(Ok(s)) if !s.is_empty() => s,
                     Ok(Ok(_)) => serde_json::json!({"ok": false, "error": "empty dispatch result"}).to_string(),
-                    Ok(Err(e)) => serde_json::json!({"ok": false, "error": format!("{e:#}")}).to_string(),
+                    Ok(Err(e)) => serde_json::json!({"ok": false, "error": describe_dispatch_error(&e)}).to_string(),
                     Err(panic_payload) => {
                         let msg = panic_payload
                             .downcast_ref::<&str>()
