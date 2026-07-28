@@ -368,18 +368,18 @@ fn browser_profiles_root_for_orphan_scan(cwd: &Path) -> PathBuf {
 }
 
 fn session_liveness_recheck(port: u16, browser_cfg: &BrowserConfig) -> bool {
-    let Some(node) = which("node") else { return true };
+    let Some(node) = which("node") else { return false };
     let tmp = std::env::temp_dir();
     let stamp = format!("{}-livecheck-{}", std::process::id(), unix_ms());
     let helper_path = tmp.join(format!("agentplug-cdp-eval-{stamp}.mjs"));
     let script_path = tmp.join(format!("agentplug-cdp-script-{stamp}.js"));
     let result_path = tmp.join(format!("agentplug-cdp-result-{stamp}.json"));
     if std::fs::write(&helper_path, CDP_EVAL_JS.as_bytes()).is_err() {
-        return true;
+        return false;
     }
     if std::fs::write(&script_path, b"return 1+1;").is_err() {
         cleanup(&[&helper_path, &script_path]);
-        return true;
+        return false;
     }
     let recheck_timeout_ms: u64 = 5000;
     let cfg = json!({
@@ -422,7 +422,7 @@ fn session_liveness_recheck(port: u16, browser_cfg: &BrowserConfig) -> bool {
                 }
             }
         }
-        Err(_) => true,
+        Err(_) => false,
     };
     cleanup(&[&helper_path, &script_path, &result_path]);
     alive
