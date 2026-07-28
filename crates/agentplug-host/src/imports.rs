@@ -509,6 +509,9 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
                         Ok::<Vec<f32>, anyhow::Error>(arr.iter().filter_map(|x| x.as_f64()).map(|x| x as f32).collect())
                     }),
                 };
+                if result.is_err() {
+                    *guard = None;
+                }
                 drop(guard);
                 if result.is_ok() {
                     break;
