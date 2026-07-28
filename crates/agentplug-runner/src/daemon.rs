@@ -1037,6 +1037,21 @@ fn dispatch_project(root: &Path, project: &mut ProjectPlugins, plugin_modules: &
                     }
                 }
 
+                if let Some(reason) = shared_store_recycle_reason(&DaemonConfig::load()) {
+                    let mut released: Vec<&str> = Vec::new();
+                    for shared_name in ["bert", "treesitter", "libsql"] {
+                        if shared_name != plugin_name && agentplug_host::release_shared_plugin(shared_name) {
+                            released.push(shared_name);
+                        }
+                    }
+                    agentplug_host::reset_shared_dispatch_count();
+                    if !released.is_empty() {
+                        eprintln!(
+                            "[agentplug daemon] pre-dispatch release of shared Stores {released:?} before {plugin_name}/{verb} -- {reason}"
+                        );
+                    }
+                }
+
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| project.dispatch(&plugin_name, &verb, &body)));
                 let out_name = format!("{plugin_name}-{verb}-{task}.json");
                 let out_body = match result {
