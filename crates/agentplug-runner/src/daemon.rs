@@ -501,6 +501,17 @@ pub fn run_takeover(version: &str) -> anyhow::Result<()> {
 fn write_daemon_heartbeat(project_count: usize, plugin_module_count: usize) {
     let last_plugin_poll_ts = HEARTBEAT_LAST_PLUGIN_POLL_TS.load(std::sync::atomic::Ordering::Relaxed);
     let last_runner_poll_ts = HEARTBEAT_LAST_RUNNER_POLL_TS.load(std::sync::atomic::Ordering::Relaxed);
+    let loaded_content_hashes: HashMap<String, String> =
+        loaded_plugin_content_hashes().lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let shared_pool_slot_hashes: HashMap<String, Vec<Option<String>>> = ["gm", "bert", "libsql", "treesitter"]
+        .iter()
+        .map(|name| (name.to_string(), agentplug_host::shared_plugin_slot_content_hashes(name)))
+        .collect();
+    let mixed_version_pools: Vec<String> = shared_pool_slot_hashes
+        .iter()
+        .filter(|(_, hashes)| hashes.iter().flatten().collect::<std::collections::HashSet<_>>().len() > 1)
+        .map(|(name, _)| name.clone())
+        .collect();
     let _ = fs::write(
         daemon_status_path(),
         serde_json::json!({
@@ -510,6 +521,9 @@ fn write_daemon_heartbeat(project_count: usize, plugin_module_count: usize) {
             "compiled_plugin_modules": plugin_module_count,
             "last_plugin_update_poll_ts": if last_plugin_poll_ts == 0 { serde_json::Value::Null } else { serde_json::json!(last_plugin_poll_ts) },
             "last_runner_update_poll_ts": if last_runner_poll_ts == 0 { serde_json::Value::Null } else { serde_json::json!(last_runner_poll_ts) },
+            "loaded_plugin_content_sha256": loaded_content_hashes,
+            "shared_pool_slot_content_sha256": shared_pool_slot_hashes,
+            "mixed_version_pools": mixed_version_pools,
         })
         .to_string(),
     );
@@ -519,6 +533,11 @@ static HEARTBEAT_PROJECT_COUNT: std::sync::atomic::AtomicUsize = std::sync::atom
 static HEARTBEAT_PLUGIN_MODULE_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 static HEARTBEAT_LAST_PLUGIN_POLL_TS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static HEARTBEAT_LAST_RUNNER_POLL_TS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static LOADED_PLUGIN_CONTENT_HASHES: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+
+fn loaded_plugin_content_hashes() -> &'static Mutex<HashMap<String, String>> {
+    LOADED_PLUGIN_CONTENT_HASHES.get_or_init(|| Mutex::new(HashMap::new()))
+}
 
 static HEARTBEAT_AUTHORITY_LOST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -547,16 +566,34 @@ fn spawn_heartbeat_ticker(heartbeat_interval: Duration) -> std::thread::JoinHand
 struct PluginModules {
     engine: Engine,
     modules: HashMap<String, Module>,
+    loaded_content_hash: HashMap<String, String>,
+}
+
+fn wasm_file_content_hash(wasm_path: &Path) -> anyhow::Result<String> {
+    let bytes = fs::read(wasm_path)?;
+    Ok(crate::download::sha256_hex(&bytes))
 }
 
 impl PluginModules {
     fn new() -> anyhow::Result<Self> {
-        Ok(Self { engine: build_engine()?, modules: HashMap::new() })
+        Ok(Self { engine: build_engine()?, modules: HashMap::new(), loaded_content_hash: HashMap::new() })
     }
 
     fn get_or_compile(&mut self, plugin_name: &str) -> anyhow::Result<()> {
+        let wasm_path = ensure_plugin_installed(plugin_name, None)?;
+        let on_disk_hash = wasm_file_content_hash(&wasm_path)?;
+        let stale = self
+            .loaded_content_hash
+            .get(plugin_name)
+            .is_some_and(|loaded_hash| loaded_hash != &on_disk_hash);
+        if stale {
+            eprintln!(
+                "[agentplug daemon] {plugin_name}.wasm content hash changed on disk since it was last compiled -- evicting the stale in-process module and the shared Store using it, forcing a recompile from the current bytes"
+            );
+            self.modules.remove(plugin_name);
+            agentplug_host::release_shared_plugin(plugin_name);
+        }
         if !self.modules.contains_key(plugin_name) {
-            let wasm_path = ensure_plugin_installed(plugin_name, None)?;
             if let Some(installed) = installed_plugin_version(plugin_name) {
                 if !is_recognized_release_semver(&installed) {
                     eprintln!(
@@ -568,8 +605,29 @@ impl PluginModules {
             eprintln!("[agentplug daemon] compiling {plugin_name}.wasm (shared across every project that uses it)...");
             let module = Module::from_file(&self.engine, &wasm_path)?;
             self.modules.insert(plugin_name.to_string(), module);
+            self.loaded_content_hash.insert(plugin_name.to_string(), on_disk_hash.clone());
+            loaded_plugin_content_hashes()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(plugin_name.to_string(), on_disk_hash);
         }
         Ok(())
+    }
+
+    fn module_with_hash(&self, plugin_name: &str) -> Option<(&Module, &str)> {
+        let module = self.modules.get(plugin_name)?;
+        let hash = self.loaded_content_hash.get(plugin_name)?;
+        Some((module, hash.as_str()))
+    }
+
+    fn modules_with_hashes(&self) -> HashMap<String, (Module, String)> {
+        self.modules
+            .iter()
+            .filter_map(|(name, module)| {
+                let hash = self.loaded_content_hash.get(name)?;
+                Some((name.clone(), (module.clone(), hash.clone())))
+            })
+            .collect()
     }
 }
 
@@ -836,11 +894,11 @@ fn dispatch_project(root: &Path, project: &mut ProjectPlugins, plugin_modules: &
             if project.is_loaded(plugin_name) {
                 continue;
             }
-            let Some(module) = plugin_modules.modules.get(plugin_name) else {
+            let Some((module, content_hash)) = plugin_modules.module_with_hash(plugin_name) else {
                 eprintln!("[agentplug daemon] plugin {plugin_name} not yet compiled for {}: dispatch this thread's own get_or_compile could not run against the shared PluginModules from a worker thread -- see plugin_modules.get_or_compile() call in run_daemon's pre-chunk warm pass", root.display());
                 continue;
             };
-            if let Err(e) = project.load_plugin(&plugin_modules.engine, plugin_name, module) {
+            if let Err(e) = project.load_plugin(&plugin_modules.engine, plugin_name, module, content_hash) {
                 eprintln!("[agentplug daemon] failed to instantiate plugin {plugin_name} for {}: {e:#}", root.display());
             }
         }
@@ -862,7 +920,7 @@ fn dispatch_project(root: &Path, project: &mut ProjectPlugins, plugin_modules: &
             }
             let mut spawned: Vec<Spawned> = Vec::with_capacity(gm_requests.len());
             for req in gm_requests {
-                let self_healing_dispatch_handle = project.dispatch_handle_with_reload(Some((plugin_modules.engine.clone(), plugin_modules.modules.clone())));
+                let self_healing_dispatch_handle = project.dispatch_handle_with_reload(Some((plugin_modules.engine.clone(), plugin_modules.modules_with_hashes())));
                 let detach_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
                 let key: InFlightKey = (root.to_path_buf(), req.verb.clone(), req.task.clone());
                 in_flight_map().lock().unwrap_or_else(|e| e.into_inner()).insert(key.clone(), InFlightHandle { detach: detach_flag.clone() });
@@ -957,7 +1015,7 @@ fn dispatch_project(root: &Path, project: &mut ProjectPlugins, plugin_modules: &
                                 let task = file_path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
                                 let body = fs::read_to_string(&claim_path).unwrap_or_default();
 
-                                let self_healing_dispatch_handle = project.dispatch_handle_with_reload(Some((plugin_modules.engine.clone(), plugin_modules.modules.clone())));
+                                let self_healing_dispatch_handle = project.dispatch_handle_with_reload(Some((plugin_modules.engine.clone(), plugin_modules.modules_with_hashes())));
                                 let detach_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
                                 let key: InFlightKey = (root.to_path_buf(), verb.clone(), task.clone());
                                 in_flight_map().lock().unwrap_or_else(|e| e.into_inner()).insert(key.clone(), InFlightHandle { detach: detach_flag.clone() });
@@ -1023,13 +1081,13 @@ fn dispatch_project(root: &Path, project: &mut ProjectPlugins, plugin_modules: &
                 };
 
                 if !project.is_loaded(&plugin_name) {
-                    let Some(module) = plugin_modules.modules.get(&plugin_name) else {
+                    let Some((module, content_hash)) = plugin_modules.module_with_hash(&plugin_name) else {
                         let out_name = format!("{plugin_name}-{verb}-{task}.json");
                         let out_body = serde_json::json!({"ok": false, "error": format!("plugin {plugin_name} not compiled yet for this daemon -- retry shortly")}).to_string();
                         write_pd_out(&out_name, &out_body);
                         continue;
                     };
-                    if let Err(e) = project.load_plugin(&plugin_modules.engine, &plugin_name, module) {
+                    if let Err(e) = project.load_plugin(&plugin_modules.engine, &plugin_name, module, content_hash) {
                         let out_name = format!("{plugin_name}-{verb}-{task}.json");
                         let out_body = serde_json::json!({"ok": false, "error": format!("plugin instantiate failed: {e:#}")}).to_string();
                         write_pd_out(&out_name, &out_body);
@@ -1161,7 +1219,6 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
     let runner_update_poll_interval = daemon_cfg.runner_update_poll_interval();
     let mut last_runner_update_poll = Instant::now();
     let mut pending_self_update: Option<(PathBuf, String)> = None;
-    let mut pending_plugin_swaps: Vec<(String, String)> = Vec::new();
 
     let mut last_instruction_source_sync: HashMap<PathBuf, Instant> = HashMap::new();
 
@@ -1286,23 +1343,12 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
                 match crate::download::refresh_plugin_if_stale(&plugin_name) {
                     Ok(Some(new_version)) => {
                         eprintln!(
-                            "[agentplug daemon] downloaded+verified plugin {plugin_name} update to {new_version} -- queued for live-swap on next idle tick"
+                            "[agentplug daemon] downloaded+verified plugin {plugin_name} update to {new_version} -- the next tick's get_or_compile content-hash check evicts and recompiles it unconditionally, no idle window required"
                         );
-                        pending_plugin_swaps.push((plugin_name, new_version));
                     }
                     Ok(None) => {}
                     Err(e) => eprintln!("[agentplug daemon] plugin update check for {plugin_name} failed: {e}"),
                 }
-            }
-        }
-
-        if !any_work && !pending_plugin_swaps.is_empty() {
-            for (plugin_name, new_version) in pending_plugin_swaps.drain(..) {
-                plugin_modules.modules.remove(&plugin_name);
-                agentplug_host::release_shared_plugin(&plugin_name);
-                eprintln!(
-                    "[agentplug daemon] refreshed plugin {plugin_name} to {new_version} -- released its Store; next call re-instantiates from the new wasm"
-                );
             }
         }
 

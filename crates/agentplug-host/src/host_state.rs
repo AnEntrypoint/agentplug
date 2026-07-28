@@ -11,6 +11,7 @@ use crate::registry::SharedPluginPool;
 pub struct SiblingHandle {
     pub store: Store<HostState>,
     pub instance: Instance,
+    pub content_hash: String,
 }
 
 pub struct HostState {

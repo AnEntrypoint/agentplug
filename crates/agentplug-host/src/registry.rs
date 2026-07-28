@@ -107,6 +107,10 @@ impl SharedPluginPool {
         self.slots.iter().any(|s| s.lock().unwrap().is_some())
     }
 
+    pub fn slot_content_hashes(&self) -> Vec<Option<String>> {
+        self.slots.iter().map(|s| s.lock().unwrap().as_ref().map(|h| h.content_hash.clone())).collect()
+    }
+
     fn any_instantiated_within(&self, timeout_ms: u64) -> bool {
         const POLL_INTERVAL_MS: u64 = 25;
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
@@ -157,6 +161,16 @@ pub fn release_shared_plugin(plugin_name: &str) -> bool {
         return false;
     }
     shared_plugin_pool(plugin_name).release_all()
+}
+
+pub fn shared_plugin_slot_content_hashes(plugin_name: &str) -> Vec<Option<String>> {
+    SHARED_PLUGINS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap()
+        .get(plugin_name)
+        .map(|pool| pool.slot_content_hashes())
+        .unwrap_or_default()
 }
 
 pub fn dispatch_on(
@@ -225,7 +239,7 @@ fn host_fs_root() -> PathBuf {
     }
 }
 
-fn instantiate_plugin(engine: &Engine, root: PathBuf, plugin_name: &str, module: &Module) -> anyhow::Result<SiblingHandle> {
+fn instantiate_plugin(engine: &Engine, root: PathBuf, plugin_name: &str, module: &Module, content_hash: &str) -> anyhow::Result<SiblingHandle> {
     let mut linker: Linker<HostState> = Linker::new(engine);
     register_wasi(&mut linker)?;
     register_env_imports(&mut linker)?;
@@ -240,7 +254,7 @@ fn instantiate_plugin(engine: &Engine, root: PathBuf, plugin_name: &str, module:
     store.set_epoch_deadline(epoch_ticks_for_seconds(DISPATCH_CALL_DEADLINE_SECS));
     let instance = linker.instantiate(&mut store, module)?;
     *self_instance_cell.lock().unwrap() = Some(instance);
-    Ok(SiblingHandle { store, instance })
+    Ok(SiblingHandle { store, instance, content_hash: content_hash.to_string() })
 }
 
 pub struct ProjectPlugins {
@@ -258,20 +272,24 @@ impl ProjectPlugins {
         self.siblings.lock().unwrap().get(plugin_name).map(|p| p.any_instantiated()).unwrap_or(false)
     }
 
-    pub fn load_plugin(&mut self, engine: &Engine, plugin_name: &str, module: &Module) -> anyhow::Result<()> {
+    pub fn load_plugin(&mut self, engine: &Engine, plugin_name: &str, module: &Module, content_hash: &str) -> anyhow::Result<()> {
         if is_stateless_shared_plugin(plugin_name) {
             let pool = shared_plugin_pool(plugin_name);
             {
                 let mut guard = pool.acquire().ok_or_else(|| anyhow::anyhow!("plugin {plugin_name} pool busy (timeout acquiring slot for load)"))?;
-                if guard.is_none() {
-                    *guard = Some(instantiate_plugin(engine, self.root.clone(), plugin_name, module)?);
+                let needs_fill = match guard.as_ref() {
+                    None => true,
+                    Some(existing) => existing.content_hash != content_hash,
+                };
+                if needs_fill {
+                    *guard = Some(instantiate_plugin(engine, self.root.clone(), plugin_name, module, content_hash)?);
                 }
             }
             self.siblings.lock().unwrap().insert(plugin_name.to_string(), pool);
             return Ok(());
         }
 
-        let instantiated = instantiate_plugin(engine, self.root.clone(), plugin_name, module)?;
+        let instantiated = instantiate_plugin(engine, self.root.clone(), plugin_name, module, content_hash)?;
         let pool = self
             .siblings
             .lock()
@@ -300,7 +318,7 @@ impl ProjectPlugins {
         dispatch_and_evict_on_error(&mut guard, verb, body, &self.root, &self.siblings, plugin_name)
     }
 
-    pub fn dispatch_handle_with_reload(&self, reload_source: Option<(Engine, HashMap<String, Module>)>) -> DispatchHandle {
+    pub fn dispatch_handle_with_reload(&self, reload_source: Option<(Engine, HashMap<String, (Module, String)>)>) -> DispatchHandle {
         DispatchHandle { root: self.root.clone(), siblings: self.siblings.clone(), reload_source }
     }
 
@@ -313,25 +331,29 @@ impl ProjectPlugins {
 pub struct DispatchHandle {
     root: PathBuf,
     siblings: Arc<Mutex<HashMap<String, Arc<SharedPluginPool>>>>,
-    reload_source: Option<(Engine, HashMap<String, Module>)>,
+    reload_source: Option<(Engine, HashMap<String, (Module, String)>)>,
 }
 
 impl DispatchHandle {
     fn reinstantiate_plugin_into_pool_slot_if_reload_source_available(&self, plugin_name: &str) -> anyhow::Result<()> {
         let Some((engine, modules)) = self.reload_source.as_ref() else { return Ok(()) };
-        let Some(module) = modules.get(plugin_name) else { return Ok(()) };
+        let Some((module, content_hash)) = modules.get(plugin_name) else { return Ok(()) };
         if is_stateless_shared_plugin(plugin_name) {
             let pool = shared_plugin_pool(plugin_name);
             {
                 let mut guard = pool.acquire().ok_or_else(|| anyhow::anyhow!("plugin {plugin_name} pool busy (timeout acquiring slot for reload)"))?;
-                if guard.is_none() {
-                    *guard = Some(instantiate_plugin(engine, self.root.clone(), plugin_name, module)?);
+                let needs_fill = match guard.as_ref() {
+                    None => true,
+                    Some(existing) => &existing.content_hash != content_hash,
+                };
+                if needs_fill {
+                    *guard = Some(instantiate_plugin(engine, self.root.clone(), plugin_name, module, content_hash)?);
                 }
             }
             self.siblings.lock().unwrap().insert(plugin_name.to_string(), pool);
             return Ok(());
         }
-        let instantiated = instantiate_plugin(engine, self.root.clone(), plugin_name, module)?;
+        let instantiated = instantiate_plugin(engine, self.root.clone(), plugin_name, module, content_hash)?;
         let pool = self
             .siblings
             .lock()

@@ -13,8 +13,8 @@ pub use imports::{git_subprocess_timeout_ms, register_env_imports, register_wasi
 pub use install::{install_dir, plugins_dir, wasmtime_cache_dir};
 pub use memory_pressure::{process_private_bytes, reset_shared_dispatch_count, shared_dispatches_since_release};
 pub use registry::{
-    epoch_ticks_for_seconds, read_project_plugin_list, release_shared_plugin, set_gm_pool_size, set_side_plugin_pool_size, DispatchHandle,
-    GmFairnessGuard, ProjectPlugins, EPOCH_TICK_INTERVAL_MS, PLUGIN_IDLE_EVICT_MS,
+    epoch_ticks_for_seconds, read_project_plugin_list, release_shared_plugin, set_gm_pool_size, set_side_plugin_pool_size,
+    shared_plugin_slot_content_hashes, DispatchHandle, GmFairnessGuard, ProjectPlugins, EPOCH_TICK_INTERVAL_MS, PLUGIN_IDLE_EVICT_MS,
 };
 
 use std::sync::OnceLock;
@@ -36,6 +36,8 @@ pub fn build_engine() -> anyhow::Result<Engine> {
     let mut config = Config::new();
     let mut cache_config = CacheConfig::new();
     cache_config.with_directory(wasmtime_cache_dir());
+    cache_config.with_files_total_size_soft_limit(256 * 1024 * 1024);
+    cache_config.with_cleanup_interval(std::time::Duration::from_secs(10 * 60));
     config.cache(Some(Cache::new(cache_config)?));
     config.wasm_backtrace_details(wasmtime::WasmBacktraceDetails::Enable);
     config.epoch_interruption(true);

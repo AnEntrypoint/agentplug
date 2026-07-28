@@ -56,10 +56,11 @@ fn main() -> anyhow::Result<()> {
 
             eprintln!("[agentplug] shared daemon still unavailable after retry -- falling back to a standalone watcher for this project");
             let wasm = download::ensure_plugin_installed("gm", None)?;
+            let content_hash = download::sha256_hex(&std::fs::read(&wasm)?);
             let engine = build_engine()?;
             let module = Module::from_file(&engine, &wasm)?;
             let mut project = ProjectPlugins::new(cwd);
-            project.load_plugin(&engine, "gm", &module)?;
+            project.load_plugin(&engine, "gm", &module, &content_hash)?;
             run_spool_watcher_single_process(&mut project, &spool_dir)
         }
         "daemon" => daemon::run_daemon(),
@@ -89,10 +90,11 @@ fn main() -> anyhow::Result<()> {
             }
 
             let wasm = download::ensure_plugin_installed(&plugin, None)?;
+            let content_hash = download::sha256_hex(&std::fs::read(&wasm)?);
             let engine = build_engine()?;
             let module = Module::from_file(&engine, &wasm)?;
             let mut project = ProjectPlugins::new(cwd);
-            project.load_plugin(&engine, &plugin, &module)?;
+            project.load_plugin(&engine, &plugin, &module, &content_hash)?;
             let out = project.dispatch(&plugin, &verb, &body)?;
             println!("{out}");
             Ok(())
