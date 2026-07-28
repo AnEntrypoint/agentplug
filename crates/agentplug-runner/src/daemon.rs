@@ -661,6 +661,64 @@ fn take_forced_runner_refresh_request() -> bool {
     }
 }
 
+fn write_spool_out(out_dir: &Path, out_name: &str, out_body: &str) {
+    let tmp = out_dir.join(format!("{out_name}.tmp.{}", std::process::id()));
+    if fs::write(&tmp, out_body).is_ok() {
+        let _ = fs::rename(&tmp, out_dir.join(out_name));
+        let _ = fs::write(out_dir.join(format!("{out_name}.ready")), b"");
+    }
+}
+
+const ORPHAN_CLAIM_EXT: &str = "inflight";
+
+fn inflight_claim_path(in_dir: &Path, verb: &str, task: &str) -> PathBuf {
+    in_dir.join(verb).join(format!("{task}.txt.{ORPHAN_CLAIM_EXT}"))
+}
+
+fn sweep_orphaned_claims(root: &Path) {
+    let spool_dir = root.join(".gm").join("exec-spool");
+    let in_dir = spool_dir.join("in");
+    let out_dir = spool_dir.join("out");
+    if fs::create_dir_all(&out_dir).is_err() {
+        return;
+    }
+    let Ok(verb_dirs) = fs::read_dir(&in_dir) else { return };
+    for verb_entry in verb_dirs.flatten() {
+        if !verb_entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let verb = verb_entry.file_name().to_string_lossy().into_owned();
+        let Ok(files) = fs::read_dir(verb_entry.path()) else { continue };
+        for file_entry in files.flatten() {
+            let path = file_entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some(ORPHAN_CLAIM_EXT) {
+                continue;
+            }
+            let task = Path::new(path.file_stem().unwrap_or_default())
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            if task.is_empty() {
+                let _ = fs::remove_file(&path);
+                continue;
+            }
+            let out_name = format!("{verb}-{task}.json");
+            if !out_dir.join(&out_name).exists() {
+                let out_body = serde_json::json!({
+                    "ok": false,
+                    "error_code": "dispatch_orphaned",
+                    "error": format!("verb {verb} (task {task}) was claimed by a daemon that died before answering -- most likely a wasm trap, an out-of-memory abort, or a shared-Store recycle during the call. The request was NOT completed and no partial work should be assumed. Re-dispatch it."),
+                    "verb": verb,
+                    "task": task,
+                }).to_string();
+                write_spool_out(&out_dir, &out_name, &out_body);
+                eprintln!("[agentplug daemon] swept orphaned claim {verb}/{task} for {} -- wrote error out-file", root.display());
+            }
+            let _ = fs::remove_file(&path);
+        }
+    }
+}
+
 fn run_gm_dispatch_to_file(root: &Path, handle: &DispatchHandle, verb: &str, task: &str, body: &str, out_dir: &Path) {
     let _fairness_guard = GmFairnessGuard::acquire(root);
     let dispatch_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handle.dispatch("gm", verb, body)));
@@ -679,11 +737,9 @@ fn run_gm_dispatch_to_file(root: &Path, handle: &DispatchHandle, verb: &str, tas
         }
     };
     let out_name = format!("{verb}-{task}.json");
-    let tmp = out_dir.join(format!("{out_name}.tmp.{}", std::process::id()));
-    if fs::write(&tmp, &out_body).is_ok() {
-        let _ = fs::rename(&tmp, out_dir.join(&out_name));
-        let _ = fs::write(out_dir.join(format!("{out_name}.ready")), b"");
-    }
+    write_spool_out(out_dir, &out_name, &out_body);
+    let in_dir = root.join(".gm").join("exec-spool").join("in");
+    let _ = fs::remove_file(inflight_claim_path(&in_dir, verb, task));
 }
 
 fn dispatch_project(root: &Path, project: &mut ProjectPlugins, plugin_modules: &PluginModules) -> bool {
@@ -732,14 +788,13 @@ fn dispatch_project(root: &Path, project: &mut ProjectPlugins, plugin_modules: &
                 if file_path.extension().and_then(|e| e.to_str()) != Some("txt") {
                     continue;
                 }
-                let claim_path = file_path.with_extension(format!("txt.claim.{}", std::process::id()));
+                let claim_path = file_path.with_extension(format!("txt.{ORPHAN_CLAIM_EXT}"));
                 if fs::rename(&file_path, &claim_path).is_err() {
                     continue;
                 }
                 did_work = true;
                 let task = file_path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
                 let body = fs::read_to_string(&claim_path).unwrap_or_default();
-                let _ = fs::remove_file(&claim_path);
                 claimed.push(ClaimedRequest { verb: verb.clone(), task, body });
             }
         }
@@ -762,21 +817,15 @@ fn dispatch_project(root: &Path, project: &mut ProjectPlugins, plugin_modules: &
         for req in reqs {
             let out_body = handle_background_convert(root, &req.body);
             let out_name = format!("{}-{}.json", req.verb, req.task);
-            let tmp = out_dir.join(format!("{out_name}.tmp.{}", std::process::id()));
-            if fs::write(&tmp, &out_body).is_ok() {
-                let _ = fs::rename(&tmp, out_dir.join(&out_name));
-                let _ = fs::write(out_dir.join(format!("{out_name}.ready")), b"");
-            }
+            write_spool_out(&out_dir, &out_name, &out_body);
+            let _ = fs::remove_file(inflight_claim_path(&in_dir, &req.verb, &req.task));
         }
     };
     for req in plugin_refresh_requests {
         let out_body = handle_plugin_refresh_request(root, &req.body);
         let out_name = format!("{}-{}.json", req.verb, req.task);
-        let tmp = out_dir.join(format!("{out_name}.tmp.{}", std::process::id()));
-        if fs::write(&tmp, &out_body).is_ok() {
-            let _ = fs::rename(&tmp, out_dir.join(&out_name));
-            let _ = fs::write(out_dir.join(format!("{out_name}.ready")), b"");
-        }
+        write_spool_out(&out_dir, &out_name, &out_body);
+        let _ = fs::remove_file(inflight_claim_path(&in_dir, &req.verb, &req.task));
         did_work = true;
     }
 
@@ -800,11 +849,8 @@ fn dispatch_project(root: &Path, project: &mut ProjectPlugins, plugin_modules: &
             for req in &gm_requests {
                 let out_name = format!("{}-{}.json", req.verb, req.task);
                 let out_body = serde_json::json!({"ok": false, "error": "gm plugin failed to load for this project (see daemon stderr for the compile/install/instantiate failure)", "verb": req.verb}).to_string();
-                let tmp = out_dir.join(format!("{out_name}.tmp.{}", std::process::id()));
-                if fs::write(&tmp, &out_body).is_ok() {
-                    let _ = fs::rename(&tmp, out_dir.join(&out_name));
-                    let _ = fs::write(out_dir.join(format!("{out_name}.ready")), b"");
-                }
+                write_spool_out(&out_dir, &out_name, &out_body);
+                let _ = fs::remove_file(inflight_claim_path(&in_dir, &req.verb, &req.task));
             }
             answer_bg_converts(bg_convert_requests);
         } else {
@@ -876,20 +922,16 @@ fn dispatch_project(root: &Path, project: &mut ProjectPlugins, plugin_modules: &
                             if file_path.extension().and_then(|e| e.to_str()) != Some("txt") {
                                 continue;
                             }
-                            let claim_path = file_path.with_extension(format!("txt.claim.{}", std::process::id()));
+                            let claim_path = file_path.with_extension(format!("txt.{ORPHAN_CLAIM_EXT}"));
                             if fs::rename(&file_path, &claim_path).is_err() {
                                 continue;
                             }
                             let bc_task = file_path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
                             let bc_body = fs::read_to_string(&claim_path).unwrap_or_default();
-                            let _ = fs::remove_file(&claim_path);
                             let out_body = handle_background_convert(root, &bc_body);
                             let out_name = format!("background-convert-{bc_task}.json");
-                            let tmp = out_dir.join(format!("{out_name}.tmp.{}", std::process::id()));
-                            if fs::write(&tmp, &out_body).is_ok() {
-                                let _ = fs::rename(&tmp, out_dir.join(&out_name));
-                                let _ = fs::write(out_dir.join(format!("{out_name}.ready")), b"");
-                            }
+                            write_spool_out(&out_dir, &out_name, &out_body);
+                            let _ = fs::remove_file(&claim_path);
                         }
                     }
 
@@ -908,13 +950,12 @@ fn dispatch_project(root: &Path, project: &mut ProjectPlugins, plugin_modules: &
                                 if file_path.extension().and_then(|e| e.to_str()) != Some("txt") {
                                     continue;
                                 }
-                                let claim_path = file_path.with_extension(format!("txt.claim.{}", std::process::id()));
+                                let claim_path = file_path.with_extension(format!("txt.{ORPHAN_CLAIM_EXT}"));
                                 if fs::rename(&file_path, &claim_path).is_err() {
                                     continue;
                                 }
                                 let task = file_path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
                                 let body = fs::read_to_string(&claim_path).unwrap_or_default();
-                                let _ = fs::remove_file(&claim_path);
 
                                 let self_healing_dispatch_handle = project.dispatch_handle_with_reload(Some((plugin_modules.engine.clone(), plugin_modules.modules.clone())));
                                 let detach_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -1119,14 +1160,23 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
     loop {
         if heartbeat_authority_lost() {
             agentplug_host::close_all_sessions();
+            for root in &known_roots {
+                sweep_orphaned_claims(root);
+            }
             eprintln!("[agentplug daemon] heartbeat authority held by another daemon -- exiting before serving further work");
             return Ok(());
         }
 
         if first_registry_poll_pending || last_registry_poll.elapsed() >= registry_poll_interval {
+            let sweep_orphans_left_by_whatever_daemon_died_before_answering = first_registry_poll_pending;
             first_registry_poll_pending = false;
             last_registry_poll = Instant::now();
             known_roots = read_registry();
+            if sweep_orphans_left_by_whatever_daemon_died_before_answering {
+                for root in &known_roots {
+                    sweep_orphaned_claims(root);
+                }
+            }
         }
 
         const BROWSER_ORPHAN_SWEEP_INTERVAL_LONGER_THAN_REGISTRY_POLL_MS: u64 = 5 * 60 * 1000;
