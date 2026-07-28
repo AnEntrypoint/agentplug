@@ -495,6 +495,8 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
             };
 
             let caller_root = caller.data().cwd();
+            let acquire_start = std::time::Instant::now();
+            let acquire_timeout_ms = crate::registry::SharedPluginPool::ACQUIRE_TIMEOUT_MS;
             let mut guard = match sibling_pool.acquire() {
                 Some(g) => g,
                 None => {
@@ -504,6 +506,21 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
                     );
                 }
             };
+            if guard.is_none() {
+                drop(guard);
+                let remaining_ms = acquire_timeout_ms.saturating_sub(acquire_start.elapsed().as_millis() as u64);
+                sibling_pool.any_instantiated_within(remaining_ms);
+                let remaining_ms = acquire_timeout_ms.saturating_sub(acquire_start.elapsed().as_millis() as u64);
+                guard = match sibling_pool.acquire_within(remaining_ms) {
+                    (Some(g), _) => g,
+                    (None, _) => {
+                        return write_guest_json(
+                            &mut caller,
+                            serde_json::json!({"ok": false, "error": "plugin_pool_busy_timeout", "plugin": plugin}),
+                        );
+                    }
+                };
+            }
             let result = match guard.as_mut() {
                 None => Err(anyhow::anyhow!("plugin_not_loaded_yet")),
                 Some(handle) => crate::registry::dispatch_on(&mut handle.store, handle.instance, &verb, &body, &caller_root, caller_siblings.clone()),

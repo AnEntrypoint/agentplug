@@ -111,7 +111,7 @@ impl SharedPluginPool {
         self.slots.iter().map(|s| s.lock().unwrap().as_ref().map(|h| h.content_hash.clone())).collect()
     }
 
-    fn any_instantiated_within(&self, timeout_ms: u64) -> bool {
+    pub(crate) fn any_instantiated_within(&self, timeout_ms: u64) -> bool {
         const POLL_INTERVAL_MS: u64 = 25;
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
         loop {
