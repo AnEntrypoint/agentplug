@@ -511,6 +511,47 @@ fn write_daemon_heartbeat(project_count: usize, plugin_module_count: usize) {
     );
 }
 
+fn write_project_heartbeat(spool_dir: &Path, busy_until: Option<u64>) {
+    let status_path = spool_dir.join(".status.json");
+    let mut payload = serde_json::json!({
+        "pid": std::process::id(),
+        "ts": now_ms(),
+        "daemon": true,
+        "shared_process": true,
+        "runtime": "agentplug",
+    });
+    if let Some(busy_until) = busy_until {
+        payload["busy_until"] = serde_json::json!(busy_until);
+    }
+    let _ = fs::write(&status_path, payload.to_string());
+}
+
+fn known_project_roots() -> &'static Mutex<Vec<PathBuf>> {
+    static SLOT: OnceLock<Mutex<Vec<PathBuf>>> = OnceLock::new();
+    SLOT.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn set_known_project_roots(roots: &[PathBuf]) {
+    *known_project_roots().lock().unwrap_or_else(|e| e.into_inner()) = roots.to_vec();
+}
+
+fn spawn_project_heartbeat_ticker(interval: Duration) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || loop {
+        std::thread::sleep(interval);
+        if heartbeat_authority_lost() {
+            return;
+        }
+        let roots = known_project_roots().lock().unwrap_or_else(|e| e.into_inner()).clone();
+        for root in roots {
+            let spool_dir = root.join(".gm").join("exec-spool");
+            if !spool_dir.exists() {
+                continue;
+            }
+            write_project_heartbeat(&spool_dir, None);
+        }
+    })
+}
+
 static HEARTBEAT_PROJECT_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 static HEARTBEAT_PLUGIN_MODULE_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 static HEARTBEAT_LAST_PLUGIN_POLL_TS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -847,11 +888,7 @@ fn dispatch_project(root: &Path, project: &mut ProjectPlugins, plugin_modules: &
         return did_work;
     }
 
-    let status_path = spool_dir.join(".status.json");
-    let _ = fs::write(
-        &status_path,
-        serde_json::json!({"pid": std::process::id(), "ts": now_ms(), "daemon": true, "shared_process": true, "runtime": "agentplug"}).to_string(),
-    );
+    write_project_heartbeat(&spool_dir, None);
 
     let requested_plugins = {
         let mut list = read_project_plugin_list(root);
@@ -982,10 +1019,7 @@ fn dispatch_project(root: &Path, project: &mut ProjectPlugins, plugin_modules: &
             while spawned.iter().any(|s| s.join_handle.is_some()) {
                 if last_status_refresh.elapsed() >= Duration::from_millis(STATUS_REFRESH_INTERVAL_MS) {
                     last_status_refresh = Instant::now();
-                    let _ = fs::write(
-                        &status_path,
-                        serde_json::json!({"pid": std::process::id(), "ts": now_ms(), "daemon": true, "shared_process": true, "runtime": "agentplug", "busy_until": now_ms() + STATUS_REFRESH_INTERVAL_MS}).to_string(),
-                    );
+                    write_project_heartbeat(&spool_dir, Some(now_ms() + STATUS_REFRESH_INTERVAL_MS));
                 }
                 for s in spawned.iter_mut() {
                     if s.join_handle.is_some()
@@ -1275,6 +1309,9 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
     let _heartbeat_ticker = spawn_heartbeat_ticker(heartbeat_interval);
     write_daemon_heartbeat(0, 0);
 
+    const PROJECT_HEARTBEAT_TICK_INTERVAL_MS: u64 = 3_000;
+    let _project_heartbeat_ticker = spawn_project_heartbeat_ticker(Duration::from_millis(PROJECT_HEARTBEAT_TICK_INTERVAL_MS));
+
     loop {
         if heartbeat_authority_lost() {
             agentplug_host::close_all_sessions();
@@ -1290,6 +1327,7 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
             first_registry_poll_pending = false;
             last_registry_poll = Instant::now();
             known_roots = read_registry();
+            set_known_project_roots(&known_roots);
             if sweep_orphans_left_by_whatever_daemon_died_before_answering {
                 for root in &known_roots {
                     sweep_orphaned_claims(root);
