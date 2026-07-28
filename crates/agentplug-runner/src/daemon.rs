@@ -134,10 +134,20 @@ impl DaemonConfig {
     fn load() -> Self {
         Self::scaffold_example_if_absent();
         let path = install_dir().join("daemon-config.json");
-        fs::read_to_string(&path)
-            .ok()
-            .and_then(|s| serde_json::from_str::<DaemonConfig>(&s).ok())
-            .unwrap_or(DaemonConfig {
+        let raw = fs::read_to_string(&path).ok();
+        if let Some(text) = raw.as_deref() {
+            let cleaned = text.trim_start_matches('\u{feff}');
+            match serde_json::from_str::<DaemonConfig>(cleaned) {
+                Ok(cfg) => return cfg,
+                Err(e) => {
+                    eprintln!(
+                        "[agentplug daemon] {} exists but failed to parse ({e}); EVERY setting in it is being ignored and compiled defaults are in force",
+                        path.display()
+                    );
+                }
+            }
+        }
+        DaemonConfig {
                 registry_poll_interval_secs: None,
                 heartbeat_interval_secs: None,
                 plugin_update_poll_interval_secs: None,
@@ -147,7 +157,7 @@ impl DaemonConfig {
                 side_plugin_concurrency: None,
                 shared_store_recycle_private_mb: None,
                 shared_store_recycle_dispatches: None,
-            })
+            }
     }
     fn registry_poll_interval(&self) -> Duration { Duration::from_secs(self.registry_poll_interval_secs.unwrap_or(5)) }
     fn heartbeat_interval(&self) -> Duration { Duration::from_secs(self.heartbeat_interval_secs.unwrap_or(10)) }
