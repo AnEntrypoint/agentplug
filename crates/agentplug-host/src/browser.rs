@@ -299,18 +299,27 @@ fn reap_os_orphans(cwd: &Path) {
                 }
             }
         }
-        let Ok(raw) = std::fs::read_to_string(&sidecar) else { continue };
-        let Ok(pid) = raw.trim().parse::<u32>() else {
-            let _ = std::fs::remove_file(&sidecar);
-            continue;
+        let sidecar_pids: Vec<u32> = std::fs::read_to_string(&sidecar)
+            .ok()
+            .and_then(|raw| raw.trim().parse::<u32>().ok())
+            .into_iter()
+            .collect();
+        let pids_to_check = if sidecar_pids.is_empty() {
+            find_pids_of_chrome_processes_using_profile_dir(&path)
+        } else {
+            sidecar_pids
         };
-        if pid_is_alive(pid) {
-            eprintln!(
-                "[agentplug browser] reaping OS-orphaned chrome pid={} (profile {}, no owning session in this process -- crash/hard-exit orphan)",
-                pid,
-                path.display()
-            );
-            kill_pid(pid);
+        let used_sidecar_missing_fallback = !sidecar.exists();
+        for pid in pids_to_check {
+            if pid_is_alive(pid) {
+                eprintln!(
+                    "[agentplug browser] reaping OS-orphaned chrome pid={} (profile {}, no owning session in this process -- crash/hard-exit orphan, sidecar-missing fallback used: {})",
+                    pid,
+                    path.display(),
+                    used_sidecar_missing_fallback
+                );
+                kill_pid(pid);
+            }
         }
         let _ = std::fs::remove_file(&sidecar);
     }
@@ -394,6 +403,45 @@ fn kill_pid(pid: u32) {
 #[cfg(not(windows))]
 fn kill_pid(pid: u32) {
     let _ = Command::new("kill").args(["-9", &pid.to_string()]).output();
+}
+
+#[cfg(windows)]
+fn find_pids_of_chrome_processes_using_profile_dir(profile_dir: &Path) -> Vec<u32> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let needle = profile_dir.to_string_lossy().replace('\\', "/").to_lowercase();
+    let output = Command::new("powershell.exe")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "Get-CimInstance Win32_Process -Filter \"Name='chrome.exe'\" | ForEach-Object { \"$($_.ProcessId)|$($_.CommandLine)\" }",
+        ])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output();
+    let Ok(o) = output else { return Vec::new() };
+    let text = String::from_utf8_lossy(&o.stdout);
+    text.lines()
+        .filter_map(|line| {
+            let (pid_str, cmdline) = line.split_once('|')?;
+            let cmdline_normalized = cmdline.replace('\\', "/").to_lowercase();
+            if !cmdline_normalized.contains(&needle) {
+                return None;
+            }
+            pid_str.trim().parse::<u32>().ok()
+        })
+        .collect()
+}
+
+#[cfg(not(windows))]
+fn find_pids_of_chrome_processes_using_profile_dir(profile_dir: &Path) -> Vec<u32> {
+    let needle = profile_dir.to_string_lossy().to_string();
+    let output = Command::new("pgrep").args(["-f", &needle]).output();
+    let Ok(o) = output else { return Vec::new() };
+    String::from_utf8_lossy(&o.stdout)
+        .lines()
+        .filter_map(|l| l.trim().parse::<u32>().ok())
+        .collect()
 }
 
 pub fn close_all_sessions() {
