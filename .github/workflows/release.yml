@@ -14,7 +14,52 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  bump:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.bump.outputs.version }}
+      sha: ${{ steps.bump.outputs.sha }}
+    steps:
+      - name: Checkout agentplug
+        uses: actions/checkout@v5
+        with:
+          token: ${{ secrets.PUBLISHER_TOKEN }}
+          fetch-depth: 0
+
+      - name: Auto-bump agentplug workspace patch version BEFORE build
+        id: bump
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.PUBLISHER_TOKEN }}
+        run: |
+          git config user.name "gm-bot"
+          git config user.email "noreply@github.com"
+          git config url."https://${GH_TOKEN}:x-oauth-basic@github.com/".insteadOf "https://github.com/"
+          CURRENT=$(grep '^version' Cargo.toml | head -1 | sed 's/.*= *"//;s/"//')
+          IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT"
+          NEW_PATCH=$((PATCH + 1))
+          NEW_VERSION="$MAJOR.$MINOR.$NEW_PATCH"
+          sed -i "0,/^version = \".*\"/{s/^version = \".*\"/version = \"$NEW_VERSION\"/}" Cargo.toml
+          git add Cargo.toml
+          if git diff --cached --quiet; then
+            echo "No version change needed"
+            echo "version=$CURRENT" >> "$GITHUB_OUTPUT"
+            echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          else
+            git commit -m "chore: auto-bump version to $NEW_VERSION [skip ci]"
+            git fetch origin main
+            if ! git rebase origin/main; then
+              echo "::error::Rebase onto origin/main hit a real conflict; refusing to auto-resolve with -X theirs (would silently discard concurrent main changes)."
+              git rebase --abort
+              exit 1
+            fi
+            git push origin HEAD:main
+            echo "version=$NEW_VERSION" >> "$GITHUB_OUTPUT"
+            echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          fi
+
   build:
+    needs: bump
     timeout-minutes: 30
     strategy:
       fail-fast: false
@@ -48,6 +93,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.bump.outputs.sha }}
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -83,20 +130,15 @@ jobs:
           if-no-files-found: error
 
   release:
-    # No `needs: build` -- see rs-plugkit's gm-runner.yml for the full
-    # rationale (a single stuck-queued matrix leg with no assigned runner
-    # blocks `needs.build` from ever resolving even under `if: always()`).
-    # Same bounded-poll-then-release-what-exists pattern, ported verbatim.
+    needs: bump
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.bump.outputs.sha }}
 
-      - name: Read version
-        id: ver
-        run: echo "version=$(grep '^version' Cargo.toml | head -1 | sed 's/.*= *\"//;s/\"//')" >> "$GITHUB_OUTPUT"
-
-      - name: Wait for as many build-matrix artifacts as show up within a bound
+      - name: Wait for as many build-matrix artifacts as show up within a bound, tolerating any single stuck-queued unscheduled leg
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -137,13 +179,14 @@ jobs:
         if: env.have_assets == 'true'
         env:
           GH_TOKEN: ${{ secrets.PUBLISHER_TOKEN }}
-          VER: ${{ steps.ver.outputs.version }}
+          VER: ${{ needs.bump.outputs.version }}
+          BUILT_SHA: ${{ needs.bump.outputs.sha }}
         run: |
           set -e
           if ! gh release view "v$VER" --repo AnEntrypoint/agentplug-bin >/dev/null 2>&1; then
             gh release create "v$VER" \
               --repo AnEntrypoint/agentplug-bin \
               --title "agentplug-runner v$VER" \
-              --notes "Native cross-platform wasm plugin-host runner, auto-published from agentplug CI at $GITHUB_SHA"
+              --notes "Native cross-platform wasm plugin-host runner, auto-published from agentplug CI at $BUILT_SHA"
           fi
           gh release upload "v$VER" --repo AnEntrypoint/agentplug-bin --clobber release-assets/*
