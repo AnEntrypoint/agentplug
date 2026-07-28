@@ -8,7 +8,26 @@ use wasmtime::{AsContextMut, Caller, Linker, Memory};
 
 use crate::host_state::HostState;
 
-const GIT_SUBPROCESS_TIMEOUT_MS: u64 = 15_000;
+const GIT_SUBPROCESS_TIMEOUT_MS_DEFAULT: u64 = 120_000;
+
+/// Wall-clock budget for one git subprocess.
+///
+/// Was a flat 15s, which is ample for the status and rev-parse calls that
+/// dominate, and far too short for the ones that are not: a push over a slow
+/// link, a fetch on a large history, or a first clone. Those failed with
+/// "timed out after 15000ms, killed" -- indistinguishable at the call site
+/// from a genuine git error, so a transient network condition read as a
+/// broken repository.
+///
+/// Raised to 120s and made overridable, because the right value is a property
+/// of the repository and the link rather than of this binary.
+fn git_subprocess_timeout_ms() -> u64 {
+    std::env::var("AGENTPLUG_GIT_TIMEOUT_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|ms| *ms > 0)
+        .unwrap_or(GIT_SUBPROCESS_TIMEOUT_MS_DEFAULT)
+}
 
 fn canonicalize_path_separators_for_stable_keying(path: &std::path::Path) -> PathBuf {
     #[cfg(windows)]
@@ -547,7 +566,7 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
                 git_cmd.creation_flags(CREATE_NO_WINDOW);
             }
             let v = match git_cmd.spawn() {
-                Ok(mut child) => match child.wait_timeout(Duration::from_millis(GIT_SUBPROCESS_TIMEOUT_MS)) {
+                Ok(mut child) => match child.wait_timeout(Duration::from_millis(git_subprocess_timeout_ms())) {
                     Ok(Some(status)) => {
                         let mut stdout = Vec::new();
                         let mut stderr = Vec::new();
@@ -563,7 +582,7 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
                         let _ = child.kill();
                         let _ = child.wait();
                         serde_json::json!({
-                            "stdout": "", "stderr": format!("git {argv:?} timed out after {GIT_SUBPROCESS_TIMEOUT_MS}ms, killed"),
+                            "stdout": "", "stderr": format!("git {argv:?} timed out after {}ms, killed", git_subprocess_timeout_ms()),
                             "exit_code": -1,
                         })
                     }
