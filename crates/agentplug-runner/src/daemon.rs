@@ -23,12 +23,34 @@ pub fn register_project(cwd: &Path) -> anyhow::Result<()> {
     }
     let existing = fs::read_to_string(&path).unwrap_or_default();
     let cwd_str = cwd.to_string_lossy().to_string();
-    if existing.lines().any(|l| l.trim() == cwd_str) {
+
+    let mut live: Vec<String> = Vec::new();
+    let mut dropped = 0usize;
+    for line in existing.lines() {
+        let entry = line.trim();
+        if entry.is_empty() || live.iter().any(|e| e == entry) {
+            continue;
+        }
+        if entry == cwd_str || Path::new(entry).exists() {
+            live.push(entry.to_string());
+        } else {
+            dropped += 1;
+        }
+    }
+
+    let already_present = live.iter().any(|e| e == &cwd_str);
+    if already_present && dropped == 0 {
         return Ok(());
     }
-    use std::io::Write as _;
-    let mut f = fs::OpenOptions::new().create(true).append(true).open(&path)?;
-    writeln!(f, "{cwd_str}")?;
+    if !already_present {
+        live.push(cwd_str);
+    }
+
+    let mut body = live.join("\n");
+    body.push('\n');
+    let tmp = path.with_extension("txt.tmp");
+    fs::write(&tmp, &body)?;
+    fs::rename(&tmp, &path)?;
     Ok(())
 }
 
