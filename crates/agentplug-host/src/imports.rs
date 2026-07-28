@@ -29,6 +29,39 @@ fn git_subprocess_timeout_ms() -> u64 {
         .unwrap_or(GIT_SUBPROCESS_TIMEOUT_MS_DEFAULT)
 }
 
+fn normalize_lexically(path: &std::path::Path) -> Option<PathBuf> {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::ParentDir => {
+                if !out.pop() {
+                    return None;
+                }
+            }
+            Component::CurDir => {}
+            other => out.push(other.as_os_str()),
+        }
+    }
+    Some(out)
+}
+
+fn sandboxed_guest_path(cwd: &std::path::Path, path: &str) -> Option<PathBuf> {
+    let requested = std::path::Path::new(path);
+    let joined = if requested.is_absolute() || requested.has_root() {
+        requested.to_path_buf()
+    } else {
+        cwd.join(requested)
+    };
+    let normalized = normalize_lexically(&joined)?;
+    let root = normalize_lexically(cwd)?;
+    if normalized == root || normalized.starts_with(&root) {
+        Some(normalized)
+    } else {
+        None
+    }
+}
+
 fn canonicalize_path_separators_for_stable_keying(path: &std::path::Path) -> PathBuf {
     #[cfg(windows)]
     {
@@ -57,8 +90,21 @@ fn read_guest_string(caller: &mut Caller<'_, HostState>, ptr: u32, len: u32) -> 
     String::from_utf8_lossy(&buf).into_owned()
 }
 
+const PACKED_ABI_FIELD_MAX: usize = 0xffff_ffff;
+
+fn pack_guest_ptr_len(ptr: u32, len: usize) -> u64 {
+    debug_assert!(
+        len <= PACKED_ABI_FIELD_MAX,
+        "write_guest_bytes: length {len} exceeds the 32-bit field of the packed (ptr,len) ABI"
+    );
+    (ptr as u64 & 0xffff_ffff) | ((len as u64) << 32)
+}
+
 fn write_guest_bytes(caller: &mut Caller<'_, HostState>, bytes: &[u8]) -> u64 {
     if bytes.is_empty() {
+        return 0;
+    }
+    if bytes.len() > PACKED_ABI_FIELD_MAX {
         return 0;
     }
     let instance = caller
@@ -76,8 +122,7 @@ fn write_guest_bytes(caller: &mut Caller<'_, HostState>, bytes: &[u8]) -> u64 {
             if memory.write(&mut *caller, ptr as usize, bytes).is_err() {
                 return 0;
             }
-            let len = bytes.len() as u64;
-            (ptr as u64 & 0xffff_ffff) | (len << 32)
+            pack_guest_ptr_len(ptr, bytes.len())
         }
         Err(e) => {
             if matches!(e.downcast_ref::<wasmtime::Trap>(), Some(wasmtime::Trap::Interrupt)) {
@@ -111,7 +156,7 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
         "host_fs_read",
         |mut caller: Caller<'_, HostState>, path_ptr: u32, path_len: u32| -> u64 {
             let path = read_guest_string(&mut caller, path_ptr, path_len);
-            let full = caller.data().cwd().join(&path);
+            let Some(full) = sandboxed_guest_path(&caller.data().cwd(), &path) else { return 0 };
             match fs::read_to_string(&full) {
                 Ok(content) => write_guest_bytes(&mut caller, content.as_bytes()),
                 Err(_) => 0,
@@ -125,7 +170,7 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
         |mut caller: Caller<'_, HostState>, path_ptr: u32, path_len: u32, data_ptr: u32, data_len: u32| -> u32 {
             let path = read_guest_string(&mut caller, path_ptr, path_len);
             let data = read_guest_string(&mut caller, data_ptr, data_len);
-            let full = caller.data().cwd().join(&path);
+            let Some(full) = sandboxed_guest_path(&caller.data().cwd(), &path) else { return 0 };
             if let Some(parent) = full.parent() {
                 let _ = fs::create_dir_all(parent);
             }
@@ -141,7 +186,7 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
         "host_fs_remove",
         |mut caller: Caller<'_, HostState>, path_ptr: u32, path_len: u32| -> u32 {
             let path = read_guest_string(&mut caller, path_ptr, path_len);
-            let full = caller.data().cwd().join(&path);
+            let Some(full) = sandboxed_guest_path(&caller.data().cwd(), &path) else { return 0 };
             match fs::metadata(&full) {
                 Ok(md) if md.is_dir() => 0,
                 Ok(_) => match fs::remove_file(&full) {
@@ -158,7 +203,7 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
         "host_fs_readdir",
         |mut caller: Caller<'_, HostState>, path_ptr: u32, path_len: u32| -> u64 {
             let path = read_guest_string(&mut caller, path_ptr, path_len);
-            let full = caller.data().cwd().join(&path);
+            let Some(full) = sandboxed_guest_path(&caller.data().cwd(), &path) else { return 0 };
             let entries: Vec<String> = fs::read_dir(&full)
                 .map(|rd| rd.filter_map(|e| e.ok()).map(|e| e.file_name().to_string_lossy().into_owned()).collect())
                 .unwrap_or_default();
@@ -171,7 +216,7 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
         "host_fs_stat",
         |mut caller: Caller<'_, HostState>, path_ptr: u32, path_len: u32| -> u64 {
             let path = read_guest_string(&mut caller, path_ptr, path_len);
-            let full = caller.data().cwd().join(&path);
+            let Some(full) = sandboxed_guest_path(&caller.data().cwd(), &path) else { return 0 };
             match fs::metadata(&full) {
                 Ok(md) => {
                     let mtime_ms = md
