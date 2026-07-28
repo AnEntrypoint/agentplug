@@ -10,6 +10,17 @@ use crate::host_state::HostState;
 
 const GIT_SUBPROCESS_TIMEOUT_MS: u64 = 15_000;
 
+fn canonicalize_path_separators_for_stable_keying(path: &std::path::Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        PathBuf::from(path.to_string_lossy().replace('/', "\\"))
+    }
+    #[cfg(not(windows))]
+    {
+        path.to_path_buf()
+    }
+}
+
 fn guest_memory(caller: &mut Caller<'_, HostState>) -> Memory {
     caller
         .get_export("memory")
@@ -388,6 +399,7 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
             } else {
                 std::path::PathBuf::from(cwd_str)
             };
+            let cwd = canonicalize_path_separators_for_stable_keying(&cwd);
             let result = crate::browser::run(&body, &cwd, &sid);
             write_guest_json(&mut caller, result)
         },
