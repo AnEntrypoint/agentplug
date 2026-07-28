@@ -10,7 +10,7 @@ use wasmtime::{Engine, Module, Trap};
 
 use agentplug_host::{build_engine, install_dir, now_ms, read_project_plugin_list, DispatchHandle, GmFairnessGuard, ProjectPlugins, PLUGIN_IDLE_EVICT_MS};
 
-use crate::download::{ensure_plugin_installed, installed_runner_version, record_runner_version};
+use crate::download::{ensure_plugin_installed, installed_plugin_version, installed_runner_version, is_recognized_release_semver, record_runner_version};
 
 fn registry_path() -> PathBuf {
     install_dir().join("daemon-registry.txt")
@@ -73,7 +73,7 @@ fn describe_dispatch_error(e: &anyhow::Error) -> String {
     }
 }
 
-fn read_registry() -> Vec<PathBuf> {
+pub(crate) fn read_registry() -> Vec<PathBuf> {
     fs::read_to_string(registry_path())
         .unwrap_or_default()
         .lines()
@@ -491,6 +491,8 @@ pub fn run_takeover(version: &str) -> anyhow::Result<()> {
 }
 
 fn write_daemon_heartbeat(project_count: usize, plugin_module_count: usize) {
+    let last_plugin_poll_ts = HEARTBEAT_LAST_PLUGIN_POLL_TS.load(std::sync::atomic::Ordering::Relaxed);
+    let last_runner_poll_ts = HEARTBEAT_LAST_RUNNER_POLL_TS.load(std::sync::atomic::Ordering::Relaxed);
     let _ = fs::write(
         daemon_status_path(),
         serde_json::json!({
@@ -498,6 +500,8 @@ fn write_daemon_heartbeat(project_count: usize, plugin_module_count: usize) {
             "ts": now_ms(),
             "active_projects": project_count,
             "compiled_plugin_modules": plugin_module_count,
+            "last_plugin_update_poll_ts": if last_plugin_poll_ts == 0 { serde_json::Value::Null } else { serde_json::json!(last_plugin_poll_ts) },
+            "last_runner_update_poll_ts": if last_runner_poll_ts == 0 { serde_json::Value::Null } else { serde_json::json!(last_runner_poll_ts) },
         })
         .to_string(),
     );
@@ -505,6 +509,8 @@ fn write_daemon_heartbeat(project_count: usize, plugin_module_count: usize) {
 
 static HEARTBEAT_PROJECT_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 static HEARTBEAT_PLUGIN_MODULE_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static HEARTBEAT_LAST_PLUGIN_POLL_TS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static HEARTBEAT_LAST_RUNNER_POLL_TS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 static HEARTBEAT_AUTHORITY_LOST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -543,6 +549,14 @@ impl PluginModules {
     fn get_or_compile(&mut self, plugin_name: &str) -> anyhow::Result<()> {
         if !self.modules.contains_key(plugin_name) {
             let wasm_path = ensure_plugin_installed(plugin_name, None)?;
+            if let Some(installed) = installed_plugin_version(plugin_name) {
+                if !is_recognized_release_semver(&installed) {
+                    eprintln!(
+                        "[agentplug daemon] BOOT WARNING: {plugin_name}.wasm at {} is served from a NON-RELEASE version marker ({installed:?}) -- this is a local-dev sideload, not a released build, and the auto-updater will never overwrite it. If this was not intentional, replace the sideload with a real release-tagged {plugin_name}.wasm.",
+                        wasm_path.display()
+                    );
+                }
+            }
             eprintln!("[agentplug daemon] compiling {plugin_name}.wasm (shared across every project that uses it)...");
             let module = Module::from_file(&self.engine, &wasm_path)?;
             self.modules.insert(plugin_name.to_string(), module);
@@ -601,12 +615,15 @@ fn handle_plugin_refresh_request(root: &Path, body: &str) -> String {
         let _ = fs::write(force_runner_refresh_marker_path(), b"");
     }
 
+    let local_dev_sideload = requested_plugin.as_deref().and_then(crate::download::read_local_dev_sideload_marker);
+
     serde_json::json!({
         "ok": true,
         "queued": true,
         "plugin": requested_plugin,
         "runner_queued": also_runner,
-        "note": "the running daemon's plugin-update (and, if runner:true was passed, runner-binary-update) poll will fire on its next loop tick instead of waiting for the normal interval; re-dispatch health shortly after to observe the new version",
+        "local_dev_sideload": local_dev_sideload,
+        "note": "the running daemon's plugin-update (and, if runner:true was passed, runner-binary-update) poll will fire on its next loop tick instead of waiting for the normal interval; re-dispatch health shortly after to observe the new version. local_dev_sideload is non-null only when the queried plugin's installed .version marker is not recognized release semver -- that plugin will never be auto-updated until the marker or the wasm is replaced",
         "root": root.display().to_string(),
     }).to_string()
 }
@@ -1160,6 +1177,7 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
         let forced_refresh_request = take_forced_plugin_refresh_request();
         if last_plugin_update_poll.elapsed() >= plugin_update_poll_interval || forced_refresh_request.is_some() {
             last_plugin_update_poll = Instant::now();
+            HEARTBEAT_LAST_PLUGIN_POLL_TS.store(now_ms(), std::sync::atomic::Ordering::Relaxed);
             let targets: Vec<String> = match &forced_refresh_request {
                 Some(Some(name)) => vec![name.clone()],
                 _ => plugin_modules.modules.keys().cloned().collect(),
@@ -1190,6 +1208,7 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
 
         if last_runner_update_poll.elapsed() >= runner_update_poll_interval || take_forced_runner_refresh_request() {
             last_runner_update_poll = Instant::now();
+            HEARTBEAT_LAST_RUNNER_POLL_TS.store(now_ms(), std::sync::atomic::Ordering::Relaxed);
             match crate::download::stage_runner_self_update() {
                 Ok(Some((staged, version))) => {
                     eprintln!("[agentplug daemon] staged self-update to {version} at {}", staged.display());

@@ -141,10 +141,56 @@ pub fn installed_plugin_version(plugin_name: &str) -> Option<String> {
     fs::read_to_string(plugin_version_path(plugin_name)).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
 }
 
+pub fn is_recognized_release_semver(version: &str) -> bool {
+    let segments: Vec<&str> = version.split('.').collect();
+    segments.len() == 3 && segments.iter().all(|seg| !seg.is_empty() && seg.chars().all(|c| c.is_ascii_digit()))
+}
+
+fn local_dev_sideload_marker_path(plugin_name: &str) -> PathBuf {
+    install_dir().join("plugins").join(format!("{plugin_name}.local-dev-sideload.json"))
+}
+
+fn warn_local_dev_sideload_loudly(plugin_name: &str, installed: &str) {
+    eprintln!(
+        "[agentplug daemon] plugin {plugin_name} is served from a NON-RELEASE marker ({installed:?}, not X.Y.Z semver) -- this looks like an intentional local-dev sideload at {}. The auto-updater will NOT overwrite it and will keep skipping every future poll until the marker is changed to a real release version or the sideload is removed. This is expected behavior for a developer build, but it means {plugin_name} is running code that is NOT the latest released version and version drift will be silent unless this warning (or the recorded sideload marker file) is checked.",
+        plugin_wasm_path(plugin_name).display()
+    );
+    let _ = fs::write(
+        local_dev_sideload_marker_path(plugin_name),
+        serde_json::json!({
+            "plugin": plugin_name,
+            "installed_marker": installed,
+            "detected_ts": crate::download::now_ms_for_marker(),
+            "note": "installed .version file is not recognized X.Y.Z semver; treated as an intentional local-dev sideload and never auto-overwritten",
+        })
+        .to_string(),
+    );
+}
+
+fn now_ms_for_marker() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+pub fn read_local_dev_sideload_marker(plugin_name: &str) -> Option<serde_json::Value> {
+    fs::read_to_string(local_dev_sideload_marker_path(plugin_name)).ok().and_then(|s| serde_json::from_str(&s).ok())
+}
+
+fn clear_local_dev_sideload_marker(plugin_name: &str) {
+    let _ = fs::remove_file(local_dev_sideload_marker_path(plugin_name));
+}
+
 pub fn refresh_plugin_if_stale(plugin_name: &str) -> anyhow::Result<Option<String>> {
     let Some(installed) = installed_plugin_version(plugin_name) else {
         return Ok(None);
     };
+    if !is_recognized_release_semver(&installed) {
+        warn_local_dev_sideload_loudly(plugin_name, &installed);
+        return Ok(None);
+    }
+    clear_local_dev_sideload_marker(plugin_name);
     let Some(latest) = fetch_latest_plugin_version(plugin_name)? else {
         return Ok(None);
     };
