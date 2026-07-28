@@ -387,6 +387,33 @@ fn instruction_source_cache_dir(root: &Path) -> PathBuf {
     root.join(".gm").join("instructions-source-cache")
 }
 
+fn run_git_bounded(args: &[&str]) -> anyhow::Result<std::process::Output> {
+    use wait_timeout::ChildExt;
+    let mut cmd = std::process::Command::new("git");
+    cmd.args(args).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
+    #[cfg(windows)]
+    {
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    let mut child = cmd.spawn()?;
+    let timeout_ms = agentplug_host::git_subprocess_timeout_ms();
+    match child.wait_timeout(Duration::from_millis(timeout_ms))? {
+        Some(status) => {
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+            if let Some(mut o) = child.stdout.take() { let _ = std::io::Read::read_to_end(&mut o, &mut stdout); }
+            if let Some(mut e) = child.stderr.take() { let _ = std::io::Read::read_to_end(&mut e, &mut stderr); }
+            Ok(std::process::Output { status, stdout, stderr })
+        }
+        None => {
+            let _ = child.kill();
+            let _ = child.wait();
+            anyhow::bail!("git {args:?} exceeded {timeout_ms}ms with no completion -- killed to avoid wedging the daemon's own main loop, which runs this call sequentially ahead of every project's dispatch");
+        }
+    }
+}
+
 fn sync_instruction_source_if_configured(root: &Path) -> anyhow::Result<()> {
     let config_path = instruction_source_config_path(root);
     let Ok(raw) = fs::read_to_string(&config_path) else { return Ok(()) };
@@ -395,42 +422,23 @@ fn sync_instruction_source_if_configured(root: &Path) -> anyhow::Result<()> {
         return Ok(());
     };
     let cache_dir = instruction_source_cache_dir(root);
+    let cache_dir_str = cache_dir.to_string_lossy().into_owned();
     let git_dir_marker = cache_dir.join(".git");
     if !git_dir_marker.exists() {
         fs::create_dir_all(root.join(".gm"))?;
-        let mut clone_cmd = std::process::Command::new("git");
-        clone_cmd.args(["clone", "--depth", "1", "--branch", &cfg.branch, &cfg.repo, &cache_dir.to_string_lossy()]);
-        #[cfg(windows)]
-        {
-            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-            clone_cmd.creation_flags(CREATE_NO_WINDOW);
-        }
-        let output = clone_cmd.output()?;
+        let output = run_git_bounded(&["clone", "--depth", "1", "--branch", &cfg.branch, &cfg.repo, &cache_dir_str])?;
         if !output.status.success() {
             anyhow::bail!("git clone of {} (branch {}) failed", cfg.repo, cfg.branch);
         }
         eprintln!("[agentplug daemon] cloned instruction source {} (branch {}) for {}", cfg.repo, cfg.branch, root.display());
         return Ok(());
     }
-    let mut fetch_cmd = std::process::Command::new("git");
-    fetch_cmd.args(["-C", &cache_dir.to_string_lossy(), "fetch", "--depth", "1", "origin", &cfg.branch]);
-    #[cfg(windows)]
-    {
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        fetch_cmd.creation_flags(CREATE_NO_WINDOW);
-    }
-    let fetch = fetch_cmd.output()?;
+    let fetch = run_git_bounded(&["-C", &cache_dir_str, "fetch", "--depth", "1", "origin", &cfg.branch])?;
     if !fetch.status.success() {
         anyhow::bail!("git fetch of {} (branch {}) failed", cfg.repo, cfg.branch);
     }
-    let mut reset_cmd = std::process::Command::new("git");
-    reset_cmd.args(["-C", &cache_dir.to_string_lossy(), "reset", "--hard", &format!("origin/{}", cfg.branch)]);
-    #[cfg(windows)]
-    {
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        reset_cmd.creation_flags(CREATE_NO_WINDOW);
-    }
-    let reset = reset_cmd.output()?;
+    let reset_target = format!("origin/{}", cfg.branch);
+    let reset = run_git_bounded(&["-C", &cache_dir_str, "reset", "--hard", &reset_target])?;
     if !reset.status.success() {
         anyhow::bail!("git reset of instruction source cache for {} failed", root.display());
     }
@@ -804,6 +812,7 @@ fn dispatch_project(root: &Path, project: &mut ProjectPlugins, plugin_modules: &
                 key: InFlightKey,
                 join_handle: Option<std::thread::JoinHandle<()>>,
                 detach_flag: Arc<std::sync::atomic::AtomicBool>,
+                spawned_at: Instant,
             }
             let mut spawned: Vec<Spawned> = Vec::with_capacity(gm_requests.len());
             for req in gm_requests {
@@ -820,13 +829,36 @@ fn dispatch_project(root: &Path, project: &mut ProjectPlugins, plugin_modules: &
                 let join_handle = std::thread::spawn(move || {
                     run_gm_dispatch_to_file(&thread_root, &self_healing_dispatch_handle, &thread_verb, &thread_task, &thread_body, &thread_out_dir);
                 });
-                spawned.push(Spawned { key, join_handle: Some(join_handle), detach_flag });
+                spawned.push(Spawned { key, join_handle: Some(join_handle), detach_flag, spawned_at: Instant::now() });
             }
 
             answer_bg_converts(bg_convert_requests);
 
+            const WORKER_AUTO_DETACH_AFTER_MS: u64 = 45_000;
+            const STATUS_REFRESH_INTERVAL_MS: u64 = 5_000;
+            let mut last_status_refresh = Instant::now();
             let bg_convert_dir = in_dir.join("background-convert");
             while spawned.iter().any(|s| s.join_handle.is_some()) {
+                if last_status_refresh.elapsed() >= Duration::from_millis(STATUS_REFRESH_INTERVAL_MS) {
+                    last_status_refresh = Instant::now();
+                    let _ = fs::write(
+                        &status_path,
+                        serde_json::json!({"pid": std::process::id(), "ts": now_ms(), "daemon": true, "shared_process": true, "runtime": "agentplug", "busy_until": now_ms() + STATUS_REFRESH_INTERVAL_MS}).to_string(),
+                    );
+                }
+                for s in spawned.iter_mut() {
+                    if s.join_handle.is_some()
+                        && !s.detach_flag.load(std::sync::atomic::Ordering::SeqCst)
+                        && s.spawned_at.elapsed() >= Duration::from_millis(WORKER_AUTO_DETACH_AFTER_MS)
+                    {
+                        eprintln!(
+                            "[agentplug daemon] gm dispatch for {} exceeded {WORKER_AUTO_DETACH_AFTER_MS}ms with no completion -- auto-detaching so this worker and the daemon's other projects are not blocked; it keeps running and will write its out/ file whenever it finishes",
+                            root.display()
+                        );
+                        s.detach_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                        s.join_handle = None;
+                    }
+                }
                 for s in spawned.iter_mut() {
                     let Some(jh) = s.join_handle.as_ref() else { continue };
                     if jh.is_finished() {
@@ -897,7 +929,7 @@ fn dispatch_project(root: &Path, project: &mut ProjectPlugins, plugin_modules: &
                                 let join_handle = std::thread::spawn(move || {
                                     run_gm_dispatch_to_file(&thread_root, &self_healing_dispatch_handle, &thread_verb, &thread_task, &thread_body, &thread_out_dir);
                                 });
-                                spawned.push(Spawned { key, join_handle: Some(join_handle), detach_flag });
+                                spawned.push(Spawned { key, join_handle: Some(join_handle), detach_flag, spawned_at: Instant::now() });
                             }
                         }
                     }
@@ -1117,9 +1149,12 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
                 .unwrap_or(true);
             if due {
                 last_instruction_source_sync.insert(root.clone(), Instant::now());
-                if let Err(e) = sync_instruction_source_if_configured(root) {
-                    eprintln!("[agentplug daemon] instruction source-repo sync failed for {}: {e:#}", root.display());
-                }
+                let thread_root = root.clone();
+                std::thread::spawn(move || {
+                    if let Err(e) = sync_instruction_source_if_configured(&thread_root) {
+                        eprintln!("[agentplug daemon] instruction source-repo sync failed for {}: {e:#}", thread_root.display());
+                    }
+                });
             }
         }
         for plugin_name in ["gm", "libsql", "bert", "treesitter"] {

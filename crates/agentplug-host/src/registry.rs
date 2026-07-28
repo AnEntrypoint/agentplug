@@ -22,6 +22,31 @@ fn is_stateless_shared_plugin(plugin_name: &str) -> bool {
     matches!(plugin_name, "bert" | "treesitter" | "libsql" | "gm")
 }
 
+#[derive(Debug)]
+pub enum PluginDispatchError {
+    NotRegistered { plugin_name: String },
+    PoolAcquireTimeout { plugin_name: String, waited_ms: u64, pool_size: usize },
+    EvictedOrPoisoned { plugin_name: String },
+}
+
+impl std::fmt::Display for PluginDispatchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PluginDispatchError::NotRegistered { plugin_name } => {
+                write!(f, "plugin {plugin_name} is not registered for this project (no plugin pool exists -- check .agentplug/plugins.txt and daemon startup logs for a compile/install failure)")
+            }
+            PluginDispatchError::PoolAcquireTimeout { plugin_name, waited_ms, pool_size } => {
+                write!(f, "plugin {plugin_name} is loaded but every pool slot stayed busy for {waited_ms}ms (pool_size={pool_size}) -- transient contention, safe to retry")
+            }
+            PluginDispatchError::EvictedOrPoisoned { plugin_name } => {
+                write!(f, "plugin {plugin_name} slot was evicted after a prior dispatch error (poisoned Store) and could not be reinstantiated -- retry will attempt to reload it")
+            }
+        }
+    }
+}
+
+impl std::error::Error for PluginDispatchError {}
+
 static GM_POOL_SIZE: OnceLock<usize> = OnceLock::new();
 
 pub fn set_gm_pool_size(n: usize) -> bool {
@@ -51,25 +76,53 @@ impl SharedPluginPool {
         Self { slots: (0..size.max(1)).map(|_| Arc::new(Mutex::new(None))).collect() }
     }
 
+    pub const ACQUIRE_TIMEOUT_MS: u64 = 20_000;
+
     pub fn acquire(&self) -> Option<std::sync::MutexGuard<'_, Option<SiblingHandle>>> {
-        const ACQUIRE_TIMEOUT_MS: u64 = 20_000;
+        self.acquire_within(Self::ACQUIRE_TIMEOUT_MS).0
+    }
+
+    pub fn acquire_within(&self, timeout_ms: u64) -> (Option<std::sync::MutexGuard<'_, Option<SiblingHandle>>>, u64) {
         const POLL_INTERVAL_MS: u64 = 25;
-        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(ACQUIRE_TIMEOUT_MS);
+        let start = std::time::Instant::now();
+        let deadline = start + std::time::Duration::from_millis(timeout_ms);
         loop {
             for slot in &self.slots {
                 if let Ok(guard) = slot.try_lock() {
-                    return Some(guard);
+                    return (Some(guard), start.elapsed().as_millis() as u64);
                 }
             }
             if std::time::Instant::now() >= deadline {
-                return None;
+                return (None, start.elapsed().as_millis() as u64);
             }
             std::thread::sleep(std::time::Duration::from_millis(POLL_INTERVAL_MS));
         }
     }
 
+    pub fn size(&self) -> usize {
+        self.slots.len()
+    }
+
     fn any_instantiated(&self) -> bool {
         self.slots.iter().any(|s| s.lock().unwrap().is_some())
+    }
+
+    fn any_instantiated_within(&self, timeout_ms: u64) -> bool {
+        const POLL_INTERVAL_MS: u64 = 25;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+        loop {
+            for slot in &self.slots {
+                if let Ok(guard) = slot.try_lock() {
+                    if guard.is_some() {
+                        return true;
+                    }
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                return self.slots.iter().any(|s| s.lock().unwrap().is_some());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(POLL_INTERVAL_MS));
+        }
     }
 
     fn release_all(&self) -> bool {
@@ -240,8 +293,10 @@ impl ProjectPlugins {
             if pool.is_some() || attempt + 1 == DISPATCH_LOOKUP_RETRY_ATTEMPTS { break; }
             std::thread::sleep(std::time::Duration::from_millis(DISPATCH_LOOKUP_RETRY_BACKOFF_MS));
         }
-        let pool = pool.ok_or_else(|| anyhow::anyhow!("plugin {plugin_name} not loaded"))?;
-        let mut guard = pool.acquire().ok_or_else(|| anyhow::anyhow!("plugin {plugin_name} pool busy (timeout acquiring slot)"))?;
+        let pool = pool.ok_or_else(|| PluginDispatchError::NotRegistered { plugin_name: plugin_name.to_string() })?;
+        let pool_size = pool.size();
+        let (guard, waited_ms) = pool.acquire_within(SharedPluginPool::ACQUIRE_TIMEOUT_MS);
+        let mut guard = guard.ok_or_else(|| PluginDispatchError::PoolAcquireTimeout { plugin_name: plugin_name.to_string(), waited_ms, pool_size })?;
         dispatch_and_evict_on_error(&mut guard, verb, body, &self.root, &self.siblings, plugin_name)
     }
 
@@ -289,32 +344,56 @@ impl DispatchHandle {
     }
 
     pub fn dispatch(&self, plugin_name: &str, verb: &str, body: &str) -> anyhow::Result<String> {
-        const DISPATCH_LOOKUP_RETRY_ATTEMPTS: u32 = 3;
-        const DISPATCH_LOOKUP_RETRY_BACKOFF_MS: u64 = 200;
+        const REGISTRATION_LOOKUP_RETRY_ATTEMPTS: u32 = 3;
+        const REGISTRATION_LOOKUP_RETRY_BACKOFF_MS: u64 = 200;
         let mut pool = None;
-        for attempt in 0..DISPATCH_LOOKUP_RETRY_ATTEMPTS {
+        for attempt in 0..REGISTRATION_LOOKUP_RETRY_ATTEMPTS {
             pool = self.siblings.lock().unwrap().get(plugin_name).cloned();
-            let evicted_slot_reads_as_registered_but_empty = pool.as_ref().map(|p| !p.any_instantiated()).unwrap_or(false);
-            if evicted_slot_reads_as_registered_but_empty {
-                let _ = self.reinstantiate_plugin_into_pool_slot_if_reload_source_available(plugin_name);
-                pool = self.siblings.lock().unwrap().get(plugin_name).cloned();
-            }
-            if pool.as_ref().map(|p| p.any_instantiated()).unwrap_or(false) || attempt + 1 == DISPATCH_LOOKUP_RETRY_ATTEMPTS { break; }
-            std::thread::sleep(std::time::Duration::from_millis(DISPATCH_LOOKUP_RETRY_BACKOFF_MS));
+            if pool.is_some() || attempt + 1 == REGISTRATION_LOOKUP_RETRY_ATTEMPTS { break; }
+            std::thread::sleep(std::time::Duration::from_millis(REGISTRATION_LOOKUP_RETRY_BACKOFF_MS));
         }
         if pool.is_none() {
             let _ = self.reinstantiate_plugin_into_pool_slot_if_reload_source_available(plugin_name);
             pool = self.siblings.lock().unwrap().get(plugin_name).cloned();
         }
-        let mut pool = pool.ok_or_else(|| anyhow::anyhow!("plugin {plugin_name} not loaded"))?;
-        let mut guard = pool.acquire().ok_or_else(|| anyhow::anyhow!("plugin {plugin_name} pool busy (timeout acquiring slot)"))?;
+        let mut pool = pool.ok_or_else(|| PluginDispatchError::NotRegistered { plugin_name: plugin_name.to_string() })?;
+        let pool_size = pool.size();
+
+        let empty_after_wait = !pool.any_instantiated_within(SharedPluginPool::ACQUIRE_TIMEOUT_MS);
+        if empty_after_wait {
+            let _ = self.reinstantiate_plugin_into_pool_slot_if_reload_source_available(plugin_name);
+            pool = self
+                .siblings
+                .lock()
+                .unwrap()
+                .get(plugin_name)
+                .cloned()
+                .ok_or_else(|| PluginDispatchError::NotRegistered { plugin_name: plugin_name.to_string() })?;
+        }
+
+        let (guard, waited_ms) = pool.acquire_within(SharedPluginPool::ACQUIRE_TIMEOUT_MS);
+        let mut guard = guard.ok_or_else(|| PluginDispatchError::PoolAcquireTimeout { plugin_name: plugin_name.to_string(), waited_ms, pool_size })?;
         if guard.is_none() {
             let _ = self.reinstantiate_plugin_into_pool_slot_if_reload_source_available(plugin_name);
             let reload_mutated_the_shared_pool_slot_in_place_not_this_stale_guard = is_stateless_shared_plugin(plugin_name) && guard.is_none();
             if reload_mutated_the_shared_pool_slot_in_place_not_this_stale_guard {
                 drop(guard);
-                pool = self.siblings.lock().unwrap().get(plugin_name).cloned().ok_or_else(|| anyhow::anyhow!("plugin {plugin_name} not loaded"))?;
-                guard = pool.acquire().ok_or_else(|| anyhow::anyhow!("plugin {plugin_name} pool busy (timeout acquiring slot)"))?;
+                pool = self
+                    .siblings
+                    .lock()
+                    .unwrap()
+                    .get(plugin_name)
+                    .cloned()
+                    .ok_or_else(|| PluginDispatchError::NotRegistered { plugin_name: plugin_name.to_string() })?;
+                let (retry_guard, retry_waited_ms) = pool.acquire_within(SharedPluginPool::ACQUIRE_TIMEOUT_MS);
+                guard = retry_guard.ok_or_else(|| PluginDispatchError::PoolAcquireTimeout {
+                    plugin_name: plugin_name.to_string(),
+                    waited_ms: retry_waited_ms,
+                    pool_size,
+                })?;
+            }
+            if guard.is_none() {
+                return Err(PluginDispatchError::EvictedOrPoisoned { plugin_name: plugin_name.to_string() }.into());
             }
         }
         dispatch_and_evict_on_error(&mut guard, verb, body, &self.root, &self.siblings, plugin_name)
@@ -329,7 +408,7 @@ fn dispatch_and_evict_on_error(
     siblings: &Arc<Mutex<HashMap<String, Arc<SharedPluginPool>>>>,
     plugin_name: &str,
 ) -> anyhow::Result<String> {
-    let handle = guard.as_mut().ok_or_else(|| anyhow::anyhow!("plugin {plugin_name} not loaded"))?;
+    let handle = guard.as_mut().ok_or_else(|| PluginDispatchError::EvictedOrPoisoned { plugin_name: plugin_name.to_string() })?;
     let result = dispatch_on(&mut handle.store, handle.instance, verb, body, root, siblings.clone());
     if result.is_err() {
         **guard = None;

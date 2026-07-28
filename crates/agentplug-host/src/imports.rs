@@ -8,25 +8,14 @@ use wasmtime::{AsContextMut, Caller, Linker, Memory};
 
 use crate::host_state::HostState;
 
-const GIT_SUBPROCESS_TIMEOUT_MS_DEFAULT: u64 = 120_000;
+const GIT_SUBPROCESS_TIMEOUT_MS_DEFAULT_AMPLE_FOR_SLOW_PUSH_FETCH_OR_FIRST_CLONE: u64 = 120_000;
 
-/// Wall-clock budget for one git subprocess.
-///
-/// Was a flat 15s, which is ample for the status and rev-parse calls that
-/// dominate, and far too short for the ones that are not: a push over a slow
-/// link, a fetch on a large history, or a first clone. Those failed with
-/// "timed out after 15000ms, killed" -- indistinguishable at the call site
-/// from a genuine git error, so a transient network condition read as a
-/// broken repository.
-///
-/// Raised to 120s and made overridable, because the right value is a property
-/// of the repository and the link rather than of this binary.
-fn git_subprocess_timeout_ms() -> u64 {
+pub fn git_subprocess_timeout_ms() -> u64 {
     std::env::var("AGENTPLUG_GIT_TIMEOUT_MS")
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
         .filter(|ms| *ms > 0)
-        .unwrap_or(GIT_SUBPROCESS_TIMEOUT_MS_DEFAULT)
+        .unwrap_or(GIT_SUBPROCESS_TIMEOUT_MS_DEFAULT_AMPLE_FOR_SLOW_PUSH_FETCH_OR_FIRST_CLONE)
 }
 
 fn normalize_lexically(path: &std::path::Path) -> Option<PathBuf> {
