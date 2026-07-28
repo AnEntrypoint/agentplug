@@ -178,9 +178,9 @@ fn strip_viewport_width_height_scale_mobile_prefix(body: &str) -> (Option<(u32, 
     let Some(rest) = trimmed.strip_prefix("viewport=") else { return (None, body) };
     let Some(nl) = rest.find('\n') else { return (None, body) };
     let (spec, remainder) = (&rest[..nl], &rest[nl + 1..]);
-    let (dims_and_scale, mobile) = match spec.strip_suffix("!desktop") {
-        Some(rest) => (rest, false),
-        None => (spec, true),
+    let (dims_and_scale, mobile) = match spec.strip_suffix("!mobile") {
+        Some(rest) => (rest, true),
+        None => (spec, false),
     };
     let (dims, scale) = match dims_and_scale.split_once('@') {
         Some((d, s)) => (d, s.trim().parse::<f64>().unwrap_or(1.0)),
