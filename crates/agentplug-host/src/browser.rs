@@ -232,6 +232,14 @@ fn session_is_alive(child: &mut Child) -> bool {
     matches!(child.try_wait(), Ok(None))
 }
 
+fn session_cdp_endpoint_responds(port: u16) -> bool {
+    let url = format!("http://127.0.0.1:{port}/json/version");
+    match ureq::get(&url).timeout(std::time::Duration::from_millis(1500)).call() {
+        Ok(resp) => resp.into_string().map(|b| b.contains("webSocketDebuggerUrl")).unwrap_or(false),
+        Err(_) => false,
+    }
+}
+
 fn kill_session(mut session: BrowserSession) {
     let _ = session.child.kill();
     let _ = session.child.wait();
@@ -776,11 +784,10 @@ pub fn run(body: &str, cwd: &Path, session_id: &str) -> Value {
     let key = session_key(cwd, session_id);
     let lifecycle_lock = session_lifecycle_lock_for_key(&key);
     let _lifecycle_guard_serializes_reuse_check_launch_and_insert = lifecycle_lock.lock().unwrap_or_else(|e| e.into_inner());
-    let port = {
+    let candidate_port = {
         let mut map = sessions_map().lock().unwrap_or_else(|e| e.into_inner());
         let reuse_port = map.get_mut(&key).and_then(|s| {
             if session_is_alive(&mut s.child) {
-                s.last_used = Instant::now();
                 Some(s.port)
             } else {
                 None
@@ -790,6 +797,27 @@ pub fn run(body: &str, cwd: &Path, session_id: &str) -> Value {
             map.remove(&key);
         }
         reuse_port
+    };
+    let port = match candidate_port.filter(|&p| session_cdp_endpoint_responds(p)) {
+        Some(p) => {
+            let mut map = sessions_map().lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(s) = map.get_mut(&key) {
+                s.last_used = Instant::now();
+            }
+            Some(p)
+        }
+        None => {
+            if candidate_port.is_some() {
+                let stale = sessions_map().lock().unwrap_or_else(|e| e.into_inner()).remove(&key);
+                if let Some(session) = stale {
+                    eprintln!(
+                        "[agentplug browser] evicting tracked session {key} -- process alive but CDP endpoint unresponsive, falling back to a fresh spawn"
+                    );
+                    kill_session(session);
+                }
+            }
+            None
+        }
     };
     let port = match port {
         Some(p) => p,
