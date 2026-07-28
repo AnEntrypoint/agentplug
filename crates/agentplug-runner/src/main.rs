@@ -63,6 +63,12 @@ fn main() -> anyhow::Result<()> {
             run_spool_watcher_single_process(&mut project, &spool_dir)
         }
         "daemon" => daemon::run_daemon(),
+        "reap-orphans" => {
+            let roots = daemon::read_registry();
+            agentplug_host::reap_idle_sessions_and_os_orphans_across_every_known_project_root(&roots);
+            println!("reaped idle sessions and orphaned chrome processes across {} registered project roots (plus the process-global headless-orphan sweep)", roots.len());
+            Ok(())
+        }
         "takeover" => {
             let version = args.get(2).cloned().unwrap_or_default();
             if version.is_empty() {
@@ -97,7 +103,7 @@ fn main() -> anyhow::Result<()> {
         }
         other => {
             eprintln!(
-                "agentplug-runner: unknown command '{other}'. Usage: agentplug-runner <plugin <name> [version]|spool|daemon|takeover <version>|dispatch [plugin] <verb> [body]|version>"
+                "agentplug-runner: unknown command '{other}'. Usage: agentplug-runner <plugin <name> [version]|spool|daemon|takeover <version>|dispatch [plugin] <verb> [body]|reap-orphans|version>"
             );
             std::process::exit(1);
         }

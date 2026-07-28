@@ -173,6 +173,15 @@ fn strip_timeout_prefix(body: &str) -> (Option<u64>, &str) {
     }
 }
 
+fn strip_session_id_prefix(body: &str) -> (Option<String>, &str) {
+    let trimmed = body.trim_start();
+    let Some(rest) = trimmed.strip_prefix("sessionId=") else { return (None, body) };
+    let Some(nl) = rest.find('\n') else { return (None, body) };
+    let (id, remainder) = (&rest[..nl], &rest[nl + 1..]);
+    let id = id.trim();
+    if id.is_empty() { (None, body) } else { (Some(id.to_string()), remainder) }
+}
+
 fn strip_viewport_width_height_scale_mobile_prefix(body: &str) -> (Option<(u32, u32, f64, bool)>, &str) {
     let trimmed = body.trim_start();
     let Some(rest) = trimmed.strip_prefix("viewport=") else { return (None, body) };
@@ -276,7 +285,28 @@ fn pid_is_alive(pid: u32) -> bool {
         .unwrap_or(true)
 }
 
+const DAEMON_STATUS_STALE_MS: u64 = 20_000;
+
+fn this_process_is_the_registered_daemon() -> bool {
+    let status_path = crate::install::install_dir().join("daemon-status.json");
+    let Ok(raw) = std::fs::read_to_string(&status_path) else { return true };
+    let Ok(v) = serde_json::from_str::<Value>(&raw) else { return true };
+    let Some(ts) = v.get("ts").and_then(|t| t.as_u64()) else { return true };
+    if unix_ms().saturating_sub(ts as u128) >= DAEMON_STATUS_STALE_MS as u128 {
+        return true;
+    }
+    let Some(recorded_pid) = v.get("pid").and_then(|p| p.as_u64()) else { return true };
+    recorded_pid == std::process::id() as u64
+}
+
 fn reap_os_orphans(cwd: &Path) {
+    if !this_process_is_the_registered_daemon() {
+        eprintln!(
+            "[agentplug browser] skipping OS-orphan reap for {} -- a different process is the fresh registered daemon, this process cannot safely judge liveness of sessions it does not own",
+            cwd.display()
+        );
+        return;
+    }
     let dir = browser_profiles_root_for_orphan_scan(cwd);
     let Ok(entries) = std::fs::read_dir(&dir) else { return };
     let claimed_dirs: std::collections::HashSet<PathBuf> = {
@@ -414,10 +444,9 @@ fn kill_pid(pid: u32) {
 }
 
 #[cfg(windows)]
-fn find_pids_of_chrome_processes_using_profile_dir(profile_dir: &Path) -> Vec<u32> {
+fn list_chrome_processes() -> Vec<(u32, String)> {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    let needle = profile_dir.to_string_lossy().replace('\\', "/").to_lowercase();
     let output = Command::new("powershell.exe")
         .args([
             "-NoProfile",
@@ -428,28 +457,117 @@ fn find_pids_of_chrome_processes_using_profile_dir(profile_dir: &Path) -> Vec<u3
         .creation_flags(CREATE_NO_WINDOW)
         .output();
     let Ok(o) = output else { return Vec::new() };
-    let text = String::from_utf8_lossy(&o.stdout);
+    let text = String::from_utf8_lossy(&o.stdout).into_owned();
     text.lines()
         .filter_map(|line| {
             let (pid_str, cmdline) = line.split_once('|')?;
-            let cmdline_normalized = cmdline.replace('\\', "/").to_lowercase();
-            if !cmdline_normalized.contains(&needle) {
-                return None;
-            }
-            pid_str.trim().parse::<u32>().ok()
+            Some((pid_str.trim().parse::<u32>().ok()?, cmdline.to_string()))
         })
         .collect()
 }
 
 #[cfg(not(windows))]
-fn find_pids_of_chrome_processes_using_profile_dir(profile_dir: &Path) -> Vec<u32> {
-    let needle = profile_dir.to_string_lossy().to_string();
-    let output = Command::new("pgrep").args(["-f", &needle]).output();
+fn list_chrome_processes() -> Vec<(u32, String)> {
+    let output = Command::new("ps").args(["-eo", "pid,args"]).output();
     let Ok(o) = output else { return Vec::new() };
-    String::from_utf8_lossy(&o.stdout)
-        .lines()
-        .filter_map(|l| l.trim().parse::<u32>().ok())
+    let text = String::from_utf8_lossy(&o.stdout).into_owned();
+    text.lines()
+        .filter_map(|line| {
+            let trimmed = line.trim_start();
+            let (pid_str, rest) = trimmed.split_once(char::is_whitespace)?;
+            if !rest.contains("chrome") && !rest.contains("chromium") {
+                return None;
+            }
+            Some((pid_str.trim().parse::<u32>().ok()?, rest.to_string()))
+        })
         .collect()
+}
+
+fn find_pids_of_chrome_processes_using_profile_dir(profile_dir: &Path) -> Vec<u32> {
+    let needle = profile_dir.to_string_lossy().replace('\\', "/").to_lowercase();
+    list_chrome_processes()
+        .into_iter()
+        .filter_map(|(pid, cmdline)| {
+            let cmdline_normalized = cmdline.replace('\\', "/").to_lowercase();
+            if cmdline_normalized.contains(&needle) { Some(pid) } else { None }
+        })
+        .collect()
+}
+
+fn cmdline_flag_value(cmdline: &str, flag: &str) -> Option<String> {
+    for token in cmdline.split_whitespace() {
+        let token = token.trim_matches('"');
+        if let Some(rest) = token.strip_prefix(flag) {
+            return Some(rest.trim_matches('"').to_string());
+        }
+    }
+    None
+}
+
+fn is_headless_root_chrome_process(cmdline: &str) -> bool {
+    let has_headless = cmdline.contains("--headless");
+    let has_debug_port = cmdline.contains("--remote-debugging-port=");
+    let has_user_data_dir = cmdline.contains("--user-data-dir=");
+    let is_child_process = cmdline.contains("--type=");
+    has_headless && has_debug_port && has_user_data_dir && !is_child_process
+}
+
+fn reap_globally_orphaned_headless_chromes() {
+    if !this_process_is_the_registered_daemon() {
+        eprintln!(
+            "[agentplug browser] skipping global headless-orphan reap -- a different process is the fresh registered daemon, this process cannot safely judge liveness of sessions it does not own"
+        );
+        return;
+    }
+    let real_user_profile = dirs_local_appdata_chrome_user_data();
+    let claimed_profile_dirs: std::collections::HashSet<String> = {
+        let map = sessions_map().lock().unwrap_or_else(|e| e.into_inner());
+        map.values()
+            .map(|s| browser_chrome_profile_dir(&s.cwd, &s.session_id).to_string_lossy().replace('\\', "/").to_lowercase())
+            .collect()
+    };
+    for (pid, cmdline) in list_chrome_processes() {
+        if !is_headless_root_chrome_process(&cmdline) {
+            continue;
+        }
+        let Some(profile_dir) = cmdline_flag_value(&cmdline, "--user-data-dir=") else { continue };
+        let profile_dir_normalized = profile_dir.replace('\\', "/").to_lowercase();
+        if let Some(real) = &real_user_profile {
+            if profile_dir_normalized == *real {
+                continue;
+            }
+        }
+        if claimed_profile_dirs.contains(&profile_dir_normalized) {
+            continue;
+        }
+        if !pid_is_alive(pid) {
+            continue;
+        }
+        eprintln!(
+            "[agentplug browser] reaping globally-orphaned headless chrome pid={} (profile {} not tracked by any live session in this process)",
+            pid, profile_dir
+        );
+        kill_pid(pid);
+    }
+}
+
+#[cfg(windows)]
+fn dirs_local_appdata_chrome_user_data() -> Option<String> {
+    let local_appdata = std::env::var_os("LOCALAPPDATA")?;
+    Some(
+        PathBuf::from(local_appdata)
+            .join("Google")
+            .join("Chrome")
+            .join("User Data")
+            .to_string_lossy()
+            .replace('\\', "/")
+            .to_lowercase(),
+    )
+}
+
+#[cfg(not(windows))]
+fn dirs_local_appdata_chrome_user_data() -> Option<String> {
+    None
 }
 
 pub fn close_all_sessions() {
@@ -469,6 +587,7 @@ pub fn reap_idle_sessions_and_os_orphans_across_every_known_project_root(roots: 
         reap_idle_sessions(root, &cfg);
         reap_os_orphans(root);
     }
+    reap_globally_orphaned_headless_chromes();
 }
 
 fn reap_idle_sessions(cwd: &Path, cfg: &BrowserConfig) {
@@ -737,7 +856,18 @@ pub fn run(body: &str, cwd: &Path, session_id: &str) -> Value {
         _ => (body.to_string(), 120_000),
     };
 
-    match parse_session_command(&inner_body) {
+    let (explicit_session_id, after_session_prefix) = strip_session_id_prefix(&inner_body);
+    let session_id_owned;
+    let session_id = match &explicit_session_id {
+        Some(explicit) => {
+            session_id_owned = explicit.clone();
+            session_id_owned.as_str()
+        }
+        None => session_id,
+    };
+    let inner_body = after_session_prefix;
+
+    match parse_session_command(inner_body) {
         SessionCommand::New => return session_new(cwd, session_id, &browser_cfg),
         SessionCommand::List => return session_list(cwd),
         SessionCommand::Close(id) if !id.is_empty() => return session_close(cwd, id, true),
@@ -749,11 +879,17 @@ pub fn run(body: &str, cwd: &Path, session_id: &str) -> Value {
         SessionCommand::None => {}
     }
 
-    let (timeout_override, after_timeout) = strip_timeout_prefix(&inner_body);
+    let (timeout_override, after_timeout) = strip_timeout_prefix(inner_body);
     let timeout_ms = timeout_override.unwrap_or(timeout_ms);
     let (mode, dom_selector, after_mode) = strip_mode_prefix(after_timeout);
     let (viewport, after_viewport) = strip_viewport_width_height_scale_mobile_prefix(after_mode);
     let (start_url, script) = parse_body(after_viewport);
+
+    if mode != BrowserMode::Dom && script.trim().is_empty() {
+        return json!({"ok": false, "stdout": "", "exit_code": 1,
+            "stderr": "browser dispatch resolved to an empty script body after prefix parsing -- nothing would be evaluated, refusing rather than silently launching/reusing a session and returning a false success",
+            "start_url": start_url});
+    }
 
     let tmp = std::env::temp_dir();
     let stamp = format!("{}-{}", std::process::id(), sanitize(session_id));
@@ -924,6 +1060,7 @@ pub fn run(body: &str, cwd: &Path, session_id: &str) -> Value {
 
     let cdp_error = result_value.get("__cdpError").and_then(|v| v.as_str());
     let ok = exit_code == 0 && !timed_out && cdp_error.is_none();
+    let default_debug = || json!({"console": [], "pageErrors": [], "network": [], "performance": null, "gl": {"errors": [], "drawCalls": {}, "errorTotalCount": 0}});
     let mut out = json!({
         "ok": ok,
         "stderr": String::from_utf8_lossy(&stderr_buf).into_owned(),
@@ -933,19 +1070,23 @@ pub fn run(body: &str, cwd: &Path, session_id: &str) -> Value {
     });
     if cdp_error.is_some() {
         out["result"] = Value::Null;
+        out["debug"] = result_value.get("debug").cloned().unwrap_or_else(default_debug);
         return out;
     }
+    let launched_real_page = matches!(mode, BrowserMode::Dom) || result_value.get("result").is_some() || result_value.get("elements").is_some();
     match mode {
         BrowserMode::Default => {
-            out["result"] = result_value;
+            out["result"] = result_value.get("result").cloned().unwrap_or(Value::Null);
+            out["debug"] = result_value.get("debug").cloned().unwrap_or_else(default_debug);
         }
         BrowserMode::Capture => {
             out["result"] = result_value.get("result").cloned().unwrap_or(Value::Null);
-            out["debug"] = result_value.get("debug").cloned().unwrap_or(json!({"console": [], "network": [], "performance": null}));
+            out["debug"] = result_value.get("debug").cloned().unwrap_or_else(default_debug);
         }
         BrowserMode::Profile => {
             out["result"] = result_value.get("result").cloned().unwrap_or(Value::Null);
             out["profile"] = result_value.get("profile").cloned().unwrap_or(json!({"timeframe": null, "culprits": []}));
+            out["debug"] = result_value.get("debug").cloned().unwrap_or_else(default_debug);
             if let Some(p) = &artifact_path {
                 out["profile_file"] = json!(p.to_string_lossy());
             }
@@ -953,12 +1094,14 @@ pub fn run(body: &str, cwd: &Path, session_id: &str) -> Value {
         BrowserMode::Trace => {
             out["result"] = result_value.get("result").cloned().unwrap_or(Value::Null);
             out["trace"] = result_value.get("trace").cloned().unwrap_or(json!({"wall_us": 0, "gpu_us": 0, "viz_us": 0, "cc_us": 0, "by_category": {}}));
+            out["debug"] = result_value.get("debug").cloned().unwrap_or_else(default_debug);
             if let Some(p) = &artifact_path {
                 out["trace_file"] = json!(p.to_string_lossy());
             }
         }
         BrowserMode::Screenshot => {
             out["result"] = result_value.get("result").cloned().unwrap_or(Value::Null);
+            out["debug"] = result_value.get("debug").cloned().unwrap_or_else(default_debug);
             let screenshot_error = result_value.get("screenshot_error").cloned();
             if let Some(p) = &artifact_path {
                 if screenshot_error.is_none() {
@@ -975,12 +1118,20 @@ pub fn run(body: &str, cwd: &Path, session_id: &str) -> Value {
             out["selector"] = json!(dom_selector);
             out["match_count"] = result_value.get("match_count").cloned().unwrap_or(json!(0));
             out["elements"] = result_value.get("elements").cloned().unwrap_or(json!([]));
+            out["debug"] = result_value.get("debug").cloned().unwrap_or_else(default_debug);
             if let Some(e) = result_value.get("error") {
                 if !e.is_null() {
                     out["result"] = json!({ "error": e });
                 }
             }
         }
+    }
+    if ok && !launched_real_page {
+        out["ok"] = json!(false);
+        out["stderr"] = json!(format!(
+            "browser dispatch returned success with no evidence a page was ever reached (empty result envelope, mode={}) -- treating as a false success rather than a silent no-op",
+            mode_label(mode)
+        ));
     }
     out
 }
