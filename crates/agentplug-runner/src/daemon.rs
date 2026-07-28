@@ -54,19 +54,7 @@ pub fn register_project(cwd: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Render a dispatch error with wasmtime's structured trap code when it has one.
-///
-/// `format!("{e:#}")` alone keeps the wasm backtrace but DROPS the `Trap`
-/// variant, so an out-of-bounds access or a failed `memory.grow` reads
-/// identically to a genuine guest panic: a bare hex backtrace with no message.
-/// That is how a four-day-long embedder outage stayed undiagnosed -- the traps
-/// were memory exhaustion in a long-lived shared Store, and nothing in the
-/// error text could say so.
-///
-/// wasm linear memory only grows, so a plugin held for the process lifetime
-/// retains every allocation peak it has ever hit; naming the trap is what lets
-/// an operator tell that apart from a logic bug in the guest.
-fn describe_dispatch_error(e: &anyhow::Error) -> String {
+fn describe_dispatch_error_naming_wasm_trap_kind_distinctly_from_a_guest_logic_error(e: &anyhow::Error) -> String {
     match e.downcast_ref::<Trap>() {
         Some(trap) => format!("[wasm trap: {trap}] {e:#}"),
         None => format!("{e:#}"),
@@ -170,21 +158,9 @@ impl DaemonConfig {
     fn shared_store_recycle_dispatches(&self) -> u64 { self.shared_store_recycle_dispatches.unwrap_or(2000).max(1) }
 }
 
-/// Why the shared plugin Stores should be dropped right now, if they should.
-///
-/// Both triggers exist because they fail in opposite directions. The private-bytes
-/// threshold is the one that actually tracks the retained wasm peak, but it depends
-/// on an OS query that can be unavailable; the dispatch counter needs no syscall at
-/// all and still bounds how far the peak can run between releases.
-///
-/// Neither is gated on the daemon being idle, which is the whole point. The existing
-/// `SHARED_PLUGIN_RELEASE_IDLE_MS` and `SELF_RECYCLE_IDLE_MS` releases both sit behind
-/// `!any_work`, so during a sustained indexing pass -- exactly when the embedder is
-/// growing linear memory fastest -- the daemon is never idle and neither ever runs.
-/// 458 of 472 observed traps fell inside a single 17-minute window under that load.
-fn shared_store_recycle_reason(cfg: &DaemonConfig) -> Option<String> {
+fn shared_store_recycle_reason_independent_of_daemon_idle_state(cfg: &DaemonConfig) -> Option<String> {
     let dispatches = agentplug_host::shared_dispatches_since_release();
-    if let Some(private_bytes) = agentplug_host::process_private_bytes() {
+    if let Some(private_bytes) = agentplug_host::process_private_bytes_tracking_retained_wasm_peak_unlike_working_set() {
         let limit = cfg.shared_store_recycle_private_bytes();
         if private_bytes >= limit {
             return Some(format!(
@@ -512,15 +488,21 @@ fn write_daemon_heartbeat(project_count: usize, plugin_module_count: usize) {
         .filter(|(_, hashes)| hashes.iter().flatten().collect::<std::collections::HashSet<_>>().len() > 1)
         .map(|(name, _)| name.clone())
         .collect();
+    let boot_ts = HEARTBEAT_DAEMON_BOOT_TS.load(std::sync::atomic::Ordering::Relaxed);
+    let plugin_poll_error = last_plugin_poll_error().lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let runner_poll_error = last_runner_poll_error().lock().unwrap_or_else(|e| e.into_inner()).clone();
     let _ = fs::write(
         daemon_status_path(),
         serde_json::json!({
             "pid": std::process::id(),
             "ts": now_ms(),
+            "daemon_boot_ts": if boot_ts == 0 { serde_json::Value::Null } else { serde_json::json!(boot_ts) },
             "active_projects": project_count,
             "compiled_plugin_modules": plugin_module_count,
             "last_plugin_update_poll_ts": if last_plugin_poll_ts == 0 { serde_json::Value::Null } else { serde_json::json!(last_plugin_poll_ts) },
             "last_runner_update_poll_ts": if last_runner_poll_ts == 0 { serde_json::Value::Null } else { serde_json::json!(last_runner_poll_ts) },
+            "last_plugin_update_poll_error": plugin_poll_error,
+            "last_runner_update_poll_error": runner_poll_error,
             "loaded_plugin_content_sha256": loaded_content_hashes,
             "shared_pool_slot_content_sha256": shared_pool_slot_hashes,
             "mixed_version_pools": mixed_version_pools,
@@ -533,6 +515,61 @@ static HEARTBEAT_PROJECT_COUNT: std::sync::atomic::AtomicUsize = std::sync::atom
 static HEARTBEAT_PLUGIN_MODULE_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 static HEARTBEAT_LAST_PLUGIN_POLL_TS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static HEARTBEAT_LAST_RUNNER_POLL_TS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static HEARTBEAT_DAEMON_BOOT_TS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn last_plugin_poll_error() -> &'static Mutex<Option<String>> {
+    static SLOT: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+    SLOT.get_or_init(|| Mutex::new(None))
+}
+
+fn last_runner_poll_error() -> &'static Mutex<Option<String>> {
+    static SLOT: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+    SLOT.get_or_init(|| Mutex::new(None))
+}
+
+fn record_plugin_poll_error(err: Option<String>) {
+    *last_plugin_poll_error().lock().unwrap_or_else(|e| e.into_inner()) = err;
+}
+
+fn record_runner_poll_error(err: Option<String>) {
+    *last_runner_poll_error().lock().unwrap_or_else(|e| e.into_inner()) = err;
+}
+
+fn persisted_plugin_poll_ts_path() -> PathBuf {
+    install_dir().join("last-plugin-update-poll-ts")
+}
+
+fn persisted_runner_poll_ts_path() -> PathBuf {
+    install_dir().join("last-runner-update-poll-ts")
+}
+
+fn read_persisted_poll_ts(path: &Path) -> u64 {
+    fs::read_to_string(path).ok().and_then(|s| s.trim().parse::<u64>().ok()).unwrap_or(0)
+}
+
+fn write_persisted_poll_ts(path: &Path, ts: u64) {
+    let _ = fs::create_dir_all(install_dir());
+    let _ = fs::write(path, ts.to_string());
+}
+
+fn instant_backdated_by_ms_capped_to_process_epoch(ms_ago: u64) -> Instant {
+    let now = Instant::now();
+    let mut probe = ms_ago;
+    while probe > 0 {
+        if let Some(candidate) = now.checked_sub(Duration::from_millis(probe)) {
+            return candidate;
+        }
+        probe /= 2;
+    }
+    now
+}
+
+fn seed_poll_timer_from_persisted_ts(path: &Path) -> Instant {
+    const NEVER_POLLED_BACKDATE_MS: u64 = 365 * 24 * 60 * 60 * 1000;
+    let persisted_ts = read_persisted_poll_ts(path);
+    let elapsed_ms = if persisted_ts == 0 { NEVER_POLLED_BACKDATE_MS } else { now_ms().saturating_sub(persisted_ts) };
+    instant_backdated_by_ms_capped_to_process_epoch(elapsed_ms)
+}
 static LOADED_PLUGIN_CONTENT_HASHES: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
 
 fn loaded_plugin_content_hashes() -> &'static Mutex<HashMap<String, String>> {
@@ -783,7 +820,7 @@ fn run_gm_dispatch_to_file(root: &Path, handle: &DispatchHandle, verb: &str, tas
     let out_body = match dispatch_result {
         Ok(Ok(s)) if !s.is_empty() => s,
         Ok(Ok(_)) => serde_json::json!({"ok": false, "error": "empty dispatch result", "verb": verb}).to_string(),
-        Ok(Err(e)) => serde_json::json!({"ok": false, "error": describe_dispatch_error(&e), "verb": verb}).to_string(),
+        Ok(Err(e)) => serde_json::json!({"ok": false, "error": describe_dispatch_error_naming_wasm_trap_kind_distinctly_from_a_guest_logic_error(&e), "verb": verb}).to_string(),
         Err(panic_payload) => {
             let msg = panic_payload
                 .downcast_ref::<&str>()
@@ -1095,7 +1132,7 @@ fn dispatch_project(root: &Path, project: &mut ProjectPlugins, plugin_modules: &
                     }
                 }
 
-                if let Some(reason) = shared_store_recycle_reason(&DaemonConfig::load()) {
+                if let Some(reason) = shared_store_recycle_reason_independent_of_daemon_idle_state(&DaemonConfig::load()) {
                     let mut released: Vec<&str> = Vec::new();
                     for shared_name in ["bert", "treesitter", "libsql"] {
                         if shared_name != plugin_name && agentplug_host::release_shared_plugin(shared_name) {
@@ -1115,7 +1152,7 @@ fn dispatch_project(root: &Path, project: &mut ProjectPlugins, plugin_modules: &
                 let out_body = match result {
                     Ok(Ok(s)) if !s.is_empty() => s,
                     Ok(Ok(_)) => serde_json::json!({"ok": false, "error": "empty dispatch result"}).to_string(),
-                    Ok(Err(e)) => serde_json::json!({"ok": false, "error": describe_dispatch_error(&e)}).to_string(),
+                    Ok(Err(e)) => serde_json::json!({"ok": false, "error": describe_dispatch_error_naming_wasm_trap_kind_distinctly_from_a_guest_logic_error(&e)}).to_string(),
                     Err(panic_payload) => {
                         let msg = panic_payload
                             .downcast_ref::<&str>()
@@ -1194,6 +1231,7 @@ pub fn run_daemon() -> anyhow::Result<()> {
 }
 
 fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
+    HEARTBEAT_DAEMON_BOOT_TS.store(now_ms(), std::sync::atomic::Ordering::Relaxed);
     write_daemon_heartbeat(0, 0);
 
     let daemon_cfg = DaemonConfig::load();
@@ -1214,10 +1252,18 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
     let mut last_shared_release = Instant::now();
 
     let plugin_update_poll_interval = daemon_cfg.plugin_update_poll_interval();
-    let mut last_plugin_update_poll = Instant::now();
+    let mut last_plugin_update_poll = seed_poll_timer_from_persisted_ts(&persisted_plugin_poll_ts_path());
+    let persisted_plugin_poll_ts_at_boot = read_persisted_poll_ts(&persisted_plugin_poll_ts_path());
+    if persisted_plugin_poll_ts_at_boot > 0 {
+        HEARTBEAT_LAST_PLUGIN_POLL_TS.store(persisted_plugin_poll_ts_at_boot, std::sync::atomic::Ordering::Relaxed);
+    }
 
     let runner_update_poll_interval = daemon_cfg.runner_update_poll_interval();
-    let mut last_runner_update_poll = Instant::now();
+    let mut last_runner_update_poll = seed_poll_timer_from_persisted_ts(&persisted_runner_poll_ts_path());
+    let persisted_runner_poll_ts_at_boot = read_persisted_poll_ts(&persisted_runner_poll_ts_path());
+    if persisted_runner_poll_ts_at_boot > 0 {
+        HEARTBEAT_LAST_RUNNER_POLL_TS.store(persisted_runner_poll_ts_at_boot, std::sync::atomic::Ordering::Relaxed);
+    }
     let mut pending_self_update: Option<(PathBuf, String)> = None;
 
     let mut last_instruction_source_sync: HashMap<PathBuf, Instant> = HashMap::new();
@@ -1334,11 +1380,14 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
         let forced_refresh_request = take_forced_plugin_refresh_request();
         if last_plugin_update_poll.elapsed() >= plugin_update_poll_interval || forced_refresh_request.is_some() {
             last_plugin_update_poll = Instant::now();
-            HEARTBEAT_LAST_PLUGIN_POLL_TS.store(now_ms(), std::sync::atomic::Ordering::Relaxed);
+            let poll_ts = now_ms();
+            HEARTBEAT_LAST_PLUGIN_POLL_TS.store(poll_ts, std::sync::atomic::Ordering::Relaxed);
+            write_persisted_poll_ts(&persisted_plugin_poll_ts_path(), poll_ts);
             let targets: Vec<String> = match &forced_refresh_request {
                 Some(Some(name)) => vec![name.clone()],
                 _ => plugin_modules.modules.keys().cloned().collect(),
             };
+            let mut cycle_errors: Vec<String> = Vec::new();
             for plugin_name in targets {
                 match crate::download::refresh_plugin_if_stale(&plugin_name) {
                     Ok(Some(new_version)) => {
@@ -1347,21 +1396,33 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
                         );
                     }
                     Ok(None) => {}
-                    Err(e) => eprintln!("[agentplug daemon] plugin update check for {plugin_name} failed: {e}"),
+                    Err(e) => {
+                        let msg = format!("plugin update check for {plugin_name} failed: {e}");
+                        eprintln!("[agentplug daemon] {msg}");
+                        cycle_errors.push(msg);
+                    }
                 }
             }
+            record_plugin_poll_error(if cycle_errors.is_empty() { None } else { Some(cycle_errors.join("; ")) });
         }
 
         if last_runner_update_poll.elapsed() >= runner_update_poll_interval || take_forced_runner_refresh_request() {
             last_runner_update_poll = Instant::now();
-            HEARTBEAT_LAST_RUNNER_POLL_TS.store(now_ms(), std::sync::atomic::Ordering::Relaxed);
+            let poll_ts = now_ms();
+            HEARTBEAT_LAST_RUNNER_POLL_TS.store(poll_ts, std::sync::atomic::Ordering::Relaxed);
+            write_persisted_poll_ts(&persisted_runner_poll_ts_path(), poll_ts);
             match crate::download::stage_runner_self_update() {
                 Ok(Some((staged, version))) => {
                     eprintln!("[agentplug daemon] staged self-update to {version} at {}", staged.display());
                     pending_self_update = Some((staged, version));
+                    record_runner_poll_error(None);
                 }
-                Ok(None) => {}
-                Err(e) => eprintln!("[agentplug daemon] runner self-update check failed: {e}"),
+                Ok(None) => record_runner_poll_error(None),
+                Err(e) => {
+                    let msg = format!("runner self-update check failed: {e}");
+                    eprintln!("[agentplug daemon] {msg}");
+                    record_runner_poll_error(Some(msg));
+                }
             }
         }
 
@@ -1375,7 +1436,7 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
             }
         }
 
-        if let Some(reason) = shared_store_recycle_reason(&daemon_cfg) {
+        if let Some(reason) = shared_store_recycle_reason_independent_of_daemon_idle_state(&daemon_cfg) {
             let mut released: Vec<&str> = Vec::new();
             for plugin_name in ["bert", "treesitter", "libsql"] {
                 if agentplug_host::release_shared_plugin(plugin_name) {

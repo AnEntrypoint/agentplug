@@ -1,19 +1,6 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// Private commit charge of the current process, in bytes.
-///
-/// Deliberately NOT the working set. A forced `EmptyWorkingSet` was measured
-/// dropping `WorkingSet64` from 1545MB to 1.0MB while the private bytes held
-/// flat: the pages were still committed, merely unmapped from the resident set.
-/// A recycle threshold keyed off the working set therefore reads a phantom
-/// sawtooth and never fires, which is precisely the failure this module exists
-/// to avoid. Wasm linear memory that has been grown stays committed until the
-/// `Store` is dropped, so private bytes is the only figure that tracks the
-/// retained peak.
-///
-/// Returns `None` when the platform figure cannot be read, so callers fall back
-/// to the dispatch-count trigger rather than recycling on a bogus zero.
-pub fn process_private_bytes() -> Option<u64> {
+pub fn process_private_bytes_tracking_retained_wasm_peak_unlike_working_set() -> Option<u64> {
     platform::process_private_bytes()
 }
 
