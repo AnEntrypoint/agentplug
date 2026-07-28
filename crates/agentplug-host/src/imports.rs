@@ -35,6 +35,15 @@ fn normalize_lexically(path: &std::path::Path) -> Option<PathBuf> {
     Some(out)
 }
 
+fn user_gm_root() -> Option<PathBuf> {
+    let home = std::env::var("HOME").ok().or_else(|| std::env::var("USERPROFILE").ok())?;
+    let home = home.trim();
+    if home.is_empty() {
+        return None;
+    }
+    normalize_lexically(&std::path::Path::new(home).join(".gm"))
+}
+
 fn sandboxed_guest_path(cwd: &std::path::Path, path: &str) -> Option<PathBuf> {
     let requested = std::path::Path::new(path);
     let joined = if requested.is_absolute() || requested.has_root() {
@@ -45,10 +54,13 @@ fn sandboxed_guest_path(cwd: &std::path::Path, path: &str) -> Option<PathBuf> {
     let normalized = normalize_lexically(&joined)?;
     let root = normalize_lexically(cwd)?;
     if normalized == root || normalized.starts_with(&root) {
-        Some(normalized)
-    } else {
-        None
+        return Some(normalized);
     }
+    let user_root = user_gm_root()?;
+    if normalized.starts_with(&user_root) {
+        return Some(normalized);
+    }
+    None
 }
 
 fn canonicalize_path_separators_for_stable_keying(path: &std::path::Path) -> PathBuf {
