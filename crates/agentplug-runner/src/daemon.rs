@@ -515,10 +515,18 @@ fn write_daemon_heartbeat(project_count: usize, plugin_module_count: usize) {
     );
 }
 
+fn canonical_runner_exe_path() -> Option<PathBuf> {
+    let mut path = std::env::current_exe().ok()?;
+    while path.extension().map(|e| e.eq_ignore_ascii_case("new")).unwrap_or(false) {
+        path = path.with_extension("");
+    }
+    Some(path)
+}
+
 fn staged_runner_awaiting_handoff() -> Option<(u64, u64)> {
-    let current_exe = std::env::current_exe().ok()?;
-    let staged = current_exe.with_extension(
-        current_exe.extension().map(|e| format!("{}.new", e.to_string_lossy())).unwrap_or_else(|| "new".to_string()),
+    let canonical = canonical_runner_exe_path()?;
+    let staged = canonical.with_extension(
+        canonical.extension().map(|e| format!("{}.new", e.to_string_lossy())).unwrap_or_else(|| "new".to_string()),
     );
     let meta = fs::metadata(&staged).ok()?;
     let staged_at_ms = meta
