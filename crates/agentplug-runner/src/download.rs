@@ -99,7 +99,7 @@ pub fn fetch_latest_runner_version() -> anyhow::Result<Option<String>> {
 pub fn stage_runner_self_update() -> anyhow::Result<Option<(PathBuf, String)>> {
     let Some(asset) = runner_asset_name() else { return Ok(None) };
     let Some(latest) = fetch_latest_runner_version()? else { return Ok(None) };
-    if installed_runner_version().as_deref() == Some(latest.as_str()) {
+    if marker_is_trustworthy_and_current(latest.as_str()) {
         return Ok(None);
     }
     let current_exe = std::env::current_exe()?;
@@ -119,6 +119,22 @@ pub fn stage_runner_self_update() -> anyhow::Result<Option<(PathBuf, String)>> {
         fs::set_permissions(&staged, perms)?;
     }
     Ok(Some((staged, latest)))
+}
+
+fn marker_is_trustworthy_and_current(latest: &str) -> bool {
+    let Some(marker) = installed_runner_version() else { return false };
+    if marker != latest {
+        return false;
+    }
+    let running = env!("CARGO_PKG_VERSION");
+    if marker == running {
+        return true;
+    }
+    eprintln!(
+        "[agentplug runner-update] version marker claims {marker} but this process is {running} -- a prior takeover recorded the version without completing the swap; correcting the marker and re-staging"
+    );
+    let _ = record_runner_version(running);
+    false
 }
 
 pub fn record_runner_version(version: &str) -> anyhow::Result<()> {
