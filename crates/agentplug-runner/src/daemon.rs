@@ -491,6 +491,7 @@ fn write_daemon_heartbeat(project_count: usize, plugin_module_count: usize) {
     let boot_ts = HEARTBEAT_DAEMON_BOOT_TS.load(std::sync::atomic::Ordering::Relaxed);
     let plugin_poll_error = last_plugin_poll_error().lock().unwrap_or_else(|e| e.into_inner()).clone();
     let runner_poll_error = last_runner_poll_error().lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let staged_runner = staged_runner_awaiting_handoff();
     let _ = fs::write(
         daemon_status_path(),
         serde_json::json!({
@@ -506,9 +507,26 @@ fn write_daemon_heartbeat(project_count: usize, plugin_module_count: usize) {
             "loaded_plugin_content_sha256": loaded_content_hashes,
             "shared_pool_slot_content_sha256": shared_pool_slot_hashes,
             "mixed_version_pools": mixed_version_pools,
+            "staged_runner_awaiting_handoff": staged_runner.is_some(),
+            "staged_runner_since_ts": staged_runner.map(|(since_ts, _)| serde_json::json!(since_ts)).unwrap_or(serde_json::Value::Null),
+            "staged_runner_waiting_ms": staged_runner.map(|(since_ts, _)| serde_json::json!(now_ms().saturating_sub(since_ts))).unwrap_or(serde_json::Value::Null),
         })
         .to_string(),
     );
+}
+
+fn staged_runner_awaiting_handoff() -> Option<(u64, u64)> {
+    let current_exe = std::env::current_exe().ok()?;
+    let staged = current_exe.with_extension(
+        current_exe.extension().map(|e| format!("{}.new", e.to_string_lossy())).unwrap_or_else(|| "new".to_string()),
+    );
+    let meta = fs::metadata(&staged).ok()?;
+    let staged_at_ms = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as u64)?;
+    Some((staged_at_ms, meta.len()))
 }
 
 fn write_project_heartbeat(spool_dir: &Path, busy_until: Option<u64>) {
