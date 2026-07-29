@@ -1325,6 +1325,8 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
         HEARTBEAT_LAST_RUNNER_POLL_TS.store(persisted_runner_poll_ts_at_boot, std::sync::atomic::Ordering::Relaxed);
     }
     let mut pending_self_update: Option<(PathBuf, String)> = None;
+    let mut pending_self_update_staged_at: Option<Instant> = None;
+    const SELF_UPDATE_MAX_STARVED_MS: u64 = 10 * 60 * 1000;
 
     let mut last_instruction_source_sync: HashMap<PathBuf, Instant> = HashMap::new();
 
@@ -1478,6 +1480,9 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
             match crate::download::stage_runner_self_update() {
                 Ok(Some((staged, version))) => {
                     eprintln!("[agentplug daemon] staged self-update to {version} at {}", staged.display());
+                    if pending_self_update.is_none() {
+                        pending_self_update_staged_at = Some(Instant::now());
+                    }
                     pending_self_update = Some((staged, version));
                     record_runner_poll_error(None);
                 }
@@ -1490,13 +1495,23 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
             }
         }
 
-        if !any_work {
+        let self_update_starved = pending_self_update_staged_at
+            .map(|staged_at| staged_at.elapsed() >= Duration::from_millis(SELF_UPDATE_MAX_STARVED_MS))
+            .unwrap_or(false);
+        if !any_work || self_update_starved {
             if let Some((staged, version)) = pending_self_update.take() {
+                if self_update_starved {
+                    eprintln!(
+                        "[agentplug daemon] self-update to {version} starved for {}ms under continuous load -- forcing handoff despite in-flight work",
+                        SELF_UPDATE_MAX_STARVED_MS
+                    );
+                }
                 if attempt_self_update_handoff(&staged, &version) {
                     agentplug_host::close_all_sessions();
                     eprintln!("[agentplug daemon] handed off to version {version} -- exiting");
                     return Ok(());
                 }
+                pending_self_update = Some((staged, version));
             }
         }
 
