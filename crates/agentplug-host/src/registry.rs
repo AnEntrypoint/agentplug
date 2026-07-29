@@ -47,6 +47,23 @@ impl std::fmt::Display for PluginDispatchError {
 
 impl std::error::Error for PluginDispatchError {}
 
+fn log_poisoned_store_eviction_event(root: &Path, plugin_name: &str, verb: &str, reinstantiation_succeeded: bool, prior_dispatch_error: &str) {
+    let log_path = root.join(".gm").join("exec-spool").join(".watcher.log");
+    let Some(parent) = log_path.parent() else { return };
+    let _ = std::fs::create_dir_all(parent);
+    let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&log_path) else { return };
+    use std::io::Write;
+    let line = serde_json::json!({
+        "event": "plugin_poisoned_store_evicted",
+        "plugin": plugin_name,
+        "verb": verb,
+        "reinstantiation_succeeded": reinstantiation_succeeded,
+        "prior_dispatch_error": prior_dispatch_error,
+        "ts": crate::now_ms(),
+    });
+    let _ = writeln!(f, "evt: {line}");
+}
+
 static GM_POOL_SIZE: OnceLock<usize> = OnceLock::new();
 
 pub fn set_gm_pool_size(n: usize) -> bool {
@@ -415,6 +432,8 @@ impl DispatchHandle {
                 })?;
             }
             if guard.is_none() {
+                eprintln!("[agentplug registry] plugin {plugin_name} could not be reinstantiated after a poisoned-Store eviction (verb {verb}) -- no reload source available or reload failed");
+                log_poisoned_store_eviction_event(&self.root, plugin_name, verb, false, "reinstantiation failed or no reload source available");
                 return Err(PluginDispatchError::EvictedOrPoisoned { plugin_name: plugin_name.to_string() }.into());
             }
         }
@@ -430,9 +449,15 @@ fn dispatch_and_evict_on_error(
     siblings: &Arc<Mutex<HashMap<String, Arc<SharedPluginPool>>>>,
     plugin_name: &str,
 ) -> anyhow::Result<String> {
-    let handle = guard.as_mut().ok_or_else(|| PluginDispatchError::EvictedOrPoisoned { plugin_name: plugin_name.to_string() })?;
+    let handle = guard.as_mut().ok_or_else(|| {
+        eprintln!("[agentplug registry] plugin {plugin_name} slot empty at dispatch of verb {verb} -- previously evicted for a poisoned Store, reload did not repopulate it");
+        log_poisoned_store_eviction_event(root, plugin_name, verb, false, "slot already empty from a prior eviction, reload did not repopulate it");
+        PluginDispatchError::EvictedOrPoisoned { plugin_name: plugin_name.to_string() }
+    })?;
     let result = dispatch_on(&mut handle.store, handle.instance, verb, body, root, siblings.clone());
-    if result.is_err() {
+    if let Err(poisoning_error) = &result {
+        eprintln!("[agentplug registry] evicting plugin {plugin_name} slot -- verb {verb} poisoned its Store: {poisoning_error}");
+        log_poisoned_store_eviction_event(root, plugin_name, verb, true, &poisoning_error.to_string());
         **guard = None;
     }
     result
