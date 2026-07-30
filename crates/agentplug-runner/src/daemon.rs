@@ -636,6 +636,10 @@ fn staged_runner_awaiting_handoff() -> Option<(u64, u64)> {
 }
 
 fn write_project_heartbeat(spool_dir: &Path, busy_until: Option<u64>) {
+    write_project_heartbeat_with_queue_info(spool_dir, busy_until, None);
+}
+
+fn write_project_heartbeat_with_queue_info(spool_dir: &Path, busy_until: Option<u64>, queue_info: Option<(usize, usize)>) {
     let status_path = spool_dir.join(".status.json");
     let mut payload = serde_json::json!({
         "pid": std::process::id(),
@@ -646,6 +650,10 @@ fn write_project_heartbeat(spool_dir: &Path, busy_until: Option<u64>) {
     });
     if let Some(busy_until) = busy_until {
         payload["busy_until"] = serde_json::json!(busy_until);
+    }
+    if let Some((position, total)) = queue_info {
+        payload["queue_position"] = serde_json::json!(position);
+        payload["queue_depth"] = serde_json::json!(total);
     }
     let _ = fs::write(&status_path, payload.to_string());
 }
@@ -1503,6 +1511,15 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
             })
             .collect();
         let worker_count = max_concurrent_projects.min(all_projects.len().max(1));
+        let queue_total = all_projects.len();
+        if queue_total > worker_count {
+            for (position, (root, _)) in all_projects.iter().enumerate() {
+                let spool_dir = root.join(".gm").join("exec-spool");
+                if fs::create_dir_all(&spool_dir).is_ok() {
+                    write_project_heartbeat_with_queue_info(&spool_dir, None, Some((position, queue_total)));
+                }
+            }
+        }
         let queue = std::sync::Mutex::new(all_projects);
         let done = std::sync::Mutex::new(Vec::<(PathBuf, ProjectPlugins, bool)>::new());
         {
