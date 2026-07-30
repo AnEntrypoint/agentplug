@@ -179,7 +179,14 @@ fn strip_session_id_prefix(body: &str) -> (Option<String>, &str) {
     let Some(nl) = rest.find('\n') else { return (None, body) };
     let (id, remainder) = (&rest[..nl], &rest[nl + 1..]);
     let id = id.trim();
-    if id.is_empty() { (None, body) } else { (Some(id.to_string()), remainder) }
+    // An explicit-but-empty `sessionId=` line (caller intends "no override",
+    // just wrote the prefix with nothing after it) must still be stripped --
+    // returning the original `body` here left the literal "sessionId=\n"
+    // text in front of whatever followed, which the downstream session-command/
+    // JS parser then choked on as malformed input instead of treating it as
+    // "no explicit id". Only the id-with-content branch is genuinely
+    // meaningful to keep, so both branches now consume the prefix line.
+    if id.is_empty() { (None, remainder) } else { (Some(id.to_string()), remainder) }
 }
 
 fn strip_viewport_width_height_scale_mobile_prefix(body: &str) -> (Option<(u32, u32, f64, bool)>, &str) {
