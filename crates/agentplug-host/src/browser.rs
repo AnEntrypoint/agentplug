@@ -870,6 +870,28 @@ pub fn run(body: &str, cwd: &Path, session_id: &str) -> Value {
     };
     let inner_body = after_session_prefix;
 
+    // The wasm-side caller (rs-plugkit's `browser` verb handler) resolves a
+    // session id from an explicit `sessionId`, the current gm dispatch's own
+    // SESSION_ID, or `.gm/exec-spool/.session-current` -- and falls back to
+    // an empty string when none of those are set (e.g. a bare `session new`
+    // dispatch with no prior browser session in this repo). Threading that
+    // empty string straight into session_new/session_key used to key the
+    // new Chrome session under the literal empty string: session_new and
+    // session_list both echoed session_id: "" back, so the caller had no
+    // real id to pass to a later `session close <id>`/`session reset <id>`
+    // (which require a non-empty explicit id) -- the session was alive and
+    // usable for eval, but permanently unaddressable for explicit lifecycle
+    // control, and a second empty-session-id dispatch would silently share
+    // (and reset-race) the same slot instead of getting its own session.
+    // Generate a real unique id here instead of ever keying by "".
+    let session_id_owned2;
+    let session_id = if session_id.is_empty() {
+        session_id_owned2 = format!("auto-{}-{}", std::process::id(), unix_ms());
+        session_id_owned2.as_str()
+    } else {
+        session_id
+    };
+
     match parse_session_command(inner_body) {
         SessionCommand::New => return session_new(cwd, session_id, &browser_cfg),
         SessionCommand::List => return session_list(cwd),
