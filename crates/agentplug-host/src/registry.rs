@@ -18,6 +18,31 @@ pub fn epoch_ticks_for_seconds(secs: u64) -> u64 {
 
 pub const DISPATCH_CALL_DEADLINE_SECS: u64 = 40;
 
+// The `bert` plugin runs BERT-forward-pass numeric inference (candle/gemm)
+// through wasmtime's general-purpose interpreter/JIT, which is measured
+// (native-vs-wasm repro harness, 2026-07-30) to run this specific workload
+// roughly 100-500x slower than the equivalent native build -- a batch that
+// completes in well under a second natively took 97-501 SECONDS through this
+// wasm host in real repo-indexing runs (.watcher.log code_index_slow_file_embed
+// events), 2-12x past the flat DISPATCH_CALL_DEADLINE_SECS=40s every other
+// plugin uses. Wasmtime's epoch_interruption forcibly traps the instance the
+// moment that deadline is exceeded mid-execution, which IS the
+// plugin_poisoned_store_evicted crash this repo has independently hit and
+// documented (.followups/poisoned-store-reload-gap.md) -- not a bug in
+// agentplug-bert's own Rust code (confirmed correct and panic-free across 70
+// native iterations against the same real model weights). Giving this one
+// plugin a much longer budget lets genuinely slow-but-correct batches finish
+// instead of being killed mid-inference and poisoning their Store slot.
+pub const BERT_DISPATCH_CALL_DEADLINE_SECS: u64 = 600;
+
+fn dispatch_call_deadline_secs(plugin_name: &str) -> u64 {
+    if plugin_name == "bert" {
+        BERT_DISPATCH_CALL_DEADLINE_SECS
+    } else {
+        DISPATCH_CALL_DEADLINE_SECS
+    }
+}
+
 fn is_stateless_shared_plugin(plugin_name: &str) -> bool {
     matches!(plugin_name, "bert" | "treesitter" | "libsql" | "gm")
 }
@@ -204,7 +229,8 @@ pub fn dispatch_on(
     if is_stateless_shared_plugin(&plugin_name) {
         crate::memory_pressure::note_shared_plugin_dispatch();
     }
-    store.set_epoch_deadline(epoch_ticks_for_seconds(DISPATCH_CALL_DEADLINE_SECS));
+    let call_deadline_secs = dispatch_call_deadline_secs(&plugin_name);
+    store.set_epoch_deadline(epoch_ticks_for_seconds(call_deadline_secs));
     let alloc = instance.get_typed_func::<u32, u32>(&mut *store, "plugkit_alloc")?;
     let memory = instance.get_memory(&mut *store, "memory").ok_or_else(|| anyhow::anyhow!("plugin {plugin_name} has no exported memory"))?;
 
@@ -221,7 +247,7 @@ pub fn dispatch_on(
         Ok(p) => p,
         Err(e) => {
             if matches!(e.downcast_ref::<wasmtime::Trap>(), Some(wasmtime::Trap::Interrupt)) {
-                return Err(anyhow::anyhow!("plugin_call_deadline_exceeded: {plugin_name} exceeded {DISPATCH_CALL_DEADLINE_SECS}s executing verb {verb}"));
+                return Err(anyhow::anyhow!("plugin_call_deadline_exceeded: {plugin_name} exceeded {call_deadline_secs}s executing verb {verb}"));
             }
             return Err(e.into());
         }
