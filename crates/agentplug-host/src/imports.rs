@@ -1,5 +1,6 @@
+use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -10,10 +11,28 @@ use crate::host_state::HostState;
 
 const GIT_SUBPROCESS_TIMEOUT_MS_DEFAULT_AMPLE_FOR_SLOW_PUSH_FETCH_OR_FIRST_CLONE: u64 = 120_000;
 
-fn plugin_call_capability_allowed(caller_plugin: &str, callee_plugin: &str) -> bool {
+#[derive(serde::Deserialize)]
+struct CapabilityAllowlistConfig {
+    #[serde(flatten)]
+    allow: HashMap<String, Vec<String>>,
+}
+
+fn compiled_default_capability_allowlist(caller_plugin: &str, callee_plugin: &str) -> bool {
     match caller_plugin {
         "gm" => matches!(callee_plugin, "bert" | "libsql" | "treesitter"),
         _ => false,
+    }
+}
+
+fn load_capability_allowlist_config(cwd: &Path) -> Option<CapabilityAllowlistConfig> {
+    let path = cwd.join(".agentplug").join("capability-allowlist.json");
+    fs::read_to_string(&path).ok().and_then(|s| serde_json::from_str::<CapabilityAllowlistConfig>(&s).ok())
+}
+
+fn plugin_call_capability_allowed(cwd: &Path, caller_plugin: &str, callee_plugin: &str) -> bool {
+    match load_capability_allowlist_config(cwd) {
+        Some(cfg) => cfg.allow.get(caller_plugin).map(|allowed| allowed.iter().any(|p| p == callee_plugin)).unwrap_or(false),
+        None => compiled_default_capability_allowlist(caller_plugin, callee_plugin),
     }
 }
 
@@ -529,7 +548,7 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
                     serde_json::json!({"ok": false, "error": "invalid_body", "reason": reason}),
                 );
             }
-            if !plugin_call_capability_allowed(&caller_plugin, &plugin) {
+            if !plugin_call_capability_allowed(&caller.data().cwd(), &caller_plugin, &plugin) {
                 return write_guest_json(
                     &mut caller,
                     serde_json::json!({"ok": false, "error": "capability_denied", "caller": caller_plugin, "plugin": plugin}),
@@ -599,7 +618,7 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
                 return -1;
             }
             let caller_plugin = caller.data().plugin_name.clone();
-            if !plugin_call_capability_allowed(&caller_plugin, "bert") {
+            if !plugin_call_capability_allowed(&caller.data().cwd(), &caller_plugin, "bert") {
                 eprintln!("[agentplug:host_vec_embed] capability_denied: caller {caller_plugin} not permitted to reach bert");
                 return -1;
             }
