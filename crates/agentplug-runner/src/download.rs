@@ -255,6 +255,10 @@ pub fn ensure_plugin_installed(plugin_name: &str, explicit_version: Option<&str>
     let sha_line = sha_resp.into_string()?;
     let expected_sha = sha_line.split_whitespace().next().ok_or_else(|| anyhow::anyhow!("empty sha256 sidecar for {effective_basename} at {base}"))?.to_string();
 
+    let prev_dest = dest.with_extension("wasm.prev");
+    if dest.exists() {
+        let _ = fs::copy(&dest, &prev_dest);
+    }
     download_and_verify(&wasm_url, &dest, &expected_sha)?;
     fs::write(&version_file, &version)?;
     Ok(dest)

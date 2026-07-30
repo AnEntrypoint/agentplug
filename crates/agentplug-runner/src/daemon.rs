@@ -421,7 +421,40 @@ fn sync_instruction_source_if_configured(root: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn staged_binary_self_check(staged_exe: &Path, expected_version: &str) -> bool {
+    let output = std::process::Command::new(staged_exe).arg("--version").output();
+    match output {
+        Ok(out) if out.status.success() => {
+            let text = String::from_utf8_lossy(&out.stdout);
+            if text.contains(expected_version) {
+                true
+            } else {
+                eprintln!(
+                    "[agentplug daemon] staged binary {} --version printed {:?}, expected to contain {expected_version} -- refusing handoff",
+                    staged_exe.display(), text.trim()
+                );
+                false
+            }
+        }
+        Ok(out) => {
+            eprintln!(
+                "[agentplug daemon] staged binary {} --version exited with {} -- refusing handoff",
+                staged_exe.display(), out.status
+            );
+            false
+        }
+        Err(e) => {
+            eprintln!("[agentplug daemon] staged binary {} --version failed to spawn: {e} -- refusing handoff", staged_exe.display());
+            false
+        }
+    }
+}
+
 fn attempt_self_update_handoff(staged_exe: &Path, version: &str) -> bool {
+    if !staged_binary_self_check(staged_exe, version) {
+        let _ = fs::remove_file(staged_exe);
+        return false;
+    }
     let ready_path = takeover_ready_path();
     let _ = fs::remove_file(&ready_path);
     if spawn_detached(staged_exe, &["takeover", version]).is_err() {
@@ -450,6 +483,49 @@ fn release_ownership_for_handoff() {
     }
 }
 
+fn promote_staged_exe_to_canonical(version: &str) {
+    let Some(canonical) = canonical_runner_exe_path() else { return };
+    let Ok(staged) = std::env::current_exe() else { return };
+    if staged == canonical {
+        return;
+    }
+    let prev = canonical.with_extension(
+        canonical.extension().map(|e| format!("{}.prev", e.to_string_lossy())).unwrap_or_else(|| "prev".to_string()),
+    );
+    if canonical.exists() {
+        if let Err(e) = fs::rename(&canonical, &prev) {
+            eprintln!(
+                "[agentplug daemon] takeover: could not back up canonical exe {} to {} before promoting {version}: {e} -- leaving canonical path stale, daemon keeps running from staged copy",
+                canonical.display(), prev.display()
+            );
+            return;
+        }
+    }
+    match fs::copy(&staged, &canonical) {
+        Ok(_) => {
+            #[cfg(not(windows))]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if let Ok(meta) = fs::metadata(&canonical) {
+                    let mut perms = meta.permissions();
+                    perms.set_mode(0o755);
+                    let _ = fs::set_permissions(&canonical, perms);
+                }
+            }
+            eprintln!("[agentplug daemon] takeover: promoted {version} onto canonical exe path {} (previous version kept at {})", canonical.display(), prev.display());
+        }
+        Err(e) => {
+            eprintln!(
+                "[agentplug daemon] takeover: failed to copy staged exe onto canonical path {}: {e} -- restoring previous version at canonical path",
+                canonical.display()
+            );
+            if prev.exists() {
+                let _ = fs::rename(&prev, &canonical);
+            }
+        }
+    }
+}
+
 pub fn run_takeover(version: &str) -> anyhow::Result<()> {
     eprintln!("[agentplug daemon] takeover: building engine for version {version}");
     let mut plugin_modules = PluginModules::new()?;
@@ -466,6 +542,7 @@ pub fn run_takeover(version: &str) -> anyhow::Result<()> {
     for _ in 0..480 {
         if read_owner_pid().is_none() && claim_ownership() {
             record_runner_version(version)?;
+            promote_staged_exe_to_canonical(version);
             eprintln!("[agentplug daemon] takeover: ownership claimed, version recorded, entering normal daemon loop");
             return run_daemon_body(plugin_modules);
         }
