@@ -218,6 +218,7 @@ struct BrowserSession {
     child: Child,
     port: u16,
     last_used: Instant,
+    target_id: Option<String>,
 }
 
 static SESSIONS: OnceLock<Mutex<HashMap<String, BrowserSession>>> = OnceLock::new();
@@ -639,6 +640,7 @@ fn session_new(cwd: &Path, session_id: &str, cfg: &BrowserConfig) -> Value {
                     child,
                     port,
                     last_used: Instant::now(),
+                    target_id: None,
                 },
             );
             json!({"ok": true, "stdout": "", "exit_code": 0, "stderr": "", "session_id": session_id, "port": port})
@@ -667,6 +669,7 @@ fn session_list(cwd: &Path) -> Value {
                 "port": s.port,
                 "alive": true,
                 "idle_ms": s.last_used.elapsed().as_millis() as u64,
+                "target_id": s.target_id,
             }));
         }
     }
@@ -934,11 +937,13 @@ pub fn run(body: &str, cwd: &Path, session_id: &str) -> Value {
         }
         reuse_port
     };
+    let mut known_target_id: Option<String> = None;
     let port = match candidate_port.filter(|&p| session_cdp_endpoint_responds(p)) {
         Some(p) => {
             let mut map = sessions_map().lock().unwrap_or_else(|e| e.into_inner());
             if let Some(s) = map.get_mut(&key) {
                 s.last_used = Instant::now();
+                known_target_id = s.target_id.clone();
             }
             Some(p)
         }
@@ -974,6 +979,7 @@ pub fn run(body: &str, cwd: &Path, session_id: &str) -> Value {
                     child: chrome_child,
                     port: new_port,
                     last_used: Instant::now(),
+                    target_id: None,
                 },
             );
             new_port
@@ -983,6 +989,7 @@ pub fn run(body: &str, cwd: &Path, session_id: &str) -> Value {
     let cfg = json!({
         "port": port,
         "startUrl": start_url,
+        "targetId": known_target_id,
         "scriptFile": script_path.to_string_lossy(),
         "resultFile": result_path.to_string_lossy(),
         "timeoutMs": timeout_ms,
@@ -1055,6 +1062,13 @@ pub fn run(body: &str, cwd: &Path, session_id: &str) -> Value {
         .ok()
         .and_then(|s| serde_json::from_str::<Value>(&s).ok())
         .unwrap_or(Value::Null);
+
+    if let Some(resolved_target_id) = result_value.get("__targetId").and_then(|v| v.as_str()) {
+        let mut map = sessions_map().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(s) = map.get_mut(&key) {
+            s.target_id = Some(resolved_target_id.to_string());
+        }
+    }
 
     cleanup(&[&helper_path, &script_path, &result_path]);
 

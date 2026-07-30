@@ -13,16 +13,33 @@ function httpJson(url, timeoutMs) {
   });
 }
 
-async function pickPageTarget(port, startUrl, timeoutMs) {
+function httpPutJson(url, timeoutMs) {
+  return new Promise((resolve) => {
+    const req = http.request(url, { method: 'PUT', timeout: timeoutMs }, (res) => {
+      let body = '';
+      res.on('data', (c) => { body += c; });
+      res.on('end', () => { try { resolve(JSON.parse(body)); } catch (_) { resolve(null); } });
+    });
+    req.on('error', () => resolve(null));
+    req.on('timeout', () => { req.destroy(); resolve(null); });
+    req.end();
+  });
+}
+
+async function pickPageTarget(port, startUrl, targetId, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     const list = await httpJson(`http://127.0.0.1:${port}/json/list`, 2000);
     if (Array.isArray(list)) {
+      if (targetId) {
+        const remembered = list.find((t) => t.id === targetId && t.webSocketDebuggerUrl);
+        if (remembered) return remembered;
+      }
       const page = list.find((t) => t.type === 'page' && t.webSocketDebuggerUrl);
       if (page) return page;
     }
     if (startUrl) {
-      const created = await httpJson(`http://127.0.0.1:${port}/json/new?${encodeURIComponent(startUrl)}`, 3000);
+      const created = await httpPutJson(`http://127.0.0.1:${port}/json/new?${encodeURIComponent(startUrl)}`, 3000);
       if (created && created.webSocketDebuggerUrl) return created;
     }
     await new Promise((r) => setTimeout(r, 250));
@@ -222,14 +239,17 @@ function aggregateCpuProfile(profile, topN) {
 
 async function main() {
   const cfg = JSON.parse(process.argv[2]);
-  const { port, startUrl, scriptFile, resultFile, timeoutMs, mode, artifactFile, viewport } = cfg;
+  const { port, startUrl, targetId, scriptFile, resultFile, timeoutMs, mode, artifactFile, viewport } = cfg;
   const script = fs.readFileSync(scriptFile, 'utf-8');
-  const target = await pickPageTarget(port, startUrl, Math.min(timeoutMs, 30000));
+  const target = await pickPageTarget(port, startUrl, targetId, Math.min(timeoutMs, 30000));
   if (!target) {
     fs.writeFileSync(resultFile, JSON.stringify({ __cdpError: 'no page target on CDP endpoint' }));
     process.stderr.write('cdp-eval: no page target\n');
     process.exit(1);
   }
+  const writeResult = (envelope) => {
+    fs.writeFileSync(resultFile, JSON.stringify({ ...envelope, __targetId: target.id }));
+  };
   const sess = await cdpSession(target.webSocketDebuggerUrl, timeoutMs);
   try {
     await sess.send('Runtime.enable', {});
@@ -255,14 +275,14 @@ async function main() {
       const debug = await collectDebug();
       if (res.exceptionDetails) {
         const msg = res.exceptionDetails.exception?.description || res.exceptionDetails.text || 'evaluate exception';
-        fs.writeFileSync(resultFile, JSON.stringify({ __cdpError: msg }));
+        writeResult({ __cdpError: msg });
         process.stderr.write(`cdp-eval: exception ${msg}\n`);
         sess.close();
         process.exit(1);
       }
       const value = res.result && ('value' in res.result) ? res.result.value : null;
       const envelope = { result: value === undefined ? null : value, debug };
-      fs.writeFileSync(resultFile, JSON.stringify(envelope));
+      writeResult(envelope);
       sess.close();
       process.exit(0);
     }
@@ -277,14 +297,14 @@ async function main() {
       const debug = await collectDebug();
       if (res.exceptionDetails) {
         const msg = res.exceptionDetails.exception?.description || res.exceptionDetails.text || 'evaluate exception';
-        fs.writeFileSync(resultFile, JSON.stringify({ __cdpError: msg }));
+        writeResult({ __cdpError: msg });
         process.stderr.write(`cdp-eval: exception ${msg}\n`);
         sess.close();
         process.exit(1);
       }
       const value = res.result && ('value' in res.result) ? res.result.value : null;
       const envelope = { result: value === undefined ? null : value, profile: agg, debug };
-      fs.writeFileSync(resultFile, JSON.stringify(envelope));
+      writeResult(envelope);
       if (artifactFile) { try { fs.writeFileSync(artifactFile, JSON.stringify(stopRes && stopRes.profile || {})); } catch (_) {} }
       sess.close();
       process.exit(0);
@@ -322,7 +342,7 @@ async function main() {
       }
       if (res.exceptionDetails) {
         const msg = res.exceptionDetails.exception?.description || res.exceptionDetails.text || 'evaluate exception';
-        fs.writeFileSync(resultFile, JSON.stringify({ __cdpError: msg }));
+        writeResult({ __cdpError: msg });
         process.stderr.write(`cdp-eval: exception ${msg}\n`);
         sess.close();
         process.exit(1);
@@ -330,7 +350,7 @@ async function main() {
       const value = res.result && ('value' in res.result) ? res.result.value : null;
       const debug = await collectDebug();
       const envelope = { result: value === undefined ? null : value, trace: { wall_us: wallUs, gpu_us: gpuUs, viz_us: vizUs, cc_us: ccUs, by_category: byCategory }, debug };
-      fs.writeFileSync(resultFile, JSON.stringify(envelope));
+      writeResult(envelope);
       if (artifactFile) { try { fs.writeFileSync(artifactFile, JSON.stringify(traceEvents)); } catch (_) {} }
       sess.close();
       process.exit(0);
@@ -340,7 +360,7 @@ async function main() {
       const res = await navigateIfNeededThenEvaluateOverCdp(sess, script, startUrl, timeoutMs);
       if (res.exceptionDetails) {
         const msg = res.exceptionDetails.exception?.description || res.exceptionDetails.text || 'evaluate exception';
-        fs.writeFileSync(resultFile, JSON.stringify({ __cdpError: msg }));
+        writeResult({ __cdpError: msg });
         process.stderr.write(`cdp-eval: exception ${msg}\n`);
         sess.close();
         process.exit(1);
@@ -359,7 +379,7 @@ async function main() {
       }
       const debug = await collectDebug();
       const envelope = { result: value === undefined ? null : value, screenshot_error: screenshotError, debug };
-      fs.writeFileSync(resultFile, JSON.stringify(envelope));
+      writeResult(envelope);
       sess.close();
       process.exit(0);
     }
@@ -386,7 +406,7 @@ async function main() {
       const res = await sess.send('Runtime.evaluate', { expression: wrapped, awaitPromise: true, returnByValue: true, userGesture: true, timeout: timeoutMs });
       if (res.exceptionDetails) {
         const msg = res.exceptionDetails.exception?.description || res.exceptionDetails.text || 'evaluate exception';
-        fs.writeFileSync(resultFile, JSON.stringify({ __cdpError: msg }));
+        writeResult({ __cdpError: msg });
         process.stderr.write(`cdp-eval: exception ${msg}\n`);
         sess.close();
         process.exit(1);
@@ -400,7 +420,7 @@ async function main() {
         const elements = Array.isArray(value) ? value : [];
         envelope = { match_count: elements.length, elements, debug };
       }
-      fs.writeFileSync(resultFile, JSON.stringify(envelope));
+      writeResult(envelope);
       sess.close();
       process.exit(0);
     }
@@ -411,17 +431,17 @@ async function main() {
       const msg = res.exceptionDetails.exception && res.exceptionDetails.exception.description
         ? res.exceptionDetails.exception.description
         : (res.exceptionDetails.text || 'evaluate exception');
-      fs.writeFileSync(resultFile, JSON.stringify({ __cdpError: msg, debug }));
+      writeResult({ __cdpError: msg, debug });
       process.stderr.write(`cdp-eval: exception ${msg}\n`);
       sess.close();
       process.exit(1);
     }
     const value = res.result && ('value' in res.result) ? res.result.value : null;
-    fs.writeFileSync(resultFile, JSON.stringify({ result: value === undefined ? null : value, debug }));
+    writeResult({ result: value === undefined ? null : value, debug });
     sess.close();
     process.exit(0);
   } catch (e) {
-    fs.writeFileSync(resultFile, JSON.stringify({ __cdpError: String(e && e.message || e) }));
+    writeResult({ __cdpError: String(e && e.message || e) });
     process.stderr.write(`cdp-eval: ${e && e.message || e}\n`);
     try { sess.close(); } catch (_) {}
     process.exit(1);
