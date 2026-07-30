@@ -873,20 +873,34 @@ pub fn run(body: &str, cwd: &Path, session_id: &str) -> Value {
     // The wasm-side caller (rs-plugkit's `browser` verb handler) resolves a
     // session id from an explicit `sessionId`, the current gm dispatch's own
     // SESSION_ID, or `.gm/exec-spool/.session-current` -- and falls back to
-    // an empty string when none of those are set (e.g. a bare `session new`
-    // dispatch with no prior browser session in this repo). Threading that
-    // empty string straight into session_new/session_key used to key the
-    // new Chrome session under the literal empty string: session_new and
-    // session_list both echoed session_id: "" back, so the caller had no
-    // real id to pass to a later `session close <id>`/`session reset <id>`
-    // (which require a non-empty explicit id) -- the session was alive and
-    // usable for eval, but permanently unaddressable for explicit lifecycle
-    // control, and a second empty-session-id dispatch would silently share
-    // (and reset-race) the same slot instead of getting its own session.
-    // Generate a real unique id here instead of ever keying by "".
+    // an empty string when none of those are set (e.g. a bare eval dispatch
+    // with no `session ...` prefix and no prior browser session recorded for
+    // this repo). Threading that empty string straight into
+    // session_new/session_key used to key the new Chrome session under the
+    // literal empty string: session_new and session_list both echoed
+    // session_id: "" back, so the caller had no real id to pass to a later
+    // `session close <id>`/`session reset <id>` (which require a non-empty
+    // explicit id).
+    //
+    // A prior fix generated a fresh `auto-{pid}-{unix_ms}` id per empty-sid
+    // call to make every session addressable. That traded one bug for a
+    // worse one: EVERY bare-eval dispatch (the common case -- no explicit
+    // `session ...` prefix) minted a brand-new id, so it always missed the
+    // session-cache lookup below and always launched a brand-new Chrome
+    // process + profile dir, even for back-to-back dispatches against the
+    // same repo seconds apart. Observed live: 21 leaked chrome.exe processes
+    // from a handful of plain-eval `browser` dispatches in one session.
+    //
+    // Fix: default to a STABLE, deterministic per-cwd+pid id ("default")
+    // instead of a time-varying one. This keeps every property the addressability
+    // fix wanted (a real non-empty id, usable with `session close`/`session
+    // reset`) while making repeat bare-eval calls resolve to the SAME
+    // session_key -> the SAME cached, already-launched Chrome -- process reuse
+    // for the overwhelmingly common no-explicit-session case, with the well-worn
+    // idle-timeout/reap machinery below still cleaning it up eventually.
     let session_id_owned2;
     let session_id = if session_id.is_empty() {
-        session_id_owned2 = format!("auto-{}-{}", std::process::id(), unix_ms());
+        session_id_owned2 = "default".to_string();
         session_id_owned2.as_str()
     } else {
         session_id
