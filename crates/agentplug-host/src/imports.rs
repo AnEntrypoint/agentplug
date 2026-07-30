@@ -10,6 +10,31 @@ use crate::host_state::HostState;
 
 const GIT_SUBPROCESS_TIMEOUT_MS_DEFAULT_AMPLE_FOR_SLOW_PUSH_FETCH_OR_FIRST_CLONE: u64 = 120_000;
 
+fn plugin_call_capability_allowed(caller_plugin: &str, callee_plugin: &str) -> bool {
+    match caller_plugin {
+        "gm" => matches!(callee_plugin, "bert" | "libsql" | "treesitter"),
+        _ => false,
+    }
+}
+
+fn is_well_formed_plugin_name(name: &str) -> bool {
+    !name.is_empty() && name.len() <= 64 && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+fn is_well_formed_verb(verb: &str) -> bool {
+    !verb.is_empty() && verb.len() <= 128 && verb.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+}
+
+fn validate_plugin_call_body(body: &str) -> Result<(), String> {
+    if body.is_empty() {
+        return Ok(());
+    }
+    if body.len() > 64 * 1024 * 1024 {
+        return Err("body_exceeds_max_size".to_string());
+    }
+    serde_json::from_str::<serde_json::Value>(body).map(|_| ()).map_err(|e| format!("body_not_valid_json: {e}"))
+}
+
 pub fn git_subprocess_timeout_ms() -> u64 {
     std::env::var("AGENTPLUG_GIT_TIMEOUT_MS")
         .ok()
@@ -485,6 +510,32 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
             let verb = read_guest_string(&mut caller, verb_ptr, verb_len);
             let body = read_guest_string(&mut caller, body_ptr, body_len);
 
+            let caller_plugin = caller.data().plugin_name.clone();
+            if !is_well_formed_plugin_name(&plugin) {
+                return write_guest_json(
+                    &mut caller,
+                    serde_json::json!({"ok": false, "error": "invalid_plugin_name", "plugin": plugin}),
+                );
+            }
+            if !is_well_formed_verb(&verb) {
+                return write_guest_json(
+                    &mut caller,
+                    serde_json::json!({"ok": false, "error": "invalid_verb", "verb": verb}),
+                );
+            }
+            if let Err(reason) = validate_plugin_call_body(&body) {
+                return write_guest_json(
+                    &mut caller,
+                    serde_json::json!({"ok": false, "error": "invalid_body", "reason": reason}),
+                );
+            }
+            if !plugin_call_capability_allowed(&caller_plugin, &plugin) {
+                return write_guest_json(
+                    &mut caller,
+                    serde_json::json!({"ok": false, "error": "capability_denied", "caller": caller_plugin, "plugin": plugin}),
+                );
+            }
+
             let caller_siblings = caller.data().siblings();
             let sibling_pool = { caller_siblings.lock().unwrap().get(&plugin).cloned() };
             let Some(sibling_pool) = sibling_pool else {
@@ -544,6 +595,14 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
         "host_vec_embed",
         |mut caller: Caller<'_, HostState>, text_ptr: u32, text_len: u32, out_ptr: u32, out_len: u32| -> i32 {
             let text = read_guest_string(&mut caller, text_ptr, text_len);
+            if text.is_empty() || text.len() > 1024 * 1024 {
+                return -1;
+            }
+            let caller_plugin = caller.data().plugin_name.clone();
+            if !plugin_call_capability_allowed(&caller_plugin, "bert") {
+                eprintln!("[agentplug:host_vec_embed] capability_denied: caller {caller_plugin} not permitted to reach bert");
+                return -1;
+            }
             let body = serde_json::json!({"text": text}).to_string();
 
             let caller_siblings = caller.data().siblings();
