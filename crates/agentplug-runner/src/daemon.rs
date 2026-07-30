@@ -262,16 +262,37 @@ pub fn ensure_daemon_running() -> anyhow::Result<bool> {
         let _ = fs::remove_file(&lock_path);
         return Ok(false);
     }
+    // Hold the spawn lock across spawn_detached_daemon() AND the freshness wait,
+    // not just the spawn call itself. Releasing it right after spawn_detached_daemon()
+    // returns (its previous position) opened a real TOCTOU window: a concurrent
+    // ensure_daemon_running() caller could see the lock file gone, is_daemon_fresh()
+    // still false (the just-spawned process hasn't written its first heartbeat to
+    // daemon-status.json yet -- process startup + wasm load is real wall-clock time),
+    // re-acquire the now-free lock, and spawn a SECOND daemon. Observed live: 4
+    // separate agentplug-runner.exe processes running simultaneously from a handful
+    // of `bun x gm-plugkit@latest spool` calls a few minutes apart, each missing the
+    // freshness window the previous spawn's daemon hadn't cleared yet. Keeping the
+    // lock held through the same wait-for-fresh loop this function already runs
+    // (previously only for the "someone else is spawning" branch above) closes the
+    // window: any concurrent caller now blocks on the lock file instead of racing
+    // past a released-but-not-yet-fresh gap.
     let spawn_result = spawn_detached_daemon();
-    let _ = fs::remove_file(&lock_path);
-    spawn_result?;
-    for _ in 0..50 {
-        std::thread::sleep(Duration::from_millis(200));
-        if is_daemon_fresh() {
-            return Ok(true);
+    let result = match spawn_result {
+        Ok(()) => {
+            let mut fresh = false;
+            for _ in 0..50 {
+                std::thread::sleep(Duration::from_millis(200));
+                if is_daemon_fresh() {
+                    fresh = true;
+                    break;
+                }
+            }
+            Ok(fresh)
         }
-    }
-    Ok(false)
+        Err(e) => Err(e),
+    };
+    let _ = fs::remove_file(&lock_path);
+    result
 }
 
 fn is_daemon_fresh() -> bool {
