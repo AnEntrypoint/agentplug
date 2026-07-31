@@ -83,6 +83,8 @@ struct DaemonConfig {
     #[serde(default)]
     runner_update_poll_interval_secs: Option<u64>,
     #[serde(default)]
+    instruction_source_poll_interval_secs: Option<u64>,
+    #[serde(default)]
     max_concurrent_projects: Option<usize>,
     #[serde(default)]
     gm_concurrency: Option<usize>,
@@ -98,7 +100,8 @@ const DAEMON_CONFIG_EXAMPLE: &str = r#"{
   "registry_poll_interval_secs": 5,
   "heartbeat_interval_secs": 10,
   "plugin_update_poll_interval_secs": 600,
-  "runner_update_poll_interval_secs": 600,
+  "runner_update_poll_interval_secs": 3600,
+  "instruction_source_poll_interval_secs": 600,
   "max_concurrent_projects": 4,
   "gm_concurrency": 4,
   "side_plugin_concurrency": 1,
@@ -140,6 +143,7 @@ impl DaemonConfig {
                 heartbeat_interval_secs: None,
                 plugin_update_poll_interval_secs: None,
                 runner_update_poll_interval_secs: None,
+                instruction_source_poll_interval_secs: None,
                 max_concurrent_projects: None,
                 gm_concurrency: None,
                 side_plugin_concurrency: None,
@@ -150,7 +154,16 @@ impl DaemonConfig {
     fn registry_poll_interval(&self) -> Duration { Duration::from_secs(self.registry_poll_interval_secs.unwrap_or(5)) }
     fn heartbeat_interval(&self) -> Duration { Duration::from_secs(self.heartbeat_interval_secs.unwrap_or(10)) }
     fn plugin_update_poll_interval(&self) -> Duration { Duration::from_secs(self.plugin_update_poll_interval_secs.unwrap_or(600)) }
-    fn runner_update_poll_interval(&self) -> Duration { Duration::from_secs(self.runner_update_poll_interval_secs.unwrap_or(600)) }
+    // Runner binaries update least often by design: they are the sole spool
+    // loader and every project's daemon depends on one staying stable, so a
+    // longer default poll cadence than plugin updates (600s) is deliberate,
+    // not an oversight -- 1hr default, still fully overridable.
+    fn runner_update_poll_interval(&self) -> Duration { Duration::from_secs(self.runner_update_poll_interval_secs.unwrap_or(3600)) }
+    // Explicit interval for the per-project .gm/instructions/source.json sync,
+    // previously coupled only incidentally to plugin_update_poll_interval's
+    // Duration value (same number, not the same timer) -- an independent key
+    // so tuning one cadence never silently retunes the other.
+    fn instruction_source_poll_interval(&self) -> Duration { Duration::from_secs(self.instruction_source_poll_interval_secs.unwrap_or(600)) }
     fn max_concurrent_projects(&self) -> usize { self.max_concurrent_projects.unwrap_or(4).max(1) }
     fn gm_concurrency(&self) -> usize { self.gm_concurrency.unwrap_or_else(|| self.max_concurrent_projects()).max(1) }
     fn side_plugin_concurrency(&self) -> usize { self.side_plugin_concurrency.unwrap_or(1).max(1) }
@@ -537,6 +550,7 @@ fn promote_staged_exe_to_canonical(version: &str) {
                     let _ = fs::set_permissions(&canonical, perms);
                 }
             }
+            record_completed_runner_swap(version);
             eprintln!("[agentplug daemon] takeover: promoted {version} onto canonical exe path {} (previous version kept at {})", canonical.display(), prev.display());
         }
         Err(e) => {
@@ -615,9 +629,31 @@ fn write_daemon_heartbeat(project_count: usize, plugin_module_count: usize) {
             "staged_runner_waiting_ms": staged_runner.map(|(since_ts, _)| serde_json::json!(now_ms().saturating_sub(since_ts))).unwrap_or(serde_json::Value::Null),
             "last_handoff_attempt_ts": handoff_attempt.as_ref().map(|(ts, _)| serde_json::json!(ts)).unwrap_or(serde_json::Value::Null),
             "last_handoff_error": handoff_attempt.as_ref().and_then(|(_, err)| err.clone()),
+            "last_completed_runner_swap": read_last_completed_runner_swap().unwrap_or(serde_json::Value::Null),
         })
         .to_string(),
     );
+}
+
+fn last_completed_runner_swap_path() -> PathBuf {
+    install_dir().join("last-completed-runner-swap.json")
+}
+
+/// Written the instant a staged runner build is promoted onto the canonical
+/// exe path -- distinct from `staged_runner_awaiting_handoff` (which only
+/// signals a swap IS pending), this is the durable "a swap just happened"
+/// record an agent can diff against its own last-seen value to learn the
+/// runner updated, without needing to poll daemon-status.json continuously.
+fn record_completed_runner_swap(version: &str) {
+    let _ = fs::write(
+        last_completed_runner_swap_path(),
+        serde_json::json!({ "version": version, "swapped_at_ts": now_ms() }).to_string(),
+    );
+}
+
+fn read_last_completed_runner_swap() -> Option<serde_json::Value> {
+    let text = fs::read_to_string(last_completed_runner_swap_path()).ok()?;
+    serde_json::from_str(&text).ok()
 }
 
 fn canonical_runner_exe_path() -> Option<PathBuf> {
@@ -1455,6 +1491,7 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
     let mut last_shared_release = Instant::now();
 
     let plugin_update_poll_interval = daemon_cfg.plugin_update_poll_interval();
+    let instruction_source_poll_interval = daemon_cfg.instruction_source_poll_interval();
     let mut last_plugin_update_poll = seed_poll_timer_from_persisted_ts(&persisted_plugin_poll_ts_path());
     let persisted_plugin_poll_ts_at_boot = read_persisted_poll_ts(&persisted_plugin_poll_ts_path());
     if persisted_plugin_poll_ts_at_boot > 0 {
@@ -1555,7 +1592,7 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
             }
             let due = last_instruction_source_sync
                 .get(root)
-                .map(|t| t.elapsed() >= plugin_update_poll_interval)
+                .map(|t| t.elapsed() >= instruction_source_poll_interval)
                 .unwrap_or(true);
             if due {
                 last_instruction_source_sync.insert(root.clone(), Instant::now());
