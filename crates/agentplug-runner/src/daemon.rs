@@ -474,11 +474,13 @@ fn staged_binary_self_check(staged_exe: &Path, expected_version: &str) -> bool {
 fn attempt_self_update_handoff(staged_exe: &Path, version: &str) -> bool {
     if !staged_binary_self_check(staged_exe, version) {
         let _ = fs::remove_file(staged_exe);
+        record_handoff_attempt(Some(format!("staged_binary_self_check failed for {version}, staged exe removed")));
         return false;
     }
     let ready_path = takeover_ready_path();
     let _ = fs::remove_file(&ready_path);
-    if spawn_detached(staged_exe, &["takeover", version]).is_err() {
+    if let Err(e) = spawn_detached(staged_exe, &["takeover", version]) {
+        record_handoff_attempt(Some(format!("spawn_detached of staged {version} failed: {e}")));
         return false;
     }
     for _ in 0..40 {
@@ -487,6 +489,7 @@ fn attempt_self_update_handoff(staged_exe: &Path, version: &str) -> bool {
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
                 if v.get("version").and_then(|x| x.as_str()) == Some(version) {
                     eprintln!("[agentplug daemon] new version {version} confirmed ready -- releasing ownership for handoff");
+                    record_handoff_attempt(None);
                     release_ownership_for_handoff();
                     return true;
                 }
@@ -494,6 +497,7 @@ fn attempt_self_update_handoff(staged_exe: &Path, version: &str) -> bool {
         }
     }
     eprintln!("[agentplug daemon] self-update to {version} did not confirm ready in time -- staying on current version, will retry next poll");
+    record_handoff_attempt(Some(format!("staged {version} did not write a matching readiness marker within 10s")));
     false
 }
 
@@ -590,6 +594,7 @@ fn write_daemon_heartbeat(project_count: usize, plugin_module_count: usize) {
     let plugin_poll_error = last_plugin_poll_error().lock().unwrap_or_else(|e| e.into_inner()).clone();
     let runner_poll_error = last_runner_poll_error().lock().unwrap_or_else(|e| e.into_inner()).clone();
     let staged_runner = staged_runner_awaiting_handoff();
+    let handoff_attempt = last_handoff_attempt().lock().unwrap_or_else(|e| e.into_inner()).clone();
     let _ = fs::write(
         daemon_status_path(),
         serde_json::json!({
@@ -608,6 +613,8 @@ fn write_daemon_heartbeat(project_count: usize, plugin_module_count: usize) {
             "staged_runner_awaiting_handoff": staged_runner.is_some(),
             "staged_runner_since_ts": staged_runner.map(|(since_ts, _)| serde_json::json!(since_ts)).unwrap_or(serde_json::Value::Null),
             "staged_runner_waiting_ms": staged_runner.map(|(since_ts, _)| serde_json::json!(now_ms().saturating_sub(since_ts))).unwrap_or(serde_json::Value::Null),
+            "last_handoff_attempt_ts": handoff_attempt.as_ref().map(|(ts, _)| serde_json::json!(ts)).unwrap_or(serde_json::Value::Null),
+            "last_handoff_error": handoff_attempt.as_ref().and_then(|(_, err)| err.clone()),
         })
         .to_string(),
     );
@@ -706,6 +713,17 @@ fn record_plugin_poll_error(err: Option<String>) {
 
 fn record_runner_poll_error(err: Option<String>) {
     *last_runner_poll_error().lock().unwrap_or_else(|e| e.into_inner()) = err;
+}
+
+type HandoffAttempt = (u64, Option<String>);
+
+fn last_handoff_attempt() -> &'static Mutex<Option<HandoffAttempt>> {
+    static SLOT: OnceLock<Mutex<Option<HandoffAttempt>>> = OnceLock::new();
+    SLOT.get_or_init(|| Mutex::new(None))
+}
+
+fn record_handoff_attempt(error: Option<String>) {
+    *last_handoff_attempt().lock().unwrap_or_else(|e| e.into_inner()) = Some((now_ms(), error));
 }
 
 fn persisted_plugin_poll_ts_path() -> PathBuf {
