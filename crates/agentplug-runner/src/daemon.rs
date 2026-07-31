@@ -342,12 +342,32 @@ fn pid_is_alive(pid: u64) -> bool {
         .unwrap_or(true)
 }
 
+fn daemon_log_path() -> PathBuf {
+    install_dir().join("daemon.log")
+}
+
+const DAEMON_LOG_MAX_BYTES: u64 = 8 * 1024 * 1024;
+
+fn daemon_log_sink() -> Option<fs::File> {
+    let path = daemon_log_path();
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    if fs::metadata(&path).map(|m| m.len() > DAEMON_LOG_MAX_BYTES).unwrap_or(false) {
+        let _ = fs::rename(&path, path.with_extension("log.prev"));
+    }
+    fs::OpenOptions::new().create(true).append(true).open(&path).ok()
+}
+
 fn spawn_detached(exe: &Path, args: &[&str]) -> anyhow::Result<()> {
     let mut cmd = std::process::Command::new(exe);
     cmd.args(args);
     cmd.stdin(std::process::Stdio::null());
     cmd.stdout(std::process::Stdio::null());
-    cmd.stderr(std::process::Stdio::null());
+    match daemon_log_sink() {
+        Some(log) => cmd.stderr(std::process::Stdio::from(log)),
+        None => cmd.stderr(std::process::Stdio::null()),
+    };
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -1480,6 +1500,12 @@ pub fn run_daemon() -> anyhow::Result<()> {
 fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
     HEARTBEAT_DAEMON_BOOT_TS.store(now_ms(), std::sync::atomic::Ordering::Relaxed);
     write_daemon_heartbeat(0, 0);
+    eprintln!(
+        "[agentplug daemon] BOOT pid={} version={} ts={}",
+        std::process::id(),
+        env!("CARGO_PKG_VERSION"),
+        now_ms()
+    );
 
     let daemon_cfg = DaemonConfig::load();
     let registry_poll_interval = daemon_cfg.registry_poll_interval();

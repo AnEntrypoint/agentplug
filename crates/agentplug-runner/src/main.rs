@@ -23,6 +23,11 @@ fn main() -> anyhow::Result<()> {
     suppress_crash_dialogs();
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
+        let loc = info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "unknown".to_string());
+        eprintln!("[agentplug daemon] PANIC pid={} at {loc}: {info}", std::process::id());
         agentplug_host::close_all_sessions();
         default_hook(info);
     }));
