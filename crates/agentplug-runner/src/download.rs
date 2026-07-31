@@ -11,6 +11,28 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
     hasher.finalize().iter().map(|b| format!("{b:02x}")).collect()
 }
 
+fn github_api_request(url: &str) -> ureq::Request {
+    let req = ureq::get(url).set("User-Agent", "agentplug-runner");
+    match std::env::var("GITHUB_TOKEN").or_else(|_| std::env::var("GH_TOKEN")) {
+        Ok(token) if !token.is_empty() => req.set("Authorization", &format!("Bearer {token}")),
+        _ => req,
+    }
+}
+
+fn describe_github_api_error(url: &str, err: ureq::Error) -> anyhow::Error {
+    match &err {
+        ureq::Error::Status(403, resp) => {
+            let remaining = resp.header("x-ratelimit-remaining").unwrap_or("?");
+            let reset = resp.header("x-ratelimit-reset").unwrap_or("?");
+            anyhow::anyhow!(
+                "GitHub API rate-limited fetching {url} (403, ratelimit-remaining={remaining}, ratelimit-reset={reset} unix secs) -- set GITHUB_TOKEN or GH_TOKEN to raise the limit from 60/hr to 5000/hr"
+            )
+        }
+        ureq::Error::Status(code, _) => anyhow::anyhow!("GitHub API returned {code} fetching {url}"),
+        ureq::Error::Transport(_) => anyhow::Error::from(err).context(format!("network error fetching {url}")),
+    }
+}
+
 pub fn download_and_verify(url: &str, dest: &Path, expected_sha256_hex: &str) -> anyhow::Result<()> {
     let resp = ureq::get(url).call()?;
     let mut reader = resp.into_reader();
@@ -91,7 +113,7 @@ pub fn installed_runner_version() -> Option<String> {
 
 pub fn fetch_latest_runner_version() -> anyhow::Result<Option<String>> {
     let url = format!("https://api.github.com/repos/{RUNNER_BIN_REPO}/releases/latest");
-    let resp = ureq::get(&url).set("User-Agent", "agentplug-runner").call()?;
+    let resp = github_api_request(&url).call().map_err(|e| describe_github_api_error(&url, e))?;
     let body: serde_json::Value = serde_json::from_str(&resp.into_string()?)?;
     Ok(body.get("tag_name").and_then(|v| v.as_str()).map(|s| s.trim_start_matches('v').to_string()))
 }
@@ -151,7 +173,7 @@ pub fn fetch_latest_plugin_version(plugin_name: &str) -> anyhow::Result<Option<S
         anyhow::bail!("unknown plugin {plugin_name} -- not registered in agentplug-runner's plugin_asset_spec map");
     };
     let url = format!("https://api.github.com/repos/{}/releases/latest", spec.repo);
-    let resp = ureq::get(&url).set("User-Agent", "agentplug-runner").call()?;
+    let resp = github_api_request(&url).call().map_err(|e| describe_github_api_error(&url, e))?;
     let body: serde_json::Value = serde_json::from_str(&resp.into_string()?)?;
     Ok(body.get("tag_name").and_then(|v| v.as_str()).map(|s| s.trim_start_matches('v').to_string()))
 }
