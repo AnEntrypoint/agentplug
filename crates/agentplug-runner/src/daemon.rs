@@ -558,11 +558,11 @@ fn release_ownership_for_handoff() {
     }
 }
 
-fn promote_staged_exe_to_canonical(version: &str) {
-    let Some(canonical) = canonical_runner_exe_path() else { return };
-    let Ok(staged) = std::env::current_exe() else { return };
+fn promote_staged_exe_to_canonical(version: &str) -> bool {
+    let Some(canonical) = canonical_runner_exe_path() else { return false };
+    let Ok(staged) = std::env::current_exe() else { return false };
     if staged == canonical {
-        return;
+        return false;
     }
     let prev = canonical.with_extension(
         canonical.extension().map(|e| format!("{}.prev", e.to_string_lossy())).unwrap_or_else(|| "prev".to_string()),
@@ -573,7 +573,7 @@ fn promote_staged_exe_to_canonical(version: &str) {
                 "[agentplug daemon] takeover: could not back up canonical exe {} to {} before promoting {version}: {e} -- leaving canonical path stale, daemon keeps running from staged copy",
                 canonical.display(), prev.display()
             );
-            return;
+            return false;
         }
     }
     match fs::copy(&staged, &canonical) {
@@ -589,6 +589,7 @@ fn promote_staged_exe_to_canonical(version: &str) {
             }
             record_completed_runner_swap(version);
             eprintln!("[agentplug daemon] takeover: promoted {version} onto canonical exe path {} (previous version kept at {})", canonical.display(), prev.display());
+            true
         }
         Err(e) => {
             eprintln!(
@@ -598,6 +599,22 @@ fn promote_staged_exe_to_canonical(version: &str) {
             if prev.exists() {
                 let _ = fs::rename(&prev, &canonical);
             }
+            false
+        }
+    }
+}
+
+fn reexec_from_canonical_and_exit(canonical: &std::path::Path) -> ! {
+    eprintln!("[agentplug daemon] takeover: re-execing from canonical path {} to release lock on staged exe", canonical.display());
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match std::process::Command::new(canonical).args(&args).spawn() {
+        Ok(_) => {
+            eprintln!("[agentplug daemon] takeover: spawned fresh process from canonical path, exiting stale staged-exe process");
+            std::process::exit(0);
+        }
+        Err(e) => {
+            eprintln!("[agentplug daemon] takeover: failed to re-exec from canonical path {}: {e} -- continuing to run from stale staged exe (will retry re-exec on next takeover)", canonical.display());
+            std::process::exit(1);
         }
     }
 }
@@ -618,7 +635,18 @@ pub fn run_takeover(version: &str) -> anyhow::Result<()> {
     for _ in 0..480 {
         if read_owner_pid().is_none() && claim_ownership() {
             record_runner_version(version)?;
-            promote_staged_exe_to_canonical(version);
+            let promoted = promote_staged_exe_to_canonical(version);
+            if promoted {
+                if let Some(canonical) = canonical_runner_exe_path() {
+                    // This process is still bound to the staged `.new` executable image for its
+                    // whole lifetime (Windows keeps a live process's own backing file locked), so
+                    // continuing in-process would leave that file permanently un-removable and
+                    // collide with every future self-update's staging path. Re-exec from the
+                    // freshly-promoted canonical path and let this process exit instead.
+                    release_ownership_for_handoff();
+                    reexec_from_canonical_and_exit(&canonical);
+                }
+            }
             eprintln!("[agentplug daemon] takeover: ownership claimed, version recorded, entering normal daemon loop");
             return run_daemon_body(plugin_modules);
         }

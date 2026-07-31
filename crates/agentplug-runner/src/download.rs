@@ -182,12 +182,29 @@ pub fn stage_runner_self_update() -> anyhow::Result<Option<(PathBuf, String)>> {
     if marker_is_trustworthy_and_current(latest.as_str()) {
         return Ok(None);
     }
+    let running_from_staged_path = std::env::current_exe()?
+        .extension()
+        .map(|e| e.eq_ignore_ascii_case("new"))
+        .unwrap_or(false);
     let mut current_exe = std::env::current_exe()?;
     while current_exe.extension().map(|e| e.eq_ignore_ascii_case("new")).unwrap_or(false) {
         current_exe = current_exe.with_extension("");
     }
+    // A process that is ITSELF still executing from a `.new`-suffixed path
+    // (its own promote_staged_exe_to_canonical copied its bytes onto the
+    // canonical path, but a running process's OWN loaded executable image
+    // stays locked to whatever file it was launched from -- Windows refuses
+    // to rename/overwrite the backing file of a live process's mapped image
+    // with "Access is denied", and that lock never clears for this
+    // process's whole lifetime) must stage the NEXT update under a
+    // DIFFERENT filename than `.new`, or every subsequent self-update
+    // attempt would try to rename onto the exact path this process is
+    // itself locked onto and fail identically forever. `.new2` sidesteps
+    // that collision; a process legitimately running from the canonical
+    // path (the common case) is unaffected and keeps using `.new` as before.
+    let staged_suffix = if running_from_staged_path { "new2" } else { "new" };
     let staged = current_exe.with_extension(
-        current_exe.extension().map(|e| format!("{}.new", e.to_string_lossy())).unwrap_or_else(|| "new".to_string())
+        current_exe.extension().map(|e| format!("{}.{staged_suffix}", e.to_string_lossy())).unwrap_or_else(|| staged_suffix.to_string())
     );
     let base = format!("https://github.com/{RUNNER_BIN_REPO}/releases/download/v{latest}");
     let sha_line = ureq::get(&format!("{base}/{asset}.sha256")).call()?.into_string()?;
