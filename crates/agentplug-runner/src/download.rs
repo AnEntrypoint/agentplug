@@ -63,22 +63,80 @@ pub fn download_and_verify(url: &str, dest: &Path, expected_sha256_hex: &str) ->
 }
 
 struct PluginAssetSpec {
-    repo: &'static str,
-    asset_basename: &'static str,
+    repo: String,
+    asset_basename: String,
 }
 
 fn gm_asset_basename() -> &'static str {
     "plugkit-slim"
 }
 
-fn plugin_asset_spec(plugin_name: &str) -> Option<PluginAssetSpec> {
+fn builtin_plugin_asset_spec(plugin_name: &str) -> Option<PluginAssetSpec> {
     match plugin_name {
-        "gm" => Some(PluginAssetSpec { repo: "AnEntrypoint/plugkit-bin", asset_basename: gm_asset_basename() }),
-        "bert" => Some(PluginAssetSpec { repo: "AnEntrypoint/agentplug-bert-bin", asset_basename: "bert" }),
-        "libsql" => Some(PluginAssetSpec { repo: "AnEntrypoint/agentplug-libsql-bin", asset_basename: "libsql" }),
-        "treesitter" => Some(PluginAssetSpec { repo: "AnEntrypoint/agentplug-treesitter-bin", asset_basename: "treesitter" }),
+        "gm" => Some(PluginAssetSpec { repo: "AnEntrypoint/plugkit-bin".to_string(), asset_basename: gm_asset_basename().to_string() }),
+        "bert" => Some(PluginAssetSpec { repo: "AnEntrypoint/agentplug-bert-bin".to_string(), asset_basename: "bert".to_string() }),
+        "libsql" => Some(PluginAssetSpec { repo: "AnEntrypoint/agentplug-libsql-bin".to_string(), asset_basename: "libsql".to_string() }),
+        "treesitter" => Some(PluginAssetSpec { repo: "AnEntrypoint/agentplug-treesitter-bin".to_string(), asset_basename: "treesitter".to_string() }),
         _ => None,
     }
+}
+
+/// A project-declared extra plugin, read from `.agentplug/plugins.json` in
+/// the project root (sibling to `read_project_plugin_list`'s own
+/// `.agentplug/plugins.txt`, which already names extra plugins to LOAD but
+/// has no way to say where to DOWNLOAD one from). Format: a JSON array of
+/// `{"name", "repo", "asset_basename"}` objects, one per extra plugin --
+/// `repo` is an `owner/repo` GitHub Releases source, `asset_basename` the
+/// asset name prefix (`{base}.wasm`/`{base}.wasm.sha256` at the release tag),
+/// mirroring the 4 built-ins' own shape exactly.
+#[derive(serde::Deserialize)]
+struct ProjectPluginSpec {
+    name: String,
+    repo: String,
+    asset_basename: String,
+}
+
+fn project_declared_plugin_specs(project_root: &Path) -> Vec<ProjectPluginSpec> {
+    let path = project_root.join(".agentplug").join("plugins.json");
+    let Ok(raw) = fs::read_to_string(&path) else { return Vec::new() };
+    match serde_json::from_str::<Vec<ProjectPluginSpec>>(&raw) {
+        Ok(specs) => specs,
+        Err(e) => {
+            eprintln!("[agentplug] {} exists but does not parse as an array of {{name,repo,asset_basename}} -- ignoring: {e}", path.display());
+            Vec::new()
+        }
+    }
+}
+
+/// Resolve a plugin name to its download spec: a project's own declared spec
+/// (from ANY currently-known project root's `.agentplug/plugins.json`) wins
+/// over the 4 hardcoded built-ins, so a project can even re-point `gm`/`bert`/
+/// `libsql`/`treesitter` at a fork if it explicitly declares one -- otherwise
+/// falls through to the compiled-in built-in spec.
+fn plugin_asset_spec_for_roots(plugin_name: &str, known_roots: &[PathBuf]) -> Option<PluginAssetSpec> {
+    for root in known_roots {
+        for spec in project_declared_plugin_specs(root) {
+            if spec.name == plugin_name {
+                return Some(PluginAssetSpec { repo: spec.repo, asset_basename: spec.asset_basename });
+            }
+        }
+    }
+    builtin_plugin_asset_spec(plugin_name)
+}
+
+fn plugin_asset_spec(plugin_name: &str) -> Option<PluginAssetSpec> {
+    let mut roots = crate::daemon::read_known_project_roots();
+    // A one-shot `plugin`/`dispatch` CLI invocation never populates the
+    // daemon's own known-roots registry (that only fills in via the daemon's
+    // own registry-poll loop) -- always also check the current process's own
+    // cwd so a single-shot command scoped to one project still honors that
+    // project's own .agentplug/plugins.json.
+    if let Ok(cwd) = std::env::current_dir() {
+        if !roots.contains(&cwd) {
+            roots.push(cwd);
+        }
+    }
+    plugin_asset_spec_for_roots(plugin_name, &roots)
 }
 
 pub fn plugin_wasm_path(plugin_name: &str) -> PathBuf {

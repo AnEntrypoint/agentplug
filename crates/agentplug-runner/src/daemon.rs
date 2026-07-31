@@ -726,6 +726,14 @@ fn set_known_project_roots(roots: &[PathBuf]) {
     *known_project_roots().lock().unwrap_or_else(|e| e.into_inner()) = roots.to_vec();
 }
 
+/// Snapshot of every project root this daemon currently knows about, for
+/// `download.rs`'s project-declared-plugin-spec lookup -- a project's own
+/// `.agentplug/plugins.json` can only be found by scanning roots the daemon
+/// has already discovered via its registry poll.
+pub fn read_known_project_roots() -> Vec<PathBuf> {
+    known_project_roots().lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
 fn spawn_project_heartbeat_ticker(interval: Duration) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || loop {
         std::thread::sleep(interval);
