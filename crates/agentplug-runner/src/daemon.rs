@@ -780,9 +780,12 @@ fn spawn_heartbeat_ticker(heartbeat_interval: Duration) -> std::thread::JoinHand
             return;
         }
         if !holds_heartbeat_authority() {
-            eprintln!("[agentplug daemon] heartbeat ticker: authority lost to another daemon -- signaling main loop to exit");
+            eprintln!(
+                "[agentplug daemon] heartbeat ticker: authority lost to another daemon -- the main loop only checks this flag between dispatch batches, which can be blocked indefinitely by in-flight work, so exiting the process directly here instead of merely signaling"
+            );
             HEARTBEAT_AUTHORITY_LOST.store(true, std::sync::atomic::Ordering::Relaxed);
-            return;
+            agentplug_host::close_all_sessions();
+            std::process::exit(0);
         }
         write_daemon_heartbeat(
             HEARTBEAT_PROJECT_COUNT.load(std::sync::atomic::Ordering::Relaxed),
