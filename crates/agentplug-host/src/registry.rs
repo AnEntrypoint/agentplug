@@ -438,10 +438,12 @@ impl DispatchHandle {
 
         let (guard, waited_ms) = pool.acquire_within(SharedPluginPool::ACQUIRE_TIMEOUT_MS);
         let mut guard = guard.ok_or_else(|| PluginDispatchError::PoolAcquireTimeout { plugin_name: plugin_name.to_string(), waited_ms, pool_size })?;
-        if guard.is_none() {
-            let _ = self.reinstantiate_plugin_into_pool_slot_if_reload_source_available(plugin_name);
-            let reload_mutated_the_shared_pool_slot_in_place_not_this_stale_guard = is_stateless_shared_plugin(plugin_name) && guard.is_none();
-            if reload_mutated_the_shared_pool_slot_in_place_not_this_stale_guard {
+        if guard.is_none() && is_stateless_shared_plugin(plugin_name) {
+            const REINSTANTIATION_RETRY_ATTEMPTS: u32 = 3;
+            const REINSTANTIATION_RETRY_BACKOFF_MS: u64 = 250;
+            let mut last_waited_ms = waited_ms;
+            for attempt in 0..REINSTANTIATION_RETRY_ATTEMPTS {
+                let _ = self.reinstantiate_plugin_into_pool_slot_if_reload_source_available(plugin_name);
                 drop(guard);
                 pool = self
                     .siblings
@@ -451,17 +453,29 @@ impl DispatchHandle {
                     .cloned()
                     .ok_or_else(|| PluginDispatchError::NotRegistered { plugin_name: plugin_name.to_string() })?;
                 let (retry_guard, retry_waited_ms) = pool.acquire_within(SharedPluginPool::ACQUIRE_TIMEOUT_MS);
+                last_waited_ms = retry_waited_ms;
                 guard = retry_guard.ok_or_else(|| PluginDispatchError::PoolAcquireTimeout {
                     plugin_name: plugin_name.to_string(),
-                    waited_ms: retry_waited_ms,
+                    waited_ms: last_waited_ms,
                     pool_size,
                 })?;
+                if guard.is_some() {
+                    break;
+                }
+                if attempt + 1 < REINSTANTIATION_RETRY_ATTEMPTS {
+                    std::thread::sleep(std::time::Duration::from_millis(REINSTANTIATION_RETRY_BACKOFF_MS));
+                }
             }
             if guard.is_none() {
-                eprintln!("[agentplug registry] plugin {plugin_name} could not be reinstantiated after a poisoned-Store eviction (verb {verb}) -- no reload source available or reload failed");
-                log_poisoned_store_eviction_event(&self.root, plugin_name, verb, false, "reinstantiation failed or no reload source available");
+                eprintln!("[agentplug registry] plugin {plugin_name} could not be reinstantiated after a poisoned-Store eviction (verb {verb}) -- no reload source available, or every retry lost the race for a free pool slot under concurrent load");
+                log_poisoned_store_eviction_event(&self.root, plugin_name, verb, false, &format!("reinstantiation failed or no reload source available after {REINSTANTIATION_RETRY_ATTEMPTS} attempts, last_waited_ms={last_waited_ms}"));
                 return Err(PluginDispatchError::EvictedOrPoisoned { plugin_name: plugin_name.to_string() }.into());
             }
+        } else if guard.is_none() {
+            let _ = self.reinstantiate_plugin_into_pool_slot_if_reload_source_available(plugin_name);
+            eprintln!("[agentplug registry] plugin {plugin_name} could not be reinstantiated after a poisoned-Store eviction (verb {verb}) -- no reload source available or reload failed");
+            log_poisoned_store_eviction_event(&self.root, plugin_name, verb, false, "reinstantiation failed or no reload source available");
+            return Err(PluginDispatchError::EvictedOrPoisoned { plugin_name: plugin_name.to_string() }.into());
         }
         dispatch_and_evict_on_error(&mut guard, verb, body, &self.root, &self.siblings, plugin_name)
     }
