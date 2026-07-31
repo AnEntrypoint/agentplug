@@ -72,7 +72,7 @@ pub(crate) fn read_registry() -> Vec<PathBuf> {
         .collect()
 }
 
-#[derive(serde::Deserialize, Clone, Copy)]
+#[derive(serde::Deserialize, Clone)]
 struct DaemonConfig {
     #[serde(default)]
     registry_poll_interval_secs: Option<u64>,
@@ -80,6 +80,15 @@ struct DaemonConfig {
     heartbeat_interval_secs: Option<u64>,
     #[serde(default)]
     plugin_update_poll_interval_secs: Option<u64>,
+    /// Per-plugin poll-CHECK cadence overrides (e.g. `{"bert": 3600}`),
+    /// keyed by plugin name -- unlisted plugins use
+    /// `plugin_update_poll_interval_secs`. Independent of per-plugin RELOAD
+    /// independence (already unconditional: `refresh_plugin_if_stale` only
+    /// reloads a plugin whose own content hash actually changed) -- this
+    /// field controls how often the poll-check itself fires per plugin, not
+    /// whether a check that finds nothing new still reloads something.
+    #[serde(default)]
+    plugin_update_poll_interval_secs_by_name: std::collections::HashMap<String, u64>,
     #[serde(default)]
     runner_update_poll_interval_secs: Option<u64>,
     #[serde(default)]
@@ -100,6 +109,7 @@ const DAEMON_CONFIG_EXAMPLE: &str = r#"{
   "registry_poll_interval_secs": 5,
   "heartbeat_interval_secs": 10,
   "plugin_update_poll_interval_secs": 600,
+  "plugin_update_poll_interval_secs_by_name": {},
   "runner_update_poll_interval_secs": 3600,
   "instruction_source_poll_interval_secs": 600,
   "max_concurrent_projects": 4,
@@ -142,6 +152,7 @@ impl DaemonConfig {
                 registry_poll_interval_secs: None,
                 heartbeat_interval_secs: None,
                 plugin_update_poll_interval_secs: None,
+                plugin_update_poll_interval_secs_by_name: std::collections::HashMap::new(),
                 runner_update_poll_interval_secs: None,
                 instruction_source_poll_interval_secs: None,
                 max_concurrent_projects: None,
@@ -154,6 +165,12 @@ impl DaemonConfig {
     fn registry_poll_interval(&self) -> Duration { Duration::from_secs(self.registry_poll_interval_secs.unwrap_or(5)) }
     fn heartbeat_interval(&self) -> Duration { Duration::from_secs(self.heartbeat_interval_secs.unwrap_or(10)) }
     fn plugin_update_poll_interval(&self) -> Duration { Duration::from_secs(self.plugin_update_poll_interval_secs.unwrap_or(600)) }
+    fn plugin_update_poll_interval_for(&self, plugin_name: &str) -> Duration {
+        match self.plugin_update_poll_interval_secs_by_name.get(plugin_name) {
+            Some(secs) => Duration::from_secs(*secs),
+            None => self.plugin_update_poll_interval(),
+        }
+    }
     // Runner binaries update least often by design: they are the sole spool
     // loader and every project's daemon depends on one staying stable, so a
     // longer default poll cadence than plugin updates (600s) is deliberate,
@@ -1526,6 +1543,20 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
 
     let plugin_update_poll_interval = daemon_cfg.plugin_update_poll_interval();
     let instruction_source_poll_interval = daemon_cfg.instruction_source_poll_interval();
+    // The outer gate uses the SHORTEST configured interval across the
+    // default and every per-plugin override, so no plugin's own poll is ever
+    // delayed past its configured cadence by a longer default -- the actual
+    // per-plugin decision (skip a not-yet-due plugin this tick) happens
+    // inside the loop below via last_plugin_specific_poll.
+    let shortest_plugin_poll_interval = daemon_cfg
+        .plugin_update_poll_interval_secs_by_name
+        .values()
+        .copied()
+        .min()
+        .map(Duration::from_secs)
+        .map(|per_plugin| per_plugin.min(plugin_update_poll_interval))
+        .unwrap_or(plugin_update_poll_interval);
+    let mut last_plugin_specific_poll: HashMap<String, Instant> = HashMap::new();
     let mut last_plugin_update_poll = seed_poll_timer_from_persisted_ts(&persisted_plugin_poll_ts_path());
     let persisted_plugin_poll_ts_at_boot = read_persisted_poll_ts(&persisted_plugin_poll_ts_path());
     if persisted_plugin_poll_ts_at_boot > 0 {
@@ -1700,7 +1731,7 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
         }
 
         let forced_refresh_request = take_forced_plugin_refresh_request();
-        if last_plugin_update_poll.elapsed() >= plugin_update_poll_interval || forced_refresh_request.is_some() {
+        if last_plugin_update_poll.elapsed() >= shortest_plugin_poll_interval || forced_refresh_request.is_some() {
             last_plugin_update_poll = Instant::now();
             let poll_ts = now_ms();
             HEARTBEAT_LAST_PLUGIN_POLL_TS.store(poll_ts, std::sync::atomic::Ordering::Relaxed);
@@ -1711,6 +1742,23 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
             };
             let mut cycle_errors: Vec<String> = Vec::new();
             for plugin_name in targets {
+                // Forced refresh always bypasses this plugin's own cadence
+                // (the agent explicitly asked for it now); the ordinary tick
+                // only polls a plugin whose OWN interval has actually
+                // elapsed -- a project setting bert to 3600s no longer gets
+                // its poll-check re-fired every time libsql's shorter
+                // interval trips the outer gate.
+                let forced = matches!(&forced_refresh_request, Some(Some(name)) if name == &plugin_name);
+                if !forced {
+                    let due = last_plugin_specific_poll
+                        .get(&plugin_name)
+                        .map(|t| t.elapsed() >= daemon_cfg.plugin_update_poll_interval_for(&plugin_name))
+                        .unwrap_or(true);
+                    if !due {
+                        continue;
+                    }
+                }
+                last_plugin_specific_poll.insert(plugin_name.clone(), Instant::now());
                 match crate::download::refresh_plugin_if_stale(&plugin_name) {
                     Ok(Some(new_version)) => {
                         eprintln!(
