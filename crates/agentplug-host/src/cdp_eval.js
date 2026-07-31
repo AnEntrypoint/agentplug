@@ -130,8 +130,10 @@ const GL_ERROR_TRACKING_INIT_SCRIPT = `
         if (err !== gl.NO_ERROR) {
           window.__gmGlErrorTotalCount += 1;
           const mode = args[0];
-          const count = args[1];
-          const instanceCount = args[4];
+          const isArrays = fnName === 'drawArrays' || fnName === 'drawArraysInstanced';
+          const count = isArrays ? args[2] : args[1];
+          const first = isArrays ? args[1] : undefined;
+          const instanceCount = isArrays ? args[3] : args[4];
           const sig = fnName + '|' + err + '|' + mode + '|' + count + '|' + (instanceCount || 0);
           const existing = window.__gmGlErrors[sig];
           if (existing) {
@@ -139,7 +141,7 @@ const GL_ERROR_TRACKING_INIT_SCRIPT = `
             existing.lastDrawCallIndex = window.__gmGlDrawCalls[fnName];
           } else if (Object.keys(window.__gmGlErrors).length < MAX_SIGNATURES) {
             window.__gmGlErrors[sig] = {
-              fn: fnName, error: err, mode, count, instanceCount: instanceCount || 0,
+              fn: fnName, error: err, mode, count, first, instanceCount: instanceCount || 0,
               occurrenceCount: 1, lastDrawCallIndex: window.__gmGlDrawCalls[fnName],
               stack: new Error().stack,
             };
