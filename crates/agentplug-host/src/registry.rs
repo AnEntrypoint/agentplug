@@ -43,8 +43,15 @@ fn dispatch_call_deadline_secs(plugin_name: &str) -> u64 {
     }
 }
 
+// `libsql` is deliberately absent: it holds OPEN DATABASE HANDLES in its wasm
+// linear memory, so dropping its Store closes them under a guest that still
+// believes `SHARED_DB` is open. The next vector query then pays a cold reopen
+// of a multi-hundred-MB store and fails, which is exactly the recall outage
+// this predicate caused while it listed libsql as stateless.
+pub const RELEASABLE_SHARED_PLUGINS: [&str; 2] = ["bert", "treesitter"];
+
 fn is_stateless_shared_plugin(plugin_name: &str) -> bool {
-    matches!(plugin_name, "bert" | "treesitter" | "libsql" | "gm")
+    matches!(plugin_name, "bert" | "treesitter" | "gm")
 }
 
 #[derive(Debug)]
@@ -256,6 +263,9 @@ pub fn dispatch_on(
     let ptr = (packed & 0xffff_ffff) as u32;
     let len = (packed >> 32) as u32;
     if ptr == 0 || len == 0 {
+        eprintln!(
+            "[agentplug registry] plugin {plugin_name} verb {verb} returned a zero packed (ptr={ptr}, len={len}) -- the caller turns this into a bodyless ok:true, so a guest expecting rows sees none and reports a bare failure"
+        );
         return Ok(String::new());
     }
     let mut buf = vec![0u8; len as usize];

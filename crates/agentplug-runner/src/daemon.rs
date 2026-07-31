@@ -1093,7 +1093,7 @@ fn sweep_orphaned_claims(root: &Path) {
                 let out_body = serde_json::json!({
                     "ok": false,
                     "error_code": "dispatch_orphaned",
-                    "error": format!("verb {verb} (task {task}) was claimed by a daemon that died before answering -- most likely a wasm trap, an out-of-memory abort, or a shared-Store recycle during the call. The request was NOT completed and no partial work should be assumed. Re-dispatch it."),
+                    "error": format!("verb {verb} (task {task}) was claimed by a daemon that died before answering -- a wasm trap, an out-of-memory abort, a shared-Store recycle during the call, or a self-update handoff that exited while this dispatch was still running (check ~/.agentplug/daemon.log for a 'handed off to version' line at the matching time). The request was NOT completed and no partial work should be assumed. Re-dispatch it."),
                     "verb": verb,
                     "task": task,
                 }).to_string();
@@ -1418,7 +1418,7 @@ fn dispatch_project(root: &Path, project: &mut ProjectPlugins, plugin_modules: &
 
                 if let Some(reason) = shared_store_recycle_reason_independent_of_daemon_idle_state(&DaemonConfig::load()) {
                     let mut released: Vec<&str> = Vec::new();
-                    for shared_name in ["bert", "treesitter", "libsql"] {
+                    for shared_name in agentplug_host::RELEASABLE_SHARED_PLUGINS {
                         if shared_name != plugin_name && agentplug_host::release_shared_plugin(shared_name) {
                             released.push(shared_name);
                         }
@@ -1802,12 +1802,22 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
         let self_update_starved = pending_self_update_staged_at
             .map(|staged_at| staged_at.elapsed() >= Duration::from_millis(SELF_UPDATE_MAX_STARVED_MS))
             .unwrap_or(false);
-        if !any_work || self_update_starved {
+        // `any_work` only covers dispatches this loop iteration still owns a
+        // join handle for. An auto-detached dispatch (WORKER_AUTO_DETACH_AFTER_MS)
+        // keeps running on a thread the loop has let go of, so `any_work` goes
+        // false while a real call is still executing -- handing off there kills
+        // it and the caller gets a `dispatch_orphaned` whose text blames a wasm
+        // trap/OOM/Store-recycle rather than the handoff that actually did it.
+        // in_flight_map keeps the detached entry until its thread is joined, so
+        // it is the signal that survives detachment.
+        let detached_still_running = !in_flight_map().lock().unwrap_or_else(|e| e.into_inner()).is_empty();
+        if (!any_work && !detached_still_running) || self_update_starved {
             if let Some((staged, version)) = pending_self_update.take() {
                 if self_update_starved {
                     eprintln!(
-                        "[agentplug daemon] self-update to {version} starved for {}ms under continuous load -- forcing handoff despite in-flight work",
-                        SELF_UPDATE_MAX_STARVED_MS
+                        "[agentplug daemon] self-update to {version} starved for {}ms under continuous load -- forcing handoff despite {} in-flight dispatch(es); their callers will see dispatch_orphaned",
+                        SELF_UPDATE_MAX_STARVED_MS,
+                        in_flight_map().lock().unwrap_or_else(|e| e.into_inner()).len()
                     );
                 }
                 if attempt_self_update_handoff(&staged, &version) {
@@ -1821,7 +1831,7 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
 
         if let Some(reason) = shared_store_recycle_reason_independent_of_daemon_idle_state(&daemon_cfg) {
             let mut released: Vec<&str> = Vec::new();
-            for plugin_name in ["bert", "treesitter", "libsql"] {
+            for plugin_name in agentplug_host::RELEASABLE_SHARED_PLUGINS {
                 if agentplug_host::release_shared_plugin(plugin_name) {
                     released.push(plugin_name);
                 }
@@ -1840,7 +1850,7 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
             last_shared_release = Instant::now();
         } else if last_shared_release.elapsed() >= Duration::from_millis(SHARED_PLUGIN_RELEASE_IDLE_MS) {
             let mut released: Vec<&str> = Vec::new();
-            for plugin_name in ["bert", "treesitter", "libsql"] {
+            for plugin_name in agentplug_host::RELEASABLE_SHARED_PLUGINS {
                 if agentplug_host::release_shared_plugin(plugin_name) {
                     released.push(plugin_name);
                 }
