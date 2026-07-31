@@ -1452,6 +1452,39 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
     let mut pending_self_update_staged_at: Option<Instant> = None;
     const SELF_UPDATE_MAX_STARVED_MS: u64 = 10 * 60 * 1000;
 
+    if let Some((staged_at_ms, _len)) = staged_runner_awaiting_handoff() {
+        if let Some(staged_path) = canonical_runner_exe_path().map(|c| {
+            c.with_extension(c.extension().map(|e| format!("{}.new", e.to_string_lossy())).unwrap_or_else(|| "new".to_string()))
+        }) {
+            let staged_age = now_ms().saturating_sub(staged_at_ms);
+            match std::process::Command::new(&staged_path).arg("--version").output() {
+                Ok(out) if out.status.success() => {
+                    let version = String::from_utf8_lossy(&out.stdout).trim().trim_start_matches('v').to_string();
+                    eprintln!(
+                        "[agentplug daemon] found pre-existing staged runner {} (version {version}) at boot, age {}ms -- adopting its on-disk mtime so a daemon restart does not reset the starve clock",
+                        staged_path.display(), staged_age
+                    );
+                    pending_self_update = Some((staged_path, version));
+                    pending_self_update_staged_at = Instant::now().checked_sub(Duration::from_millis(staged_age));
+                }
+                Ok(out) => {
+                    eprintln!(
+                        "[agentplug daemon] pre-existing staged runner {} at boot failed --version check (exit {}) -- removing stale/corrupt staged binary",
+                        staged_path.display(), out.status
+                    );
+                    let _ = fs::remove_file(&staged_path);
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[agentplug daemon] pre-existing staged runner {} at boot could not be spawned for --version ({e}) -- removing stale/corrupt staged binary",
+                        staged_path.display()
+                    );
+                    let _ = fs::remove_file(&staged_path);
+                }
+            }
+        }
+    }
+
     let mut last_instruction_source_sync: HashMap<PathBuf, Instant> = HashMap::new();
 
     let mut last_browser_orphan_sweep = Instant::now()
