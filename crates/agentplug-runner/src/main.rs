@@ -6,7 +6,21 @@ use std::path::PathBuf;
 use agentplug_host::{build_engine, ProjectPlugins};
 use wasmtime::Module;
 
+#[cfg(windows)]
+fn suppress_crash_dialogs() {
+    use windows_sys::Win32::System::Diagnostics::Debug::{
+        SetErrorMode, SEM_FAILCRITICALERRORS, SEM_NOGPFAULTERRORBOX,
+    };
+    unsafe {
+        SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX);
+    }
+}
+
+#[cfg(not(windows))]
+fn suppress_crash_dialogs() {}
+
 fn main() -> anyhow::Result<()> {
+    suppress_crash_dialogs();
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         agentplug_host::close_all_sessions();
