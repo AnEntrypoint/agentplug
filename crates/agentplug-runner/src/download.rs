@@ -102,7 +102,10 @@ pub fn stage_runner_self_update() -> anyhow::Result<Option<(PathBuf, String)>> {
     if marker_is_trustworthy_and_current(latest.as_str()) {
         return Ok(None);
     }
-    let current_exe = std::env::current_exe()?;
+    let mut current_exe = std::env::current_exe()?;
+    while current_exe.extension().map(|e| e.eq_ignore_ascii_case("new")).unwrap_or(false) {
+        current_exe = current_exe.with_extension("");
+    }
     let staged = current_exe.with_extension(
         current_exe.extension().map(|e| format!("{}.new", e.to_string_lossy())).unwrap_or_else(|| "new".to_string())
     );

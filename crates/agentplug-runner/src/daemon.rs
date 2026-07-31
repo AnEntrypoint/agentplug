@@ -628,11 +628,27 @@ fn canonical_runner_exe_path() -> Option<PathBuf> {
     Some(path)
 }
 
+fn staged_matches_running(canonical: &Path, staged: &Path) -> bool {
+    let Ok(running_meta) = fs::metadata(canonical) else { return false };
+    let Ok(staged_meta) = fs::metadata(staged) else { return false };
+    if running_meta.len() != staged_meta.len() {
+        return false;
+    }
+    let Ok(running_bytes) = fs::read(canonical) else { return false };
+    let Ok(staged_bytes) = fs::read(staged) else { return false };
+    running_bytes == staged_bytes
+}
+
 fn staged_runner_awaiting_handoff() -> Option<(u64, u64)> {
     let canonical = canonical_runner_exe_path()?;
     let staged = canonical.with_extension(
         canonical.extension().map(|e| format!("{}.new", e.to_string_lossy())).unwrap_or_else(|| "new".to_string()),
     );
+    if staged_matches_running(&canonical, &staged) {
+        let _ = fs::remove_file(&staged);
+        let _ = fs::remove_file(takeover_ready_path());
+        return None;
+    }
     let meta = fs::metadata(&staged).ok()?;
     let staged_at_ms = meta
         .modified()
