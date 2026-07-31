@@ -19,6 +19,12 @@ pub struct HostState {
     pub plugin_name: String,
     pub self_instance: Arc<Mutex<Option<wasmtime::Instance>>>,
     siblings: Mutex<Arc<Mutex<HashMap<String, Arc<SharedPluginPool>>>>>,
+    /// Set when a host response could not be handed to the guest -- the guest
+    /// receives a zero packed value, which is indistinguishable from a genuine
+    /// empty response unless the reason is recorded out of band. `dispatch_on`
+    /// reads and clears it so a lost response fails loudly instead of arriving
+    /// as a bodyless success.
+    lost_response_reason: Mutex<Option<String>>,
     pub wasi: WasiP1Ctx,
 }
 
@@ -39,6 +45,7 @@ impl HostState {
             plugin_name,
             self_instance: Arc::new(Mutex::new(None)),
             siblings: Mutex::new(Arc::new(Mutex::new(HashMap::new()))),
+            lost_response_reason: Mutex::new(None),
             wasi,
         }
     }
@@ -55,6 +62,7 @@ impl HostState {
             plugin_name,
             self_instance: Arc::new(Mutex::new(None)),
             siblings: Mutex::new(Arc::new(Mutex::new(HashMap::new()))),
+            lost_response_reason: Mutex::new(None),
             wasi,
         }
     }
@@ -73,5 +81,13 @@ impl HostState {
 
     pub fn cwd(&self) -> PathBuf {
         self.cwd.lock().unwrap().clone()
+    }
+
+    pub fn note_lost_response(&self, reason: String) {
+        *self.lost_response_reason.lock().unwrap_or_else(|e| e.into_inner()) = Some(reason);
+    }
+
+    pub fn take_lost_response(&self) -> Option<String> {
+        self.lost_response_reason.lock().unwrap_or_else(|e| e.into_inner()).take()
     }
 }

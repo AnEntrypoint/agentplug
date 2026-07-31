@@ -150,10 +150,12 @@ fn write_guest_bytes(caller: &mut Caller<'_, HostState>, bytes: &[u8]) -> u64 {
         return 0;
     }
     if bytes.len() > PACKED_ABI_FIELD_MAX {
-        eprintln!(
-            "[agentplug host] write_guest_bytes: {} bytes exceeds the 32-bit packed-ABI field -- returning 0, which the guest reads as a null response",
+        let reason = format!(
+            "host response of {} bytes exceeds the 32-bit packed-ABI field",
             bytes.len()
         );
+        eprintln!("[agentplug host] write_guest_bytes: {reason} -- returning 0, which the guest reads as a null response");
+        caller.data().note_lost_response(reason);
         return 0;
     }
     let instance = caller
@@ -169,20 +171,25 @@ fn write_guest_bytes(caller: &mut Caller<'_, HostState>, bytes: &[u8]) -> u64 {
         Ok(ptr) => {
             let memory = guest_memory(caller);
             if memory.write(&mut *caller, ptr as usize, bytes).is_err() {
-                eprintln!(
-                    "[agentplug host] write_guest_bytes: guest memory.write of {} bytes at ptr {ptr} failed -- returning 0, which the guest reads as a null response",
+                let reason = format!(
+                    "guest memory.write of {} bytes at ptr {ptr} failed",
                     bytes.len()
                 );
+                eprintln!("[agentplug host] write_guest_bytes: {reason} -- returning 0, which the guest reads as a null response");
+                caller.data().note_lost_response(reason);
                 return 0;
             }
             pack_guest_ptr_len(ptr, bytes.len())
         }
         Err(e) => {
             let interrupted = matches!(e.downcast_ref::<wasmtime::Trap>(), Some(wasmtime::Trap::Interrupt));
-            eprintln!(
-                "[agentplug host] write_guest_bytes: plugkit_alloc({}) failed (interrupted={interrupted}): {e} -- returning 0, which the guest reads as a null response",
-                bytes.len()
-            );
+            let reason = if interrupted {
+                format!("plugkit_alloc({}) hit the epoch deadline while handing the host response back to the guest", bytes.len())
+            } else {
+                format!("plugkit_alloc({}) failed: {e}", bytes.len())
+            };
+            eprintln!("[agentplug host] write_guest_bytes: {reason} -- returning 0, which the guest reads as a null response");
+            caller.data().note_lost_response(reason);
             if interrupted {
                 caller.as_context_mut().set_epoch_deadline(crate::registry::epoch_ticks_for_seconds(crate::registry::DISPATCH_CALL_DEADLINE_SECS));
             }

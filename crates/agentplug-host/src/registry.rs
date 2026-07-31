@@ -232,6 +232,7 @@ pub fn dispatch_on(
 ) -> anyhow::Result<String> {
     store.data().set_cwd(caller_root.to_path_buf());
     store.data().set_siblings(caller_siblings);
+    let _ = store.data().take_lost_response();
     let plugin_name = store.data().plugin_name.clone();
     if is_stateless_shared_plugin(&plugin_name) {
         crate::memory_pressure::note_shared_plugin_dispatch();
@@ -263,8 +264,18 @@ pub fn dispatch_on(
     let ptr = (packed & 0xffff_ffff) as u32;
     let len = (packed >> 32) as u32;
     if ptr == 0 || len == 0 {
+        // A zero packed value has two very different meanings: the plugin
+        // genuinely returned nothing, or a host response was built and then
+        // lost on its way into guest memory. Only the second is a failure, and
+        // reporting both as an empty success is what made a deadline abort
+        // indistinguishable from a plugin's own empty answer.
+        if let Some(reason) = store.data().take_lost_response() {
+            return Err(anyhow::anyhow!(
+                "plugin_response_lost: {plugin_name} verb {verb} produced a response that never reached the guest -- {reason}"
+            ));
+        }
         eprintln!(
-            "[agentplug registry] plugin {plugin_name} verb {verb} returned a zero packed (ptr={ptr}, len={len}) -- the caller turns this into a bodyless ok:true, so a guest expecting rows sees none and reports a bare failure"
+            "[agentplug registry] plugin {plugin_name} verb {verb} returned a zero packed (ptr={ptr}, len={len}) with no recorded write failure -- treating it as a genuine empty response"
         );
         return Ok(String::new());
     }
