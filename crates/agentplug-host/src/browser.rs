@@ -507,9 +507,31 @@ fn kill_pid(pid: u32) {
 }
 
 #[cfg(windows)]
+const WMI_CIRCUIT_BREAKER_COOLDOWN_MS: u64 = 300_000;
+
+#[cfg(windows)]
+static WMI_LAST_TIMEOUT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(windows)]
+fn wmi_circuit_breaker_open() -> bool {
+    let last = WMI_LAST_TIMEOUT_MS.load(std::sync::atomic::Ordering::Relaxed);
+    if last == 0 {
+        return false;
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    now.saturating_sub(last) < WMI_CIRCUIT_BREAKER_COOLDOWN_MS
+}
+
+#[cfg(windows)]
 fn list_chrome_processes() -> Vec<(u32, String)> {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    if wmi_circuit_breaker_open() {
+        return Vec::new();
+    }
     let mut cmd = Command::new("powershell.exe");
     cmd.args([
         "-NoProfile",
@@ -519,8 +541,13 @@ fn list_chrome_processes() -> Vec<(u32, String)> {
     ])
     .creation_flags(CREATE_NO_WINDOW);
     let Some(stdout) = run_bounded_capturing_stdout(&mut cmd) else {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        WMI_LAST_TIMEOUT_MS.store(now, std::sync::atomic::Ordering::Relaxed);
         eprintln!(
-            "[agentplug browser] list_chrome_processes: Get-CimInstance (WMI) did not answer within {ORPHAN_SCAN_SUBPROCESS_TIMEOUT_MS}ms -- killed the stalled powershell.exe and returning empty rather than blocking the daemon's main loop forever. Orphan reaping will simply see no chrome processes this pass and retry next cycle."
+            "[agentplug browser] list_chrome_processes: Get-CimInstance (WMI) did not answer within {ORPHAN_SCAN_SUBPROCESS_TIMEOUT_MS}ms -- killed the stalled powershell.exe and returning empty. Circuit breaker opened for {WMI_CIRCUIT_BREAKER_COOLDOWN_MS}ms: further orphan-reap passes in that window skip the WMI call entirely instead of re-paying the same timeout every loop iteration and starving real project dispatch."
         );
         return Vec::new();
     };
