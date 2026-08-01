@@ -114,6 +114,15 @@ fn main() -> anyhow::Result<()> {
             let module = Module::from_file(&engine, &wasm)?;
             let mut project = ProjectPlugins::new(cwd);
             project.load_plugin(&engine, &plugin, &module, &content_hash)?;
+            for side in ["libsql", "bert", "treesitter"] {
+                if side == plugin {
+                    continue;
+                }
+                let Ok(side_wasm) = download::ensure_plugin_installed(side, None) else { continue };
+                let Ok(side_bytes) = std::fs::read(&side_wasm) else { continue };
+                let Ok(side_module) = Module::from_file(&engine, &side_wasm) else { continue };
+                let _ = project.load_plugin(&engine, side, &side_module, &download::sha256_hex(&side_bytes));
+            }
             let out = project.dispatch(&plugin, &verb, &body)?;
             println!("{out}");
             Ok(())
