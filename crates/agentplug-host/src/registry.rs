@@ -43,6 +43,33 @@ fn dispatch_call_deadline_secs(plugin_name: &str) -> u64 {
     }
 }
 
+/// The packed-ABI signature of `host_plugin_call` carries no budget, so the
+/// deadline was previously the host's alone to choose -- unlike `exec_js`,
+/// where `timeoutMs` is mandatory and caller-supplied. A caller that knows its
+/// call is slow (a large embed batch) or that wants to fail fast (a health
+/// probe) had no way to say so, and discovered the host's choice only by
+/// being killed at it.
+///
+/// Adding a parameter would break every existing plugin, so the budget rides
+/// in the body, which is already JSON: `{"deadline_secs": N}`. Absent or
+/// unparseable leaves the per-plugin default exactly as it was, so every
+/// existing caller is unaffected. Clamped to a sane ceiling so a caller
+/// cannot disable the epoch guard entirely by asking for a huge budget.
+const CALLER_SUPPLIED_DEADLINE_CEILING_SECS: u64 = 3600;
+
+fn deadline_secs_for_call(plugin_name: &str, body: &str) -> u64 {
+    let default_secs = dispatch_call_deadline_secs(plugin_name);
+    if !body.contains("deadline_secs") {
+        return default_secs;
+    }
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v.get("deadline_secs").and_then(|d| d.as_u64()))
+        .filter(|s| *s > 0)
+        .map(|s| s.min(CALLER_SUPPLIED_DEADLINE_CEILING_SECS))
+        .unwrap_or(default_secs)
+}
+
 // `libsql` is deliberately absent: it holds OPEN DATABASE HANDLES in its wasm
 // linear memory, so dropping its Store closes them under a guest that still
 // believes `SHARED_DB` is open. The next vector query then pays a cold reopen
@@ -237,7 +264,7 @@ pub fn dispatch_on(
     if is_stateless_shared_plugin(&plugin_name) {
         crate::memory_pressure::note_shared_plugin_dispatch();
     }
-    let call_deadline_secs = dispatch_call_deadline_secs(&plugin_name);
+    let call_deadline_secs = deadline_secs_for_call(&plugin_name, body);
     store.set_epoch_deadline(epoch_ticks_for_seconds(call_deadline_secs));
     let alloc = instance.get_typed_func::<u32, u32>(&mut *store, "plugkit_alloc")?;
     let memory = instance.get_memory(&mut *store, "memory").ok_or_else(|| anyhow::anyhow!("plugin {plugin_name} has no exported memory"))?;

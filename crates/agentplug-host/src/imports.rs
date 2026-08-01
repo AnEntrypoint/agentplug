@@ -9,6 +9,17 @@ use wasmtime::{AsContextMut, Caller, Linker, Memory};
 
 use crate::host_state::HostState;
 
+// ureq's `tls` feature already bundles rustls + webpki-roots -- Mozilla's
+// root CA set compiled in, never consulting an OS certificate store -- so
+// this agent is immune to a sandboxed environment lacking OS trust anchors
+// by construction, with no extra wiring needed. Built once, not per-request:
+// constructing an Agent parses the whole root bundle, and every fetch()
+// dispatch reuses this one.
+fn fetch_agent() -> &'static ureq::Agent {
+    static AGENT: std::sync::OnceLock<ureq::Agent> = std::sync::OnceLock::new();
+    AGENT.get_or_init(|| ureq::AgentBuilder::new().timeout(Duration::from_secs(10)).build())
+}
+
 const GIT_SUBPROCESS_TIMEOUT_MS_DEFAULT_AMPLE_FOR_SLOW_PUSH_FETCH_OR_FIRST_CLONE: u64 = 120_000;
 
 #[derive(serde::Deserialize)]
@@ -372,8 +383,7 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
                 if opts_str.is_empty() { serde_json::json!({}) } else { serde_json::from_str(&opts_str).unwrap_or(serde_json::json!({})) };
             let method = opts.get("method").and_then(|v| v.as_str()).unwrap_or("GET").to_uppercase();
             let body = opts.get("body").and_then(|v| v.as_str());
-            let agent = ureq::AgentBuilder::new().timeout(std::time::Duration::from_secs(10)).build();
-            let req = agent.request(&method, &url);
+            let req = fetch_agent().request(&method, &url);
             let resp = match body {
                 Some(b) => req.send_string(b),
                 None => req.call(),
@@ -382,13 +392,13 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
                 Ok(r) => {
                     let status = r.status();
                     let text = r.into_string().unwrap_or_default();
-                    serde_json::json!({"status": status, "body": text})
+                    serde_json::json!({"ok": true, "status": status, "body": text})
                 }
                 Err(ureq::Error::Status(code, r)) => {
                     let text = r.into_string().unwrap_or_default();
-                    serde_json::json!({"status": code, "body": text})
+                    serde_json::json!({"ok": false, "status": code, "body": text})
                 }
-                Err(e) => serde_json::json!({"status": 0, "error": e.to_string()}),
+                Err(e) => serde_json::json!({"ok": false, "status": 0, "error": e.to_string()}),
             };
             write_guest_json(&mut caller, result)
         },
