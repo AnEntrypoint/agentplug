@@ -171,6 +171,8 @@ fn write_guest_bytes(caller: &mut Caller<'_, HostState>, bytes: &[u8]) -> u64 {
     let alloc = instance
         .get_typed_func::<u32, u32>(&mut *caller, "plugkit_alloc")
         .expect("plugkit_alloc export missing on wasm module");
+    const RESPONSE_HANDOFF_GRACE_SECS: u64 = 5;
+    caller.as_context_mut().set_epoch_deadline(crate::registry::epoch_ticks_for_seconds(RESPONSE_HANDOFF_GRACE_SECS));
     match alloc.call(&mut *caller, bytes.len() as u32) {
         Ok(ptr) => {
             let memory = guest_memory(caller);
