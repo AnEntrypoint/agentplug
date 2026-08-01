@@ -18,7 +18,7 @@ fn registry_path() -> PathBuf {
 
 fn cwd_is_inside_a_spool_tree(cwd: &Path) -> bool {
     cwd.components().any(|c| c.as_os_str() == ".gm")
-        && cwd.to_string_lossy().replace('\', "/").contains("/.gm/exec-spool")
+        && cwd.to_string_lossy().replace('\\', "/").contains("/.gm/exec-spool")
 }
 
 pub fn register_project(cwd: &Path) -> anyhow::Result<()> {
@@ -918,6 +918,24 @@ fn loaded_plugin_content_hashes() -> &'static Mutex<HashMap<String, String>> {
     LOADED_PLUGIN_CONTENT_HASHES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+static LAST_PLUGIN_COMPILE_FAILURE: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+
+fn last_plugin_compile_failure() -> &'static Mutex<HashMap<String, String>> {
+    LAST_PLUGIN_COMPILE_FAILURE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn record_plugin_compile_failure(plugin_name: &str, reason: String) {
+    last_plugin_compile_failure().lock().unwrap_or_else(|e| e.into_inner()).insert(plugin_name.to_string(), reason);
+}
+
+fn clear_plugin_compile_failure(plugin_name: &str) {
+    last_plugin_compile_failure().lock().unwrap_or_else(|e| e.into_inner()).remove(plugin_name);
+}
+
+fn read_plugin_compile_failure(plugin_name: &str) -> Option<String> {
+    last_plugin_compile_failure().lock().unwrap_or_else(|e| e.into_inner()).get(plugin_name).cloned()
+}
+
 static HEARTBEAT_AUTHORITY_LOST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn heartbeat_authority_lost() -> bool {
@@ -1199,13 +1217,23 @@ fn dispatch_project(root: &Path, project: &mut ProjectPlugins, plugin_modules: &
 
     write_project_heartbeat(&spool_dir, None);
 
+    // Additive, never replacing. A non-empty .agentplug/plugins.txt used to
+    // REPLACE this set, so a project naming the three side plugins silently
+    // dropped `gm` itself and every dispatch failed to load -- observed live,
+    // and the failure names the plugin that WAS listed rather than the one
+    // that went missing, which makes it hard to attribute. Listing a plugin
+    // should only ever add reach, never remove it.
     let requested_plugins = {
-        let mut list = read_project_plugin_list(root);
-        if list.is_empty() {
-            list.push("gm".to_string());
-            list.push("libsql".to_string());
-            list.push("bert".to_string());
-            list.push("treesitter".to_string());
+        let mut list = vec![
+            "gm".to_string(),
+            "libsql".to_string(),
+            "bert".to_string(),
+            "treesitter".to_string(),
+        ];
+        for extra in read_project_plugin_list(root) {
+            if !list.contains(&extra) {
+                list.push(extra);
+            }
         }
         list
     };
@@ -1273,23 +1301,35 @@ fn dispatch_project(root: &Path, project: &mut ProjectPlugins, plugin_modules: &
     if gm_requests.is_empty() {
         answer_bg_converts(bg_convert_requests);
     } else {
+        let mut gm_load_failure_reason: Option<String> = None;
         for plugin_name in &requested_plugins {
             if project.is_loaded(plugin_name) {
                 continue;
             }
             let Some((module, content_hash)) = plugin_modules.module_with_hash(plugin_name) else {
-                eprintln!("[agentplug daemon] plugin {plugin_name} not yet compiled for {}: dispatch this thread's own get_or_compile could not run against the shared PluginModules from a worker thread -- see plugin_modules.get_or_compile() call in run_daemon's pre-chunk warm pass", root.display());
+                let reason = match read_plugin_compile_failure(plugin_name) {
+                    Some(compile_err) => format!("plugin {plugin_name} failed to compile/install: {compile_err}"),
+                    None => format!("plugin {plugin_name} not yet compiled for {}: dispatch this thread's own get_or_compile could not run against the shared PluginModules from a worker thread -- see plugin_modules.get_or_compile() call in run_daemon's pre-chunk warm pass", root.display()),
+                };
+                eprintln!("[agentplug daemon] {reason}");
+                if plugin_name == "gm" { gm_load_failure_reason = Some(reason); }
                 continue;
             };
             if let Err(e) = project.load_plugin(&plugin_modules.engine, plugin_name, module, content_hash) {
-                eprintln!("[agentplug daemon] failed to instantiate plugin {plugin_name} for {}: {e:#}", root.display());
+                let reason = format!("failed to instantiate plugin {plugin_name} for {}: {e:#}", root.display());
+                eprintln!("[agentplug daemon] {reason}");
+                if plugin_name == "gm" { gm_load_failure_reason = Some(reason); }
             }
         }
 
         if !project.is_loaded("gm") {
+            let error_message = match &gm_load_failure_reason {
+                Some(reason) => format!("gm plugin failed to load for this project: {reason}"),
+                None => "gm plugin failed to load for this project (see daemon stderr for the compile/install/instantiate failure)".to_string(),
+            };
             for req in &gm_requests {
                 let out_name = format!("{}-{}.json", req.verb, req.task);
-                let out_body = serde_json::json!({"ok": false, "error": "gm plugin failed to load for this project (see daemon stderr for the compile/install/instantiate failure)", "verb": req.verb}).to_string();
+                let out_body = serde_json::json!({"ok": false, "error": error_message, "verb": req.verb}).to_string();
                 write_spool_out(&out_dir, &out_name, &out_body);
                 let _ = fs::remove_file(inflight_claim_path(&in_dir, &req.verb, &req.task));
             }
@@ -1711,8 +1751,12 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
 
         for root in &known_roots {
             for plugin_name in read_project_plugin_list(root) {
-                if let Err(e) = plugin_modules.get_or_compile(&plugin_name) {
-                    eprintln!("[agentplug daemon] failed to compile/install plugin {plugin_name} for {}: {e:#}", root.display());
+                match plugin_modules.get_or_compile(&plugin_name) {
+                    Ok(()) => clear_plugin_compile_failure(&plugin_name),
+                    Err(e) => {
+                        eprintln!("[agentplug daemon] failed to compile/install plugin {plugin_name} for {}: {e:#}", root.display());
+                        record_plugin_compile_failure(&plugin_name, format!("{e:#}"));
+                    }
                 }
             }
             let due = last_instruction_source_sync
@@ -1730,8 +1774,12 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
             }
         }
         for plugin_name in ["gm", "libsql", "bert", "treesitter"] {
-            if let Err(e) = plugin_modules.get_or_compile(plugin_name) {
-                eprintln!("[agentplug daemon] failed to compile/install default plugin {plugin_name}: {e:#}");
+            match plugin_modules.get_or_compile(plugin_name) {
+                Ok(()) => clear_plugin_compile_failure(plugin_name),
+                Err(e) => {
+                    eprintln!("[agentplug daemon] failed to compile/install default plugin {plugin_name}: {e:#}");
+                    record_plugin_compile_failure(plugin_name, format!("{e:#}"));
+                }
             }
         }
 
