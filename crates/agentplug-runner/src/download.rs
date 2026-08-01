@@ -12,7 +12,7 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
 }
 
 fn github_api_request(url: &str) -> ureq::Request {
-    let req = ureq::get(url).set("User-Agent", "agentplug-runner");
+    let req = agentplug_host::shared_agent().get(url).set("User-Agent", "agentplug-runner");
     match std::env::var("GITHUB_TOKEN").or_else(|_| std::env::var("GH_TOKEN")) {
         Ok(token) if !token.is_empty() => req.set("Authorization", &format!("Bearer {token}")),
         _ => req,
@@ -34,7 +34,7 @@ fn describe_github_api_error(url: &str, err: ureq::Error) -> anyhow::Error {
 }
 
 pub fn download_and_verify(url: &str, dest: &Path, expected_sha256_hex: &str) -> anyhow::Result<()> {
-    let resp = ureq::get(url).call()?;
+    let resp = agentplug_host::shared_agent().get(url).call()?;
     let mut reader = resp.into_reader();
     let mut bytes = Vec::new();
     let mut buf = [0u8; 65536];
@@ -207,7 +207,7 @@ pub fn stage_runner_self_update() -> anyhow::Result<Option<(PathBuf, String)>> {
         current_exe.extension().map(|e| format!("{}.{staged_suffix}", e.to_string_lossy())).unwrap_or_else(|| staged_suffix.to_string())
     );
     let base = format!("https://github.com/{RUNNER_BIN_REPO}/releases/download/v{latest}");
-    let sha_line = ureq::get(&format!("{base}/{asset}.sha256")).call()?.into_string()?;
+    let sha_line = agentplug_host::shared_agent().get(&format!("{base}/{asset}.sha256")).call()?.into_string()?;
     let expected_sha = sha_line.split_whitespace().next()
         .ok_or_else(|| anyhow::anyhow!("empty sha256 sidecar for {asset} at {base}"))?.to_string();
     download_and_verify(&format!("{base}/{asset}"), &staged, &expected_sha)?;
@@ -343,10 +343,10 @@ pub fn ensure_plugin_installed(plugin_name: &str, explicit_version: Option<&str>
     let base = format!("https://github.com/{}/releases/download/v{version}", spec.repo);
 
     let sha_url = format!("{base}/{}.wasm.sha256", spec.asset_basename);
-    let sha_resp = match ureq::get(&sha_url).call() {
+    let sha_resp = match agentplug_host::shared_agent().get(&sha_url).call() {
         Ok(resp) => resp,
         Err(_) if spec.asset_basename == "plugkit-slim" => {
-            ureq::get(&format!("{base}/plugkit.wasm.sha256")).call()?
+            agentplug_host::shared_agent().get(&format!("{base}/plugkit.wasm.sha256")).call()?
         }
         Err(e) => return Err(e.into()),
     };

@@ -9,15 +9,8 @@ use wasmtime::{AsContextMut, Caller, Linker, Memory};
 
 use crate::host_state::HostState;
 
-// ureq's `tls` feature already bundles rustls + webpki-roots -- Mozilla's
-// root CA set compiled in, never consulting an OS certificate store -- so
-// this agent is immune to a sandboxed environment lacking OS trust anchors
-// by construction, with no extra wiring needed. Built once, not per-request:
-// constructing an Agent parses the whole root bundle, and every fetch()
-// dispatch reuses this one.
 fn fetch_agent() -> &'static ureq::Agent {
-    static AGENT: std::sync::OnceLock<ureq::Agent> = std::sync::OnceLock::new();
-    AGENT.get_or_init(|| ureq::AgentBuilder::new().timeout(Duration::from_secs(10)).build())
+    crate::http_agent::shared_agent()
 }
 
 const GIT_SUBPROCESS_TIMEOUT_MS_DEFAULT_AMPLE_FOR_SLOW_PUSH_FETCH_OR_FIRST_CLONE: u64 = 120_000;

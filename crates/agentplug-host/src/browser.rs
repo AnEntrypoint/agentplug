@@ -69,7 +69,42 @@ fn which(cmd: &str) -> Option<PathBuf> {
     })
 }
 
+fn explicit_chrome_path_override() -> Option<PathBuf> {
+    std::env::var_os("GM_BROWSER_CHROME_PATH")
+        .or_else(|| std::env::var_os("CHROME_PATH"))
+        .map(PathBuf::from)
+        .filter(|p| p.exists())
+}
+
+fn find_chrome_under_playwright_browsers_path() -> Option<PathBuf> {
+    let root = std::env::var_os("PLAYWRIGHT_BROWSERS_PATH")?;
+    let root = PathBuf::from(root);
+    if !root.is_dir() {
+        return None;
+    }
+    let exe_name = if cfg!(windows) { "chrome.exe" } else { "chrome" };
+    let mut stack = vec![root];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.file_name().and_then(|n| n.to_str()) == Some(exe_name) {
+                return Some(path);
+            }
+        }
+    }
+    None
+}
+
 fn find_chrome() -> Option<PathBuf> {
+    if let Some(p) = explicit_chrome_path_override() {
+        return Some(p);
+    }
+    if let Some(p) = find_chrome_under_playwright_browsers_path() {
+        return Some(p);
+    }
     let candidates = if cfg!(windows) {
         vec![
             PathBuf::from(r"C:\Program Files\Google\Chrome\Application\chrome.exe"),
@@ -268,19 +303,39 @@ fn pid_sidecar_path(profile_dir: &Path) -> PathBuf {
 }
 
 #[cfg(windows)]
+const ORPHAN_SCAN_SUBPROCESS_TIMEOUT_MS: u64 = 10_000;
+
+#[cfg(windows)]
+fn run_bounded_capturing_stdout(cmd: &mut Command) -> Option<Vec<u8>> {
+    let mut child = cmd.stdout(std::process::Stdio::piped()).spawn().ok()?;
+    match child.wait_timeout(Duration::from_millis(ORPHAN_SCAN_SUBPROCESS_TIMEOUT_MS)) {
+        Ok(Some(_)) => {
+            let mut stdout = Vec::new();
+            if let Some(mut o) = child.stdout.take() {
+                let _ = std::io::Read::read_to_end(&mut o, &mut stdout);
+            }
+            Some(stdout)
+        }
+        _ => {
+            let _ = child.kill();
+            let _ = child.wait();
+            None
+        }
+    }
+}
+
+#[cfg(windows)]
 fn pid_is_alive(pid: u32) -> bool {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    let output = Command::new("tasklist")
-        .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
-        .creation_flags(CREATE_NO_WINDOW)
-        .output();
-    match output {
-        Ok(o) => {
-            let s = String::from_utf8_lossy(&o.stdout);
+    let mut cmd = Command::new("tasklist");
+    cmd.args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"]).creation_flags(CREATE_NO_WINDOW);
+    match run_bounded_capturing_stdout(&mut cmd) {
+        Some(stdout) => {
+            let s = String::from_utf8_lossy(&stdout);
             s.lines().next().map(|l| l.contains(',')).unwrap_or(false)
         }
-        Err(_) => true,
+        None => true,
     }
 }
 
@@ -455,17 +510,21 @@ fn kill_pid(pid: u32) {
 fn list_chrome_processes() -> Vec<(u32, String)> {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    let output = Command::new("powershell.exe")
-        .args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            "Get-CimInstance Win32_Process -Filter \"Name='chrome.exe'\" | ForEach-Object { \"$($_.ProcessId)|$($_.CommandLine)\" }",
-        ])
-        .creation_flags(CREATE_NO_WINDOW)
-        .output();
-    let Ok(o) = output else { return Vec::new() };
-    let text = String::from_utf8_lossy(&o.stdout).into_owned();
+    let mut cmd = Command::new("powershell.exe");
+    cmd.args([
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        "Get-CimInstance Win32_Process -Filter \"Name='chrome.exe'\" | ForEach-Object { \"$($_.ProcessId)|$($_.CommandLine)\" }",
+    ])
+    .creation_flags(CREATE_NO_WINDOW);
+    let Some(stdout) = run_bounded_capturing_stdout(&mut cmd) else {
+        eprintln!(
+            "[agentplug browser] list_chrome_processes: Get-CimInstance (WMI) did not answer within {ORPHAN_SCAN_SUBPROCESS_TIMEOUT_MS}ms -- killed the stalled powershell.exe and returning empty rather than blocking the daemon's main loop forever. Orphan reaping will simply see no chrome processes this pass and retry next cycle."
+        );
+        return Vec::new();
+    };
+    let text = String::from_utf8_lossy(&stdout).into_owned();
     text.lines()
         .filter_map(|line| {
             let (pid_str, cmdline) = line.split_once('|')?;
@@ -736,6 +795,16 @@ fn chrome_launch_log_path(profile_dir: &Path) -> PathBuf {
     profile_dir.join("chrome-launch.log")
 }
 
+#[cfg(unix)]
+fn running_as_unix_root() -> bool {
+    unsafe { libc::geteuid() == 0 }
+}
+
+#[cfg(not(unix))]
+fn running_as_unix_root() -> bool {
+    false
+}
+
 fn chrome_stderr_log_indicates_suid_sandbox_init_denial(log_path: &Path) -> bool {
     std::fs::read_to_string(log_path)
         .map(|s| {
@@ -800,7 +869,10 @@ fn launch_chrome(cwd: &Path, session_id: &str, browser_cfg: &BrowserConfig) -> R
     let _ = std::fs::remove_file(&log_path);
 
     let no_sandbox_env = std::env::var("GM_BROWSER_NO_SANDBOX").ok();
-    let mut no_sandbox = matches!(no_sandbox_env.as_deref(), Some("1")) || cfg!(windows);
+    let running_as_root = running_as_unix_root();
+    let mut no_sandbox = matches!(no_sandbox_env.as_deref(), Some("1"))
+        || cfg!(windows)
+        || (running_as_root && no_sandbox_env.as_deref() != Some("0"));
     let headless = browser_cfg.headless();
     let port = free_port();
     let mut chrome_child = spawn_chrome_once(&chrome, &profile_dir, port, headless, no_sandbox)?;

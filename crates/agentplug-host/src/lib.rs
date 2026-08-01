@@ -1,6 +1,7 @@
 mod browser;
 mod exec_js;
 mod host_state;
+mod http_agent;
 mod memory_pressure;
 mod task;
 mod imports;
@@ -9,6 +10,7 @@ mod registry;
 
 pub use browser::{close_all_sessions, reap_idle_sessions_and_os_orphans_across_every_known_project_root};
 pub use host_state::HostState;
+pub use http_agent::{build_agent, shared_agent};
 pub use imports::{git_subprocess_timeout_ms, register_env_imports, register_wasi};
 pub use install::{install_dir, plugins_dir, wasmtime_cache_dir};
 pub use memory_pressure::{process_private_bytes_tracking_retained_wasm_peak_unlike_working_set, reset_shared_dispatch_count, shared_dispatches_since_release};

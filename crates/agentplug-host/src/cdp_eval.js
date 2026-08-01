@@ -96,15 +96,36 @@ function cdpSession(wsUrl, timeoutMs) {
 }
 
 async function navigateIfNeededThenEvaluateOverCdp(sess, script, startUrl, timeoutMs) {
+  let navigationFailure = null;
   if (startUrl) {
+    await sess.send('Network.enable', {});
     await sess.send('Page.enable', {});
-    await sess.send('Page.navigate', { url: startUrl });
+    const prevOnIdLessNotification = sess.onIdLessNotification;
+    let mainFrameRequestId = null;
+    sess.onIdLessNotification = (msg) => {
+      if (prevOnIdLessNotification) prevOnIdLessNotification(msg);
+      if (msg.method === 'Network.requestWillBeSent' && msg.params && msg.params.type === 'Document' && !mainFrameRequestId) {
+        mainFrameRequestId = msg.params.requestId;
+      }
+      if (msg.method === 'Network.loadingFailed' && msg.params && msg.params.requestId === mainFrameRequestId) {
+        navigationFailure = msg.params.errorText || 'loading failed';
+      }
+    };
+    const navResult = await sess.send('Page.navigate', { url: startUrl });
+    if (navResult && navResult.errorText) {
+      navigationFailure = navResult.errorText;
+    }
     await new Promise((r) => setTimeout(r, 1200));
+    sess.onIdLessNotification = prevOnIdLessNotification;
   }
   const wrapped = `(async () => { ${script} })()`;
-  return sess.send('Runtime.evaluate', {
+  const result = await sess.send('Runtime.evaluate', {
     expression: wrapped, awaitPromise: true, returnByValue: true, userGesture: true, timeout: timeoutMs,
   });
+  if (navigationFailure && !result.exceptionDetails) {
+    result.exceptionDetails = { text: `page navigation failed: ${navigationFailure} (url=${startUrl})` };
+  }
+  return result;
 }
 
 const GL_ERROR_TRACKING_INIT_SCRIPT = `

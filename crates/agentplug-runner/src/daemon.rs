@@ -779,6 +779,21 @@ fn write_project_heartbeat_with_queue_info(spool_dir: &Path, busy_until: Option<
         payload["queue_position"] = serde_json::json!(position);
         payload["queue_depth"] = serde_json::json!(total);
     }
+    if let Some((staged_at_ms, _len)) = staged_runner_awaiting_handoff() {
+        payload["runner_update_in_progress"] = serde_json::json!(true);
+        payload["runner_update_waiting_ms"] = serde_json::json!(now_ms().saturating_sub(staged_at_ms));
+    }
+    if let Some(swap) = read_last_completed_runner_swap() {
+        payload["last_completed_runner_swap"] = swap;
+    }
+    let loaded_plugin_versions_informational_only_not_a_recovery_signal: serde_json::Map<String, serde_json::Value> =
+        ["gm", "bert", "libsql", "treesitter"]
+            .iter()
+            .filter_map(|name| installed_plugin_version(name).map(|v| (name.to_string(), serde_json::json!(v))))
+            .collect();
+    if !loaded_plugin_versions_informational_only_not_a_recovery_signal.is_empty() {
+        payload["loaded_plugin_versions"] = serde_json::Value::Object(loaded_plugin_versions_informational_only_not_a_recovery_signal);
+    }
     let _ = fs::write(&status_path, payload.to_string());
 }
 
