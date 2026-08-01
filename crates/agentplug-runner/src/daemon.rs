@@ -16,7 +16,18 @@ fn registry_path() -> PathBuf {
     install_dir().join("daemon-registry.txt")
 }
 
+fn cwd_is_inside_a_spool_tree(cwd: &Path) -> bool {
+    cwd.components().any(|c| c.as_os_str() == ".gm")
+        && cwd.to_string_lossy().replace('\', "/").contains("/.gm/exec-spool")
+}
+
 pub fn register_project(cwd: &Path) -> anyhow::Result<()> {
+    if cwd_is_inside_a_spool_tree(cwd) {
+        anyhow::bail!(
+            "refusing to register {} as a project root -- its own path is already inside a .gm/exec-spool tree, which means this is spool runtime state (in/out/status files), not a genuine project directory. Launch the spool from the actual project root instead.",
+            cwd.display()
+        );
+    }
     let path = registry_path();
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -1507,7 +1518,8 @@ pub fn try_dispatch_via_daemon(cwd: &Path, plugin: &str, verb: &str, body: &str)
     if std::env::var("AGENTPLUG_NO_DAEMON").is_ok() {
         return None;
     }
-    if register_project(cwd).is_err() {
+    if let Err(e) = register_project(cwd) {
+        eprintln!("[agentplug] {e}");
         return None;
     }
     if !ensure_daemon_running().unwrap_or(false) {
