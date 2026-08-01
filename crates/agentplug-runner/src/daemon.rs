@@ -1034,7 +1034,12 @@ fn handle_background_convert(root: &Path, body: &str) -> String {
             serde_json::json!({"ok": true, "converted": true, "verb": req.verb, "task": req.task}).to_string()
         }
         None => {
-            serde_json::json!({"ok": false, "error": "already_completed", "verb": req.verb, "task": req.task}).to_string()
+            let out_path = root.join(".gm").join("exec-spool").join("out").join(format!("{}-{}.json", req.verb, req.task));
+            if out_path.exists() {
+                serde_json::json!({"ok": false, "error": "already_completed", "verb": req.verb, "task": req.task}).to_string()
+            } else {
+                serde_json::json!({"ok": false, "error": "unknown_task", "reason": "no in-flight dispatch and no out/ file found for this verb+task -- this task id was never dispatched, or its verb never matched", "verb": req.verb, "task": req.task}).to_string()
+            }
         }
     }
 }
