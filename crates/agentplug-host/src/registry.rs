@@ -145,11 +145,25 @@ fn side_plugin_pool_size() -> usize {
 
 pub struct SharedPluginPool {
     slots: Vec<Arc<Mutex<Option<SiblingHandle>>>>,
+    /// Content hashes whose Stores must be evicted the instant their in-flight
+    /// dispatch completes -- the deferred half of a plugin version swap. A swap
+    /// request (`request_store_swap`) evicts every FREE slot holding the old
+    /// hash immediately and records the hash here when at least one slot was
+    /// busy, so the swap can never kill (or indefinitely block behind) a live
+    /// call: in-flight dispatches finish on the old Store, then
+    /// `evict_if_swap_pending` drops their slot on completion and the next
+    /// dispatch reinstantiates from the new module. Membership is left in
+    /// place until the same bytes become current again (`note_bytes_current`),
+    /// which is the rollback case.
+    swap_pending_hashes: Mutex<std::collections::HashSet<String>>,
 }
 
 impl SharedPluginPool {
     pub fn new(size: usize) -> Self {
-        Self { slots: (0..size.max(1)).map(|_| Arc::new(Mutex::new(None))).collect() }
+        Self {
+            slots: (0..size.max(1)).map(|_| Arc::new(Mutex::new(None))).collect(),
+            swap_pending_hashes: Mutex::new(std::collections::HashSet::new()),
+        }
     }
 
     pub const ACQUIRE_TIMEOUT_MS: u64 = 20_000;
@@ -205,16 +219,77 @@ impl SharedPluginPool {
         }
     }
 
-    fn release_all(&self) -> bool {
+    /// Non-blocking memory-reclaim release: evict every slot that is FREE
+    /// right now, skip slots held by an in-flight dispatch. This used to be a
+    /// blocking `slot.lock()` per slot (`release_all`), which parked the
+    /// daemon's single main loop behind the longest in-flight dispatch on this
+    /// plugin (observed: a 90s browser call stalled every other project's
+    /// dispatch, the update polls, and the self-update handoff). Memory
+    /// reclamation is best-effort -- a busy slot's Store is dropped the moment
+    /// its call ends (see `request_store_swap`) or on the next recycle pass,
+    /// neither of which needs the caller to wait.
+    fn try_release_all(&self) -> bool {
         let mut released = false;
         for slot in &self.slots {
-            let mut guard = slot.lock().unwrap();
-            if guard.is_some() {
-                *guard = None;
-                released = true;
+            if let Ok(mut guard) = slot.try_lock() {
+                if guard.is_some() {
+                    *guard = None;
+                    released = true;
+                }
             }
         }
         released
+    }
+
+    /// The swap half of a plugin version change: evict every FREE slot still
+    /// holding `old_hash` immediately, and for each slot BUSY with an
+    /// in-flight dispatch record `old_hash` so `evict_if_swap_pending` drops
+    /// that slot the instant its call completes. Never blocks and never kills
+    /// a live call -- the old and new Stores coexist across different slots
+    /// until the last old-Store dispatch drains (the daemon's
+    /// `mixed_version_pools` telemetry already anticipates this transient).
+    /// Returns (evicted_now, deferred_to_completion).
+    pub fn request_store_swap(&self, old_hash: &str) -> (usize, usize) {
+        let mut evicted = 0usize;
+        let mut deferred = 0usize;
+        for slot in &self.slots {
+            match slot.try_lock() {
+                Ok(mut guard) => {
+                    if guard.as_ref().is_some_and(|h| h.content_hash == old_hash) {
+                        *guard = None;
+                        evicted += 1;
+                    }
+                }
+                Err(_) => deferred += 1,
+            }
+        }
+        if deferred > 0 {
+            self.swap_pending_hashes.lock().unwrap_or_else(|e| e.into_inner()).insert(old_hash.to_string());
+        }
+        (evicted, deferred)
+    }
+
+    /// Called by every dispatch path right after a call completes: if a
+    /// version swap is waiting on this slot's (now-finished) old-version
+    /// Store, drop it here so the next acquire reinstantiates from the new
+    /// module instead of silently reusing the stale Store.
+    pub fn evict_if_swap_pending(&self, guard: &mut std::sync::MutexGuard<'_, Option<SiblingHandle>>) {
+        let Some(handle) = guard.as_ref() else { return };
+        let pending = self.swap_pending_hashes.lock().unwrap_or_else(|e| e.into_inner());
+        if pending.contains(&handle.content_hash) {
+            drop(pending);
+            **guard = None;
+        }
+    }
+
+    /// The rollback case: `hash` is the CURRENT on-disk bytes again, so Stores
+    /// carrying it must stop being treated as swap casualties.
+    pub fn note_bytes_current(&self, hash: &str) {
+        self.swap_pending_hashes.lock().unwrap_or_else(|e| e.into_inner()).remove(hash);
+    }
+
+    pub fn swap_pending_hashes(&self) -> Vec<String> {
+        self.swap_pending_hashes.lock().unwrap_or_else(|e| e.into_inner()).iter().cloned().collect()
     }
 }
 
@@ -232,11 +307,45 @@ fn shared_plugin_pool(plugin_name: &str) -> Arc<SharedPluginPool> {
         .clone()
 }
 
+/// Best-effort, non-blocking shared-Store release (memory recycle paths). Busy
+/// slots are skipped, never waited on and never killed -- see
+/// `SharedPluginPool::try_release_all`.
 pub fn release_shared_plugin(plugin_name: &str) -> bool {
     if !is_stateless_shared_plugin(plugin_name) {
         return false;
     }
-    shared_plugin_pool(plugin_name).release_all()
+    shared_plugin_pool(plugin_name).try_release_all()
+}
+
+/// Version-swap entry point for the daemon's `get_or_compile` content-hash
+/// check: drain the old hash behind in-flight dispatches instead of killing
+/// them or blocking the caller until they finish.
+pub fn request_shared_store_swap(plugin_name: &str, old_hash: &str) -> (usize, usize) {
+    if !is_stateless_shared_plugin(plugin_name) {
+        return (0, 0);
+    }
+    shared_plugin_pool(plugin_name).request_store_swap(old_hash)
+}
+
+/// `hash` is once again the current on-disk bytes for this plugin (rollback /
+/// republish of identical bytes) -- stop evicting its Stores on completion.
+pub fn note_shared_plugin_bytes_current(plugin_name: &str, hash: &str) {
+    if !is_stateless_shared_plugin(plugin_name) {
+        return;
+    }
+    shared_plugin_pool(plugin_name).note_bytes_current(hash);
+}
+
+/// Old-version content hashes a swap is still waiting to drain, for
+/// .status.json / daemon-status.json deferral reporting.
+pub fn shared_plugin_swap_pending_hashes(plugin_name: &str) -> Vec<String> {
+    SHARED_PLUGINS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap()
+        .get(plugin_name)
+        .map(|pool| pool.swap_pending_hashes())
+        .unwrap_or_default()
 }
 
 pub fn shared_plugin_slot_content_hashes(plugin_name: &str) -> Vec<Option<String>> {
@@ -416,7 +525,7 @@ impl ProjectPlugins {
         let pool_size = pool.size();
         let (guard, waited_ms) = pool.acquire_within(SharedPluginPool::ACQUIRE_TIMEOUT_MS);
         let mut guard = guard.ok_or_else(|| PluginDispatchError::PoolAcquireTimeout { plugin_name: plugin_name.to_string(), waited_ms, pool_size })?;
-        dispatch_and_evict_on_error(&mut guard, verb, body, &self.root, &self.siblings, plugin_name)
+        dispatch_and_evict_on_error(&mut guard, &pool, verb, body, &self.root, &self.siblings, plugin_name)
     }
 
     pub fn dispatch_handle_with_reload(&self, reload_source: Option<(Engine, HashMap<String, (Module, String)>)>) -> DispatchHandle {
@@ -498,68 +607,73 @@ impl DispatchHandle {
             let _ = self.reinstantiate_plugin_into_pool_slot_if_reload_source_available(plugin_name);
             pool = self.siblings.lock().unwrap().get(plugin_name).cloned();
         }
-        let mut pool = pool.ok_or_else(|| PluginDispatchError::NotRegistered { plugin_name: plugin_name.to_string() })?;
+        let pool = pool.ok_or_else(|| PluginDispatchError::NotRegistered { plugin_name: plugin_name.to_string() })?;
         let pool_size = pool.size();
-
-        let empty_after_wait = !pool.any_instantiated_within(SharedPluginPool::ACQUIRE_TIMEOUT_MS);
-        if empty_after_wait {
-            let _ = self.reinstantiate_plugin_into_pool_slot_if_reload_source_available(plugin_name);
-            pool = self
-                .siblings
-                .lock()
-                .unwrap()
-                .get(plugin_name)
-                .cloned()
-                .ok_or_else(|| PluginDispatchError::NotRegistered { plugin_name: plugin_name.to_string() })?;
-        }
-
         let (guard, waited_ms) = pool.acquire_within(SharedPluginPool::ACQUIRE_TIMEOUT_MS);
         let mut guard = guard.ok_or_else(|| PluginDispatchError::PoolAcquireTimeout { plugin_name: plugin_name.to_string(), waited_ms, pool_size })?;
-        if guard.is_none() && is_stateless_shared_plugin(plugin_name) {
+        if guard.is_none() {
+            // The slot we hold is empty (poisoned-Store eviction). NEVER call
+            // the reload while still holding this guard: the reload's own
+            // pool.acquire() can only take a FREE slot, so for a size-1 pool
+            // (every side plugin, and gm under gm_concurrency=1) the held
+            // guard self-deadlocks every attempt for the full acquire timeout
+            // and the eviction becomes permanent until a process restart --
+            // observed live as three consecutive identical EvictedOrPoisoned
+            // failures that only a spool reboot cleared. Drop first.
+            drop(guard);
             const REINSTANTIATION_RETRY_ATTEMPTS: u32 = 3;
             const REINSTANTIATION_RETRY_BACKOFF_MS: u64 = 250;
-            let mut last_waited_ms = waited_ms;
+            let mut last_reload_error: Option<String> = None;
+            let mut refilled_pool: Option<Arc<SharedPluginPool>> = None;
             for attempt in 0..REINSTANTIATION_RETRY_ATTEMPTS {
-                let _ = self.reinstantiate_plugin_into_pool_slot_if_reload_source_available(plugin_name);
-                drop(guard);
-                pool = self
+                if let Err(e) = self.reinstantiate_plugin_into_pool_slot_if_reload_source_available(plugin_name) {
+                    last_reload_error = Some(format!("{e:#}"));
+                }
+                let candidate_pool = self
                     .siblings
                     .lock()
                     .unwrap()
                     .get(plugin_name)
                     .cloned()
                     .ok_or_else(|| PluginDispatchError::NotRegistered { plugin_name: plugin_name.to_string() })?;
-                let (retry_guard, retry_waited_ms) = pool.acquire_within(SharedPluginPool::ACQUIRE_TIMEOUT_MS);
-                last_waited_ms = retry_waited_ms;
-                guard = retry_guard.ok_or_else(|| PluginDispatchError::PoolAcquireTimeout {
-                    plugin_name: plugin_name.to_string(),
-                    waited_ms: last_waited_ms,
-                    pool_size,
-                })?;
-                if guard.is_some() {
+                let is_refilled = {
+                    let (retry_guard, retry_waited_ms) = candidate_pool.acquire_within(SharedPluginPool::ACQUIRE_TIMEOUT_MS);
+                    let retry_guard = retry_guard.ok_or_else(|| PluginDispatchError::PoolAcquireTimeout {
+                        plugin_name: plugin_name.to_string(),
+                        waited_ms: retry_waited_ms,
+                        pool_size,
+                    })?;
+                    retry_guard.is_some()
+                };
+                if is_refilled {
+                    refilled_pool = Some(candidate_pool);
                     break;
                 }
                 if attempt + 1 < REINSTANTIATION_RETRY_ATTEMPTS {
                     std::thread::sleep(std::time::Duration::from_millis(REINSTANTIATION_RETRY_BACKOFF_MS));
                 }
             }
-            if guard.is_none() {
-                eprintln!("[agentplug registry] plugin {plugin_name} could not be reinstantiated after a poisoned-Store eviction (verb {verb}) -- no reload source available, or every retry lost the race for a free pool slot under concurrent load");
-                log_poisoned_store_eviction_event(&self.root, plugin_name, verb, false, &format!("reinstantiation failed or no reload source available after {REINSTANTIATION_RETRY_ATTEMPTS} attempts, last_waited_ms={last_waited_ms}"));
+            let Some(refilled_pool) = refilled_pool else {
+                let detail = last_reload_error.unwrap_or_else(|| "reload produced no error but no slot was repopulated".to_string());
+                eprintln!("[agentplug registry] plugin {plugin_name} could not be reinstantiated after a poisoned-Store eviction (verb {verb}) -- {detail}");
+                log_poisoned_store_eviction_event(&self.root, plugin_name, verb, false, &format!("reinstantiation failed after {REINSTANTIATION_RETRY_ATTEMPTS} attempts: {detail}"));
                 return Err(PluginDispatchError::EvictedOrPoisoned { plugin_name: plugin_name.to_string() }.into());
-            }
-        } else if guard.is_none() {
-            let _ = self.reinstantiate_plugin_into_pool_slot_if_reload_source_available(plugin_name);
-            eprintln!("[agentplug registry] plugin {plugin_name} could not be reinstantiated after a poisoned-Store eviction (verb {verb}) -- no reload source available or reload failed");
-            log_poisoned_store_eviction_event(&self.root, plugin_name, verb, false, "reinstantiation failed or no reload source available");
-            return Err(PluginDispatchError::EvictedOrPoisoned { plugin_name: plugin_name.to_string() }.into());
+            };
+            let (final_guard, final_waited_ms) = refilled_pool.acquire_within(SharedPluginPool::ACQUIRE_TIMEOUT_MS);
+            let mut final_guard = final_guard.ok_or_else(|| PluginDispatchError::PoolAcquireTimeout {
+                plugin_name: plugin_name.to_string(),
+                waited_ms: final_waited_ms,
+                pool_size,
+            })?;
+            return dispatch_and_evict_on_error(&mut final_guard, &refilled_pool, verb, body, &self.root, &self.siblings, plugin_name);
         }
-        dispatch_and_evict_on_error(&mut guard, verb, body, &self.root, &self.siblings, plugin_name)
+        dispatch_and_evict_on_error(&mut guard, &pool, verb, body, &self.root, &self.siblings, plugin_name)
     }
 }
 
 fn dispatch_and_evict_on_error(
     guard: &mut std::sync::MutexGuard<'_, Option<SiblingHandle>>,
+    pool: &Arc<SharedPluginPool>,
     verb: &str,
     body: &str,
     root: &Path,
@@ -576,6 +690,10 @@ fn dispatch_and_evict_on_error(
         eprintln!("[agentplug registry] evicting plugin {plugin_name} slot -- verb {verb} poisoned its Store: {poisoning_error}");
         log_poisoned_store_eviction_event(root, plugin_name, verb, true, &poisoning_error.to_string());
         **guard = None;
+    } else {
+        // A version swap deferred behind THIS in-flight call completes here:
+        // drop the old-version Store now that it is no longer executing.
+        pool.evict_if_swap_pending(guard);
     }
     result
 }
@@ -646,4 +764,115 @@ pub fn read_project_plugin_list(root: &Path) -> Vec<String> {
         .map(|l| l.trim().to_string())
         .filter(|l| !l.is_empty())
         .collect()
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Instant;
+    use wasmtime::{Linker, Store};
+
+    /// A minimal plugkit-ABI guest: alloc always hands out offset 1024,
+    /// plugin_call ignores its args and returns the packed (ptr=2048, len=2)
+    /// of the "ok" data segment. Lets a dispatch run end-to-end without any
+    /// real plugin wasm.
+    const SUCCESS_WAT: &str = r#"(module
+  (memory (export "memory") 1)
+  (func (export "plugkit_alloc") (param i32) (result i32) (i32.const 1024))
+  (func (export "plugkit_free") (param i32 i32))
+  (func (export "plugin_call") (param i32 i32 i32 i32) (result i64) (i64.const 8589936640))
+  (data (i32.const 2048) "ok")
+)"#;
+
+    fn bare_handle(engine: &Engine, hash: &str) -> SiblingHandle {
+        let module = Module::new(engine, "(module)").unwrap();
+        let linker: Linker<HostState> = Linker::new(engine);
+        let mut store = Store::new(engine, HostState::new(std::env::temp_dir(), "test".to_string()));
+        let instance = linker.instantiate(&mut store, &module).unwrap();
+        SiblingHandle { store, instance, content_hash: hash.to_string() }
+    }
+
+    #[test]
+    fn store_swap_defers_behind_in_flight_and_completes_on_finish() {
+        let engine = Engine::default();
+        let pool = SharedPluginPool::new(2);
+        // Slot 0: idle old-version Store. Slot 1: old-version Store whose
+        // guard is HELD, simulating an in-flight dispatch mid-call.
+        *pool.slots[0].lock().unwrap() = Some(bare_handle(&engine, "old"));
+        let mut in_flight_guard = pool.slots[1].lock().unwrap();
+        *in_flight_guard = Some(bare_handle(&engine, "old"));
+
+        let started = Instant::now();
+        let (evicted, deferred) = pool.request_store_swap("old");
+        assert_eq!((evicted, deferred), (1, 1));
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "a version swap must never block behind an in-flight dispatch"
+        );
+        assert!(pool.slots[0].lock().unwrap().is_none(), "free old-version slot must be evicted immediately");
+        assert!(in_flight_guard.is_some(), "the in-flight dispatch's Store must NOT be dropped under it");
+        assert!(pool.swap_pending_hashes().contains(&"old".to_string()));
+
+        // The in-flight dispatch finishes; the completion hook drops its slot,
+        // completing the swap exactly when the last old-Store call ends.
+        pool.evict_if_swap_pending(&mut in_flight_guard);
+        assert!(in_flight_guard.is_none(), "swap completes when the last old-Store dispatch ends");
+
+        // A new-version Store refilling that slot is never evicted by the
+        // stale pending hash.
+        *in_flight_guard = Some(bare_handle(&engine, "new"));
+        pool.evict_if_swap_pending(&mut in_flight_guard);
+        assert!(in_flight_guard.is_some(), "new-version Stores are untouched by the old hash's pending mark");
+
+        // Rollback safety: the old bytes becoming current again clears the mark.
+        pool.note_bytes_current("old");
+        assert!(pool.swap_pending_hashes().is_empty());
+    }
+
+    #[test]
+    fn try_release_all_skips_busy_slots_instead_of_blocking() {
+        let engine = Engine::default();
+        let pool = SharedPluginPool::new(2);
+        *pool.slots[0].lock().unwrap() = Some(bare_handle(&engine, "h"));
+        let mut busy_guard = pool.slots[1].lock().unwrap();
+        *busy_guard = Some(bare_handle(&engine, "h"));
+
+        let started = Instant::now();
+        assert!(pool.try_release_all());
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "memory-recycle release must skip busy slots, not park the caller behind a long dispatch"
+        );
+        assert!(pool.slots[0].lock().unwrap().is_none());
+        assert!(busy_guard.is_some(), "busy slot skipped, its dispatch undisturbed");
+    }
+
+    #[test]
+    fn dispatch_handle_reinstantiates_a_poisoned_evicted_slot_and_serves_the_call() {
+        let engine = Engine::default();
+        let module = Module::new(&engine, SUCCESS_WAT).unwrap();
+        let root = std::env::temp_dir();
+        let siblings: Arc<Mutex<HashMap<String, Arc<SharedPluginPool>>>> = Arc::new(Mutex::new(HashMap::new()));
+        // Size-1 pool with an empty slot: exactly the post-poisoning-eviction
+        // state that self-deadlocked the old reload path (the reload's own
+        // pool.acquire() could never take the one slot while the dispatch
+        // still held its guard, so every attempt burned the full 20s acquire
+        // timeout and failed identically until a process restart).
+        let pool = Arc::new(SharedPluginPool::new(1));
+        siblings.lock().unwrap().insert("testplug".to_string(), pool);
+        let mut modules: HashMap<String, (Module, String)> = HashMap::new();
+        modules.insert("testplug".to_string(), (module, "h1".to_string()));
+        let handle = DispatchHandle { root: root.clone(), siblings, reload_source: Some((engine.clone(), modules)) };
+
+        let started = Instant::now();
+        let out = handle
+            .dispatch("testplug", "verb", "{}")
+            .expect("an evicted slot with a reload source must be reinstantiated and serve the dispatch");
+        assert_eq!(out, "ok");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(SharedPluginPool::ACQUIRE_TIMEOUT_MS / 1000),
+            "reload self-deadlock regression: dispatch took the full acquire-timeout path"
+        );
+    }
 }

@@ -666,6 +666,16 @@ pub fn run_takeover(version: &str) -> anyhow::Result<()> {
     anyhow::bail!("takeover: old daemon never released ownership within the wait window -- aborting, old daemon keeps serving")
 }
 
+fn pending_store_swaps_by_plugin() -> serde_json::Map<String, serde_json::Value> {
+    ["gm", "bert", "libsql", "treesitter"]
+        .iter()
+        .filter_map(|name| {
+            let hashes = agentplug_host::shared_plugin_swap_pending_hashes(name);
+            if hashes.is_empty() { None } else { Some((name.to_string(), serde_json::json!(hashes))) }
+        })
+        .collect()
+}
+
 fn write_daemon_heartbeat(project_count: usize, plugin_module_count: usize) {
     let last_plugin_poll_ts = HEARTBEAT_LAST_PLUGIN_POLL_TS.load(std::sync::atomic::Ordering::Relaxed);
     let last_runner_poll_ts = HEARTBEAT_LAST_RUNNER_POLL_TS.load(std::sync::atomic::Ordering::Relaxed);
@@ -700,6 +710,7 @@ fn write_daemon_heartbeat(project_count: usize, plugin_module_count: usize) {
             "loaded_plugin_content_sha256": loaded_content_hashes,
             "shared_pool_slot_content_sha256": shared_pool_slot_hashes,
             "mixed_version_pools": mixed_version_pools,
+            "pending_store_swaps": pending_store_swaps_by_plugin(),
             "staged_runner_awaiting_handoff": staged_runner.is_some(),
             "staged_runner_since_ts": staged_runner.map(|(since_ts, _)| serde_json::json!(since_ts)).unwrap_or(serde_json::Value::Null),
             "staged_runner_waiting_ms": staged_runner.map(|(since_ts, _)| serde_json::json!(now_ms().saturating_sub(since_ts))).unwrap_or(serde_json::Value::Null),
@@ -796,6 +807,10 @@ fn write_project_heartbeat_with_queue_info(spool_dir: &Path, busy_until: Option<
     }
     if let Some(swap) = read_last_completed_runner_swap() {
         payload["last_completed_runner_swap"] = swap;
+    }
+    let pending_store_swaps = pending_store_swaps_by_plugin();
+    if !pending_store_swaps.is_empty() {
+        payload["pending_store_swaps"] = serde_json::Value::Object(pending_store_swaps);
     }
     let loaded_plugin_versions_informational_only_not_a_recovery_signal: serde_json::Map<String, serde_json::Value> =
         ["gm", "bert", "libsql", "treesitter"]
@@ -982,16 +997,15 @@ impl PluginModules {
     fn get_or_compile(&mut self, plugin_name: &str) -> anyhow::Result<()> {
         let wasm_path = ensure_plugin_installed(plugin_name, None)?;
         let on_disk_hash = wasm_file_content_hash(&wasm_path)?;
-        let stale = self
-            .loaded_content_hash
-            .get(plugin_name)
-            .is_some_and(|loaded_hash| loaded_hash != &on_disk_hash);
+        let old_loaded_hash = self.loaded_content_hash.get(plugin_name).cloned();
+        let stale = old_loaded_hash.as_deref().is_some_and(|loaded_hash| loaded_hash != on_disk_hash);
         if stale {
+            let old_hash = old_loaded_hash.unwrap_or_default();
+            let (evicted_now, deferred) = agentplug_host::request_shared_store_swap(plugin_name, &old_hash);
             eprintln!(
-                "[agentplug daemon] {plugin_name}.wasm content hash changed on disk since it was last compiled -- evicting the stale in-process module and the shared Store using it, forcing a recompile from the current bytes"
+                "[agentplug daemon] {plugin_name}.wasm content hash changed on disk since it was last compiled -- evicting the stale in-process module and draining the shared Stores using it ({evicted_now} slot(s) evicted now, {deferred} still in-flight and finishing on the old Store; their slots evict on completion), forcing a recompile from the current bytes"
             );
             self.modules.remove(plugin_name);
-            agentplug_host::release_shared_plugin(plugin_name);
         }
         if !self.modules.contains_key(plugin_name) {
             if let Some(installed) = installed_plugin_version(plugin_name) {
@@ -1009,7 +1023,11 @@ impl PluginModules {
             loaded_plugin_content_hashes()
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .insert(plugin_name.to_string(), on_disk_hash);
+                .insert(plugin_name.to_string(), on_disk_hash.clone());
+            // Rollback safety: if these exact bytes were previously deferred
+            // behind an in-flight dispatch and are now current again, Stores
+            // carrying them must stop being evicted on completion.
+            agentplug_host::note_shared_plugin_bytes_current(plugin_name, &on_disk_hash);
         }
         Ok(())
     }
@@ -1239,6 +1257,17 @@ fn run_gm_dispatch_to_file(root: &Path, handle: &DispatchHandle, verb: &str, tas
     write_spool_out(out_dir, &out_name, &out_body);
     let in_dir = root.join(".gm").join("exec-spool").join("in");
     let _ = fs::remove_file(inflight_claim_path(&in_dir, verb, task));
+    // Remove our own in-flight entry on completion. The dispatch loop's join
+    // path (below, in dispatch_project) only removes entries whose join handle
+    // it still owns -- a worker auto-detached after WORKER_AUTO_DETACH_AFTER_MS
+    // has its handle dropped with the entry left behind, which used to leak it
+    // PERMANENTLY: detached_still_running stayed true forever, so every later
+    // runner self-update went down the 10-minute starve path and force-handed
+    // off "despite N in-flight dispatch(es)" where N counted long-dead
+    // entries, killing whatever real dispatches were running at that moment
+    // (their callers saw dispatch_orphaned).
+    let key: InFlightKey = (root.to_path_buf(), verb.to_string(), task.to_string());
+    in_flight_map().lock().unwrap_or_else(|e| e.into_inner()).remove(&key);
 }
 
 fn dispatch_project(root: &Path, project: &mut ProjectPlugins, plugin_modules: &PluginModules) -> bool {
@@ -2012,7 +2041,13 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
 
         if any_work {
             last_any_dispatch = Instant::now();
-        } else if last_any_dispatch.elapsed() >= Duration::from_millis(SELF_RECYCLE_IDLE_MS) {
+        } else if last_any_dispatch.elapsed() >= Duration::from_millis(SELF_RECYCLE_IDLE_MS) && !detached_still_running {
+            // detached_still_running is the in_flight_map signal that survives
+            // worker auto-detachment -- the same gap the self-update handoff
+            // gate above already guards. Without it, a >45s dispatch that
+            // outlives its join handle is invisible to `any_work`, and this
+            // idle self-recycle exits the process out from under it (its
+            // caller gets dispatch_orphaned blamed on a wasm trap/OOM).
             eprintln!(
                 "[agentplug daemon] self-recycling after {}ms fully idle -- reclaims shared-plugin peak wasm memory (monotonic linear memory, no in-place shrink); next real dispatch spawns a fresh process",
                 SELF_RECYCLE_IDLE_MS
@@ -2023,5 +2058,45 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
         if !any_work {
             std::thread::sleep(Duration::from_millis(200));
         }
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression for the detached-worker in_flight_map leak: a dispatch that
+    /// outlives its join handle (WORKER_AUTO_DETACH_AFTER_MS) used to leave
+    /// its in-flight entry behind forever, permanently wedging
+    /// detached_still_running and forcing every later runner self-update down
+    /// the 10-minute starve path that kills real in-flight work. The dispatch
+    /// itself must now clear its own entry on completion.
+    #[test]
+    fn completed_dispatch_removes_its_own_in_flight_entry() {
+        let root = std::env::temp_dir().join(format!("agentplug-test-inflight-{}-{}", std::process::id(), now_ms()));
+        let spool_dir = root.join(".gm").join("exec-spool");
+        let out_dir = spool_dir.join("out");
+        fs::create_dir_all(&out_dir).unwrap();
+
+        // No plugins registered: the dispatch itself errors out (NotRegistered),
+        // which is fine -- this test only cares that the bookkeeping runs even
+        // on the failure path.
+        let project = ProjectPlugins::new(root.clone());
+        let handle = project.dispatch_handle();
+        let key: InFlightKey = (root.clone(), "verbX".to_string(), "taskY".to_string());
+        in_flight_map()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key.clone(), InFlightHandle { detach: Arc::new(std::sync::atomic::AtomicBool::new(false)) });
+
+        run_gm_dispatch_to_file(&root, &handle, "verbX", "taskY", "{}", &out_dir);
+
+        assert!(
+            in_flight_map().lock().unwrap_or_else(|e| e.into_inner()).get(&key).is_none(),
+            "a completed dispatch must clear its own in-flight entry so the handoff/idle gates stop counting it"
+        );
+        assert!(out_dir.join("verbX-taskY.json").exists(), "the out file must still be written");
+        let _ = fs::remove_dir_all(&root);
     }
 }

@@ -620,6 +620,8 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
                 None => Err(anyhow::anyhow!("plugin_not_loaded_yet")),
                 Some(handle) => crate::registry::dispatch_on(&mut handle.store, handle.instance, &verb, &body, &caller_root, caller_siblings.clone()),
             };
+            // Complete any version swap that deferred behind this call.
+            sibling_pool.evict_if_swap_pending(&mut guard);
             drop(guard);
 
             match result {
@@ -677,6 +679,9 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
                 };
                 if result.is_err() {
                     *guard = None;
+                } else {
+                    // Complete any version swap that deferred behind this call.
+                    sibling_pool.evict_if_swap_pending(&mut guard);
                 }
                 drop(guard);
                 if result.is_ok() {

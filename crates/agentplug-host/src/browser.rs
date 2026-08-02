@@ -257,7 +257,12 @@ fn browser_chrome_profile_dir(cwd: &Path, session_id: &str) -> PathBuf {
 struct BrowserSession {
     cwd: PathBuf,
     session_id: String,
-    child: Child,
+    /// None for a session ADOPTED from an OS-orphaned chrome after a daemon
+    /// restart -- the pid is known (sidecar) but this process holds no Child
+    /// handle for it. Liveness then goes through pid_is_alive instead of
+    /// try_wait.
+    child: Option<Child>,
+    pid: u32,
     port: u16,
     last_used: Instant,
     target_id: Option<String>,
@@ -280,8 +285,11 @@ fn session_lifecycle_lock_for_key(key: &str) -> Arc<Mutex<()>> {
     locks.entry(key.to_string()).or_insert_with(|| Arc::new(Mutex::new(()))).clone()
 }
 
-fn session_is_alive(child: &mut Child) -> bool {
-    matches!(child.try_wait(), Ok(None))
+fn session_is_alive(session: &mut BrowserSession) -> bool {
+    match session.child.as_mut() {
+        Some(child) => matches!(child.try_wait(), Ok(None)),
+        None => pid_is_alive(session.pid),
+    }
 }
 
 fn session_cdp_endpoint_responds(port: u16) -> bool {
@@ -293,14 +301,92 @@ fn session_cdp_endpoint_responds(port: u16) -> bool {
 }
 
 fn kill_session(mut session: BrowserSession) {
-    kill_pid(session.child.id());
-    let _ = session.child.kill();
-    let _ = session.child.wait();
-    let _ = std::fs::remove_file(pid_sidecar_path(&browser_chrome_profile_dir(&session.cwd, &session.session_id)));
+    kill_pid(session.pid);
+    if let Some(mut child) = session.child.take() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    let profile_dir = browser_chrome_profile_dir(&session.cwd, &session.session_id);
+    let _ = std::fs::remove_file(pid_sidecar_path(&profile_dir));
+    let _ = std::fs::remove_file(port_sidecar_path(&profile_dir));
+    let _ = std::fs::remove_file(session_id_sidecar_path(&profile_dir));
 }
 
 fn pid_sidecar_path(profile_dir: &Path) -> PathBuf {
     profile_dir.join("chrome.pid")
+}
+
+fn port_sidecar_path(profile_dir: &Path) -> PathBuf {
+    profile_dir.join("chrome.port")
+}
+
+fn session_id_sidecar_path(profile_dir: &Path) -> PathBuf {
+    profile_dir.join("chrome.session-id")
+}
+
+/// Written next to the pid sidecar at every successful chrome spawn so a
+/// LATER daemon process (self-update handoff, idle self-recycle, panic
+/// restart) can re-attach to this chrome instead of reaping it -- pid + CDP
+/// port + the raw (unsanitized) session id are everything adoption needs.
+fn write_session_sidecars(profile_dir: &Path, pid: u32, port: u16, session_id: &str) {
+    let _ = std::fs::write(pid_sidecar_path(profile_dir), pid.to_string());
+    let _ = std::fs::write(port_sidecar_path(profile_dir), port.to_string());
+    let _ = std::fs::write(session_id_sidecar_path(profile_dir), session_id);
+}
+
+/// Re-attach to a chrome that outlived the daemon process that launched it.
+/// Returns the adopted session id when the profile dir has intact sidecars,
+/// the recorded pid is alive, and the recorded CDP port still answers --
+/// in which case the session is inserted into the live sessions map (as an
+/// adopted, Child-less session) and the caller must NOT reap or relaunch it.
+/// Any gap in that chain returns None and the caller keeps its old behavior
+/// (reap as orphan / launch fresh).
+fn try_adopt_orphaned_session(cwd: &Path, session_id_hint: Option<&str>, profile_dir: &Path) -> Option<String> {
+    let session_id = std::fs::read_to_string(session_id_sidecar_path(profile_dir))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| session_id_hint.map(|s| s.to_string()))
+        .or_else(|| {
+            profile_dir
+                .file_name()
+                .and_then(|n| n.to_str())
+                .and_then(|n| n.strip_prefix("browser-chrome-profile-"))
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+        })?;
+    let pid: u32 = std::fs::read_to_string(pid_sidecar_path(profile_dir)).ok()?.trim().parse().ok()?;
+    let port: u16 = std::fs::read_to_string(port_sidecar_path(profile_dir)).ok()?.trim().parse().ok()?;
+    if !pid_is_alive(pid) || !session_cdp_endpoint_responds(port) {
+        return None;
+    }
+    let key = session_key(cwd, &session_id);
+    {
+        let mut map = sessions_map().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(existing) = map.get_mut(&key) {
+            if session_is_alive(existing) {
+                return Some(session_id);
+            }
+            map.remove(&key);
+        }
+        map.insert(
+            key,
+            BrowserSession {
+                cwd: cwd.to_path_buf(),
+                session_id: session_id.clone(),
+                child: None,
+                pid,
+                port,
+                last_used: Instant::now(),
+                target_id: None,
+            },
+        );
+    }
+    eprintln!(
+        "[agentplug browser] adopted OS-orphaned chrome pid={} port={} as session '{}' for {} -- a daemon recycle no longer costs a browser session its chrome/page state",
+        pid, port, session_id, cwd.display()
+    );
+    Some(session_id)
 }
 
 #[cfg(windows)]
@@ -400,6 +486,15 @@ fn reap_os_orphans(cwd: &Path) {
                     continue;
                 }
             }
+        }
+        // Adoption before reaping: a chrome whose launcher daemon died
+        // (self-update handoff, idle self-recycle, panic) is only orphaned
+        // from THIS process's perspective -- with intact sidecars and a live
+        // CDP endpoint it is re-attached as a session, not killed. Reaping is
+        // now the fallback for genuinely-unadoptable orphans (missing/stale
+        // sidecars, dead CDP endpoint).
+        if try_adopt_orphaned_session(cwd, None, &path).is_some() {
+            continue;
         }
         let sidecar_pids: Vec<u32> = std::fs::read_to_string(&sidecar)
             .ok()
@@ -665,13 +760,29 @@ fn dirs_local_appdata_chrome_user_data() -> Option<String> {
     None
 }
 
+/// Called on every daemon shutdown/handoff path (self-update handoff,
+/// heartbeat authority loss, panic hook). This used to KILL every session's
+/// chrome, which meant an infrastructure event the browser session had nothing
+/// to do with (a runner version swap, a contested ownership file, a daemon
+/// panic) destroyed that session's entire page state -- observed live as
+/// "[agentplug browser] reaping OS-orphaned chrome" followed by lost work.
+///
+/// It now DETACHES instead: the session is forgotten by this process but its
+/// chrome keeps running with the pid/port/session-id sidecars in place, so
+/// the next daemon (or the next dispatch in this one) re-attaches via
+/// `try_adopt_orphaned_session`. Child::drop does not kill the process, and
+/// sessions that are genuinely done are still reaped later by the
+/// idle-timeout and deregistered-root sweepers after re-adoption.
 pub fn close_all_sessions() {
     let mut map = sessions_map().lock().unwrap_or_else(|e| e.into_inner());
     let keys: Vec<String> = map.keys().cloned().collect();
     for k in keys {
         if let Some(session) = map.remove(&k) {
-            eprintln!("[agentplug browser] closing session {} for handoff/shutdown", session.session_id);
-            kill_session(session);
+            eprintln!(
+                "[agentplug browser] detaching session {} (pid {}) for handoff/shutdown -- chrome keeps running as an adoptable orphan",
+                session.session_id, session.pid
+            );
+            drop(session);
         }
     }
 }
@@ -756,13 +867,15 @@ fn session_new(cwd: &Path, session_id: &str, cfg: &BrowserConfig) -> Value {
     }
     match launch_chrome(cwd, session_id, cfg) {
         Ok((child, port)) => {
+            let pid = child.id();
             let mut map = sessions_map().lock().unwrap_or_else(|e| e.into_inner());
             map.insert(
                 key,
                 BrowserSession {
                     cwd: cwd.to_path_buf(),
                     session_id: session_id.to_string(),
-                    child,
+                    child: Some(child),
+                    pid,
                     port,
                     last_used: Instant::now(),
                     target_id: None,
@@ -783,7 +896,7 @@ fn session_list(cwd: &Path) -> Value {
         .collect();
     let mut out = Vec::new();
     for k in keys_for_cwd {
-        let alive = map.get_mut(&k).map(|s| session_is_alive(&mut s.child)).unwrap_or(false);
+        let alive = map.get_mut(&k).map(|s| session_is_alive(s)).unwrap_or(false);
         if !alive {
             map.remove(&k);
             continue;
@@ -936,7 +1049,7 @@ fn launch_chrome(cwd: &Path, session_id: &str, browser_cfg: &BrowserConfig) -> R
     let port = free_port();
     let mut chrome_child = spawn_chrome_once(&chrome, &profile_dir, port, headless, no_sandbox)?;
 
-    let _ = std::fs::write(pid_sidecar_path(&profile_dir), chrome_child.id().to_string());
+    write_session_sidecars(&profile_dir, chrome_child.id(), port, session_id);
 
     if !cdp_ready(port, Instant::now() + browser_cfg.chrome_ready_deadline(), browser_cfg) {
         kill_pid(chrome_child.id());
@@ -947,7 +1060,7 @@ fn launch_chrome(cwd: &Path, session_id: &str, browser_cfg: &BrowserConfig) -> R
             no_sandbox = true;
             let port2 = free_port();
             let mut retry_child = spawn_chrome_once(&chrome, &profile_dir, port2, headless, no_sandbox)?;
-            let _ = std::fs::write(pid_sidecar_path(&profile_dir), retry_child.id().to_string());
+            write_session_sidecars(&profile_dir, retry_child.id(), port2, session_id);
             if cdp_ready(port2, Instant::now() + browser_cfg.chrome_ready_deadline(), browser_cfg) {
                 return Ok((retry_child, port2));
             }
@@ -957,6 +1070,8 @@ fn launch_chrome(cwd: &Path, session_id: &str, browser_cfg: &BrowserConfig) -> R
         }
 
         let _ = std::fs::remove_file(pid_sidecar_path(&profile_dir));
+        let _ = std::fs::remove_file(port_sidecar_path(&profile_dir));
+        let _ = std::fs::remove_file(session_id_sidecar_path(&profile_dir));
         let log_tail = std::fs::read_to_string(&log_path)
             .ok()
             .map(|s| s.lines().rev().take(5).collect::<Vec<_>>().join(" | "))
@@ -1102,7 +1217,7 @@ pub fn run(body: &str, cwd: &Path, session_id: &str) -> Value {
     let candidate_port = {
         let mut map = sessions_map().lock().unwrap_or_else(|e| e.into_inner());
         let reuse_port = map.get_mut(&key).and_then(|s| {
-            if session_is_alive(&mut s.child) {
+            if session_is_alive(s) {
                 Some(s.port)
             } else {
                 None
@@ -1139,26 +1254,48 @@ pub fn run(body: &str, cwd: &Path, session_id: &str) -> Value {
     let port = match port {
         Some(p) => p,
         None => {
-            let (chrome_child, new_port) = match launch_chrome(cwd, session_id, &browser_cfg) {
-                Ok(v) => v,
-                Err(e) => {
-                    cleanup(&[&helper_path, &script_path, &result_path]);
-                    return json!({"ok": false, "stdout": "", "exit_code": 1, "stderr": e});
+            // A daemon recycle (self-update handoff, idle self-recycle, panic)
+            // may have left this session's chrome running as an OS orphan with
+            // intact sidecars. Re-attach to it instead of spawning a second
+            // chrome onto the same (locked) profile dir -- which both fails
+            // the launch AND destroys the page state the caller still wants.
+            let adopted_port = try_adopt_orphaned_session(cwd, Some(session_id), &browser_chrome_profile_dir(cwd, session_id))
+                .filter(|adopted_id| adopted_id == session_id)
+                .and_then(|adopted_id| {
+                    let adopted_key = session_key(cwd, &adopted_id);
+                    let mut map = sessions_map().lock().unwrap_or_else(|e| e.into_inner());
+                    map.get_mut(&adopted_key).map(|s| {
+                        s.last_used = Instant::now();
+                        s.port
+                    })
+                });
+            match adopted_port {
+                Some(p) => p,
+                None => {
+                    let (chrome_child, new_port) = match launch_chrome(cwd, session_id, &browser_cfg) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            cleanup(&[&helper_path, &script_path, &result_path]);
+                            return json!({"ok": false, "stdout": "", "exit_code": 1, "stderr": e});
+                        }
+                    };
+                    let pid = chrome_child.id();
+                    let mut map = sessions_map().lock().unwrap_or_else(|e| e.into_inner());
+                    map.insert(
+                        key.clone(),
+                        BrowserSession {
+                            cwd: cwd.to_path_buf(),
+                            session_id: session_id.to_string(),
+                            child: Some(chrome_child),
+                            pid,
+                            port: new_port,
+                            last_used: Instant::now(),
+                            target_id: None,
+                        },
+                    );
+                    new_port
                 }
-            };
-            let mut map = sessions_map().lock().unwrap_or_else(|e| e.into_inner());
-            map.insert(
-                key.clone(),
-                BrowserSession {
-                    cwd: cwd.to_path_buf(),
-                    session_id: session_id.to_string(),
-                    child: chrome_child,
-                    port: new_port,
-                    last_used: Instant::now(),
-                    target_id: None,
-                },
-            );
-            new_port
+            }
         }
     };
 
