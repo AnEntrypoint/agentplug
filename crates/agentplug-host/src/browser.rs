@@ -896,7 +896,7 @@ fn session_list(cwd: &Path) -> Value {
         .collect();
     let mut out = Vec::new();
     for k in keys_for_cwd {
-        let alive = map.get_mut(&k).map(|s| session_is_alive(s)).unwrap_or(false);
+        let alive = map.get_mut(&k).map(session_is_alive).unwrap_or(false);
         if !alive {
             map.remove(&k);
             continue;
