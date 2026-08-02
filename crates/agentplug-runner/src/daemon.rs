@@ -1138,7 +1138,7 @@ fn inflight_claim_path(in_dir: &Path, verb: &str, task: &str) -> PathBuf {
     in_dir.join(verb).join(format!("{task}.txt.{ORPHAN_CLAIM_EXT}"))
 }
 
-fn sweep_orphaned_claims(root: &Path) {
+pub fn sweep_orphaned_claims(root: &Path) {
     let spool_dir = root.join(".gm").join("exec-spool");
     let in_dir = spool_dir.join("in");
     let out_dir = spool_dir.join("out");
@@ -1178,6 +1178,42 @@ fn sweep_orphaned_claims(root: &Path) {
                 eprintln!("[agentplug daemon] swept orphaned claim {verb}/{task} for {} -- wrote error out-file", root.display());
             }
             let _ = fs::remove_file(&path);
+        }
+    }
+}
+
+pub fn sweep_unconsumable_spool_files(root: &Path) {
+    let spool_dir = root.join(".gm").join("exec-spool");
+    let in_dir = spool_dir.join("in");
+    let quarantine_dir = spool_dir.join("in-quarantine");
+    let Ok(verb_dirs) = fs::read_dir(&in_dir) else { return };
+    for verb_entry in verb_dirs.flatten() {
+        if !verb_entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let verb = verb_entry.file_name().to_string_lossy().into_owned();
+        let Ok(files) = fs::read_dir(verb_entry.path()) else { continue };
+        for file_entry in files.flatten() {
+            let path = file_entry.path();
+            if !file_entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+                continue;
+            }
+            let ext = path.extension().and_then(|e| e.to_str());
+            if ext == Some("txt") || ext == Some(ORPHAN_CLAIM_EXT) {
+                continue;
+            }
+            let file_name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            if file_name.is_empty() {
+                continue;
+            }
+            let _ = fs::create_dir_all(&quarantine_dir);
+            let dest = quarantine_dir.join(format!("{verb}__{file_name}"));
+            if fs::rename(&path, &dest).is_ok() {
+                eprintln!(
+                    "[agentplug daemon] quarantined unconsumable spool file in/{verb}/{file_name} to {} -- the spool ABI is in/<verb>/<numeric-id>.txt, so a non-conforming name is never claimed by the dispatch loop and would otherwise sit invisibly forever",
+                    dest.display()
+                );
+            }
         }
     }
 }
@@ -1737,6 +1773,7 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
             if sweep_orphans_left_by_whatever_daemon_died_before_answering {
                 for root in &known_roots {
                     sweep_orphaned_claims(root);
+                    sweep_unconsumable_spool_files(root);
                 }
             }
         }

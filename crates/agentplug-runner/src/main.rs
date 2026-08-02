@@ -83,6 +83,13 @@ fn main() -> anyhow::Result<()> {
             run_spool_watcher_single_process(&mut project, &spool_dir)
         }
         "daemon" => daemon::run_daemon(),
+        "sweep-spool" => {
+            let root = args.get(2).map(PathBuf::from).unwrap_or_else(|| std::env::current_dir().expect("cwd unavailable"));
+            daemon::sweep_orphaned_claims(&root);
+            daemon::sweep_unconsumable_spool_files(&root);
+            println!("swept orphaned claims and unconsumable spool files under {}", root.display());
+            Ok(())
+        }
         "reap-orphans" => {
             let roots = daemon::read_registry();
             agentplug_host::reap_idle_sessions_and_os_orphans_across_every_known_project_root(&roots);
@@ -133,7 +140,7 @@ fn main() -> anyhow::Result<()> {
         }
         other => {
             eprintln!(
-                "agentplug-runner: unknown command '{other}'. Usage: agentplug-runner <plugin <name> [version]|spool|daemon|takeover <version>|dispatch [plugin] <verb> [body]|reap-orphans|version>"
+                "agentplug-runner: unknown command '{other}'. Usage: agentplug-runner <plugin <name> [version]|spool|daemon|takeover <version>|dispatch [plugin] <verb> [body]|reap-orphans|sweep-spool [root]|version>"
             );
             std::process::exit(1);
         }

@@ -273,13 +273,23 @@ pub fn dispatch_on(
     memory.write(&mut *store, verb_ptr as usize, verb.as_bytes())?;
     let body_ptr = alloc.call(&mut *store, body.len() as u32)?;
     memory.write(&mut *store, body_ptr as usize, body.as_bytes())?;
+    let free = instance.get_typed_func::<(u32, u32), ()>(&mut *store, "plugkit_free").ok();
+    let free_call_args = |store: &mut Store<HostState>| {
+        if let Some(free) = &free {
+            let _ = free.call(&mut *store, (verb_ptr, verb.len() as u32));
+            let _ = free.call(&mut *store, (body_ptr, body.len() as u32));
+        }
+    };
 
     let dispatch_fn = instance
         .get_typed_func::<(u32, u32, u32, u32), u64>(&mut *store, "plugin_call")
         .or_else(|_| instance.get_typed_func::<(u32, u32, u32, u32), u64>(&mut *store, "dispatch_verb"))?;
     let call_result = dispatch_fn.call(&mut *store, (verb_ptr, verb.len() as u32, body_ptr, body.len() as u32));
     let packed = match call_result {
-        Ok(p) => p,
+        Ok(p) => {
+            free_call_args(store);
+            p
+        }
         Err(e) => {
             if matches!(e.downcast_ref::<wasmtime::Trap>(), Some(wasmtime::Trap::Interrupt)) {
                 return Err(anyhow::anyhow!("plugin_call_deadline_exceeded: {plugin_name} exceeded {call_deadline_secs}s executing verb {verb}"));
