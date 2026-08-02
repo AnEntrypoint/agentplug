@@ -11,6 +11,77 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
     hasher.finalize().iter().map(|b| format!("{b:02x}")).collect()
 }
 
+fn npm_registry_latest_version(package: &str) -> anyhow::Result<String> {
+    let url = format!("https://registry.npmjs.org/{package}/latest");
+    let resp = agentplug_host::shared_agent().get(&url).call()?;
+    let body = resp.into_string()?;
+    let v: serde_json::Value = serde_json::from_str(&body)?;
+    v.get("version")
+        .and_then(|s| s.as_str())
+        .map(String::from)
+        .ok_or_else(|| anyhow::anyhow!("npm registry response for {package} had no version field"))
+}
+
+fn npm_registry_tarball_url(package: &str, version: &str) -> anyhow::Result<String> {
+    let url = format!("https://registry.npmjs.org/{package}/{version}");
+    let resp = agentplug_host::shared_agent().get(&url).call()?;
+    let body = resp.into_string()?;
+    let v: serde_json::Value = serde_json::from_str(&body)?;
+    v.get("dist")
+        .and_then(|d| d.get("tarball"))
+        .and_then(|t| t.as_str())
+        .map(String::from)
+        .ok_or_else(|| anyhow::anyhow!("npm registry response for {package}@{version} had no dist.tarball field"))
+}
+
+fn extract_file_from_npm_tarball(tarball_bytes: &[u8], file_name: &str) -> anyhow::Result<Vec<u8>> {
+    let decoder = flate2::read::GzDecoder::new(tarball_bytes);
+    let mut archive = tar::Archive::new(decoder);
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        let path = entry.path()?.to_string_lossy().into_owned();
+        if path.ends_with(&format!("/{file_name}")) || path == file_name {
+            let mut buf = Vec::new();
+            entry.read_to_end(&mut buf)?;
+            return Ok(buf);
+        }
+    }
+    anyhow::bail!("npm tarball did not contain a file named {file_name} (package.json's own \"main\" convention -- expected package/{file_name})")
+}
+
+fn try_ensure_plugin_installed_via_npm_mirror(spec: &PluginAssetSpec, dest: &Path, version_file: &Path) -> anyhow::Result<PathBuf> {
+    let package = spec.npm_package.as_deref().ok_or_else(|| anyhow::anyhow!("no npm mirror configured for this plugin"))?;
+    let version = npm_registry_latest_version(package)?;
+    let tarball_url = npm_registry_tarball_url(package, &version)?;
+    let tarball_resp = agentplug_host::shared_agent().get(&tarball_url).call()?;
+    let mut tarball_bytes = Vec::new();
+    tarball_resp.into_reader().read_to_end(&mut tarball_bytes)?;
+
+    let wasm_name = format!("{}.wasm", spec.asset_basename);
+    let sha_name = format!("{}.wasm.sha256", spec.asset_basename);
+    let wasm_bytes = extract_file_from_npm_tarball(&tarball_bytes, &wasm_name)?;
+    let sha_bytes = extract_file_from_npm_tarball(&tarball_bytes, &sha_name)?;
+    let sha_text = String::from_utf8_lossy(&sha_bytes).into_owned();
+    let expected_sha = sha_text.split_whitespace().next()
+        .ok_or_else(|| anyhow::anyhow!("empty sha256 sidecar for {} in npm package {package}", spec.asset_basename))?
+        .to_string();
+    let actual_sha = sha256_hex(&wasm_bytes);
+    if actual_sha != expected_sha {
+        anyhow::bail!("npm mirror {package}@{version} sha256 mismatch: expected {expected_sha}, got {actual_sha}");
+    }
+
+    let prev_dest = dest.with_extension("wasm.prev");
+    if dest.exists() {
+        let _ = fs::copy(dest, &prev_dest);
+    }
+    let tmp = dest.with_extension("wasm.tmp");
+    fs::write(&tmp, &wasm_bytes)?;
+    fs::rename(&tmp, dest)?;
+    fs::write(version_file, &version)?;
+    eprintln!("[agentplug] {} installed via npm mirror {package}@{version} (GitHub Releases path failed or was unreachable)", spec.asset_basename);
+    Ok(dest.to_path_buf())
+}
+
 fn github_api_request(url: &str) -> ureq::Request {
     let req = agentplug_host::shared_agent().get(url).set("User-Agent", "agentplug-runner");
     match std::env::var("GITHUB_TOKEN").or_else(|_| std::env::var("GH_TOKEN")) {
@@ -65,6 +136,7 @@ pub fn download_and_verify(url: &str, dest: &Path, expected_sha256_hex: &str) ->
 struct PluginAssetSpec {
     repo: String,
     asset_basename: String,
+    npm_package: Option<String>,
 }
 
 fn gm_asset_basename() -> &'static str {
@@ -73,10 +145,10 @@ fn gm_asset_basename() -> &'static str {
 
 fn builtin_plugin_asset_spec(plugin_name: &str) -> Option<PluginAssetSpec> {
     match plugin_name {
-        "gm" => Some(PluginAssetSpec { repo: "AnEntrypoint/plugkit-bin".to_string(), asset_basename: gm_asset_basename().to_string() }),
-        "bert" => Some(PluginAssetSpec { repo: "AnEntrypoint/agentplug-bert-bin".to_string(), asset_basename: "bert".to_string() }),
-        "libsql" => Some(PluginAssetSpec { repo: "AnEntrypoint/agentplug-libsql-bin".to_string(), asset_basename: "libsql".to_string() }),
-        "treesitter" => Some(PluginAssetSpec { repo: "AnEntrypoint/agentplug-treesitter-bin".to_string(), asset_basename: "treesitter".to_string() }),
+        "gm" => Some(PluginAssetSpec { repo: "AnEntrypoint/plugkit-bin".to_string(), asset_basename: gm_asset_basename().to_string(), npm_package: Some("plugkit-wasm".to_string()) }),
+        "bert" => Some(PluginAssetSpec { repo: "AnEntrypoint/agentplug-bert-bin".to_string(), asset_basename: "bert".to_string(), npm_package: Some("agentplug-bert-wasm".to_string()) }),
+        "libsql" => Some(PluginAssetSpec { repo: "AnEntrypoint/agentplug-libsql-bin".to_string(), asset_basename: "libsql".to_string(), npm_package: Some("agentplug-libsql-wasm".to_string()) }),
+        "treesitter" => Some(PluginAssetSpec { repo: "AnEntrypoint/agentplug-treesitter-bin".to_string(), asset_basename: "treesitter".to_string(), npm_package: Some("agentplug-treesitter-wasm".to_string()) }),
         _ => None,
     }
 }
@@ -117,7 +189,7 @@ fn plugin_asset_spec_for_roots(plugin_name: &str, known_roots: &[PathBuf]) -> Op
     for root in known_roots {
         for spec in project_declared_plugin_specs(root) {
             if spec.name == plugin_name {
-                return Some(PluginAssetSpec { repo: spec.repo, asset_basename: spec.asset_basename });
+                return Some(PluginAssetSpec { repo: spec.repo, asset_basename: spec.asset_basename, npm_package: None });
             }
         }
     }
@@ -325,17 +397,32 @@ pub fn ensure_plugin_installed(plugin_name: &str, explicit_version: Option<&str>
     let Some(spec) = plugin_asset_spec(plugin_name) else {
         anyhow::bail!("unknown plugin {plugin_name} -- not registered in agentplug-runner's plugin_asset_spec map");
     };
+    let version_file = plugin_version_path(plugin_name);
+
+    match ensure_plugin_installed_via_github(plugin_name, explicit_version, &spec, &dest, &version_file) {
+        Ok(path) => Ok(path),
+        Err(github_err) => {
+            match try_ensure_plugin_installed_via_npm_mirror(&spec, &dest, &version_file) {
+                Ok(path) => Ok(path),
+                Err(npm_err) => Err(anyhow::anyhow!(
+                    "plugin {plugin_name} install failed on both paths -- GitHub Releases: {github_err:#}; npm mirror: {npm_err:#}"
+                )),
+            }
+        }
+    }
+}
+
+fn ensure_plugin_installed_via_github(plugin_name: &str, explicit_version: Option<&str>, spec: &PluginAssetSpec, dest: &Path, version_file: &Path) -> anyhow::Result<PathBuf> {
     let version = match explicit_version {
         Some(v) => v.to_string(),
         None => fetch_latest_plugin_version(plugin_name)?
             .ok_or_else(|| anyhow::anyhow!("could not resolve latest version for plugin {plugin_name}"))?,
     };
 
-    let version_file = plugin_version_path(plugin_name);
     if dest.exists() {
-        if let Ok(installed) = fs::read_to_string(&version_file) {
+        if let Ok(installed) = fs::read_to_string(version_file) {
             if installed.trim() == version {
-                return Ok(dest);
+                return Ok(dest.to_path_buf());
             }
         }
     }
@@ -357,9 +444,9 @@ pub fn ensure_plugin_installed(plugin_name: &str, explicit_version: Option<&str>
 
     let prev_dest = dest.with_extension("wasm.prev");
     if dest.exists() {
-        let _ = fs::copy(&dest, &prev_dest);
+        let _ = fs::copy(dest, &prev_dest);
     }
-    download_and_verify(&wasm_url, &dest, &expected_sha)?;
-    fs::write(&version_file, &version)?;
-    Ok(dest)
+    download_and_verify(&wasm_url, dest, &expected_sha)?;
+    fs::write(version_file, &version)?;
+    Ok(dest.to_path_buf())
 }
