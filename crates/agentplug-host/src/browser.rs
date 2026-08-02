@@ -682,7 +682,38 @@ pub fn reap_idle_sessions_and_os_orphans_across_every_known_project_root(roots: 
         reap_idle_sessions(root, &cfg);
         reap_os_orphans(root);
     }
+    reap_sessions_for_deregistered_roots(roots);
     reap_globally_orphaned_headless_chromes();
+}
+
+/// `reap_idle_sessions` only ever matches a session whose `cwd` is IN `roots`
+/// -- a session belonging to a project root that has since been deleted or
+/// deregistered from the daemon registry never appears in any `roots` pass
+/// again, so its idle timer is never even evaluated and its Chrome subprocess
+/// keeps running until the whole daemon restarts. This closes that gap: any
+/// live session whose `cwd` is no longer present in the current known-roots
+/// list is reaped unconditionally, independent of its idle timer, because
+/// there is no longer any registry-tracked project that could still be using
+/// it.
+fn reap_sessions_for_deregistered_roots(roots: &[std::path::PathBuf]) {
+    let mut map = sessions_map().lock().unwrap_or_else(|e| e.into_inner());
+    let dead_keys: Vec<String> = map
+        .iter()
+        .filter(|(_, s)| !roots.iter().any(|r| r == &s.cwd))
+        .map(|(k, _)| k.clone())
+        .collect();
+    for k in dead_keys {
+        if let Some(session) = map.remove(&k) {
+            eprintln!(
+                "[agentplug browser] reaping session {} for deregistered root {} (no longer in known_roots)",
+                session.session_id,
+                session.cwd.display()
+            );
+            kill_session(session);
+        }
+    }
+    drop(map);
+    evict_session_lifecycle_locks_with_no_active_holder();
 }
 
 fn reap_idle_sessions(cwd: &Path, cfg: &BrowserConfig) {
