@@ -426,9 +426,28 @@ pub struct DispatchHandle {
 }
 
 impl DispatchHandle {
+    /// Two structurally different reasons this can be a silent no-op, which
+    /// used to be indistinguishable from each other AND from an actual
+    /// successful reinstantiation (every call site does `let _ = ...`): no
+    /// `reload_source` was ever attached to this DispatchHandle at all
+    /// (`dispatch_handle()`, the no-reload constructor -- callers of it are
+    /// asserted to be zero at time of writing, so this branch firing is
+    /// itself a signal something now calls the no-reload path), versus a
+    /// `reload_source` that WAS attached but whose snapshot map simply does
+    /// not contain this specific plugin name. The eprintln on the second
+    /// branch is the diagnostic the poisoned-store followup doc asked for --
+    /// it names which plugin was missing and how large the snapshot was, so
+    /// a live reproduction can confirm whether the snapshot itself was ever
+    /// missing the plugin (a real upstream bug) versus some other cause.
     fn reinstantiate_plugin_into_pool_slot_if_reload_source_available(&self, plugin_name: &str) -> anyhow::Result<()> {
-        let Some((engine, modules)) = self.reload_source.as_ref() else { return Ok(()) };
-        let Some((module, content_hash)) = modules.get(plugin_name) else { return Ok(()) };
+        let Some((engine, modules)) = self.reload_source.as_ref() else {
+            eprintln!("[agentplug registry] reinstantiate skipped for {plugin_name}: this DispatchHandle has no reload_source attached at all (dispatch_handle() no-reload constructor)");
+            return Ok(());
+        };
+        let Some((module, content_hash)) = modules.get(plugin_name) else {
+            eprintln!("[agentplug registry] reinstantiate skipped for {plugin_name}: reload_source snapshot has {} plugin(s) ({:?}) but does not include {plugin_name}", modules.len(), modules.keys().collect::<Vec<_>>());
+            return Ok(());
+        };
         if is_stateless_shared_plugin(plugin_name) {
             let pool = shared_plugin_pool(plugin_name);
             {
