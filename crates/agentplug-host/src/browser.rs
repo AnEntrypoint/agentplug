@@ -293,6 +293,7 @@ fn session_cdp_endpoint_responds(port: u16) -> bool {
 }
 
 fn kill_session(mut session: BrowserSession) {
+    kill_pid(session.child.id());
     let _ = session.child.kill();
     let _ = session.child.wait();
     let _ = std::fs::remove_file(pid_sidecar_path(&browser_chrome_profile_dir(&session.cwd, &session.session_id)));
@@ -907,6 +908,7 @@ fn launch_chrome(cwd: &Path, session_id: &str, browser_cfg: &BrowserConfig) -> R
     let _ = std::fs::write(pid_sidecar_path(&profile_dir), chrome_child.id().to_string());
 
     if !cdp_ready(port, Instant::now() + browser_cfg.chrome_ready_deadline(), browser_cfg) {
+        kill_pid(chrome_child.id());
         let _ = chrome_child.kill();
         let _ = chrome_child.wait();
 
@@ -918,6 +920,7 @@ fn launch_chrome(cwd: &Path, session_id: &str, browser_cfg: &BrowserConfig) -> R
             if cdp_ready(port2, Instant::now() + browser_cfg.chrome_ready_deadline(), browser_cfg) {
                 return Ok((retry_child, port2));
             }
+            kill_pid(retry_child.id());
             let _ = retry_child.kill();
             let _ = retry_child.wait();
         }
