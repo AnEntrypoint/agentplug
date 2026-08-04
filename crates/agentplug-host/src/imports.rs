@@ -325,6 +325,11 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
                     use std::io::Write;
                     let _ = writeln!(f, "evt: {evt_line}");
                 }
+                // per-project content (file paths, PRD ids, git SHAs, embed progress) already
+                // landed in this project's own .watcher.log above -- do not also fan it out to
+                // the machine-global daemon.log, where every other project sharing this daemon
+                // would see it.
+                return 1;
             }
             eprintln!("[agentplug:{plugin} L{level}] {msg}");
             1
