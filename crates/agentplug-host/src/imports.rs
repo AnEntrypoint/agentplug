@@ -325,10 +325,6 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
                     use std::io::Write;
                     let _ = writeln!(f, "evt: {evt_line}");
                 }
-                // per-project content (file paths, PRD ids, git SHAs, embed progress) already
-                // landed in this project's own .watcher.log above -- do not also fan it out to
-                // the machine-global daemon.log, where every other project sharing this daemon
-                // would see it.
                 return 1;
             }
             eprintln!("[agentplug:{plugin} L{level}] {msg}");
@@ -737,16 +733,6 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
                 if p.is_absolute() { p } else { caller.data().cwd().join(p) }
             };
             if !cwd.is_dir() {
-                // A caller-supplied cwd/repo field that isn't a real path (a bare
-                // project name like "gm" instead of an absolute path) resolves to
-                // a nonexistent joined directory here. Handing that straight to
-                // Command::current_dir produces a bare OS error (267 on Windows,
-                // "The directory name is invalid") with no indication of WHICH
-                // path was wrong or why -- the same failure this function's own
-                // porcelain_or_dirty caller then reports as an opaque
-                // "git-status-failed", forcing a caller to reverse-engineer the
-                // real cause from a Windows error code. Naming the resolved path
-                // and the raw cwd_arg it came from turns that into a one-look fix.
                 let v = serde_json::json!({
                     "stdout": "",
                     "stderr": format!(
