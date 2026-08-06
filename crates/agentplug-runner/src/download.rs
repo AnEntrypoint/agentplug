@@ -370,6 +370,20 @@ fn clear_local_dev_sideload_marker(plugin_name: &str) {
     let _ = fs::remove_file(local_dev_sideload_marker_path(plugin_name));
 }
 
+fn fetch_remote_wasm_sha256(plugin_name: &str, version: &str) -> anyhow::Result<String> {
+    let Some(spec) = plugin_asset_spec(plugin_name) else {
+        anyhow::bail!("unknown plugin {plugin_name} -- not registered in agentplug-runner's plugin_asset_spec map");
+    };
+    let base = format!("https://github.com/{}/releases/download/v{version}", spec.repo);
+    let sha_line = agentplug_host::shared_agent().get(&format!("{base}/{}.wasm.sha256", spec.asset_basename)).call()?.into_string()?;
+    sha_line.split_whitespace().next().map(str::to_string)
+        .ok_or_else(|| anyhow::anyhow!("empty sha256 sidecar for {} at {base}", spec.asset_basename))
+}
+
+fn installed_wasm_sha256(plugin_name: &str) -> Option<String> {
+    fs::read(plugin_wasm_path(plugin_name)).ok().map(|bytes| sha256_hex(&bytes))
+}
+
 pub fn refresh_plugin_if_stale(plugin_name: &str) -> anyhow::Result<Option<String>> {
     let Some(installed) = installed_plugin_version(plugin_name) else {
         return Ok(None);
@@ -383,7 +397,12 @@ pub fn refresh_plugin_if_stale(plugin_name: &str) -> anyhow::Result<Option<Strin
         return Ok(None);
     };
     if latest == installed {
-        return Ok(None);
+        match (fetch_remote_wasm_sha256(plugin_name, &latest), installed_wasm_sha256(plugin_name)) {
+            (Ok(remote_sha), Some(local_sha)) if !remote_sha.eq_ignore_ascii_case(&local_sha) => {
+                eprintln!("[agentplug daemon] plugin {plugin_name} version {latest} matches but the released asset's sha256 has changed ({remote_sha} vs installed {local_sha}) -- re-fetching under the same tag");
+            }
+            _ => return Ok(None),
+        }
     }
     ensure_plugin_installed(plugin_name, Some(&latest))?;
     Ok(Some(latest))
