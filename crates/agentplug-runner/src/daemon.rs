@@ -1191,6 +1191,7 @@ pub fn sweep_orphaned_claims(root: &Path) {
                     "error": format!("verb {verb} (task {task}) was claimed by a daemon that died before answering -- a wasm trap, an out-of-memory abort, a shared-Store recycle during the call, or a self-update handoff that exited while this dispatch was still running (check ~/.agentplug/daemon.log for a 'handed off to version' line at the matching time). The request was NOT completed and no partial work should be assumed. Re-dispatch it."),
                     "verb": verb,
                     "task": task,
+                    "sweeping_pid": std::process::id(),
                 }).to_string();
                 write_spool_out(&out_dir, &out_name, &out_body);
                 eprintln!("[agentplug daemon] swept orphaned claim {verb}/{task} for {} -- wrote error out-file", root.display());
