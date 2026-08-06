@@ -379,7 +379,17 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
                 if opts_str.is_empty() { serde_json::json!({}) } else { serde_json::from_str(&opts_str).unwrap_or(serde_json::json!({})) };
             let method = opts.get("method").and_then(|v| v.as_str()).unwrap_or("GET").to_uppercase();
             let body = opts.get("body").and_then(|v| v.as_str());
-            let req = fetch_agent().request(&method, &url);
+            let mut req = fetch_agent().request(&method, &url);
+            if let Some(headers) = opts.get("headers").and_then(|v| v.as_object()) {
+                for (k, v) in headers {
+                    if let Some(vs) = v.as_str() {
+                        req = req.set(k, vs);
+                    }
+                }
+            }
+            if let Some(timeout_ms) = opts.get("timeoutMs").and_then(|v| v.as_u64()) {
+                req = req.timeout(std::time::Duration::from_millis(timeout_ms));
+            }
             let resp = match body {
                 Some(b) => req.send_string(b),
                 None => req.call(),
