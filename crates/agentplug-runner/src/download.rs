@@ -449,14 +449,15 @@ fn ensure_plugin_installed_via_github(plugin_name: &str, explicit_version: Optio
     let base = format!("https://github.com/{}/releases/download/v{version}", spec.repo);
 
     let sha_url = format!("{base}/{}.wasm.sha256", spec.asset_basename);
+    let mut effective_basename = spec.asset_basename.as_str();
     let sha_resp = match agentplug_host::shared_agent().get(&sha_url).call() {
         Ok(resp) => resp,
         Err(_) if spec.asset_basename == "plugkit-slim" => {
+            effective_basename = "plugkit";
             agentplug_host::shared_agent().get(&format!("{base}/plugkit.wasm.sha256")).call()?
         }
         Err(e) => return Err(e.into()),
     };
-    let effective_basename = if sha_resp.get_url().contains("plugkit-slim") { "plugkit-slim" } else { "plugkit" };
     let wasm_url = format!("{base}/{effective_basename}.wasm");
     let sha_line = sha_resp.into_string()?;
     let expected_sha = sha_line.split_whitespace().next().ok_or_else(|| anyhow::anyhow!("empty sha256 sidecar for {effective_basename} at {base}"))?.to_string();
