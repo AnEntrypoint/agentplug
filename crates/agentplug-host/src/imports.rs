@@ -108,9 +108,10 @@ fn user_gm_root() -> Option<PathBuf> {
 static FS_WRITE_LOCKS: OnceLock<Mutex<HashMap<PathBuf, std::sync::Arc<Mutex<()>>>>> = OnceLock::new();
 
 fn fs_write_lock_for(path: &Path) -> std::sync::Arc<Mutex<()>> {
+    let key = canonicalize_path_separators_for_stable_keying(path);
     let registry = FS_WRITE_LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
     let mut guard = registry.lock().unwrap_or_else(|e| e.into_inner());
-    guard.entry(path.to_path_buf()).or_insert_with(|| std::sync::Arc::new(Mutex::new(()))).clone()
+    guard.entry(key).or_insert_with(|| std::sync::Arc::new(Mutex::new(()))).clone()
 }
 
 /// Serializes writers to the same path, then writes via temp-file + rename
