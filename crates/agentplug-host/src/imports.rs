@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use wait_timeout::ChildExt;
@@ -90,6 +91,50 @@ fn user_gm_root() -> Option<PathBuf> {
         return None;
     }
     normalize_lexically(&std::path::Path::new(home).join(".gm"))
+}
+
+/// Process-wide per-path locks for host_fs_write. The shared plugin pool
+/// dispatches guest writes from multiple wasmtime Store instances on
+/// separate OS threads with no serialization of their own (see
+/// registry.rs's SHARED_PLUGINS pool, keyed by plugin name across every
+/// project the daemon serves, not by file path) -- a plain fs::write here
+/// raced two concurrent guest writers to the same path (e.g. two
+/// back-to-back prd-add dispatches performing a read-modify-write cycle
+/// against .gm/prd.yml) into a lost update, even though the guest side
+/// (orchestrator/cas.rs's cas_retry_write) already does an optimistic
+/// recheck/confirm around its own read-modify-write. This lock closes the
+/// gap the guest-side optimistic check cannot see: true interleaving of
+/// two independent fs::write calls at the host layer.
+static FS_WRITE_LOCKS: OnceLock<Mutex<HashMap<PathBuf, std::sync::Arc<Mutex<()>>>>> = OnceLock::new();
+
+fn fs_write_lock_for(path: &Path) -> std::sync::Arc<Mutex<()>> {
+    let registry = FS_WRITE_LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = registry.lock().unwrap_or_else(|e| e.into_inner());
+    guard.entry(path.to_path_buf()).or_insert_with(|| std::sync::Arc::new(Mutex::new(()))).clone()
+}
+
+/// Serializes writers to the same path, then writes via temp-file + rename
+/// so a reader can never observe a torn/partial write either (matching the
+/// atomic_write pattern already used for .gm/memories/*.md in
+/// crates/plugkit-core/src/memory_md.rs's rename_batch, ported to the host
+/// side where the real fs::write call lives for the guest's host_fs_write
+/// import).
+fn atomic_write_locked(full: &Path, data: &str) -> std::io::Result<()> {
+    let lock = fs_write_lock_for(full);
+    let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = full.with_extension(format!(
+        "{}.tmp-{}",
+        full.extension().and_then(|e| e.to_str()).unwrap_or(""),
+        std::process::id()
+    ));
+    fs::write(&tmp, data)?;
+    match fs::rename(&tmp, full) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
 }
 
 fn sandboxed_guest_path(cwd: &std::path::Path, path: &str) -> Option<PathBuf> {
@@ -245,7 +290,7 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
             if let Some(parent) = full.parent() {
                 let _ = fs::create_dir_all(parent);
             }
-            match fs::write(&full, data) {
+            match atomic_write_locked(&full, &data) {
                 Ok(()) => 1,
                 Err(_) => 0,
             }
