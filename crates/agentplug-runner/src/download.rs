@@ -405,7 +405,61 @@ pub fn refresh_plugin_if_stale(plugin_name: &str) -> anyhow::Result<Option<Strin
         }
     }
     ensure_plugin_installed(plugin_name, Some(&latest))?;
+    if plugin_name == "gm" {
+        if let Err(e) = refresh_installed_skill_md() {
+            eprintln!("[agentplug daemon] SKILL.md refresh after gm plugin update to {latest} failed: {e:#}");
+        }
+    }
     Ok(Some(latest))
+}
+
+const SKILL_MD_REMOTE_REPO: &str = "AnEntrypoint/gm";
+const SKILL_MD_REMOTE_BRANCH: &str = "main";
+
+fn normalize_newlines(s: &str) -> String {
+    s.replace("\r\n", "\n")
+}
+
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).map(PathBuf::from)
+}
+
+pub fn refresh_installed_skill_md() -> anyhow::Result<Vec<PathBuf>> {
+    let url = format!(
+        "https://raw.githubusercontent.com/{SKILL_MD_REMOTE_REPO}/{SKILL_MD_REMOTE_BRANCH}/skills/gm/SKILL.md"
+    );
+    let bundled = agentplug_host::shared_agent().get(&url).call()?.into_string()?;
+    let bundled_hash = sha256_hex(normalize_newlines(&bundled).as_bytes());
+
+    let Some(home) = home_dir() else {
+        anyhow::bail!("no HOME/USERPROFILE set -- cannot locate installed skills directories");
+    };
+    let targets = [
+        home.join(".agents").join("skills").join("gm").join("SKILL.md"),
+        home.join(".claude").join("skills").join("gm").join("SKILL.md"),
+    ];
+
+    let mut refreshed = Vec::new();
+    for target in targets {
+        let needs_write = match fs::read_to_string(&target) {
+            Ok(existing) => sha256_hex(normalize_newlines(&existing).as_bytes()) != bundled_hash,
+            Err(_) => true,
+        };
+        if !needs_write {
+            continue;
+        }
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let tmp = target.with_extension("md.tmp");
+        fs::write(&tmp, &bundled)?;
+        fs::rename(&tmp, &target)?;
+        refreshed.push(target);
+    }
+    if !refreshed.is_empty() {
+        eprintln!("[agentplug daemon] SKILL.md refreshed: {} target(s)", refreshed.len());
+    }
+    Ok(refreshed)
 }
 
 pub fn ensure_plugin_installed(plugin_name: &str, explicit_version: Option<&str>) -> anyhow::Result<PathBuf> {
