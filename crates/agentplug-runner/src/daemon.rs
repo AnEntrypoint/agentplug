@@ -1661,8 +1661,27 @@ pub fn try_dispatch_via_daemon(cwd: &Path, plugin: &str, verb: &str, body: &str)
     None
 }
 
+fn seed_github_token_from_gh_cli_if_unset() {
+    if std::env::var_os("GITHUB_TOKEN").is_some() || std::env::var_os("GH_TOKEN").is_some() {
+        return;
+    }
+    let Ok(output) = std::process::Command::new("gh").args(["auth", "token"]).output() else {
+        return;
+    };
+    if !output.status.success() {
+        return;
+    }
+    let token = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if token.is_empty() {
+        return;
+    }
+    std::env::set_var("GH_TOKEN", &token);
+    eprintln!("[agentplug daemon] seeded GH_TOKEN from `gh auth token` -- ci-status and other GitHub API verbs now run authenticated, avoiding the unauthenticated 60/hr rate limit");
+}
+
 pub fn run_daemon() -> anyhow::Result<()> {
     eprintln!("[agentplug daemon] starting, registry {}", registry_path().display());
+    seed_github_token_from_gh_cli_if_unset();
 
     if !claim_ownership() {
         let existing_pid = read_owner_pid();
