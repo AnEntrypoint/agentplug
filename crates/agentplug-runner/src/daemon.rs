@@ -1986,12 +1986,27 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
         // in_flight_map keeps the detached entry until its thread is joined, so
         // it is the signal that survives detachment.
         let detached_still_running = !in_flight_map().lock().unwrap_or_else(|e| e.into_inner()).is_empty();
-        if (!any_work && !detached_still_running) || self_update_starved {
+        // A runner self-update is never urgent -- the current binary keeps serving
+        // correctly, this is purely picking up a newer build. Once starved, a
+        // second, longer grace period gives whatever's still genuinely in-flight
+        // (heavy verbs like `instruction` running a codeinsight rebuild routinely
+        // take 15-30s+) a chance to finish naturally on later loop iterations
+        // instead of being killed the instant the first deadline passes -- that
+        // instant-kill was the recurring `instruction`-specific dispatch_orphaned
+        // pattern this comment used to just document as an unavoidable cost. The
+        // hard cap still forces the handoff eventually so a genuinely wedged
+        // dispatch cannot block updates forever.
+        const SELF_UPDATE_HARD_CAP_MS: u64 = SELF_UPDATE_MAX_STARVED_MS + 60_000;
+        let self_update_hard_capped = pending_self_update_staged_at
+            .map(|staged_at| staged_at.elapsed() >= Duration::from_millis(SELF_UPDATE_HARD_CAP_MS))
+            .unwrap_or(false);
+        let force_handoff_despite_in_flight = self_update_starved && detached_still_running && self_update_hard_capped;
+        if (!any_work && !detached_still_running) || force_handoff_despite_in_flight {
             if let Some((staged, version)) = pending_self_update.take() {
-                if self_update_starved {
+                if force_handoff_despite_in_flight {
                     eprintln!(
-                        "[agentplug daemon] self-update to {version} starved for {}ms under continuous load -- forcing handoff despite {} in-flight dispatch(es); their callers will see dispatch_orphaned",
-                        SELF_UPDATE_MAX_STARVED_MS,
+                        "[agentplug daemon] self-update to {version} starved for {}ms with in-flight dispatches still running after the extra grace window -- forcing handoff despite {} in-flight dispatch(es); their callers will see dispatch_orphaned",
+                        SELF_UPDATE_HARD_CAP_MS,
                         in_flight_map().lock().unwrap_or_else(|e| e.into_inner()).len()
                     );
                 }

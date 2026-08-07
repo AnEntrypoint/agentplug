@@ -424,40 +424,79 @@ fn home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).map(PathBuf::from)
 }
 
-pub fn refresh_installed_skill_md() -> anyhow::Result<Vec<PathBuf>> {
-    let url = format!(
-        "https://raw.githubusercontent.com/{SKILL_MD_REMOTE_REPO}/{SKILL_MD_REMOTE_BRANCH}/skills/gm/SKILL.md"
-    );
-    let bundled = agentplug_host::shared_agent().get(&url).call()?.into_string()?;
-    let bundled_hash = sha256_hex(normalize_newlines(&bundled).as_bytes());
+fn installed_skill_roots(home: &Path) -> [PathBuf; 2] {
+    [home.join(".agents").join("skills"), home.join(".claude").join("skills")]
+}
 
+fn discover_installed_skill_names(home: &Path) -> anyhow::Result<Vec<String>> {
+    let mut names = std::collections::BTreeSet::new();
+    for root in installed_skill_roots(home) {
+        let Ok(entries) = fs::read_dir(&root) else { continue };
+        for entry in entries.flatten() {
+            if !entry.path().is_dir() {
+                continue;
+            }
+            if entry.path().join("SKILL.md").exists() {
+                if let Some(name) = entry.file_name().to_str() {
+                    names.insert(name.to_string());
+                }
+            }
+        }
+    }
+    Ok(names.into_iter().collect())
+}
+
+fn fetch_remote_skill_md(skill_name: &str) -> anyhow::Result<String> {
+    let url = format!(
+        "https://raw.githubusercontent.com/{SKILL_MD_REMOTE_REPO}/{SKILL_MD_REMOTE_BRANCH}/skills/{skill_name}/SKILL.md"
+    );
+    Ok(agentplug_host::shared_agent().get(&url).call()?.into_string()?)
+}
+
+pub fn refresh_installed_skill_md() -> anyhow::Result<Vec<PathBuf>> {
     let Some(home) = home_dir() else {
         anyhow::bail!("no HOME/USERPROFILE set -- cannot locate installed skills directories");
     };
-    let targets = [
-        home.join(".agents").join("skills").join("gm").join("SKILL.md"),
-        home.join(".claude").join("skills").join("gm").join("SKILL.md"),
-    ];
+    let skill_names = discover_installed_skill_names(&home)?;
+    if skill_names.is_empty() {
+        return Ok(Vec::new());
+    }
 
     let mut refreshed = Vec::new();
-    for target in targets {
-        let needs_write = match fs::read_to_string(&target) {
-            Ok(existing) => sha256_hex(normalize_newlines(&existing).as_bytes()) != bundled_hash,
-            Err(_) => true,
+    let mut failures = Vec::new();
+    for skill_name in skill_names {
+        let bundled = match fetch_remote_skill_md(&skill_name) {
+            Ok(content) => content,
+            Err(e) => {
+                failures.push(format!("{skill_name}: {e:#}"));
+                continue;
+            }
         };
-        if !needs_write {
-            continue;
+        let bundled_hash = sha256_hex(normalize_newlines(&bundled).as_bytes());
+
+        for root in installed_skill_roots(&home) {
+            let target = root.join(&skill_name).join("SKILL.md");
+            if !target.exists() {
+                continue;
+            }
+            let needs_write = match fs::read_to_string(&target) {
+                Ok(existing) => sha256_hex(normalize_newlines(&existing).as_bytes()) != bundled_hash,
+                Err(_) => true,
+            };
+            if !needs_write {
+                continue;
+            }
+            let tmp = target.with_extension("md.tmp");
+            fs::write(&tmp, &bundled)?;
+            fs::rename(&tmp, &target)?;
+            refreshed.push(target);
         }
-        if let Some(parent) = target.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let tmp = target.with_extension("md.tmp");
-        fs::write(&tmp, &bundled)?;
-        fs::rename(&tmp, &target)?;
-        refreshed.push(target);
     }
     if !refreshed.is_empty() {
         eprintln!("[agentplug daemon] SKILL.md refreshed: {} target(s)", refreshed.len());
+    }
+    if !failures.is_empty() {
+        eprintln!("[agentplug daemon] SKILL.md refresh had {} failure(s): {}", failures.len(), failures.join("; "));
     }
     Ok(refreshed)
 }
