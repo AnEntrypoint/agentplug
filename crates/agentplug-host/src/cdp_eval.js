@@ -26,6 +26,11 @@ function httpPutJson(url, timeoutMs) {
   });
 }
 
+function isInternalChromeUrl(url) {
+  if (!url) return false;
+  return url.startsWith('chrome://') || url.startsWith('chrome-untrusted://') || url.startsWith('devtools://');
+}
+
 async function pickPageTarget(port, startUrl, targetId, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -35,8 +40,13 @@ async function pickPageTarget(port, startUrl, targetId, timeoutMs) {
         const remembered = list.find((t) => t.id === targetId && t.webSocketDebuggerUrl);
         if (remembered) return remembered;
       }
-      const page = list.find((t) => t.type === 'page' && t.webSocketDebuggerUrl);
-      if (page) return page;
+      const pages = list.filter((t) => t.type === 'page' && t.webSocketDebuggerUrl);
+      // No remembered target (or it's gone): never silently adopt Chrome's own
+      // new-tab-page as the working tab -- prefer any real, non-internal page
+      // first, and only fall back to an internal page if nothing else exists.
+      const realPage = pages.find((t) => !isInternalChromeUrl(t.url));
+      if (realPage) return realPage;
+      if (!startUrl && pages.length) return pages[0];
     }
     if (startUrl) {
       const created = await httpPutJson(`http://127.0.0.1:${port}/json/new?${encodeURIComponent(startUrl)}`, 3000);
