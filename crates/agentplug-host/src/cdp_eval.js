@@ -287,6 +287,16 @@ async function main() {
   try {
     await sess.send('Runtime.enable', {});
     await sess.send('Page.enable', {});
+    // Chrome throttles rAF/setInterval/setTimeout to ~1/sec on a backgrounded tab (real OS-level
+    // window focus, not just "is this the active browser tab") -- automation-driven tabs are near-
+    // permanently backgrounded from Chrome's perspective even when they're the only/active MCP tab,
+    // which silently invalidates any live fps/frame-time measurement taken through this verb (JS-side
+    // document.hidden overrides do nothing; the throttle lives below that layer). Emulation.set-
+    // FocusEmulationEnabled is CDP's own sanctioned override for exactly this automation scenario --
+    // makes the page's document.hasFocus()/visibilityState report focused and lifts the background
+    // timer/rAF throttle, regardless of the real OS window state. Best-effort: older/non-Chromium
+    // targets may not support this domain, hence the swallow.
+    await sess.send('Emulation.setFocusEmulationEnabled', { enabled: true }).catch(() => {});
     const collectDebug = await attachDebugCapture(sess);
 
     if (viewport && viewport.width && viewport.height) {
