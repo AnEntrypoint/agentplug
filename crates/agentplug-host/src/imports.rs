@@ -598,6 +598,25 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
 
     linker.func_wrap(
         "env",
+        "host_oxi_exec",
+        |mut caller: Caller<'_, HostState>, body_ptr: u32, body_len: u32, cwd_ptr: u32, cwd_len: u32, sid_ptr: u32, sid_len: u32| -> u64 {
+            let body = read_guest_string(&mut caller, body_ptr, body_len);
+            let cwd_str = read_guest_string(&mut caller, cwd_ptr, cwd_len);
+            let sid = read_guest_string(&mut caller, sid_ptr, sid_len);
+            let cwd = if cwd_str.trim().is_empty() {
+                caller.data().cwd()
+            } else {
+                std::path::PathBuf::from(cwd_str)
+            };
+            let cwd = canonicalize_path_separators_for_stable_keying(&cwd);
+            let siblings = caller.data().siblings();
+            let result = crate::oxibrowser_driver::run(&body, &cwd, &sid, siblings);
+            write_guest_json(&mut caller, result)
+        },
+    )?;
+
+    linker.func_wrap(
+        "env",
         "host_plugin_call",
         |mut caller: Caller<'_, HostState>,
          plugin_ptr: u32,

@@ -3,6 +3,7 @@ mod exec_js;
 mod host_state;
 mod http_agent;
 mod memory_pressure;
+mod oxibrowser_driver;
 mod task;
 mod imports;
 mod install;
