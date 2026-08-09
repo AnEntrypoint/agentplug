@@ -406,6 +406,24 @@ impl ProjectPlugins {
         self.siblings.lock().unwrap().get(plugin_name).map(|p| p.any_instantiated()).unwrap_or(false)
     }
 
+    /// Like `is_loaded`, but for non-shared (stateful, per-session) plugins a
+    /// loaded instance whose content hash no longer matches `content_hash` is
+    /// treated as not-loaded, so a rebuilt `.wasm` is picked up on the next
+    /// dispatch instead of being served stale forever. Shared plugins already
+    /// self-refresh their hash inside `load_plugin`'s pool-fill check, so this
+    /// only changes behavior for the non-shared path.
+    pub fn is_loaded_current(&self, plugin_name: &str, content_hash: &str) -> bool {
+        if is_stateless_shared_plugin(plugin_name) {
+            return self.is_loaded(plugin_name);
+        }
+        self.siblings
+            .lock()
+            .unwrap()
+            .get(plugin_name)
+            .map(|p| p.slot_content_hashes().iter().any(|h| h.as_deref() == Some(content_hash)))
+            .unwrap_or(false)
+    }
+
     pub fn load_plugin(&mut self, engine: &Engine, plugin_name: &str, module: &Module, content_hash: &str) -> anyhow::Result<()> {
         if is_stateless_shared_plugin(plugin_name) {
             let pool = shared_plugin_pool(plugin_name);

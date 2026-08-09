@@ -1566,18 +1566,23 @@ fn dispatch_project(root: &Path, project: &mut ProjectPlugins, plugin_modules: &
                     }
                 };
 
-                if !project.is_loaded(&plugin_name) {
-                    let Some((module, content_hash)) = plugin_modules.module_with_hash(&plugin_name) else {
-                        let out_name = format!("{plugin_name}-{verb}-{task}.json");
-                        let out_body = serde_json::json!({"ok": false, "error": format!("plugin {plugin_name} not compiled yet for this daemon -- retry shortly")}).to_string();
-                        write_pd_out(&out_name, &out_body);
-                        continue;
-                    };
-                    if let Err(e) = project.load_plugin(&plugin_modules.engine, &plugin_name, module, content_hash) {
-                        let out_name = format!("{plugin_name}-{verb}-{task}.json");
-                        let out_body = serde_json::json!({"ok": false, "error": format!("plugin instantiate failed: {e:#}")}).to_string();
-                        write_pd_out(&out_name, &out_body);
-                        continue;
+                {
+                    let current = plugin_modules.module_with_hash(&plugin_name)
+                        .map(|(_, hash)| project.is_loaded_current(&plugin_name, hash))
+                        .unwrap_or_else(|| project.is_loaded(&plugin_name));
+                    if !current {
+                        let Some((module, content_hash)) = plugin_modules.module_with_hash(&plugin_name) else {
+                            let out_name = format!("{plugin_name}-{verb}-{task}.json");
+                            let out_body = serde_json::json!({"ok": false, "error": format!("plugin {plugin_name} not compiled yet for this daemon -- retry shortly")}).to_string();
+                            write_pd_out(&out_name, &out_body);
+                            continue;
+                        };
+                        if let Err(e) = project.load_plugin(&plugin_modules.engine, &plugin_name, module, content_hash) {
+                            let out_name = format!("{plugin_name}-{verb}-{task}.json");
+                            let out_body = serde_json::json!({"ok": false, "error": format!("plugin instantiate failed: {e:#}")}).to_string();
+                            write_pd_out(&out_name, &out_body);
+                            continue;
+                        }
                     }
                 }
 
