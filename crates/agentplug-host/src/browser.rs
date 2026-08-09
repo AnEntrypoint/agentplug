@@ -187,6 +187,13 @@ fn strip_mode_prefix(body: &str) -> (BrowserMode, String, &str) {
             return (mode, String::new(), rest);
         }
     }
+    if let Some(rest) = trimmed.strip_prefix("screenshot=") {
+        let (name, remainder) = match rest.find('\n') {
+            Some(nl) => (rest[..nl].trim().to_string(), &rest[nl + 1..]),
+            None => (rest.trim().to_string(), ""),
+        };
+        return (BrowserMode::Screenshot, name, remainder);
+    }
     if let Some(rest) = trimmed.strip_prefix("dom=") {
         let (selector, remainder) = match rest.find('\n') {
             Some(nl) => (rest[..nl].trim().to_string(), &rest[nl + 1..]),
@@ -1175,7 +1182,8 @@ pub fn run(body: &str, cwd: &Path, session_id: &str) -> Value {
 
     let (timeout_override, after_timeout) = strip_timeout_prefix(inner_body);
     let timeout_ms = timeout_override.unwrap_or(timeout_ms);
-    let (mode, dom_selector, after_mode) = strip_mode_prefix(after_timeout);
+    let (mode, mode_name, after_mode) = strip_mode_prefix(after_timeout);
+    let dom_selector = mode_name.clone();
     let (viewport, after_viewport) = strip_viewport_width_height_scale_mobile_prefix(after_mode);
     let (start_url, script) = parse_body(after_viewport);
 
@@ -1195,7 +1203,12 @@ pub fn run(body: &str, cwd: &Path, session_id: &str) -> Value {
         BrowserMode::Screenshot => {
             let dir = cwd.join(".gm").join("witness");
             let _ = std::fs::create_dir_all(&dir);
-            Some(dir.join(format!("{}-{}.png", mode_label(mode), unix_ms())))
+            let stem = if mode_name.trim().is_empty() {
+                format!("{}-{}", mode_label(mode), unix_ms())
+            } else {
+                sanitize(mode_name.trim())
+            };
+            Some(dir.join(format!("{stem}.png")))
         }
         _ => {
             let dir = browser_profiles_dir(cwd);
