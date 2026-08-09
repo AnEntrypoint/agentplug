@@ -1049,15 +1049,15 @@ impl PluginModules {
     }
 }
 
-type InFlightKey = (PathBuf, String, String);
+pub(crate) type InFlightKey = (PathBuf, String, String);
 
-struct InFlightHandle {
-    detach: Arc<std::sync::atomic::AtomicBool>,
+pub(crate) struct InFlightHandle {
+    pub(crate) detach: Arc<std::sync::atomic::AtomicBool>,
 }
 
 static IN_FLIGHT: OnceLock<Mutex<HashMap<InFlightKey, InFlightHandle>>> = OnceLock::new();
 
-fn in_flight_map() -> &'static Mutex<HashMap<InFlightKey, InFlightHandle>> {
+pub(crate) fn in_flight_map() -> &'static Mutex<HashMap<InFlightKey, InFlightHandle>> {
     IN_FLIGHT.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -1237,7 +1237,7 @@ pub fn sweep_unconsumable_spool_files(root: &Path) {
     }
 }
 
-fn run_gm_dispatch_to_file(root: &Path, handle: &DispatchHandle, verb: &str, task: &str, body: &str, out_dir: &Path) {
+pub(crate) fn run_gm_dispatch_to_file(root: &Path, handle: &DispatchHandle, verb: &str, task: &str, body: &str, out_dir: &Path) {
     let _fairness_guard = GmFairnessGuard::acquire(root);
     let dispatch_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handle.dispatch("gm", verb, body)));
     let out_body = match dispatch_result {
@@ -2093,45 +2093,5 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
         if !any_work {
             std::thread::sleep(Duration::from_millis(200));
         }
-    }
-}
-
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Regression for the detached-worker in_flight_map leak: a dispatch that
-    /// outlives its join handle (WORKER_AUTO_DETACH_AFTER_MS) used to leave
-    /// its in-flight entry behind forever, permanently wedging
-    /// detached_still_running and forcing every later runner self-update down
-    /// the 10-minute starve path that kills real in-flight work. The dispatch
-    /// itself must now clear its own entry on completion.
-    #[test]
-    fn completed_dispatch_removes_its_own_in_flight_entry() {
-        let root = std::env::temp_dir().join(format!("agentplug-test-inflight-{}-{}", std::process::id(), now_ms()));
-        let spool_dir = root.join(".gm").join("exec-spool");
-        let out_dir = spool_dir.join("out");
-        fs::create_dir_all(&out_dir).unwrap();
-
-        // No plugins registered: the dispatch itself errors out (NotRegistered),
-        // which is fine -- this test only cares that the bookkeeping runs even
-        // on the failure path.
-        let project = ProjectPlugins::new(root.clone());
-        let handle = project.dispatch_handle();
-        let key: InFlightKey = (root.clone(), "verbX".to_string(), "taskY".to_string());
-        in_flight_map()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(key.clone(), InFlightHandle { detach: Arc::new(std::sync::atomic::AtomicBool::new(false)) });
-
-        run_gm_dispatch_to_file(&root, &handle, "verbX", "taskY", "{}", &out_dir);
-
-        assert!(
-            in_flight_map().lock().unwrap_or_else(|e| e.into_inner()).get(&key).is_none(),
-            "a completed dispatch must clear its own in-flight entry so the handoff/idle gates stop counting it"
-        );
-        assert!(out_dir.join("verbX-taskY.json").exists(), "the out file must still be written");
-        let _ = fs::remove_dir_all(&root);
     }
 }

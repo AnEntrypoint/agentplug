@@ -138,13 +138,82 @@ fn main() -> anyhow::Result<()> {
             println!("agentplug-runner {}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
+        "selfcheck-registry" => selfcheck_registry(),
+        "selfcheck-inflight" => selfcheck_inflight_cleanup(),
         other => {
             eprintln!(
-                "agentplug-runner: unknown command '{other}'. Usage: agentplug-runner <plugin <name> [version]|spool|daemon|takeover <version>|dispatch [plugin] <verb> [body]|reap-orphans|sweep-spool [root]|version>"
+                "agentplug-runner: unknown command '{other}'. Usage: agentplug-runner <plugin <name> [version]|spool|daemon|takeover <version>|dispatch [plugin] <verb> [body]|reap-orphans|sweep-spool [root]|selfcheck-registry|selfcheck-inflight|version>"
             );
             std::process::exit(1);
         }
     }
+}
+
+const SELFCHECK_SUCCESS_WAT: &str = r#"(module
+  (memory (export "memory") 1)
+  (func (export "plugkit_alloc") (param i32) (result i32) (i32.const 1024))
+  (func (export "plugkit_free") (param i32 i32))
+  (func (export "plugin_call") (param i32 i32 i32 i32) (result i64) (i64.const 8589936640))
+  (data (i32.const 2048) "ok")
+)"#;
+
+fn selfcheck_registry() -> anyhow::Result<()> {
+    use agentplug_host::{note_shared_plugin_bytes_current, request_shared_store_swap, shared_plugin_slot_content_hashes, shared_plugin_swap_pending_hashes};
+
+    let engine = build_engine()?;
+    let module = Module::new(&engine, SELFCHECK_SUCCESS_WAT)?;
+    let root = std::env::temp_dir().join(format!("agentplug-selfcheck-registry-{}", std::process::id()));
+    let mut project = ProjectPlugins::new(root.clone());
+    project.load_plugin(&engine, "gm", &module, "hash-a")?;
+    let out = project.dispatch("gm", "probe", "{}")?;
+    assert_eq!(out, "ok", "fresh slot must serve a real dispatch through the compiled module");
+    println!("[selfcheck-registry] fresh gm slot dispatched and returned {out:?}");
+
+    let (evicted_now, deferred) = request_shared_store_swap("gm", "hash-a");
+    println!("[selfcheck-registry] swap request against idle slot: evicted_now={evicted_now} deferred={deferred}");
+    assert_eq!((evicted_now, deferred), (1, 0), "an idle slot holding the old hash must be evicted immediately, nothing deferred");
+    assert!(shared_plugin_slot_content_hashes("gm").iter().all(|h| h.is_none()), "evicted slot must show no content hash");
+
+    project.load_plugin(&engine, "gm", &module, "hash-b")?;
+    let out2 = project.dispatch("gm", "probe", "{}")?;
+    assert_eq!(out2, "ok", "reinstantiated slot on the new hash must still serve real dispatches");
+    println!("[selfcheck-registry] slot reinstantiated on hash-b and served a second real dispatch: {out2:?}");
+
+    note_shared_plugin_bytes_current("gm", "hash-b");
+    assert!(shared_plugin_swap_pending_hashes("gm").is_empty(), "marking hash-b current must leave no pending swap hashes");
+    println!("[selfcheck-registry] all invariants witnessed live through real wasmtime dispatch: PASS");
+    Ok(())
+}
+
+fn selfcheck_inflight_cleanup() -> anyhow::Result<()> {
+    use std::fs;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+
+    let root = std::env::temp_dir().join(format!("agentplug-selfcheck-inflight-{}-{}", std::process::id(), agentplug_host::now_ms()));
+    let spool_dir = root.join(".gm").join("exec-spool");
+    let out_dir = spool_dir.join("out");
+    fs::create_dir_all(&out_dir)?;
+
+    let project = ProjectPlugins::new(root.clone());
+    let handle = project.dispatch_handle();
+    let key: daemon::InFlightKey = (root.clone(), "verbX".to_string(), "taskY".to_string());
+    daemon::in_flight_map()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(key.clone(), daemon::InFlightHandle { detach: Arc::new(AtomicBool::new(false)) });
+
+    daemon::run_gm_dispatch_to_file(&root, &handle, "verbX", "taskY", "{}", &out_dir);
+
+    let entry_remains = daemon::in_flight_map().lock().unwrap_or_else(|e| e.into_inner()).get(&key).is_some();
+    let out_written = out_dir.join("verbX-taskY.json").exists();
+    println!("[selfcheck-inflight] entry_remains={entry_remains} out_written={out_written}");
+    assert!(!entry_remains, "a completed dispatch must clear its own in-flight entry so the handoff/idle gates stop counting it");
+    assert!(out_written, "the out file must still be written even when the dispatch itself errors (no registered plugin)");
+
+    let _ = fs::remove_dir_all(&root);
+    println!("[selfcheck-inflight] witnessed live against the real daemon dispatch path: PASS");
+    Ok(())
 }
 
 fn run_spool_watcher_single_process(project: &mut ProjectPlugins, spool_dir: &std::path::Path) -> anyhow::Result<()> {
