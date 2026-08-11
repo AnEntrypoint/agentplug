@@ -225,9 +225,34 @@ fn build_command_mode(
     match lang {
         "nodejs" | "js" => {
             let wrapped = match mode {
-                ExecMode::Default => format!(
-                    "(async () => {{\n  try {{\n    const __r = await (async () => {{\n{code}\n}})();\n    try {{ console.log('{RESULT_SENTINEL}' + JSON.stringify(__r === undefined ? null : __r)); }}\n    catch (__se) {{ console.log('{RESULT_SENTINEL}' + JSON.stringify({{ __unserializable: String(__se && __se.message || __se) }})); }}\n  }} catch (__e) {{\n    console.error(String(__e && __e.stack || __e));\n    process.exitCode = 1;\n  }}\n}})();\n"
-                ),
+                ExecMode::Default => {
+                    let trimmed = code.trim();
+                    let is_bare_expression = !trimmed.is_empty()
+                        && !trimmed.contains(';')
+                        && !trimmed.contains('\n')
+                        && !trimmed.starts_with("return")
+                        && !trimmed.starts_with("const ")
+                        && !trimmed.starts_with("let ")
+                        && !trimmed.starts_with("var ")
+                        && !trimmed.starts_with("throw ")
+                        && !trimmed.starts_with("if")
+                        && !trimmed.starts_with("for")
+                        && !trimmed.starts_with("while")
+                        && !trimmed.starts_with("switch")
+                        && !trimmed.starts_with("try")
+                        && !trimmed.starts_with("function")
+                        && !trimmed.starts_with("class ")
+                        && !trimmed.starts_with("//")
+                        && !trimmed.starts_with("/*");
+                    let body = if is_bare_expression {
+                        format!("    return (\n{code}\n);\n")
+                    } else {
+                        format!("{code}\n")
+                    };
+                    format!(
+                        "(async () => {{\n  try {{\n    const __r = await (async () => {{\n{body}}})();\n    try {{ console.log('{RESULT_SENTINEL}' + JSON.stringify(__r === undefined ? null : __r)); }}\n    catch (__se) {{ console.log('{RESULT_SENTINEL}' + JSON.stringify({{ __unserializable: String(__se && __se.message || __se) }})); }}\n  }} catch (__e) {{\n    console.error(String(__e && __e.stack || __e));\n    process.exitCode = 1;\n  }}\n}})();\n"
+                    )
+                },
                 ExecMode::Mem => format!(
                     "const {{ performance: __perf }} = require('perf_hooks');\n\
                      (async () => {{\n\
