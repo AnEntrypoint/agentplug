@@ -280,9 +280,32 @@ async function main() {
     process.stderr.write('cdp-eval: no page target\n');
     process.exit(1);
   }
+  let resultWritten = false;
   const writeResult = (envelope) => {
+    resultWritten = true;
     fs.writeFileSync(resultFile, JSON.stringify({ ...envelope, __targetId: target.id }));
   };
+  // The Rust host kills this process outright (SIGKILL-equivalent on Windows,
+  // no chance to flush a result file) once its own outer wait_timeout expires,
+  // which races an in-flight Runtime.evaluate awaitPromise directly: a script
+  // whose awaited promise resolves even a moment after that outer deadline
+  // never gets to call writeResult, so the host reads a missing result file
+  // as Value::Null and reports it identically to a real marshaling failure.
+  // This watchdog fires a fixed margin before the host's own deadline and
+  // force-writes whatever partial signal is available (pending-eval marker,
+  // no console/network capture) so a real still-running async page always
+  // yields a distinguishable, honest __cdpError instead of a silent null.
+  const HOST_KILL_MARGIN_MS = 1500;
+  const watchdogDeadline = Math.max(500, timeoutMs - HOST_KILL_MARGIN_MS);
+  const watchdogTimer = setTimeout(() => {
+    if (resultWritten) return;
+    writeResult({
+      __cdpError: `evaluate did not settle within ${timeoutMs}ms (awaitPromise still pending when the pre-kill watchdog fired) -- the awaited script is genuinely slower than timeoutMs, not a marshaling bug; raise timeoutMs to observe its real completion`,
+    });
+    process.stderr.write('cdp-eval: watchdog force-wrote pending-evaluate result before host kill\n');
+    process.exit(1);
+  }, watchdogDeadline);
+  watchdogTimer.unref();
   const sess = await cdpSession(target.webSocketDebuggerUrl, timeoutMs);
   try {
     await sess.send('Runtime.enable', {});
