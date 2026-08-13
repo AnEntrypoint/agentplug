@@ -120,9 +120,11 @@ struct DaemonConfig {
     shared_store_recycle_dispatches: Option<u64>,
 }
 
-// max_concurrent_projects/gm_concurrency/side_plugin_concurrency are
+// max_concurrent_projects/gm_concurrency/side_plugin_concurrency/
+// shared_store_recycle_private_mb/shared_store_recycle_dispatches are
 // deliberately absent here: leaving them unset lets DaemonConfig's accessors
-// derive a default from this machine's actual available_parallelism() at
+// derive a default from this machine's actual available_parallelism() (the
+// first three directly, the last two via gm_concurrency()'s pool size) at
 // every boot. Baking a literal number into this scaffold (as used to happen)
 // would freeze that number into daemon-config.json on the very first run and
 // make every future boot re-read the same static value forever, regardless
@@ -134,9 +136,7 @@ const DAEMON_CONFIG_EXAMPLE: &str = r#"{
   "plugin_update_poll_interval_secs": 600,
   "plugin_update_poll_interval_secs_by_name": {},
   "runner_update_poll_interval_secs": 3600,
-  "instruction_source_poll_interval_secs": 600,
-  "shared_store_recycle_private_mb": 1600,
-  "shared_store_recycle_dispatches": 2000
+  "instruction_source_poll_interval_secs": 600
 }
 "#;
 
@@ -210,8 +210,23 @@ impl DaemonConfig {
     // hardcoded 1, which serialized every side-plugin call behind a single
     // slot even on a many-core host.
     fn side_plugin_concurrency(&self) -> usize { self.side_plugin_concurrency.unwrap_or_else(|| host_available_parallelism().div_ceil(2)).max(1) }
-    fn shared_store_recycle_private_bytes(&self) -> u64 { self.shared_store_recycle_private_mb.unwrap_or(1600).max(256) * 1024 * 1024 }
-    fn shared_store_recycle_dispatches(&self) -> u64 { self.shared_store_recycle_dispatches.unwrap_or(2000).max(1) }
+    // The recycle thresholds gate on total private-memory footprint and
+    // total dispatch count across ALL live Store slots, so "how much is
+    // normal before recycling" scales with how many slots gm_concurrency()
+    // actually grants -- a bare literal here would recycle a many-core
+    // host's larger pool exactly as eagerly as a single-core host's tiny
+    // one. 400MB/slot and 500 dispatches/slot reproduce the previous
+    // 1600MB/2000-dispatch static defaults exactly at the previous
+    // hardcoded pool size of 4, so an unconfigured 4-core host sees no
+    // behavior change from this fix.
+    fn shared_store_recycle_private_bytes(&self) -> u64 {
+        let default_mb = 400u64.saturating_mul(self.gm_concurrency() as u64).max(512);
+        self.shared_store_recycle_private_mb.unwrap_or(default_mb).max(256) * 1024 * 1024
+    }
+    fn shared_store_recycle_dispatches(&self) -> u64 {
+        let default = 500u64.saturating_mul(self.gm_concurrency() as u64).max(100);
+        self.shared_store_recycle_dispatches.unwrap_or(default).max(1)
+    }
 }
 
 fn shared_store_recycle_reason_independent_of_daemon_idle_state(cfg: &DaemonConfig) -> Option<String> {
