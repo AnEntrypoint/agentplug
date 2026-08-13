@@ -224,6 +224,32 @@ fn strip_timeout_prefix(body: &str) -> (Option<u64>, &str) {
     }
 }
 
+// `url=<target>\n<rest>` (and a bare `https://...\n<rest>`) must compose with
+// mode prefixes stacked AFTER it (`url=...\nscreenshot\n<expr>`), per the
+// documented stacking order timeout -> url -> mode. Previously only
+// `parse_body` recognized `url=`/bare-URL, and it ran once AFTER the
+// timeout/mode/viewport loop had already exited on the unrecognized `url=`
+// line -- so `screenshot`/`capture`/etc. following a `url=` line was left
+// inside the script body as literal text instead of selecting the mode,
+// producing `ReferenceError: screenshot is not defined`. Stripping url in the
+// same loop lets a mode prefix stacked after it actually get recognized.
+fn strip_url_prefix(body: &str) -> (Option<String>, &str) {
+    let trimmed = body.trim_start();
+    if let Some(rest) = trimmed.strip_prefix("url=") {
+        return match rest.find('\n') {
+            Some(nl) => (Some(rest[..nl].trim().to_string()), &rest[nl + 1..]),
+            None => (Some(rest.trim().to_string()), ""),
+        };
+    }
+    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        return match trimmed.find('\n') {
+            Some(nl) => (Some(trimmed[..nl].trim().to_string()), &trimmed[nl + 1..]),
+            None => (Some(trimmed.trim().to_string()), ""),
+        };
+    }
+    (None, body)
+}
+
 fn strip_session_id_prefix(body: &str) -> (Option<String>, &str) {
     let trimmed = body.trim_start();
     let Some(rest) = trimmed.strip_prefix("sessionId=") else { return (None, body) };
@@ -1193,12 +1219,19 @@ pub fn run(body: &str, cwd: &Path, session_id: &str) -> Value {
     let mut mode = BrowserMode::Default;
     let mut mode_name = String::new();
     let mut viewport = None;
+    let mut url_override: Option<String> = None;
     let mut rest: &str = inner_body;
     loop {
         let (t, after_timeout) = strip_timeout_prefix(rest);
         if let Some(ms) = t {
             timeout_override = Some(ms);
             rest = after_timeout;
+            continue;
+        }
+        let (u, after_url) = strip_url_prefix(rest);
+        if let Some(url) = u {
+            url_override = Some(url);
+            rest = after_url;
             continue;
         }
         let (m, name, after_mode) = strip_mode_prefix(rest);
@@ -1218,7 +1251,17 @@ pub fn run(body: &str, cwd: &Path, session_id: &str) -> Value {
     }
     let dom_selector = mode_name.clone();
     let timeout_ms = timeout_override.unwrap_or(timeout_ms);
-    let (start_url, script) = parse_body(rest);
+    let (parsed_url, parsed_script) = parse_body(rest);
+    let start_url = url_override.clone().or(parsed_url);
+    let script = if url_override.is_some() && parsed_script.trim().is_empty() {
+        // A `url=<target>` (or bare-URL) prefix with nothing after it means
+        // "just navigate there" -- same default script parse_body already used
+        // for a bare-URL-only body, so `url=`-only and bare-URL-only behave
+        // identically instead of the former erroring as an empty script body.
+        "return {url: location.href};".to_string()
+    } else {
+        parsed_script
+    };
 
     if mode != BrowserMode::Dom && script.trim().is_empty() {
         return json!({"ok": false, "stdout": "", "exit_code": 1,
