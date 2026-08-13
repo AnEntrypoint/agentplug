@@ -157,21 +157,30 @@ fn cdp_ready(port: u16, deadline: Instant, cfg: &BrowserConfig) -> bool {
     false
 }
 
-fn parse_body(body: &str) -> (Option<String>, String) {
+// Split out from parse_body so url=/bare-http(s) can be stripped inside the
+// same stacking loop as timeout=/mode/viewport (see the loop in the caller)
+// instead of only ever being resolved LAST against whatever remained after
+// every other prefix -- the previous parse_body-only-at-the-end shape meant
+// `url=... \n dom=...` (url first) failed with a SyntaxError from the mode
+// parser choking on a literal "dom=..." line, while `dom=... \n url=...`
+// (url last) silently worked. "Prefixes stack" implies order-independence;
+// this makes url= a first-class member of the same loop as every other
+// prefix so it composes in either order.
+fn strip_url_prefix(body: &str) -> (Option<String>, String, &str) {
     let trimmed = body.trim_start();
     if let Some(rest) = trimmed.strip_prefix("url=") {
         if let Some(nl) = rest.find('\n') {
-            return (Some(rest[..nl].trim().to_string()), rest[nl + 1..].to_string());
+            return (Some(rest[..nl].trim().to_string()), String::new(), &rest[nl + 1..]);
         }
-        return (Some(rest.trim().to_string()), String::new());
+        return (Some(rest.trim().to_string()), String::new(), "");
     }
     if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
         if let Some(nl) = trimmed.find('\n') {
-            return (Some(trimmed[..nl].trim().to_string()), trimmed[nl + 1..].to_string());
+            return (Some(trimmed[..nl].trim().to_string()), String::new(), &trimmed[nl + 1..]);
         }
-        return (Some(trimmed.trim().to_string()), "return {url: location.href};".to_string());
+        return (Some(trimmed.trim().to_string()), "return {url: location.href};".to_string(), "");
     }
-    (None, body.to_string())
+    (None, String::new(), body)
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -1193,6 +1202,8 @@ pub fn run(body: &str, cwd: &Path, session_id: &str) -> Value {
     let mut mode = BrowserMode::Default;
     let mut mode_name = String::new();
     let mut viewport = None;
+    let mut start_url: Option<String> = None;
+    let mut url_default_script = String::new();
     let mut rest: &str = inner_body;
     loop {
         let (t, after_timeout) = strip_timeout_prefix(rest);
@@ -1214,11 +1225,20 @@ pub fn run(body: &str, cwd: &Path, session_id: &str) -> Value {
             rest = after_viewport;
             continue;
         }
+        if start_url.is_none() {
+            let (u, default_script, after_url) = strip_url_prefix(rest);
+            if u.is_some() {
+                start_url = u;
+                url_default_script = default_script;
+                rest = after_url;
+                continue;
+            }
+        }
         break;
     }
     let dom_selector = mode_name.clone();
     let timeout_ms = timeout_override.unwrap_or(timeout_ms);
-    let (start_url, script) = parse_body(rest);
+    let script = if rest.trim().is_empty() { url_default_script } else { rest.to_string() };
 
     if mode != BrowserMode::Dom && script.trim().is_empty() {
         return json!({"ok": false, "stdout": "", "exit_code": 1,

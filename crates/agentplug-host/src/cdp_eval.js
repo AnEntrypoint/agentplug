@@ -128,7 +128,27 @@ async function navigateIfNeededThenEvaluateOverCdp(sess, script, startUrl, timeo
     await new Promise((r) => setTimeout(r, 1200));
     sess.onIdLessNotification = prevOnIdLessNotification;
   }
-  const wrapped = `(async () => { ${script} })()`;
+  // The documented contract ("bare JS", same REPL semantics as the
+  // javascript_tool: "the result of the last expression is returned
+  // automatically") never required an explicit `return` -- but wrapping the
+  // raw script in a plain async-IIFE body executes it as ordinary statements
+  // with no implicit return, so `1+1` or `({a:1})` silently evaluated to
+  // `undefined` (serialized as `result: null`) with no error, indistinguishable
+  // from a real null result or evaluation failure. Try the single-expression
+  // form first (`return (<script>)`), which is what a bare expression body
+  // needs to actually produce a value; a script that fails to parse that way
+  // (multi-statement code, an already-explicit `return`, a `;`-terminated
+  // statement list) falls back to the raw statement-body form unchanged.
+  const trimmedScript = script.trim();
+  const exprAttempt = `(async () => { return (\n${trimmedScript}\n); })()`;
+  const stmtAttempt = `(async () => { ${script} })()`;
+  let wrapped = stmtAttempt;
+  if (trimmedScript && !/^\s*(return|const|let|var|if|for|while|switch|try|function|async|throw)\b/.test(trimmedScript)) {
+    try {
+      new Function(`"use strict"; return (\n${trimmedScript}\n);`);
+      wrapped = exprAttempt;
+    } catch (_) { /* not a single valid expression -- use the statement-body form */ }
+  }
   const result = await sess.send('Runtime.evaluate', {
     expression: wrapped, awaitPromise: true, returnByValue: true, userGesture: true, timeout: timeoutMs,
   });
