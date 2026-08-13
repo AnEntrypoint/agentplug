@@ -59,11 +59,22 @@ fn try_ensure_plugin_installed_via_npm_mirror(spec: &PluginAssetSpec, dest: &Pat
 
     let wasm_name = format!("{}.wasm", spec.asset_basename);
     let sha_name = format!("{}.wasm.sha256", spec.asset_basename);
-    let wasm_bytes = extract_file_from_npm_tarball(&tarball_bytes, &wasm_name)?;
-    let sha_bytes = extract_file_from_npm_tarball(&tarball_bytes, &sha_name)?;
+    let (effective_basename, wasm_bytes, sha_bytes) = match extract_file_from_npm_tarball(&tarball_bytes, &wasm_name) {
+        Ok(wasm_bytes) => {
+            let sha_bytes = extract_file_from_npm_tarball(&tarball_bytes, &sha_name)?;
+            (spec.asset_basename.as_str(), wasm_bytes, sha_bytes)
+        }
+        Err(slim_err) if spec.asset_basename == "plugkit-slim" => {
+            let wasm_bytes = extract_file_from_npm_tarball(&tarball_bytes, "plugkit.wasm")
+                .map_err(|_| slim_err)?;
+            let sha_bytes = extract_file_from_npm_tarball(&tarball_bytes, "plugkit.wasm.sha256")?;
+            ("plugkit", wasm_bytes, sha_bytes)
+        }
+        Err(e) => return Err(e),
+    };
     let sha_text = String::from_utf8_lossy(&sha_bytes).into_owned();
     let expected_sha = sha_text.split_whitespace().next()
-        .ok_or_else(|| anyhow::anyhow!("empty sha256 sidecar for {} in npm package {package}", spec.asset_basename))?
+        .ok_or_else(|| anyhow::anyhow!("empty sha256 sidecar for {effective_basename} in npm package {package}"))?
         .to_string();
     let actual_sha = sha256_hex(&wasm_bytes);
     if actual_sha != expected_sha {
@@ -78,7 +89,7 @@ fn try_ensure_plugin_installed_via_npm_mirror(spec: &PluginAssetSpec, dest: &Pat
     fs::write(&tmp, &wasm_bytes)?;
     fs::rename(&tmp, dest)?;
     fs::write(version_file, &version)?;
-    eprintln!("[agentplug] {} installed via npm mirror {package}@{version} (GitHub Releases path failed or was unreachable)", spec.asset_basename);
+    eprintln!("[agentplug] {effective_basename} installed via npm mirror {package}@{version} (GitHub Releases path failed or was unreachable)");
     Ok(dest.to_path_buf())
 }
 
