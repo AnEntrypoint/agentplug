@@ -155,8 +155,15 @@ impl SharedPluginPool {
         self.slots.len()
     }
 
-    fn any_instantiated(&self) -> bool {
-        self.slots.iter().any(|s| s.lock().unwrap().is_some())
+    fn all_instantiated(&self) -> bool {
+        self.slots.iter().all(|s| match s.try_lock() {
+            Ok(g) => g.is_some(),
+            Err(_) => true,
+        })
+    }
+
+    pub(crate) fn slots_for_fill(&self) -> &[Arc<Mutex<Option<SiblingHandle>>>] {
+        &self.slots
     }
 
     pub fn slot_content_hashes(&self) -> Vec<Option<String>> {
@@ -403,7 +410,7 @@ impl ProjectPlugins {
     }
 
     pub fn is_loaded(&self, plugin_name: &str) -> bool {
-        self.siblings.lock().unwrap().get(plugin_name).map(|p| p.any_instantiated()).unwrap_or(false)
+        self.siblings.lock().unwrap().get(plugin_name).map(|p| p.all_instantiated()).unwrap_or(false)
     }
 
     /// Like `is_loaded`, but for non-shared (stateful, per-session) plugins a
@@ -427,14 +434,15 @@ impl ProjectPlugins {
     pub fn load_plugin(&mut self, engine: &Engine, plugin_name: &str, module: &Module, content_hash: &str) -> anyhow::Result<()> {
         if is_stateless_shared_plugin(plugin_name) {
             let pool = shared_plugin_pool(plugin_name);
-            {
-                let mut guard = pool.acquire().ok_or_else(|| anyhow::anyhow!("plugin {plugin_name} pool busy (timeout acquiring slot for load)"))?;
-                let needs_fill = match guard.as_ref() {
-                    None => true,
-                    Some(existing) => existing.content_hash != content_hash,
-                };
-                if needs_fill {
-                    *guard = Some(instantiate_plugin(engine, self.root.clone(), plugin_name, module, content_hash)?);
+            for slot in pool.slots_for_fill() {
+                if let Ok(mut guard) = slot.try_lock() {
+                    let needs_fill = match guard.as_ref() {
+                        None => true,
+                        Some(existing) => existing.content_hash != content_hash,
+                    };
+                    if needs_fill {
+                        *guard = Some(instantiate_plugin(engine, self.root.clone(), plugin_name, module, content_hash)?);
+                    }
                 }
             }
             self.siblings.lock().unwrap().insert(plugin_name.to_string(), pool);

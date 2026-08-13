@@ -941,10 +941,28 @@ fn last_plugin_compile_failure() -> &'static Mutex<HashMap<String, String>> {
 
 fn record_plugin_compile_failure(plugin_name: &str, reason: String) {
     last_plugin_compile_failure().lock().unwrap_or_else(|e| e.into_inner()).insert(plugin_name.to_string(), reason);
+    plugin_compile_backoff_until().lock().unwrap_or_else(|e| e.into_inner()).insert(plugin_name.to_string(), Instant::now() + PLUGIN_COMPILE_RETRY_BACKOFF);
 }
 
 fn clear_plugin_compile_failure(plugin_name: &str) {
     last_plugin_compile_failure().lock().unwrap_or_else(|e| e.into_inner()).remove(plugin_name);
+    plugin_compile_backoff_until().lock().unwrap_or_else(|e| e.into_inner()).remove(plugin_name);
+}
+
+const PLUGIN_COMPILE_RETRY_BACKOFF: Duration = Duration::from_secs(60);
+
+static PLUGIN_COMPILE_BACKOFF_UNTIL: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
+
+fn plugin_compile_backoff_until() -> &'static Mutex<HashMap<String, Instant>> {
+    PLUGIN_COMPILE_BACKOFF_UNTIL.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn plugin_compile_in_backoff(plugin_name: &str) -> bool {
+    plugin_compile_backoff_until()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(plugin_name)
+        .is_some_and(|until| Instant::now() < *until)
 }
 
 fn read_plugin_compile_failure(plugin_name: &str) -> Option<String> {
@@ -1843,6 +1861,9 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
 
         for root in &known_roots {
             for plugin_name in read_project_plugin_list(root) {
+                if plugin_compile_in_backoff(&plugin_name) {
+                    continue;
+                }
                 match plugin_modules.get_or_compile(&plugin_name) {
                     Ok(()) => clear_plugin_compile_failure(&plugin_name),
                     Err(e) => {
@@ -1866,6 +1887,9 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
             }
         }
         for plugin_name in ["gm", "libsql", "bert", "treesitter"] {
+            if plugin_compile_in_backoff(plugin_name) {
+                continue;
+            }
             match plugin_modules.get_or_compile(plugin_name) {
                 Ok(()) => clear_plugin_compile_failure(plugin_name),
                 Err(e) => {
