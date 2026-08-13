@@ -2,6 +2,7 @@ use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use agentplug_host::install_dir;
 
@@ -49,6 +50,14 @@ fn extract_file_from_npm_tarball(tarball_bytes: &[u8], file_name: &str) -> anyho
     anyhow::bail!("npm tarball did not contain a file named {file_name} (package.json's own \"main\" convention -- expected package/{file_name})")
 }
 
+fn extract_wasm_and_sha_from_npm_tarball(tarball_bytes: &[u8], asset_basename: &str) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
+    let wasm_name = format!("{asset_basename}.wasm");
+    let sha_name = format!("{asset_basename}.wasm.sha256");
+    let wasm_bytes = extract_file_from_npm_tarball(tarball_bytes, &wasm_name)?;
+    let sha_bytes = extract_file_from_npm_tarball(tarball_bytes, &sha_name)?;
+    Ok((wasm_bytes, sha_bytes))
+}
+
 fn try_ensure_plugin_installed_via_npm_mirror(spec: &PluginAssetSpec, dest: &Path, version_file: &Path) -> anyhow::Result<PathBuf> {
     let package = spec.npm_package.as_deref().ok_or_else(|| anyhow::anyhow!("no npm mirror configured for this plugin"))?;
     let version = npm_registry_latest_version(package)?;
@@ -57,10 +66,18 @@ fn try_ensure_plugin_installed_via_npm_mirror(spec: &PluginAssetSpec, dest: &Pat
     let mut tarball_bytes = Vec::new();
     tarball_resp.into_reader().read_to_end(&mut tarball_bytes)?;
 
-    let wasm_name = format!("{}.wasm", spec.asset_basename);
-    let sha_name = format!("{}.wasm.sha256", spec.asset_basename);
-    let wasm_bytes = extract_file_from_npm_tarball(&tarball_bytes, &wasm_name)?;
-    let sha_bytes = extract_file_from_npm_tarball(&tarball_bytes, &sha_name)?;
+    // The npm mirror package publishes only the fat asset (embedded model
+    // weights) under its own basename (e.g. plugkit-wasm ships plugkit.wasm,
+    // never plugkit-slim.wasm) -- fall back the same way the GitHub-releases
+    // path already does at ensure_plugin_installed_via_github's sha404 branch.
+    let (wasm_bytes, sha_bytes) = match extract_wasm_and_sha_from_npm_tarball(&tarball_bytes, &spec.asset_basename) {
+        Ok(pair) => pair,
+        Err(e) if spec.asset_basename == "plugkit-slim" => {
+            eprintln!("[agentplug] npm package {package}@{version} has no plugkit-slim.wasm ({e:#}) -- falling back to plugkit.wasm");
+            extract_wasm_and_sha_from_npm_tarball(&tarball_bytes, "plugkit")?
+        }
+        Err(e) => return Err(e),
+    };
     let sha_text = String::from_utf8_lossy(&sha_bytes).into_owned();
     let expected_sha = sha_text.split_whitespace().next()
         .ok_or_else(|| anyhow::anyhow!("empty sha256 sidecar for {} in npm package {package}", spec.asset_basename))?
@@ -70,6 +87,9 @@ fn try_ensure_plugin_installed_via_npm_mirror(spec: &PluginAssetSpec, dest: &Pat
         anyhow::bail!("npm mirror {package}@{version} sha256 mismatch: expected {expected_sha}, got {actual_sha}");
     }
 
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent)?;
+    }
     let prev_dest = dest.with_extension("wasm.prev");
     if dest.exists() {
         let _ = fs::copy(dest, &prev_dest);
@@ -83,10 +103,23 @@ fn try_ensure_plugin_installed_via_npm_mirror(spec: &PluginAssetSpec, dest: &Pat
 }
 
 fn github_api_request(url: &str) -> ureq::Request {
-    let req = agentplug_host::shared_agent().get(url).set("User-Agent", "agentplug-runner");
-    match std::env::var("GITHUB_TOKEN").or_else(|_| std::env::var("GH_TOKEN")) {
-        Ok(token) if !token.is_empty() => req.set("Authorization", &format!("Bearer {token}")),
-        _ => req,
+    agentplug_host::shared_agent().get(url).set("User-Agent", "agentplug-runner")
+}
+
+fn github_token() -> Option<String> {
+    std::env::var("GITHUB_TOKEN").or_else(|_| std::env::var("GH_TOKEN")).ok().filter(|t| !t.is_empty())
+}
+
+fn github_api_call(url: &str) -> Result<ureq::Response, ureq::Error> {
+    let Some(token) = github_token() else {
+        return github_api_request(url).call();
+    };
+    match github_api_request(url).set("Authorization", &format!("Bearer {token}")).call() {
+        Err(ureq::Error::Status(401, _)) => {
+            eprintln!("[agentplug] GITHUB_TOKEN/GH_TOKEN rejected (401 Bad credentials) fetching {url} -- retrying unauthenticated");
+            github_api_request(url).call()
+        }
+        other => other,
     }
 }
 
@@ -243,7 +276,7 @@ pub fn installed_runner_version() -> Option<String> {
 
 pub fn fetch_latest_runner_version() -> anyhow::Result<Option<String>> {
     let url = format!("https://api.github.com/repos/{RUNNER_BIN_REPO}/releases/latest");
-    let resp = github_api_request(&url).call().map_err(|e| describe_github_api_error(&url, e))?;
+    let resp = github_api_call(&url).map_err(|e| describe_github_api_error(&url, e))?;
     let body: serde_json::Value = serde_json::from_str(&resp.into_string()?)?;
     Ok(body.get("tag_name").and_then(|v| v.as_str()).map(|s| s.trim_start_matches('v').to_string()))
 }
@@ -320,7 +353,7 @@ pub fn fetch_latest_plugin_version(plugin_name: &str) -> anyhow::Result<Option<S
         anyhow::bail!("unknown plugin {plugin_name} -- not registered in agentplug-runner's plugin_asset_spec map");
     };
     let url = format!("https://api.github.com/repos/{}/releases/latest", spec.repo);
-    let resp = github_api_request(&url).call().map_err(|e| describe_github_api_error(&url, e))?;
+    let resp = github_api_call(&url).map_err(|e| describe_github_api_error(&url, e))?;
     let body: serde_json::Value = serde_json::from_str(&resp.into_string()?)?;
     Ok(body.get("tag_name").and_then(|v| v.as_str()).map(|s| s.trim_start_matches('v').to_string()))
 }
@@ -501,17 +534,55 @@ pub fn refresh_installed_skill_md() -> anyhow::Result<Vec<PathBuf>> {
     Ok(refreshed)
 }
 
+// get_or_compile calls ensure_plugin_installed on every daemon main-loop tick
+// (100ms) for every configured plugin, unconditionally -- with no gate here, a
+// plugin that fails to install (bad token, exhausted rate limit, network down)
+// gets re-attempted at ~10Hz forever, which itself exhausts GitHub's
+// unauthenticated 60/hr rate limit in under two seconds and keeps it exhausted.
+// This is the bounded-retry/circuit-breaker the install path was missing.
+const PLUGIN_INSTALL_RETRY_COOLDOWN: Duration = Duration::from_secs(30);
+
+// Persisted to disk, not an in-process Mutex<HashMap>: the daemon's own
+// self-update handoff (stage_runner_self_update/run_takeover) launches the
+// staged runner as a genuinely separate OS process to pre-warm every plugin
+// before the old process hands off, and any one-shot CLI `plugin`/`dispatch`
+// invocation is its own process too -- an in-memory clock is invisible across
+// that process boundary, so a takeover landing mid-cooldown would immediately
+// re-attempt the network install with no memory of the still-live backoff,
+// reintroducing the exact burst this cooldown exists to prevent. A shared
+// timestamp file next to the plugin's own wasm/version files fixes that.
+fn plugin_install_failure_marker_path(plugin_name: &str) -> PathBuf {
+    install_dir().join("plugins").join(format!("{plugin_name}.install-backoff-ts"))
+}
+
+fn read_plugin_install_failure_elapsed(plugin_name: &str) -> Option<Duration> {
+    let raw = fs::read_to_string(plugin_install_failure_marker_path(plugin_name)).ok()?;
+    let failed_at_ms: u64 = raw.trim().parse().ok()?;
+    Some(Duration::from_millis(now_ms_for_marker().saturating_sub(failed_at_ms)))
+}
+
 pub fn ensure_plugin_installed(plugin_name: &str, explicit_version: Option<&str>) -> anyhow::Result<PathBuf> {
     let dest = plugin_wasm_path(plugin_name);
     if dest.exists() && explicit_version.is_none() {
         return Ok(dest);
+    }
+    if explicit_version.is_none() {
+        if let Some(elapsed) = read_plugin_install_failure_elapsed(plugin_name) {
+            if elapsed < PLUGIN_INSTALL_RETRY_COOLDOWN {
+                anyhow::bail!(
+                    "plugin {plugin_name} install failed {:.0}s ago -- retry backoff active for {:.0}s more",
+                    elapsed.as_secs_f64(),
+                    (PLUGIN_INSTALL_RETRY_COOLDOWN - elapsed).as_secs_f64()
+                );
+            }
+        }
     }
     let Some(spec) = plugin_asset_spec(plugin_name) else {
         anyhow::bail!("unknown plugin {plugin_name} -- not registered in agentplug-runner's plugin_asset_spec map");
     };
     let version_file = plugin_version_path(plugin_name);
 
-    match ensure_plugin_installed_via_github(plugin_name, explicit_version, &spec, &dest, &version_file) {
+    let result = match ensure_plugin_installed_via_github(plugin_name, explicit_version, &spec, &dest, &version_file) {
         Ok(path) => Ok(path),
         Err(github_err) => {
             match try_ensure_plugin_installed_via_npm_mirror(&spec, &dest, &version_file) {
@@ -521,7 +592,20 @@ pub fn ensure_plugin_installed(plugin_name: &str, explicit_version: Option<&str>
                 )),
             }
         }
+    };
+    if explicit_version.is_none() {
+        let marker = plugin_install_failure_marker_path(plugin_name);
+        match &result {
+            Ok(_) => { let _ = fs::remove_file(&marker); }
+            Err(_) => {
+                if let Some(parent) = marker.parent() {
+                    let _ = fs::create_dir_all(parent);
+                }
+                let _ = fs::write(&marker, now_ms_for_marker().to_string());
+            }
+        }
     }
+    result
 }
 
 fn ensure_plugin_installed_via_github(plugin_name: &str, explicit_version: Option<&str>, spec: &PluginAssetSpec, dest: &Path, version_file: &Path) -> anyhow::Result<PathBuf> {
