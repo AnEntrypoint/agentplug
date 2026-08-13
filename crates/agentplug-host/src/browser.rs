@@ -110,6 +110,15 @@ fn find_chrome() -> Option<PathBuf> {
             PathBuf::from(r"C:\Program Files\Google\Chrome\Application\chrome.exe"),
             PathBuf::from(r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"),
         ]
+    } else if cfg!(target_os = "macos") {
+        let mut v = vec![
+            PathBuf::from("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
+            PathBuf::from("/Applications/Chromium.app/Contents/MacOS/Chromium"),
+        ];
+        if let Some(home) = std::env::var_os("HOME") {
+            v.push(PathBuf::from(home).join("Applications/Google Chrome.app/Contents/MacOS/Google Chrome"));
+        }
+        v
     } else {
         vec![
             PathBuf::from("/usr/bin/google-chrome"),
@@ -1180,12 +1189,36 @@ pub fn run(body: &str, cwd: &Path, session_id: &str) -> Value {
         SessionCommand::None => {}
     }
 
-    let (timeout_override, after_timeout) = strip_timeout_prefix(inner_body);
-    let timeout_ms = timeout_override.unwrap_or(timeout_ms);
-    let (mode, mode_name, after_mode) = strip_mode_prefix(after_timeout);
+    let mut timeout_override: Option<u64> = None;
+    let mut mode = BrowserMode::Default;
+    let mut mode_name = String::new();
+    let mut viewport = None;
+    let mut rest: &str = inner_body;
+    loop {
+        let (t, after_timeout) = strip_timeout_prefix(rest);
+        if let Some(ms) = t {
+            timeout_override = Some(ms);
+            rest = after_timeout;
+            continue;
+        }
+        let (m, name, after_mode) = strip_mode_prefix(rest);
+        if m != BrowserMode::Default {
+            mode = m;
+            mode_name = name;
+            rest = after_mode;
+            continue;
+        }
+        let (v, after_viewport) = strip_viewport_width_height_scale_mobile_prefix(rest);
+        if v.is_some() {
+            viewport = v;
+            rest = after_viewport;
+            continue;
+        }
+        break;
+    }
     let dom_selector = mode_name.clone();
-    let (viewport, after_viewport) = strip_viewport_width_height_scale_mobile_prefix(after_mode);
-    let (start_url, script) = parse_body(after_viewport);
+    let timeout_ms = timeout_override.unwrap_or(timeout_ms);
+    let (start_url, script) = parse_body(rest);
 
     if mode != BrowserMode::Dom && script.trim().is_empty() {
         return json!({"ok": false, "stdout": "", "exit_code": 1,
