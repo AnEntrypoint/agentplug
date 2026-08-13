@@ -2,8 +2,7 @@ use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use agentplug_host::install_dir;
 
@@ -543,9 +542,23 @@ pub fn refresh_installed_skill_md() -> anyhow::Result<Vec<PathBuf>> {
 // This is the bounded-retry/circuit-breaker the install path was missing.
 const PLUGIN_INSTALL_RETRY_COOLDOWN: Duration = Duration::from_secs(30);
 
-fn plugin_install_failure_clock() -> &'static Mutex<std::collections::HashMap<String, Instant>> {
-    static CLOCK: OnceLock<Mutex<std::collections::HashMap<String, Instant>>> = OnceLock::new();
-    CLOCK.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+// Persisted to disk, not an in-process Mutex<HashMap>: the daemon's own
+// self-update handoff (stage_runner_self_update/run_takeover) launches the
+// staged runner as a genuinely separate OS process to pre-warm every plugin
+// before the old process hands off, and any one-shot CLI `plugin`/`dispatch`
+// invocation is its own process too -- an in-memory clock is invisible across
+// that process boundary, so a takeover landing mid-cooldown would immediately
+// re-attempt the network install with no memory of the still-live backoff,
+// reintroducing the exact burst this cooldown exists to prevent. A shared
+// timestamp file next to the plugin's own wasm/version files fixes that.
+fn plugin_install_failure_marker_path(plugin_name: &str) -> PathBuf {
+    install_dir().join("plugins").join(format!("{plugin_name}.install-backoff-ts"))
+}
+
+fn read_plugin_install_failure_elapsed(plugin_name: &str) -> Option<Duration> {
+    let raw = fs::read_to_string(plugin_install_failure_marker_path(plugin_name)).ok()?;
+    let failed_at_ms: u64 = raw.trim().parse().ok()?;
+    Some(Duration::from_millis(now_ms_for_marker().saturating_sub(failed_at_ms)))
 }
 
 pub fn ensure_plugin_installed(plugin_name: &str, explicit_version: Option<&str>) -> anyhow::Result<PathBuf> {
@@ -554,8 +567,7 @@ pub fn ensure_plugin_installed(plugin_name: &str, explicit_version: Option<&str>
         return Ok(dest);
     }
     if explicit_version.is_none() {
-        if let Some(last_failure) = plugin_install_failure_clock().lock().unwrap_or_else(|e| e.into_inner()).get(plugin_name).copied() {
-            let elapsed = last_failure.elapsed();
+        if let Some(elapsed) = read_plugin_install_failure_elapsed(plugin_name) {
             if elapsed < PLUGIN_INSTALL_RETRY_COOLDOWN {
                 anyhow::bail!(
                     "plugin {plugin_name} install failed {:.0}s ago -- retry backoff active for {:.0}s more",
@@ -582,10 +594,15 @@ pub fn ensure_plugin_installed(plugin_name: &str, explicit_version: Option<&str>
         }
     };
     if explicit_version.is_none() {
-        let mut clock = plugin_install_failure_clock().lock().unwrap_or_else(|e| e.into_inner());
+        let marker = plugin_install_failure_marker_path(plugin_name);
         match &result {
-            Ok(_) => { clock.remove(plugin_name); }
-            Err(_) => { clock.insert(plugin_name.to_string(), Instant::now()); }
+            Ok(_) => { let _ = fs::remove_file(&marker); }
+            Err(_) => {
+                if let Some(parent) = marker.parent() {
+                    let _ = fs::create_dir_all(parent);
+                }
+                let _ = fs::write(&marker, now_ms_for_marker().to_string());
+            }
         }
     }
     result
