@@ -648,7 +648,31 @@ fn promote_staged_exe_to_canonical(version: &str) -> bool {
 fn reexec_from_canonical_and_exit(canonical: &std::path::Path) -> ! {
     eprintln!("[agentplug daemon] takeover: re-execing from canonical path {} to release lock on staged exe", canonical.display());
     let args: Vec<String> = std::env::args().skip(1).collect();
-    match std::process::Command::new(canonical).args(&args).spawn() {
+    let mut cmd = std::process::Command::new(canonical);
+    cmd.args(&args);
+    cmd.stdin(std::process::Stdio::null());
+    cmd.stdout(std::process::Stdio::null());
+    match daemon_log_sink() {
+        Some(log) => { cmd.stderr(std::process::Stdio::from(log)); }
+        None => { cmd.stderr(std::process::Stdio::null()); }
+    };
+    #[cfg(windows)]
+    {
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        cmd.creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
+    }
+    match cmd.spawn() {
         Ok(_) => {
             eprintln!("[agentplug daemon] takeover: spawned fresh process from canonical path, exiting stale staged-exe process");
             std::process::exit(0);
