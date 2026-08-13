@@ -83,6 +83,10 @@ pub(crate) fn read_registry() -> Vec<PathBuf> {
         .collect()
 }
 
+fn host_available_parallelism() -> usize {
+    std::thread::available_parallelism().map(std::num::NonZeroUsize::get).unwrap_or(4)
+}
+
 #[derive(serde::Deserialize, Clone)]
 struct DaemonConfig {
     #[serde(default)]
@@ -116,6 +120,14 @@ struct DaemonConfig {
     shared_store_recycle_dispatches: Option<u64>,
 }
 
+// max_concurrent_projects/gm_concurrency/side_plugin_concurrency are
+// deliberately absent here: leaving them unset lets DaemonConfig's accessors
+// derive a default from this machine's actual available_parallelism() at
+// every boot. Baking a literal number into this scaffold (as used to happen)
+// would freeze that number into daemon-config.json on the very first run and
+// make every future boot re-read the same static value forever, regardless
+// of how many cores the host actually has -- an operator who wants a fixed
+// value can still add these keys back by hand.
 const DAEMON_CONFIG_EXAMPLE: &str = r#"{
   "registry_poll_interval_secs": 5,
   "heartbeat_interval_secs": 10,
@@ -123,9 +135,6 @@ const DAEMON_CONFIG_EXAMPLE: &str = r#"{
   "plugin_update_poll_interval_secs_by_name": {},
   "runner_update_poll_interval_secs": 3600,
   "instruction_source_poll_interval_secs": 600,
-  "max_concurrent_projects": 4,
-  "gm_concurrency": 4,
-  "side_plugin_concurrency": 1,
   "shared_store_recycle_private_mb": 1600,
   "shared_store_recycle_dispatches": 2000
 }
@@ -192,9 +201,15 @@ impl DaemonConfig {
     // Duration value (same number, not the same timer) -- an independent key
     // so tuning one cadence never silently retunes the other.
     fn instruction_source_poll_interval(&self) -> Duration { Duration::from_secs(self.instruction_source_poll_interval_secs.unwrap_or(600)) }
-    fn max_concurrent_projects(&self) -> usize { self.max_concurrent_projects.unwrap_or(4).max(1) }
+    fn max_concurrent_projects(&self) -> usize { self.max_concurrent_projects.unwrap_or_else(host_available_parallelism).max(1) }
     fn gm_concurrency(&self) -> usize { self.gm_concurrency.unwrap_or_else(|| self.max_concurrent_projects()).max(1) }
-    fn side_plugin_concurrency(&self) -> usize { self.side_plugin_concurrency.unwrap_or(1).max(1) }
+    // Side plugins (bert/libsql/treesitter) run CPU-heavy embedding/index work
+    // that benefits less from oversubscription than the lightweight gm
+    // dispatch path, so this defaults to half the host's cores rather than
+    // the full count -- still scales with hardware instead of the previous
+    // hardcoded 1, which serialized every side-plugin call behind a single
+    // slot even on a many-core host.
+    fn side_plugin_concurrency(&self) -> usize { self.side_plugin_concurrency.unwrap_or_else(|| host_available_parallelism().div_ceil(2)).max(1) }
     fn shared_store_recycle_private_bytes(&self) -> u64 { self.shared_store_recycle_private_mb.unwrap_or(1600).max(256) * 1024 * 1024 }
     fn shared_store_recycle_dispatches(&self) -> u64 { self.shared_store_recycle_dispatches.unwrap_or(2000).max(1) }
 }
@@ -1718,6 +1733,13 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
     let daemon_cfg = DaemonConfig::load();
     let registry_poll_interval = daemon_cfg.registry_poll_interval();
     let heartbeat_interval = daemon_cfg.heartbeat_interval();
+    eprintln!(
+        "[agentplug daemon] concurrency: max_concurrent_projects={} gm_concurrency={} side_plugin_concurrency={} (host_available_parallelism={}, unset config keys derive from it)",
+        daemon_cfg.max_concurrent_projects(),
+        daemon_cfg.gm_concurrency(),
+        daemon_cfg.side_plugin_concurrency(),
+        host_available_parallelism()
+    );
     agentplug_host::set_gm_pool_size(daemon_cfg.gm_concurrency());
     agentplug_host::set_side_plugin_pool_size(daemon_cfg.side_plugin_concurrency());
 
