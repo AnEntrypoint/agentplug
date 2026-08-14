@@ -1319,15 +1319,29 @@ pub fn sweep_unconsumable_spool_files(root: &Path) {
 /// e.g. freddie's Node.js) can reach a raw plugin like `libsql` through the
 /// same file-drop spool protocol gm-skill itself already uses, instead of
 /// spawning `agentplug-runner dispatch <plugin> <verb>` as a fresh subprocess
-/// per call. Live measurement (2026-08-14) found the CLI's per-call cost and
-/// this spool path's per-call cost statistically indistinguishable on a
-/// loaded daemon (~1-1.4s both ways; a same-window `gm phase-status` control
-/// cost more, 2.5s) -- avoiding the subprocess spawn did NOT close a latency
-/// gap, because the spawn was never the dominant cost on that measurement.
-/// Whether a genuinely idle daemon has a lower floor, and whether that floor
-/// is close to zero-copy dispatch or has its own per-call wasm-instantiation
-/// tax, is still open -- re-measure on a quiet daemon before using this path
-/// for anything latency-sensitive.
+/// per call.
+///
+/// LATENCY, ROOT-CAUSED (2026-08-14): a wall-clock ~0.8-1.4s per call was
+/// measured on this path (and identically on `gm`'s own verbs via the same
+/// spool). The plugin's own internal `dispatch.end` log timing was 12-160ms
+/// for the SAME calls -- the gap is not dispatch/wasm cost, it is queueing:
+/// `run_daemon`'s outer sweep round-robins a small `max_concurrent_projects`
+/// worker pool across every root in `known_roots` (87 active_projects
+/// observed live in `~/.agentplug/daemon-status.json` on this machine), so a
+/// freshly-dropped spool file waits for this project's turn in that rotation
+/// before its dispatch even starts. This is a structural property of the
+/// shared, machine-wide, one-daemon-per-machine design (every project always
+/// shares it -- see `main.rs`'s "registered {} with the shared system-wide
+/// daemon" message), not a per-plugin or per-verb defect, and it reproduces
+/// identically for `gm` itself under the same load. A caller with many
+/// concurrent low-latency calls to make (freddie's session-write hot path
+/// was the motivating case) should not route them through ANY daemon-spool
+/// verb, `libsql`/`bert` included, on a machine serving many registered
+/// projects -- the queueing wait dominates regardless of which plugin
+/// answers. This spool path remains correct and useful for occasional/
+/// non-hot-path calls (matches every other existing spool verb's latency
+/// profile); it was never going to be, and is not now claimed to be, a
+/// low-latency alternative to an in-process client library.
 const RAW_PLUGIN_SPOOL_VERBS: &[&str] = &["libsql", "bert"];
 
 pub(crate) fn run_gm_dispatch_to_file(root: &Path, handle: &DispatchHandle, verb: &str, task: &str, body: &str, out_dir: &Path) {
