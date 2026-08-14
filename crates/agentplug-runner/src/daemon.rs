@@ -1309,9 +1309,43 @@ pub fn sweep_unconsumable_spool_files(root: &Path) {
     }
 }
 
+/// Spool verb-directories reserved to bypass the `gm` plugin and dispatch
+/// straight to a raw daemon-loaded plugin instead. A caller drops
+/// `in/libsql/<N>.txt` with the actual libsql verb (`exec`/`query`/...)
+/// carried INSIDE the JSON body as `"verb"` -- the directory name IS the
+/// plugin name here, unlike every other spool verb-directory where the
+/// directory name is a `gm` orchestrator verb and the plugin is implicitly
+/// `gm`. This exists so a plain host process (no wasm runtime of its own,
+/// e.g. freddie's Node.js) can reach a raw plugin like `libsql` through the
+/// same file-drop spool protocol gm-skill itself already uses, instead of
+/// spawning `agentplug-runner dispatch <plugin> <verb>` as a fresh subprocess
+/// per call. Live measurement (2026-08-14) found the CLI's per-call cost and
+/// this spool path's per-call cost statistically indistinguishable on a
+/// loaded daemon (~1-1.4s both ways; a same-window `gm phase-status` control
+/// cost more, 2.5s) -- avoiding the subprocess spawn did NOT close a latency
+/// gap, because the spawn was never the dominant cost on that measurement.
+/// Whether a genuinely idle daemon has a lower floor, and whether that floor
+/// is close to zero-copy dispatch or has its own per-call wasm-instantiation
+/// tax, is still open -- re-measure on a quiet daemon before using this path
+/// for anything latency-sensitive.
+const RAW_PLUGIN_SPOOL_VERBS: &[&str] = &["libsql", "bert"];
+
 pub(crate) fn run_gm_dispatch_to_file(root: &Path, handle: &DispatchHandle, verb: &str, task: &str, body: &str, out_dir: &Path) {
     let _fairness_guard = GmFairnessGuard::acquire(root);
-    let dispatch_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handle.dispatch("gm", verb, body)));
+    let plugin_name = if RAW_PLUGIN_SPOOL_VERBS.contains(&verb) { verb } else { "gm" };
+    let inner_verb_owned: String = if plugin_name == "gm" {
+        String::new()
+    } else {
+        serde_json::from_str::<serde_json::Value>(body)
+            .ok()
+            .and_then(|v| v.get("verb").and_then(|s| s.as_str()).map(|s| s.to_string()))
+            .unwrap_or_else(|| "capabilities".to_string())
+    };
+    let dispatch_result = if plugin_name == "gm" {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handle.dispatch("gm", verb, body)))
+    } else {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handle.dispatch(plugin_name, &inner_verb_owned, body)))
+    };
     let out_body = match dispatch_result {
         Ok(Ok(s)) if !s.is_empty() => s,
         Ok(Ok(_)) => serde_json::json!({"ok": false, "error": "empty dispatch result", "verb": verb}).to_string(),
