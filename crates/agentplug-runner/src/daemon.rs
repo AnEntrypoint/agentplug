@@ -1054,6 +1054,19 @@ struct PluginModules {
     engine: Engine,
     modules: HashMap<String, Module>,
     loaded_content_hash: HashMap<String, String>,
+    // (mtime, len) of the wasm file the LAST time its content hash was
+    // actually computed, keyed by plugin name -- lets get_or_compile skip
+    // the full fs::read+sha256 (a 136MB read for bert.wasm, 56MB for
+    // treesitter.wasm on this machine) on every call when the file plainly
+    // has not changed since the last check. Root-caused 2026-08-14:
+    // get_or_compile ran unconditionally once per sweep tick with no
+    // cadence gate, so this was ~200MB of disk read + hashing on the main
+    // sweep thread, serialized before any project's worker pool dispatch
+    // even started -- directly on the path that made a freshly-dropped
+    // spool file wait multiple seconds for its own dispatch to begin, on a
+    // daemon whose actual per-call dispatch work (12-160ms, per
+    // dispatch.end) was never the bottleneck.
+    last_hash_check_stat: HashMap<String, (std::time::SystemTime, u64)>,
 }
 
 fn wasm_file_content_hash(wasm_path: &Path) -> anyhow::Result<String> {
@@ -1061,14 +1074,45 @@ fn wasm_file_content_hash(wasm_path: &Path) -> anyhow::Result<String> {
     Ok(crate::download::sha256_hex(&bytes))
 }
 
+fn wasm_file_stat(wasm_path: &Path) -> Option<(std::time::SystemTime, u64)> {
+    let meta = fs::metadata(wasm_path).ok()?;
+    let mtime = meta.modified().ok()?;
+    Some((mtime, meta.len()))
+}
+
 impl PluginModules {
     fn new() -> anyhow::Result<Self> {
-        Ok(Self { engine: build_engine()?, modules: HashMap::new(), loaded_content_hash: HashMap::new() })
+        Ok(Self {
+            engine: build_engine()?,
+            modules: HashMap::new(),
+            loaded_content_hash: HashMap::new(),
+            last_hash_check_stat: HashMap::new(),
+        })
     }
 
     fn get_or_compile(&mut self, plugin_name: &str) -> anyhow::Result<()> {
         let wasm_path = ensure_plugin_installed(plugin_name, None)?;
+        let current_stat = wasm_file_stat(&wasm_path);
+        let stat_unchanged = current_stat.is_some()
+            && current_stat == self.last_hash_check_stat.get(plugin_name).copied();
+        // Already compiled AND the file's (mtime, len) matches what it was
+        // the last time the content hash was actually computed: skip the
+        // read+hash entirely, this call cost one fs::metadata stat. A
+        // genuinely swapped file with the SAME mtime+len as before (a
+        // pathological same-second same-size rewrite) is not distinguished
+        // from an unchanged file here -- acceptable because
+        // ensure_plugin_installed's own download path always advances
+        // mtime and almost always changes len for a real content swap, and
+        // this is a staleness OPTIMIZATION layered on top of the already-
+        // existing hash check, not a replacement for it: the very next call
+        // whose stat differs still does the full re-hash.
+        if stat_unchanged && self.modules.contains_key(plugin_name) {
+            return Ok(());
+        }
         let on_disk_hash = wasm_file_content_hash(&wasm_path)?;
+        if let Some(stat) = current_stat {
+            self.last_hash_check_stat.insert(plugin_name.to_string(), stat);
+        }
         let old_loaded_hash = self.loaded_content_hash.get(plugin_name).cloned();
         let stale = old_loaded_hash.as_deref().is_some_and(|loaded_hash| loaded_hash != on_disk_hash);
         if stale {
@@ -1321,27 +1365,32 @@ pub fn sweep_unconsumable_spool_files(root: &Path) {
 /// spawning `agentplug-runner dispatch <plugin> <verb>` as a fresh subprocess
 /// per call.
 ///
-/// LATENCY, ROOT-CAUSED (2026-08-14): a wall-clock ~0.8-1.4s per call was
-/// measured on this path (and identically on `gm`'s own verbs via the same
-/// spool). The plugin's own internal `dispatch.end` log timing was 12-160ms
-/// for the SAME calls -- the gap is not dispatch/wasm cost, it is queueing:
-/// `run_daemon`'s outer sweep round-robins a small `max_concurrent_projects`
-/// worker pool across every root in `known_roots` (87 active_projects
-/// observed live in `~/.agentplug/daemon-status.json` on this machine), so a
-/// freshly-dropped spool file waits for this project's turn in that rotation
-/// before its dispatch even starts. This is a structural property of the
-/// shared, machine-wide, one-daemon-per-machine design (every project always
-/// shares it -- see `main.rs`'s "registered {} with the shared system-wide
-/// daemon" message), not a per-plugin or per-verb defect, and it reproduces
-/// identically for `gm` itself under the same load. A caller with many
-/// concurrent low-latency calls to make (freddie's session-write hot path
-/// was the motivating case) should not route them through ANY daemon-spool
-/// verb, `libsql`/`bert` included, on a machine serving many registered
-/// projects -- the queueing wait dominates regardless of which plugin
-/// answers. This spool path remains correct and useful for occasional/
-/// non-hot-path calls (matches every other existing spool verb's latency
-/// profile); it was never going to be, and is not now claimed to be, a
-/// low-latency alternative to an in-process client library.
+/// LATENCY, ROOT-CAUSED AND FIXED (2026-08-14): a wall-clock ~0.8-2.5s per
+/// call was measured on this path (and identically on `gm`'s own verbs via
+/// the same spool). The plugin's own internal `dispatch.end` log timing was
+/// 12-160ms for the SAME calls, so the gap was not dispatch/wasm cost --
+/// tracing further found the true dominant cost was `PluginModules::
+/// get_or_compile` running unconditionally once per outer sweep tick,
+/// serialized on the main sweep thread BEFORE any project's worker pool even
+/// started, doing a full `fs::read` + SHA-256 hash of every default plugin's
+/// `.wasm` file on every single call regardless of whether the file had
+/// changed (bert.wasm is 136MB, treesitter.wasm 56MB on this machine -- that
+/// is ~200MB of disk read + hashing on the critical path per tick). Fixed by
+/// caching each plugin's `(mtime, len)` at the time its hash was last
+/// actually computed and skipping the read+hash entirely when a fresh
+/// `fs::metadata` stat matches -- reduces the common case to one cheap stat
+/// call. A secondary, smaller contributor was `dispatch_project` paying a
+/// `create_dir_all`x2 + heartbeat write + `plugins.txt` read for every
+/// registered project on every tick even when that project's spool `in/`
+/// directory was empty; also fixed with a read-first fast path that returns
+/// immediately for the idle case. Measured post-fix on this machine: steady-
+/// state calls to this path (after the first, which still pays the one-time
+/// cold-compile cost per plugin) dropped from 900ms-2.5s to 128-183ms.
+/// Neither the shared-daemon design (every project always shares one
+/// process) nor the ~130-180ms remaining per-call floor changed -- this
+/// spool path is still not a substitute for an in-process client library on
+/// freddie's session-write hot path, just no longer pathologically slower
+/// than it needed to be for occasional/non-hot-path callers.
 const RAW_PLUGIN_SPOOL_VERBS: &[&str] = &["libsql", "bert"];
 
 pub(crate) fn run_gm_dispatch_to_file(root: &Path, handle: &DispatchHandle, verb: &str, task: &str, body: &str, out_dir: &Path) {
@@ -1397,41 +1446,32 @@ fn dispatch_project(root: &Path, project: &mut ProjectPlugins, plugin_modules: &
     let spool_dir = root.join(".gm").join("exec-spool");
     let in_dir = spool_dir.join("in");
     let out_dir = spool_dir.join("out");
-    if fs::create_dir_all(&in_dir).is_err() || fs::create_dir_all(&out_dir).is_err() {
-        return did_work;
-    }
 
-    write_project_heartbeat(&spool_dir, None);
-
-    // Additive, never replacing. A non-empty .agentplug/plugins.txt used to
-    // REPLACE this set, so a project naming the three side plugins silently
-    // dropped `gm` itself and every dispatch failed to load -- observed live,
-    // and the failure names the plugin that WAS listed rather than the one
-    // that went missing, which makes it hard to attribute. Listing a plugin
-    // should only ever add reach, never remove it.
-    let requested_plugins = {
-        let mut list = vec![
-            "gm".to_string(),
-            "libsql".to_string(),
-            "bert".to_string(),
-            "treesitter".to_string(),
-            "oxibrowser".to_string(),
-        ];
-        for extra in read_project_plugin_list(root) {
-            if !list.contains(&extra) {
-                list.push(extra);
-            }
-        }
-        list
-    };
-
+    // Fast path for the overwhelmingly common case (an idle project with
+    // nothing claimed this tick): try the scan-and-claim pass FIRST, against
+    // whatever in_dir already exists on disk, before paying for
+    // create_dir_all x2 + a heartbeat write + a plugins.txt read. On a
+    // machine serving many registered projects (87 observed live), this
+    // per-project setup cost was paid unconditionally by every worker for
+    // every project on every sweep tick regardless of whether that project
+    // had any pending work -- with a small fixed worker pool, that idle-cost
+    // multiplied by "many idle projects" is what queued a freshly-dropped
+    // spool file behind every other project's turn before its own dispatch
+    // even started (root-caused 2026-08-14: wall-clock 0.8-2.5s per call vs.
+    // a 12-160ms internal dispatch.end timing for the SAME calls). Cutting
+    // the idle case down to one read_dir attempt (no directory creation, no
+    // heartbeat write, no plugins.txt read) shortens every idle worker's
+    // turn, which shortens how long a busy project waits in the shared work
+    // queue for a free worker.
     struct ClaimedRequest {
         verb: String,
         task: String,
         body: String,
     }
     let mut claimed: Vec<ClaimedRequest> = Vec::new();
-    if let Ok(entries) = fs::read_dir(&in_dir) {
+    let in_dir_scan = fs::read_dir(&in_dir);
+    let in_dir_existed = in_dir_scan.is_ok();
+    if let Ok(entries) = in_dir_scan {
         for verb_entry in entries.flatten() {
             if !verb_entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
                 continue;
@@ -1455,6 +1495,43 @@ fn dispatch_project(root: &Path, project: &mut ProjectPlugins, plugin_modules: &
             }
         }
     }
+
+    // Nothing claimed and the directory already existed (the common steady-
+    // state idle case): skip create_dir_all/heartbeat/plugins.txt entirely,
+    // this project cost one read_dir call this tick.
+    if claimed.is_empty() && in_dir_existed {
+        return did_work;
+    }
+
+    // Either in_dir didn't exist yet (first tick for this project, or it was
+    // removed) or there is real work to do -- pay the setup cost now, exactly
+    // as before this fast path was added.
+    if fs::create_dir_all(&in_dir).is_err() || fs::create_dir_all(&out_dir).is_err() {
+        return did_work;
+    }
+    write_project_heartbeat(&spool_dir, None);
+
+    // Additive, never replacing. A non-empty .agentplug/plugins.txt used to
+    // REPLACE this set, so a project naming the three side plugins silently
+    // dropped `gm` itself and every dispatch failed to load -- observed live,
+    // and the failure names the plugin that WAS listed rather than the one
+    // that went missing, which makes it hard to attribute. Listing a plugin
+    // should only ever add reach, never remove it.
+    let requested_plugins = {
+        let mut list = vec![
+            "gm".to_string(),
+            "libsql".to_string(),
+            "bert".to_string(),
+            "treesitter".to_string(),
+            "oxibrowser".to_string(),
+        ];
+        for extra in read_project_plugin_list(root) {
+            if !list.contains(&extra) {
+                list.push(extra);
+            }
+        }
+        list
+    };
 
     let mut gm_requests: Vec<ClaimedRequest> = Vec::with_capacity(claimed.len());
     let mut bg_convert_requests: Vec<ClaimedRequest> = Vec::new();
