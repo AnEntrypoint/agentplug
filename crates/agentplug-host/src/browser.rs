@@ -1115,11 +1115,25 @@ fn launch_chrome(cwd: &Path, session_id: &str, browser_cfg: &BrowserConfig) -> R
     Ok((chrome_child, port))
 }
 
-pub fn run(body: &str, cwd: &Path, session_id: &str) -> Value {
+pub fn run(body: &str, cwd_raw: &Path, session_id: &str) -> Value {
     let Some(node) = which("node") else {
         return json!({"ok": false, "stdout": "", "exit_code": 1,
             "stderr": "node not found on PATH; required to drive Chrome over CDP"});
     };
+
+    // session_key/session_list compare cwd by raw Path::display() string equality (no filesystem
+    // normalization) -- two dispatches naming the SAME real directory via a different literal spelling
+    // (a trailing separator, mixed \ vs /, or Windows drive-letter case) silently miss each other's
+    // session, causing session_list to report [] for a session that is genuinely alive and tracked
+    // under a different key, and every subsequent dispatch to relaunch Chrome from scratch instead of
+    // reusing it (live-witnessed: a project whose caller passed cwd inconsistently across dispatches
+    // within one debugging session). canonicalize() resolves symlinks/`.`/`..` and normalizes
+    // separators/case on the underlying filesystem, giving every dispatch for the same real directory
+    // the identical key regardless of how its caller happened to spell the path this time. Falls back
+    // to the raw path if canonicalization fails (e.g. the directory doesn't exist yet) rather than
+    // erroring the whole dispatch over a cosmetic normalization step.
+    let cwd_owned = cwd_raw.canonicalize().unwrap_or_else(|_| cwd_raw.to_path_buf());
+    let cwd: &Path = &cwd_owned;
 
     let t0 = Instant::now();
     let browser_cfg = BrowserConfig::load(cwd);
