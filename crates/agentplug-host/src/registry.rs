@@ -45,7 +45,7 @@ fn deadline_secs_for_call(plugin_name: &str, body: &str) -> u64 {
     caller_supplied_deadline_secs(body).unwrap_or_else(|| dispatch_call_deadline_secs(plugin_name))
 }
 
-pub const RELEASABLE_SHARED_PLUGINS: [&str; 2] = ["bert", "treesitter"];
+pub const RELEASABLE_SHARED_PLUGINS: [&str; 3] = ["bert", "treesitter", "gm"];
 
 const STATELESS_SHARED_PLUGIN_NAMES: [&str; 3] = ["bert", "treesitter", "gm"];
 
