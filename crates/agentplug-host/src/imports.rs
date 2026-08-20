@@ -123,6 +123,10 @@ fn fs_write_lock_for(path: &Path) -> std::sync::Arc<Mutex<()>> {
 fn atomic_write_locked(full: &Path, data: &str) -> std::io::Result<()> {
     let lock = fs_write_lock_for(full);
     let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+    atomic_write_under_held_lock(full, data)
+}
+
+fn atomic_write_under_held_lock(full: &Path, data: &str) -> std::io::Result<()> {
     let tmp = full.with_extension(format!(
         "{}.tmp-{}",
         full.extension().and_then(|e| e.to_str()).unwrap_or(""),
@@ -136,6 +140,32 @@ fn atomic_write_locked(full: &Path, data: &str) -> std::io::Result<()> {
             Err(e)
         }
     }
+}
+
+/// Compare-and-swap write: read-compare-write as ONE critical section under
+/// the same per-path lock atomic_write_locked uses. atomic_write_locked
+/// alone only serializes the write half of a read-modify-write cycle --
+/// two guest callers can each read the same "before" content (via a
+/// separate, unlocked host_fs_read call), independently compute a new
+/// document, and then both call host_fs_write: the lock stops their writes
+/// from interleaving/tearing, but NOT from one silently clobbering the
+/// other's already-landed change, since neither write re-validates the
+/// content it was based on is still current. The guest's own optimistic
+/// recheck/confirm (orchestrator/cas.rs) can't close this gap either,
+/// because its recheck read and its write are two independent host calls
+/// with no shared lock scope. This function closes it by doing the
+/// "is `expected` still current" check and the write inside one lock hold.
+/// Returns Ok(true) on a successful swap, Ok(false) on a CAS mismatch (the
+/// guest should re-read and retry), Err on a real I/O failure.
+fn atomic_cas_write_locked(full: &Path, expected: &str, data: &str) -> std::io::Result<bool> {
+    let lock = fs_write_lock_for(full);
+    let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+    let current = fs::read_to_string(full).unwrap_or_default();
+    if current != expected {
+        return Ok(false);
+    }
+    atomic_write_under_held_lock(full, data)?;
+    Ok(true)
 }
 
 fn sandboxed_guest_path(cwd: &std::path::Path, path: &str) -> Option<PathBuf> {
@@ -293,6 +323,25 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
             }
             match atomic_write_locked(&full, &data) {
                 Ok(()) => 1,
+                Err(_) => 0,
+            }
+        },
+    )?;
+
+    linker.func_wrap(
+        "env",
+        "host_fs_cas_write",
+        |mut caller: Caller<'_, HostState>, path_ptr: u32, path_len: u32, expected_ptr: u32, expected_len: u32, data_ptr: u32, data_len: u32| -> u32 {
+            let path = read_guest_string(&mut caller, path_ptr, path_len);
+            let expected = read_guest_string(&mut caller, expected_ptr, expected_len);
+            let data = read_guest_string(&mut caller, data_ptr, data_len);
+            let Some(full) = sandboxed_guest_path(&caller.data().cwd(), &path) else { return 0 };
+            if let Some(parent) = full.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            match atomic_cas_write_locked(&full, &expected, &data) {
+                Ok(true) => 1,
+                Ok(false) => 2,
                 Err(_) => 0,
             }
         },
