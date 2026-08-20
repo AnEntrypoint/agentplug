@@ -1524,6 +1524,7 @@ fn dispatch_project(root: &Path, project: &mut ProjectPlugins, plugin_modules: &
             "bert".to_string(),
             "treesitter".to_string(),
             "oxibrowser".to_string(),
+            "crux".to_string(),
         ];
         for extra in read_project_plugin_list(root) {
             if !list.contains(&extra) {
