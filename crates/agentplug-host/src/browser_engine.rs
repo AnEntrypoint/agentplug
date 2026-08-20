@@ -37,7 +37,7 @@ fn load_engine_file_config(cwd: &Path) -> BrowserEngineFileConfig {
         .unwrap_or_default()
 }
 
-fn steel_endpoint_override(cwd: &Path) -> Option<String> {
+pub(crate) fn steel_endpoint_override(cwd: &Path) -> Option<String> {
     if let Some(v) = std::env::var("GM_STEEL_BROWSER_URL").ok().filter(|s| !s.trim().is_empty()) {
         return Some(v);
     }
@@ -105,9 +105,19 @@ pub fn select_engine(cwd: &Path, requested: Option<&str>) -> Engine {
     }
     let effective = requested.map(|s| s.to_string()).or_else(|| load_engine_file_config(cwd).engine);
     match effective.as_deref() {
-        Some("lightpanda") => Engine::Lightpanda,
+        Some("lightpanda") if lightpanda_reachable(cwd) => Engine::Lightpanda,
         Some("chrome") | Some("cdp") | None | Some(_) => Engine::Chrome,
     }
+}
+
+/// `browser` is lightpanda's real home once a native plugin exists for every
+/// platform this runs on; until then it is a transparent alias for `cdp`
+/// (real Chrome) wherever lightpanda cannot actually run -- no native
+/// Windows binary (confirmed in lightpanda-io/browser's own README) and no
+/// `lightpanda_path`/`GM_LIGHTPANDA_PATH` override naming a WSL2/Docker
+/// wrapper.
+fn lightpanda_reachable(cwd: &Path) -> bool {
+    lightpanda_native_binary_available() || lightpanda_path_override(cwd).is_some()
 }
 
 fn lightpanda_native_binary_available() -> bool {

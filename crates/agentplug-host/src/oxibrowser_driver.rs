@@ -6,10 +6,12 @@
 //! `cdp`/`browser` verbs (real Chrome, lightpanda, steel) support --
 //! anything outside that subset (screenshot/capture/profile/trace/viewport,
 //! multi-tab session pooling) returns a clear "not supported here, use
-//! cdp/browser" error rather than silently mishandling it. `serp` always
-//! runs the in-process oxibrowser engine, even when steel-browser is
-//! configured for `cdp`/`browser` -- a configured `steel_endpoint` takes
-//! over the CDP-capable engines uniformly but never this in-process path.
+//! cdp/browser" error rather than silently mishandling it. When
+//! steel-browser is configured (`.gm/browser-config.json`'s
+//! `steel_endpoint` or `GM_STEEL_BROWSER_URL`), `run` redirects the whole
+//! dispatch to `browser::run` instead, since Steel takes over `serp` too
+//! (explicit user decision: steel-browser overrides every one of
+//! serp/browser/cdp uniformly, not just the CDP-capable pair).
 
 use serde_json::{json, Value};
 use std::path::Path;
@@ -149,23 +151,37 @@ fn call_oxibrowser(
     }
 }
 
-/// Entry point mirroring `browser::run`'s `(body, cwd, session_id)` shape,
-/// called from `host_oxi_exec`. `body` is the same envelope
-/// (`{"body": "<plain-text>", "timeoutMs": <n>}`) the `browser` verb sends.
+/// Entry point mirroring `browser::run`'s `(body, opts, cwd, session_id)`
+/// shape, called from `host_oxi_exec`. `body` is the caller's raw
+/// plain-text verbatim, never JSON-wrapped; `opts` is the small separate
+/// metadata payload (`{"timeoutMs": <n>}`) rs-plugkit's `serp` verb sends
+/// via host_oxi_exec's own opts_ptr/opts_len param.
 pub fn run(
     body: &str,
+    opts: &str,
     cwd: &Path,
     session_id: &str,
     siblings: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<crate::registry::SharedPluginPool>>>>,
 ) -> Value {
-    let (inner_body, _timeout_ms): (String, u64) = match serde_json::from_str::<Value>(body) {
-        Ok(Value::Object(obj)) => {
-            let b = obj.get("body").and_then(|v| v.as_str()).map(|s| s.to_string()).unwrap_or_default();
-            let t = obj.get("timeoutMs").and_then(|v| v.as_u64()).unwrap_or(120_000);
-            (b, t)
+    // A configured steel-browser endpoint takes over serp too (explicit
+    // user decision: steel overrides serp/browser/cdp uniformly, not just
+    // the two CDP-capable verbs). oxibrowser's own verb surface has no wire
+    // compatibility with a CDP session, so this redirects the whole
+    // dispatch to browser::run (the same CDP-over-port driver cdp/browser
+    // use) with `engine: "steel"` forced into a fresh opts payload, rather
+    // than trying to translate oxibrowser's narrower body grammar onto a
+    // CDP session.
+    if crate::browser_engine::steel_endpoint_override(cwd).is_some() {
+        let mut opts_v: Value = serde_json::from_str(opts).unwrap_or_else(|_| json!({}));
+        if let Some(obj) = opts_v.as_object_mut() {
+            obj.insert("engine".to_string(), json!("steel"));
+        } else {
+            opts_v = json!({"engine": "steel"});
         }
-        _ => (body.to_string(), 120_000),
-    };
+        return crate::browser::run(body, &opts_v.to_string(), cwd, session_id);
+    }
+
+    let inner_body = body.to_string();
 
     let (explicit_sid, after_sid) = strip_session_id_prefix(&inner_body);
     let session_id = explicit_sid.as_deref().filter(|s| !s.is_empty()).unwrap_or(session_id);

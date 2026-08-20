@@ -1148,7 +1148,7 @@ fn launch_chrome(cwd: &Path, session_id: &str, browser_cfg: &BrowserConfig) -> R
     Ok((chrome_child, port))
 }
 
-pub fn run(body: &str, cwd_raw: &Path, session_id: &str) -> Value {
+pub fn run(body: &str, opts: &str, cwd_raw: &Path, session_id: &str) -> Value {
     let Some(node) = which("node") else {
         return json!({"ok": false, "stdout": "", "exit_code": 1,
             "stderr": "node not found on PATH; required to drive Chrome over CDP"});
@@ -1173,19 +1173,16 @@ pub fn run(body: &str, cwd_raw: &Path, session_id: &str) -> Value {
     reap_idle_sessions(cwd, &browser_cfg);
     reap_os_orphans(cwd);
 
-    let (inner_body, timeout_ms, requested_engine): (String, u64, Option<String>) = match serde_json::from_str::<Value>(body) {
-        Ok(Value::Object(obj)) => {
-            let b = obj
-                .get("body")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string())
-                .unwrap_or_default();
-            let t = obj.get("timeoutMs").and_then(|v| v.as_u64()).unwrap_or(120_000);
-            let e = crate::browser_engine::requested_engine_from_envelope(&Value::Object(obj));
-            (b, t, e)
-        }
-        _ => (body.to_string(), 120_000, None),
-    };
+    // `body` is the caller's raw code/plain-text verbatim -- never JSON-wrapped
+    // and never re-parsed here. `opts` is the small, separate metadata
+    // payload (rs-plugkit's verbs.rs sends it via host_browser_exec's own
+    // opts_ptr/opts_len param, matching host_exec_js's two-buffer shape) so
+    // a caller's raw JS/plain-text body is never JSON-escaped just to carry
+    // timeoutMs/engine alongside it.
+    let inner_body = body.to_string();
+    let opts_v: Value = serde_json::from_str(opts).unwrap_or_else(|_| json!({}));
+    let timeout_ms = opts_v.get("timeoutMs").and_then(|v| v.as_u64()).unwrap_or(120_000);
+    let requested_engine = crate::browser_engine::requested_engine_from_envelope(&opts_v);
     let engine = crate::browser_engine::select_engine(cwd, requested_engine.as_deref());
 
     let (explicit_session_id, after_session_prefix) = strip_session_id_prefix(&inner_body);
