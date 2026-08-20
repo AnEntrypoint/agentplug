@@ -11,7 +11,7 @@ use wait_timeout::ChildExt;
 const CDP_EVAL_JS: &str = include_str!("cdp_eval.js");
 
 #[derive(serde::Deserialize)]
-struct BrowserConfig {
+pub(crate) struct BrowserRuntimeConfig {
     #[serde(default)]
     cdp_poll_timeout_ms: Option<u64>,
     #[serde(default)]
@@ -26,13 +26,15 @@ struct BrowserConfig {
     session_idle_timeout_ms: Option<u64>,
 }
 
-impl BrowserConfig {
+type BrowserConfig = BrowserRuntimeConfig;
+
+impl BrowserRuntimeConfig {
     fn load(cwd: &Path) -> Self {
         let path = cwd.join(".gm").join("browser-config.json");
         std::fs::read_to_string(&path)
             .ok()
-            .and_then(|s| serde_json::from_str::<BrowserConfig>(&s).ok())
-            .unwrap_or(BrowserConfig {
+            .and_then(|s| serde_json::from_str::<BrowserRuntimeConfig>(&s).ok())
+            .unwrap_or(BrowserRuntimeConfig {
                 cdp_poll_timeout_ms: None,
                 cdp_poll_interval_ms: None,
                 chrome_ready_deadline_ms: None,
@@ -43,7 +45,7 @@ impl BrowserConfig {
     }
     fn cdp_poll_timeout(&self) -> Duration { Duration::from_millis(self.cdp_poll_timeout_ms.unwrap_or(1000)) }
     fn cdp_poll_interval(&self) -> Duration { Duration::from_millis(self.cdp_poll_interval_ms.unwrap_or(250)) }
-    fn chrome_ready_deadline(&self) -> Duration { Duration::from_millis(self.chrome_ready_deadline_ms.unwrap_or(30_000)) }
+    pub(crate) fn chrome_ready_deadline(&self) -> Duration { Duration::from_millis(self.chrome_ready_deadline_ms.unwrap_or(30_000)) }
     fn eval_timeout_grace(&self) -> u64 { self.eval_timeout_grace_ms.unwrap_or(6000) }
     fn headless(&self) -> bool { self.headless.unwrap_or(false) }
     fn session_idle_timeout(&self) -> Duration {
@@ -142,6 +144,8 @@ fn free_port() -> u16 {
         .unwrap_or(9222)
 }
 
+pub(crate) fn free_port_probe() -> u16 { free_port() }
+
 fn cdp_ready(port: u16, deadline: Instant, cfg: &BrowserConfig) -> bool {
     while Instant::now() < deadline {
         let url = format!("http://127.0.0.1:{port}/json/version");
@@ -155,6 +159,10 @@ fn cdp_ready(port: u16, deadline: Instant, cfg: &BrowserConfig) -> bool {
         std::thread::sleep(cfg.cdp_poll_interval());
     }
     false
+}
+
+pub(crate) fn cdp_ready_probe(port: u16, deadline: Instant, cfg: &BrowserRuntimeConfig) -> bool {
+    cdp_ready(port, deadline, cfg)
 }
 
 // Split out from parse_body so url=/bare-http(s) can be stripped inside the
@@ -285,12 +293,20 @@ struct BrowserSession {
     /// None for a session ADOPTED from an OS-orphaned chrome after a daemon
     /// restart -- the pid is known (sidecar) but this process holds no Child
     /// handle for it. Liveness then goes through pid_is_alive instead of
-    /// try_wait.
+    /// try_wait. Also None for a dialed steel-browser session (owns_process
+    /// false) -- there the port is real but no local pid/process exists at
+    /// all, adopted or otherwise.
     child: Option<Child>,
     pid: u32,
     port: u16,
     last_used: Instant,
     target_id: Option<String>,
+    /// False for a steel-browser session: an always-on external service we
+    /// only dial, never spawn and never own the lifecycle of. `pid` is 0 in
+    /// that case and liveness/teardown route through the CDP endpoint check
+    /// instead of pid_is_alive/kill_pid, which would otherwise operate on a
+    /// meaningless local pid.
+    owns_process: bool,
 }
 
 static SESSIONS: OnceLock<Mutex<HashMap<String, BrowserSession>>> = OnceLock::new();
@@ -311,6 +327,9 @@ fn session_lifecycle_lock_for_key(key: &str) -> Arc<Mutex<()>> {
 }
 
 fn session_is_alive(session: &mut BrowserSession) -> bool {
+    if !session.owns_process {
+        return session_cdp_endpoint_responds(session.port);
+    }
     match session.child.as_mut() {
         Some(child) => matches!(child.try_wait(), Ok(None)),
         None => pid_is_alive(session.pid),
@@ -326,6 +345,13 @@ fn session_cdp_endpoint_responds(port: u16) -> bool {
 }
 
 fn kill_session(mut session: BrowserSession) {
+    if !session.owns_process {
+        // A steel-browser session dials an operator-owned always-on
+        // external service -- there is no local process or sidecar for
+        // this repo's session to tear down, only the map entry (already
+        // removed by the caller before this runs) to forget.
+        return;
+    }
     kill_pid(session.pid);
     if let Some(mut child) = session.child.take() {
         let _ = child.kill();
@@ -404,6 +430,7 @@ fn try_adopt_orphaned_session(cwd: &Path, session_id_hint: Option<&str>, profile
                 port,
                 last_used: Instant::now(),
                 target_id: None,
+                owns_process: true,
             },
         );
     }
@@ -880,7 +907,7 @@ fn evict_session_lifecycle_locks_with_no_active_holder() {
     locks.retain(|_, arc| Arc::strong_count(arc) > 1);
 }
 
-fn session_new(cwd: &Path, session_id: &str, cfg: &BrowserConfig) -> Value {
+fn session_new(cwd: &Path, session_id: &str, cfg: &BrowserConfig, engine: crate::browser_engine::Engine) -> Value {
     let key = session_key(cwd, session_id);
     let lifecycle_lock = session_lifecycle_lock_for_key(&key);
     let _lifecycle_guard = lifecycle_lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -890,20 +917,22 @@ fn session_new(cwd: &Path, session_id: &str, cfg: &BrowserConfig) -> Value {
             kill_session(existing);
         }
     }
-    match launch_chrome(cwd, session_id, cfg) {
-        Ok((child, port)) => {
-            let pid = child.id();
+    match crate::browser_engine::acquire(engine, cwd, session_id, cfg) {
+        Ok(acquired) => {
+            let pid = acquired.child.as_ref().map(|c| c.id()).unwrap_or(0);
+            let port = acquired.port;
             let mut map = sessions_map().lock().unwrap_or_else(|e| e.into_inner());
             map.insert(
                 key,
                 BrowserSession {
                     cwd: cwd.to_path_buf(),
                     session_id: session_id.to_string(),
-                    child: Some(child),
+                    child: acquired.child,
                     pid,
                     port,
                     last_used: Instant::now(),
                     target_id: None,
+                    owns_process: acquired.owns_process,
                 },
             );
             json!({"ok": true, "stdout": "", "exit_code": 0, "stderr": "", "session_id": session_id, "port": port})
@@ -1058,6 +1087,10 @@ fn spawn_chrome_once(
         .map_err(|e| format!("chrome launch failed: {e}"))
 }
 
+pub(crate) fn launch_chrome_pub(cwd: &Path, session_id: &str, browser_cfg: &BrowserRuntimeConfig) -> Result<(Child, u16), String> {
+    launch_chrome(cwd, session_id, browser_cfg)
+}
+
 fn launch_chrome(cwd: &Path, session_id: &str, browser_cfg: &BrowserConfig) -> Result<(Child, u16), String> {
     let chrome = find_chrome().ok_or_else(|| "no Chrome found; install Google Chrome or Chromium".to_string())?;
     let profile_dir = browser_chrome_profile_dir(cwd, session_id);
@@ -1140,7 +1173,7 @@ pub fn run(body: &str, cwd_raw: &Path, session_id: &str) -> Value {
     reap_idle_sessions(cwd, &browser_cfg);
     reap_os_orphans(cwd);
 
-    let (inner_body, timeout_ms): (String, u64) = match serde_json::from_str::<Value>(body) {
+    let (inner_body, timeout_ms, requested_engine): (String, u64, Option<String>) = match serde_json::from_str::<Value>(body) {
         Ok(Value::Object(obj)) => {
             let b = obj
                 .get("body")
@@ -1148,10 +1181,12 @@ pub fn run(body: &str, cwd_raw: &Path, session_id: &str) -> Value {
                 .map(|s| s.to_string())
                 .unwrap_or_default();
             let t = obj.get("timeoutMs").and_then(|v| v.as_u64()).unwrap_or(120_000);
-            (b, t)
+            let e = crate::browser_engine::requested_engine_from_envelope(&Value::Object(obj));
+            (b, t, e)
         }
-        _ => (body.to_string(), 120_000),
+        _ => (body.to_string(), 120_000, None),
     };
+    let engine = crate::browser_engine::select_engine(cwd, requested_engine.as_deref());
 
     let (explicit_session_id, after_session_prefix) = strip_session_id_prefix(&inner_body);
     let session_id_owned;
@@ -1201,7 +1236,7 @@ pub fn run(body: &str, cwd_raw: &Path, session_id: &str) -> Value {
     };
 
     match parse_session_command(inner_body) {
-        SessionCommand::New => return session_new(cwd, session_id, &browser_cfg),
+        SessionCommand::New => return session_new(cwd, session_id, &browser_cfg, engine),
         SessionCommand::List => return session_list(cwd),
         SessionCommand::Close(id) if !id.is_empty() => return session_close(cwd, id, true),
         SessionCommand::Reset(id) if !id.is_empty() => return session_close(cwd, id, false),
@@ -1335,42 +1370,52 @@ pub fn run(body: &str, cwd_raw: &Path, session_id: &str) -> Value {
         Some(p) => p,
         None => {
             // A daemon recycle (self-update handoff, idle self-recycle, panic)
-            // may have left this session's chrome running as an OS orphan with
-            // intact sidecars. Re-attach to it instead of spawning a second
-            // chrome onto the same (locked) profile dir -- which both fails
-            // the launch AND destroys the page state the caller still wants.
-            let adopted_port = try_adopt_orphaned_session(cwd, Some(session_id), &browser_chrome_profile_dir(cwd, session_id))
-                .filter(|adopted_id| adopted_id == session_id)
-                .and_then(|adopted_id| {
-                    let adopted_key = session_key(cwd, &adopted_id);
-                    let mut map = sessions_map().lock().unwrap_or_else(|e| e.into_inner());
-                    map.get_mut(&adopted_key).map(|s| {
-                        s.last_used = Instant::now();
-                        s.port
+            // may have left this session's chrome/lightpanda running as an OS
+            // orphan with intact sidecars. Re-attach to it instead of
+            // spawning a second process onto the same (locked) profile dir --
+            // which both fails the launch AND destroys the page state the
+            // caller still wants. A steel session owns no local process or
+            // sidecar (always dialed fresh against the operator's own
+            // always-on endpoint), so adoption is meaningless for it and
+            // skipped outright.
+            let adopted_port = if engine == crate::browser_engine::Engine::Steel {
+                None
+            } else {
+                try_adopt_orphaned_session(cwd, Some(session_id), &browser_chrome_profile_dir(cwd, session_id))
+                    .filter(|adopted_id| adopted_id == session_id)
+                    .and_then(|adopted_id| {
+                        let adopted_key = session_key(cwd, &adopted_id);
+                        let mut map = sessions_map().lock().unwrap_or_else(|e| e.into_inner());
+                        map.get_mut(&adopted_key).map(|s| {
+                            s.last_used = Instant::now();
+                            s.port
+                        })
                     })
-                });
+            };
             match adopted_port {
                 Some(p) => p,
                 None => {
-                    let (chrome_child, new_port) = match launch_chrome(cwd, session_id, &browser_cfg) {
+                    let acquired = match crate::browser_engine::acquire(engine, cwd, session_id, &browser_cfg) {
                         Ok(v) => v,
                         Err(e) => {
                             cleanup(&[&helper_path, &script_path, &result_path]);
                             return json!({"ok": false, "stdout": "", "exit_code": 1, "stderr": e});
                         }
                     };
-                    let pid = chrome_child.id();
+                    let pid = acquired.child.as_ref().map(|c| c.id()).unwrap_or(0);
+                    let new_port = acquired.port;
                     let mut map = sessions_map().lock().unwrap_or_else(|e| e.into_inner());
                     map.insert(
                         key.clone(),
                         BrowserSession {
                             cwd: cwd.to_path_buf(),
                             session_id: session_id.to_string(),
-                            child: Some(chrome_child),
+                            child: acquired.child,
                             pid,
                             port: new_port,
                             last_used: Instant::now(),
                             target_id: None,
+                            owns_process: acquired.owns_process,
                         },
                     );
                     new_port
@@ -1560,6 +1605,8 @@ fn unix_ms() -> u128 {
         .map(|d| d.as_millis())
         .unwrap_or(0)
 }
+
+pub(crate) fn sanitize_pub(s: &str) -> String { sanitize(s) }
 
 fn sanitize(s: &str) -> String {
     s.chars()

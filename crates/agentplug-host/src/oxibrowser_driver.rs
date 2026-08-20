@@ -1,12 +1,15 @@
-//! Translates the `browser` verb's plain-text-body dispatch shape into calls
+//! Translates the `serp` verb's plain-text-body dispatch shape into calls
 //! against the sideloaded `oxibrowser` plugin (its own `plugkit_alloc`/
 //! `plugin_call` instance, driven via the same sibling-pool machinery
 //! `host_plugin_call` uses). oxibrowser's verb surface (navigate/evaluate/
 //! dom-query/extract-markdown/capabilities) is a genuine subset of what the
-//! `cdp` verb (real Chrome) supports -- anything outside that subset
-//! (screenshot/capture/profile/trace/viewport, multi-tab session pooling)
-//! returns a clear "not supported here, use cdp" error rather than silently
-//! mishandling it.
+//! `cdp`/`browser` verbs (real Chrome, lightpanda, steel) support --
+//! anything outside that subset (screenshot/capture/profile/trace/viewport,
+//! multi-tab session pooling) returns a clear "not supported here, use
+//! cdp/browser" error rather than silently mishandling it. `serp` always
+//! runs the in-process oxibrowser engine, even when steel-browser is
+//! configured for `cdp`/`browser` -- a configured `steel_endpoint` takes
+//! over the CDP-capable engines uniformly but never this in-process path.
 
 use serde_json::{json, Value};
 use std::path::Path;

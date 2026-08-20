@@ -182,8 +182,8 @@ fn builtin_plugin_asset_spec(plugin_name: &str) -> Option<PluginAssetSpec> {
         "bert" => Some(PluginAssetSpec { repo: "AnEntrypoint/agentplug-bert-bin".to_string(), asset_basename: "bert".to_string(), npm_package: Some("agentplug-bert-wasm".to_string()) }),
         "libsql" => Some(PluginAssetSpec { repo: "AnEntrypoint/agentplug-libsql-bin".to_string(), asset_basename: "libsql".to_string(), npm_package: Some("agentplug-libsql-wasm".to_string()) }),
         "treesitter" => Some(PluginAssetSpec { repo: "AnEntrypoint/agentplug-treesitter-bin".to_string(), asset_basename: "treesitter".to_string(), npm_package: Some("agentplug-treesitter-wasm".to_string()) }),
-        "oxibrowser" => Some(PluginAssetSpec { repo: "AnEntrypoint/obrowser-bin".to_string(), asset_basename: "oxibrowser".to_string(), npm_package: Some("obrowser-wasm".to_string()) }),
-        "crux" => Some(PluginAssetSpec { repo: "AnEntrypoint/agentplug-crux-bin".to_string(), asset_basename: "crux".to_string(), npm_package: Some("agentplug-crux-wasm".to_string()) }),
+        "oxibrowser" => Some(PluginAssetSpec { repo: "AnEntrypoint/obrowser-bin".to_string(), asset_basename: "oxibrowser".to_string(), npm_package: None }),
+        "crux" => Some(PluginAssetSpec { repo: "AnEntrypoint/agentplug-crux-bin".to_string(), asset_basename: "crux".to_string(), npm_package: None }),
         _ => None,
     }
 }
