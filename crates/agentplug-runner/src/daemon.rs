@@ -1583,6 +1583,35 @@ fn dispatch_project(root: &Path, project: &mut ProjectPlugins, plugin_modules: &
             if let Err(e) = project.load_plugin(&plugin_modules.engine, plugin_name, module, content_hash) {
                 let reason = format!("failed to instantiate plugin {plugin_name} for {}: {e:#}", root.display());
                 eprintln!("[agentplug daemon] {reason}");
+                // A load/instantiate failure here (as opposed to a compile failure, already
+                // handled above) means the plugin's *bytes* are fine but its host-import contract
+                // doesn't match what this runner itself implements -- almost always the plugin's
+                // own release channel having published a newer build than this runner's compiled-
+                // in host ABI supports (see `record_plugin_load_failure_and_rollback`'s doc
+                // comment for the full mechanism and how it was diagnosed). Roll back to the last
+                // version that DID load, if one exists, so the project recovers on its own rather
+                // than staying permanently broken until a human notices and manually restores
+                // `plugin_name.wasm.prev` -- `get_or_compile`'s own content-hash staleness check
+                // (this same loop's earlier `plugin_modules.module_with_hash` call, on ITS next
+                // invocation) picks up the rolled-back bytes and recompiles automatically, no
+                // separate cache-eviction call needed here.
+                match crate::download::record_plugin_load_failure_and_rollback(plugin_name) {
+                    Ok(true) => {
+                        eprintln!(
+                            "[agentplug daemon] {plugin_name} rolled back after instantiate failure -- retry this dispatch; the rolled-back version will compile and load on the next attempt"
+                        );
+                    }
+                    Ok(false) => {
+                        eprintln!(
+                            "[agentplug daemon] {plugin_name} instantiate failure has no prior working version to roll back to (first install, or no .wasm.prev backup exists) -- cannot self-recover"
+                        );
+                    }
+                    Err(rollback_err) => {
+                        eprintln!(
+                            "[agentplug daemon] {plugin_name} rollback after instantiate failure itself failed: {rollback_err:#}"
+                        );
+                    }
+                }
                 if plugin_name == "gm" { gm_load_failure_reason = Some(reason); }
             }
         }

@@ -90,10 +90,7 @@ fn try_ensure_plugin_installed_via_npm_mirror(spec: &PluginAssetSpec, dest: &Pat
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent)?;
     }
-    let prev_dest = dest.with_extension("wasm.prev");
-    if dest.exists() {
-        let _ = fs::copy(dest, &prev_dest);
-    }
+    snapshot_prev_wasm_and_version(dest, version_file);
     let tmp = dest.with_extension("wasm.tmp");
     fs::write(&tmp, &wasm_bytes)?;
     fs::rename(&tmp, dest)?;
@@ -135,10 +132,7 @@ fn try_ensure_plugin_installed_via_direct_release_latest(spec: &PluginAssetSpec,
         .to_string();
 
     let wasm_url = format!("https://github.com/{}/releases/latest/download/{}.wasm", spec.repo, spec.asset_basename);
-    let prev_dest = dest.with_extension("wasm.prev");
-    if dest.exists() {
-        let _ = fs::copy(dest, &prev_dest);
-    }
+    snapshot_prev_wasm_and_version(dest, version_file);
     download_and_verify(&wasm_url, dest, &expected_sha)?;
     fs::write(version_file, &version)?;
     eprintln!(
@@ -298,6 +292,24 @@ pub fn plugin_wasm_path(plugin_name: &str) -> PathBuf {
 
 fn plugin_version_path(plugin_name: &str) -> PathBuf {
     install_dir().join("plugins").join(format!("{plugin_name}.version"))
+}
+
+/// Snapshot `dest` (the plugin's `.wasm`) and `version_file` (its `.version`) to `.wasm.prev`/
+/// `.version.prev` before a new download overwrites them, if `dest` already exists from a prior
+/// install. Called from every one of the three install paths
+/// (`ensure_plugin_installed_via_github`/`try_ensure_plugin_installed_via_direct_release_latest`/
+/// `try_ensure_plugin_installed_via_npm_mirror`) right before they write the new version, so
+/// [`record_plugin_load_failure_and_rollback`] can always restore a matching (wasm, version) pair
+/// together -- restoring only the `.wasm` bytes while leaving `.version` pointing at the new,
+/// failed release tag would make `refresh_plugin_if_stale` believe the (rolled-back, older) binary
+/// on disk IS already the latest version and stop checking for updates entirely.
+fn snapshot_prev_wasm_and_version(dest: &Path, version_file: &Path) {
+    if dest.exists() {
+        let _ = fs::copy(dest, dest.with_extension("wasm.prev"));
+    }
+    if version_file.exists() {
+        let _ = fs::copy(version_file, version_file.with_extension("version.prev"));
+    }
 }
 
 const RUNNER_BIN_REPO: &str = "AnEntrypoint/agentplug-bin";
@@ -471,6 +483,39 @@ fn clear_local_dev_sideload_marker(plugin_name: &str) {
     let _ = fs::remove_file(local_dev_sideload_marker_path(plugin_name));
 }
 
+fn known_bad_version_marker_path(plugin_name: &str) -> PathBuf {
+    install_dir().join("plugins").join(format!("{plugin_name}.known-bad-versions.json"))
+}
+
+fn read_known_bad_versions(plugin_name: &str) -> std::collections::HashSet<String> {
+    fs::read_to_string(known_bad_version_marker_path(plugin_name))
+        .ok()
+        .and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok())
+        .map(|v| v.into_iter().collect())
+        .unwrap_or_default()
+}
+
+/// Records `version` as known-bad for `plugin_name` so [`ensure_plugin_installed_via_github`]'s
+/// stale check (called from [`refresh_plugin_if_stale`] on every poll tick) never re-fetches the
+/// exact same broken release tag again -- without this, a plugin release that fails to
+/// instantiate against this runner's own compiled-in host ABI (see
+/// [`record_plugin_load_failure_and_rollback`]'s doc comment) gets silently re-downloaded on the
+/// very next poll cycle, because "the release tag changed" and "the release tag is loadable" are
+/// two different questions this runner previously only asked the first of. Appends rather than
+/// overwrites -- a plugin can accumulate more than one known-bad tag across separate publish
+/// mistakes upstream, and every one of them must stay excluded, not just the most recent.
+fn record_known_bad_version(plugin_name: &str, version: &str) {
+    let mut versions = read_known_bad_versions(plugin_name);
+    if versions.insert(version.to_string()) {
+        let mut sorted: Vec<&String> = versions.iter().collect();
+        sorted.sort();
+        let _ = fs::write(
+            known_bad_version_marker_path(plugin_name),
+            serde_json::to_string(&sorted).unwrap_or_default(),
+        );
+    }
+}
+
 fn fetch_remote_wasm_sha256(plugin_name: &str, version: &str) -> anyhow::Result<String> {
     let Some(spec) = plugin_asset_spec(plugin_name) else {
         anyhow::bail!("unknown plugin {plugin_name} -- not registered in agentplug-runner's plugin_asset_spec map");
@@ -508,6 +553,20 @@ pub fn refresh_plugin_if_stale(plugin_name: &str) -> anyhow::Result<Option<Strin
             _ => return Ok(None),
         }
     }
+    if read_known_bad_versions(plugin_name).contains(&latest) {
+        // The "latest" release tag this poll resolved to is one this runner already tried and
+        // failed to instantiate (see record_plugin_load_failure_and_rollback) -- almost always a
+        // real upstream ABI mismatch (the plugin repo published a release built against a newer
+        // host-import contract than this runner's own compiled-in rs-plugkit version implements)
+        // rather than something a retry fixes. Re-fetching it every poll tick would just repeat
+        // the same failed load forever; skip until either a NEWER tag appears (the normal
+        // resolution: upstream publishes a fix) or this runner itself is updated to a compatible
+        // host ABI (self-update already runs on its own schedule, independent of this check).
+        eprintln!(
+            "[agentplug daemon] plugin {plugin_name} latest release {latest} is a previously-recorded known-bad version for this runner (host ABI mismatch) -- staying on {installed} until either a newer release appears or this runner updates"
+        );
+        return Ok(None);
+    }
     ensure_plugin_installed(plugin_name, Some(&latest))?;
     if plugin_name == "gm" {
         if let Err(e) = refresh_installed_skill_md() {
@@ -515,6 +574,50 @@ pub fn refresh_plugin_if_stale(plugin_name: &str) -> anyhow::Result<Option<Strin
         }
     }
     Ok(Some(latest))
+}
+
+/// Called from the daemon's plugin-instantiation failure path (see
+/// `daemon.rs`'s `load_plugin` error handling) when a freshly-downloaded plugin version fails to
+/// load against this runner's own compiled-in host ABI -- observed live as `agentplug`'s
+/// per-plugin release channel (e.g. `AnEntrypoint/plugkit-bin` for `gm`) outpacing
+/// `agentplug-bin`'s own release cadence, so a plugin built against a newer host-import contract
+/// (a changed function signature such as `host_browser_exec`/`host_fs_cas_write`) gets published
+/// and auto-fetched before this runner itself has a matching update -- rather than leaving the
+/// project permanently unable to dispatch anything until a human notices and manually restores
+/// `plugin.wasm.prev`, roll back automatically to the last version that DID load (the `.prev`
+/// backup `ensure_plugin_installed_via_github` always writes before overwriting `dest`, see that
+/// function's own `prev_dest` handling) and record the failed version so
+/// [`refresh_plugin_if_stale`]'s poll loop does not immediately re-fetch and re-fail the exact
+/// same tag on its next tick. Returns `Ok(true)` if a rollback file existed and was restored,
+/// `Ok(false)` if there was nothing to roll back to (e.g. this was the plugin's first-ever
+/// install and it failed) -- the caller should treat `Ok(false)` as "still broken, no prior
+/// version to fall back to" and surface the original error rather than retry.
+pub fn record_plugin_load_failure_and_rollback(plugin_name: &str) -> anyhow::Result<bool> {
+    if let Some(failed_version) = installed_plugin_version(plugin_name) {
+        record_known_bad_version(plugin_name, &failed_version);
+    }
+    let dest = plugin_wasm_path(plugin_name);
+    let prev_dest = dest.with_extension("wasm.prev");
+    if !prev_dest.exists() {
+        return Ok(false);
+    }
+    fs::copy(&prev_dest, &dest)?;
+    // Restore the matching `.version` alongside the rolled-back `.wasm` bytes (see
+    // `snapshot_prev_wasm_and_version`'s doc comment for why the two must move together) --
+    // best-effort: an older install predating this rollback support may have a `.wasm.prev` with
+    // no matching `.version.prev` sibling, in which case the `.version` file is left as-is rather
+    // than failing the whole rollback over a file that was never written in the first place.
+    let version_file = plugin_version_path(plugin_name);
+    let prev_version_file = version_file.with_extension("version.prev");
+    if prev_version_file.exists() {
+        let _ = fs::copy(&prev_version_file, &version_file);
+    }
+    eprintln!(
+        "[agentplug daemon] plugin {plugin_name} rolled back to its previous working version ({} restored from {})",
+        dest.display(),
+        prev_dest.display()
+    );
+    Ok(true)
 }
 
 const SKILL_MD_REMOTE_REPO: &str = "AnEntrypoint/gm";
@@ -711,10 +814,7 @@ fn ensure_plugin_installed_via_github(plugin_name: &str, explicit_version: Optio
     let sha_line = sha_resp.into_string()?;
     let expected_sha = sha_line.split_whitespace().next().ok_or_else(|| anyhow::anyhow!("empty sha256 sidecar for {effective_basename} at {base}"))?.to_string();
 
-    let prev_dest = dest.with_extension("wasm.prev");
-    if dest.exists() {
-        let _ = fs::copy(dest, &prev_dest);
-    }
+    snapshot_prev_wasm_and_version(dest, version_file);
     download_and_verify(&wasm_url, dest, &expected_sha)?;
     fs::write(version_file, &version)?;
     Ok(dest.to_path_buf())
