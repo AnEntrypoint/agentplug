@@ -360,7 +360,14 @@ pub fn fetch_latest_plugin_version(plugin_name: &str) -> anyhow::Result<Option<S
     let Some(spec) = plugin_asset_spec(plugin_name) else {
         anyhow::bail!("unknown plugin {plugin_name} -- not registered in agentplug-runner's plugin_asset_spec map");
     };
-    let url = format!("https://api.github.com/repos/{}/releases?per_page=20", spec.repo);
+    // per_page=100 (GitHub's max): a repo shared with a high-cadence sibling
+    // (rs-codeinsight has published 50+ releases in the time rs-plugkit
+    // published 1) can bury this plugin's own latest release deep past a
+    // smaller page -- witnessed live: the top 20 most-recent releases in
+    // plugkit-bin were ALL rs-codeinsight, zero of which carry a
+    // plugkit-slim/plugkit asset; 100 was enough to surface gm's actual
+    // latest at position ~21.
+    let url = format!("https://api.github.com/repos/{}/releases?per_page=100", spec.repo);
     let resp = github_api_call(&url).map_err(|e| describe_github_api_error(&url, e))?;
     let body: serde_json::Value = serde_json::from_str(&resp.into_string()?)?;
     let Some(releases) = body.as_array() else {
