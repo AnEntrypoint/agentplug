@@ -137,6 +137,7 @@ fn builtin_plugin_asset_spec(plugin_name: &str) -> Option<PluginAssetSpec> {
         "treesitter" => Some(PluginAssetSpec { repo: "AnEntrypoint/agentplug-treesitter-bin".to_string(), asset_basename: "treesitter".to_string() }),
         "oxibrowser" => Some(PluginAssetSpec { repo: "AnEntrypoint/obrowser-bin".to_string(), asset_basename: "oxibrowser".to_string() }),
         "crux" => Some(PluginAssetSpec { repo: "AnEntrypoint/agentplug-crux-bin".to_string(), asset_basename: "crux".to_string() }),
+        "liqology" => Some(PluginAssetSpec { repo: "AnEntrypoint/liqology".to_string(), asset_basename: "liqology".to_string() }),
         _ => None,
     }
 }
