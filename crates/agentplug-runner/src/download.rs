@@ -341,14 +341,50 @@ pub fn record_runner_version(version: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Some `PluginAssetSpec.repo`s (e.g. `AnEntrypoint/plugkit-bin`) are shared
+/// across more than one plugin family that each publish their own releases
+/// into the same repo under their own asset basename (rs-plugkit's `gm` and
+/// rs-codeinsight both publish to `plugkit-bin`). `GET /releases/latest`
+/// returns the single most-recently-created release in the WHOLE repo,
+/// with no regard for which asset it carries -- so the other family's
+/// release can silently shadow this plugin's own latest the moment it
+/// publishes, and every subsequent poll 404s on `{asset_basename}.wasm`
+/// (witnessed live: `gm`'s own v0.1.1243 masked by a same-day rs-codeinsight
+/// v0.3.48 release in the same repo, both of which sort as GitHub's "latest"
+/// but only one contains a `plugkit-slim.wasm` asset). Fetch the recent
+/// releases list instead and pick the newest one whose assets actually
+/// include this plugin's basename -- `plugkit-slim` also accepts the `plugkit`
+/// fallback name, mirroring `ensure_plugin_installed_via_github`'s own
+/// slim/fat fallback.
 pub fn fetch_latest_plugin_version(plugin_name: &str) -> anyhow::Result<Option<String>> {
     let Some(spec) = plugin_asset_spec(plugin_name) else {
         anyhow::bail!("unknown plugin {plugin_name} -- not registered in agentplug-runner's plugin_asset_spec map");
     };
-    let url = format!("https://api.github.com/repos/{}/releases/latest", spec.repo);
+    let url = format!("https://api.github.com/repos/{}/releases?per_page=20", spec.repo);
     let resp = github_api_call(&url).map_err(|e| describe_github_api_error(&url, e))?;
     let body: serde_json::Value = serde_json::from_str(&resp.into_string()?)?;
-    Ok(body.get("tag_name").and_then(|v| v.as_str()).map(|s| s.trim_start_matches('v').to_string()))
+    let Some(releases) = body.as_array() else {
+        anyhow::bail!("unexpected releases-list response shape for {}", spec.repo);
+    };
+    let wanted_names: [String; 2] = [
+        format!("{}.wasm", spec.asset_basename),
+        // plugkit-slim's own release step also uploads the fat `plugkit.wasm` --
+        // accept either so a release step is not double-special-cased here.
+        if spec.asset_basename == "plugkit-slim" { "plugkit.wasm".to_string() } else { format!("{}.wasm", spec.asset_basename) },
+    ];
+    for release in releases {
+        let has_asset = release
+            .get("assets")
+            .and_then(|a| a.as_array())
+            .map(|assets| assets.iter().any(|a| {
+                a.get("name").and_then(|n| n.as_str()).map(|n| wanted_names.iter().any(|w| w == n)).unwrap_or(false)
+            }))
+            .unwrap_or(false);
+        if has_asset {
+            return Ok(release.get("tag_name").and_then(|v| v.as_str()).map(|s| s.trim_start_matches('v').to_string()));
+        }
+    }
+    Ok(None)
 }
 
 pub fn installed_plugin_version(plugin_name: &str) -> Option<String> {
