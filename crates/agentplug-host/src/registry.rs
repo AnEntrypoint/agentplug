@@ -53,6 +53,75 @@ fn is_stateless_shared_plugin(plugin_name: &str) -> bool {
     STATELESS_SHARED_PLUGIN_NAMES.contains(&plugin_name)
 }
 
+/// A sibling wasm plugin's lifecycle state (paper Section 4.3, Definition
+/// 49), the same three-state reduction `discipline_note.rs::FiberLifecycle`
+/// uses for disciplines (gm has no async load step for either -- a plugin
+/// load is one synchronous `Module::from_file` + `load_plugin` call, so
+/// there is no `Reloading` window to model). Generalizes the fiber
+/// lifecycle abstraction beyond disciplines to gm's OTHER real component
+/// family: `Inactive` (never loaded, or evicted), `Active` (a pool slot
+/// currently holds this plugin's content), `Unloading` (a load attempt
+/// failed or the plugin was evicted, one dispatch before the state
+/// collapses back to `Inactive`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginFiberLifecycle {
+    Inactive,
+    Active,
+    Unloading,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct PluginFiberState {
+    state: PluginFiberLifecycle,
+    #[serde(default)]
+    content_hash: Option<String>,
+}
+
+fn plugin_fiber_state_path(plugin_name: &str) -> PathBuf {
+    crate::install::install_dir()
+        .join("plugins")
+        .join(format!("{plugin_name}.fiber-state.json"))
+}
+
+fn read_plugin_fiber_state(plugin_name: &str) -> PluginFiberState {
+    std::fs::read_to_string(plugin_fiber_state_path(plugin_name))
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or(PluginFiberState { state: PluginFiberLifecycle::Inactive, content_hash: None })
+}
+
+fn write_plugin_fiber_state(plugin_name: &str, state: PluginFiberLifecycle, content_hash: Option<String>) {
+    let body = PluginFiberState { state, content_hash };
+    if let Ok(text) = serde_json::to_string(&body) {
+        let _ = std::fs::write(plugin_fiber_state_path(plugin_name), text);
+    }
+}
+
+/// Advances one plugin's persisted lifecycle by exactly one transition,
+/// given whether `load_plugin` just succeeded. Mirrors the discipline
+/// fiber's `advance_fiber`: `Inactive -> Active` on success,
+/// `Active -> Unloading` on failure (a load attempt that fails leaves the
+/// prior content in place structurally via `load_plugin`'s own LIFO
+/// revert, but the LIFECYCLE marks the attempt as a withdrawal-in-
+/// progress), `Unloading -> Inactive` on the following call regardless of
+/// outcome.
+pub fn advance_plugin_fiber(plugin_name: &str, load_succeeded: bool, content_hash: Option<&str>) {
+    let current = read_plugin_fiber_state(plugin_name).state;
+    let next = match (current, load_succeeded) {
+        (PluginFiberLifecycle::Inactive, true) => PluginFiberLifecycle::Active,
+        (PluginFiberLifecycle::Inactive, false) => PluginFiberLifecycle::Inactive,
+        (PluginFiberLifecycle::Active, true) => PluginFiberLifecycle::Active,
+        (PluginFiberLifecycle::Active, false) => PluginFiberLifecycle::Unloading,
+        (PluginFiberLifecycle::Unloading, _) => PluginFiberLifecycle::Inactive,
+    };
+    write_plugin_fiber_state(plugin_name, next, content_hash.map(|s| s.to_string()));
+}
+
+pub fn read_plugin_lifecycle(plugin_name: &str) -> PluginFiberLifecycle {
+    read_plugin_fiber_state(plugin_name).state
+}
+
 #[derive(Debug)]
 pub enum PluginDispatchError {
     NotRegistered { plugin_name: String },
@@ -292,6 +361,27 @@ pub fn shared_plugin_slot_content_hashes(plugin_name: &str) -> Vec<Option<String
         .get(plugin_name)
         .map(|pool| pool.slot_content_hashes())
         .unwrap_or_default()
+}
+
+/// The content hash currently answering dispatches for `plugin_name`,
+/// mirroring the paper's `provider_k(gamma)` (Definition 46): each shared
+/// plugin is a singleton service (bert/libsql/treesitter each have exactly
+/// one logical identity, unlike the paper's multi-provider services), so
+/// its `SharedPluginPool` -- every dispatch resolving through the pool's
+/// slots regardless of which slot happens to be free -- already IS the
+/// stable entrypoint a Cordis service broker (Section 6.2) provides: a
+/// caller never names a concrete slot, only the plugin name, and the pool
+/// decouples that name from which of its N pooled instances actually
+/// answers. Returns `None` when no slot has been filled yet (the service
+/// has no active provider). A pool with mixed content hashes across slots
+/// (a swap in progress) returns the hash the FIRST filled slot carries --
+/// callers wanting the full in-flight picture use
+/// `shared_plugin_slot_content_hashes` instead.
+pub fn get_active_provider(plugin_name: &str) -> Option<String> {
+    shared_plugin_slot_content_hashes(plugin_name)
+        .into_iter()
+        .flatten()
+        .next()
 }
 
 pub fn dispatch_on(
