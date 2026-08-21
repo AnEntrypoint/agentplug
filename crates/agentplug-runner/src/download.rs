@@ -12,92 +12,6 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
     hasher.finalize().iter().map(|b| format!("{b:02x}")).collect()
 }
 
-fn npm_registry_latest_version(package: &str) -> anyhow::Result<String> {
-    let url = format!("https://registry.npmjs.org/{package}/latest");
-    let resp = agentplug_host::shared_agent().get(&url).call()?;
-    let body = resp.into_string()?;
-    let v: serde_json::Value = serde_json::from_str(&body)?;
-    v.get("version")
-        .and_then(|s| s.as_str())
-        .map(String::from)
-        .ok_or_else(|| anyhow::anyhow!("npm registry response for {package} had no version field"))
-}
-
-fn npm_registry_tarball_url(package: &str, version: &str) -> anyhow::Result<String> {
-    let url = format!("https://registry.npmjs.org/{package}/{version}");
-    let resp = agentplug_host::shared_agent().get(&url).call()?;
-    let body = resp.into_string()?;
-    let v: serde_json::Value = serde_json::from_str(&body)?;
-    v.get("dist")
-        .and_then(|d| d.get("tarball"))
-        .and_then(|t| t.as_str())
-        .map(String::from)
-        .ok_or_else(|| anyhow::anyhow!("npm registry response for {package}@{version} had no dist.tarball field"))
-}
-
-fn extract_file_from_npm_tarball(tarball_bytes: &[u8], file_name: &str) -> anyhow::Result<Vec<u8>> {
-    let decoder = flate2::read::GzDecoder::new(tarball_bytes);
-    let mut archive = tar::Archive::new(decoder);
-    for entry in archive.entries()? {
-        let mut entry = entry?;
-        let path = entry.path()?.to_string_lossy().into_owned();
-        if path.ends_with(&format!("/{file_name}")) || path == file_name {
-            let mut buf = Vec::new();
-            entry.read_to_end(&mut buf)?;
-            return Ok(buf);
-        }
-    }
-    anyhow::bail!("npm tarball did not contain a file named {file_name} (package.json's own \"main\" convention -- expected package/{file_name})")
-}
-
-fn extract_wasm_and_sha_from_npm_tarball(tarball_bytes: &[u8], asset_basename: &str) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
-    let wasm_name = format!("{asset_basename}.wasm");
-    let sha_name = format!("{asset_basename}.wasm.sha256");
-    let wasm_bytes = extract_file_from_npm_tarball(tarball_bytes, &wasm_name)?;
-    let sha_bytes = extract_file_from_npm_tarball(tarball_bytes, &sha_name)?;
-    Ok((wasm_bytes, sha_bytes))
-}
-
-fn try_ensure_plugin_installed_via_npm_mirror(spec: &PluginAssetSpec, dest: &Path, version_file: &Path) -> anyhow::Result<PathBuf> {
-    let package = spec.npm_package.as_deref().ok_or_else(|| anyhow::anyhow!("no npm mirror configured for this plugin"))?;
-    let version = npm_registry_latest_version(package)?;
-    let tarball_url = npm_registry_tarball_url(package, &version)?;
-    let tarball_resp = agentplug_host::shared_agent().get(&tarball_url).call()?;
-    let mut tarball_bytes = Vec::new();
-    tarball_resp.into_reader().read_to_end(&mut tarball_bytes)?;
-
-    // The npm mirror package publishes only the fat asset (embedded model
-    // weights) under its own basename (e.g. plugkit-wasm ships plugkit.wasm,
-    // never plugkit-slim.wasm) -- fall back the same way the GitHub-releases
-    // path already does at ensure_plugin_installed_via_github's sha404 branch.
-    let (wasm_bytes, sha_bytes) = match extract_wasm_and_sha_from_npm_tarball(&tarball_bytes, &spec.asset_basename) {
-        Ok(pair) => pair,
-        Err(e) if spec.asset_basename == "plugkit-slim" => {
-            eprintln!("[agentplug] npm package {package}@{version} has no plugkit-slim.wasm ({e:#}) -- falling back to plugkit.wasm");
-            extract_wasm_and_sha_from_npm_tarball(&tarball_bytes, "plugkit")?
-        }
-        Err(e) => return Err(e),
-    };
-    let sha_text = String::from_utf8_lossy(&sha_bytes).into_owned();
-    let expected_sha = sha_text.split_whitespace().next()
-        .ok_or_else(|| anyhow::anyhow!("empty sha256 sidecar for {} in npm package {package}", spec.asset_basename))?
-        .to_string();
-    let actual_sha = sha256_hex(&wasm_bytes);
-    if actual_sha != expected_sha {
-        anyhow::bail!("npm mirror {package}@{version} sha256 mismatch: expected {expected_sha}, got {actual_sha}");
-    }
-
-    if let Some(parent) = dest.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    snapshot_prev_wasm_and_version(dest, version_file);
-    let tmp = dest.with_extension("wasm.tmp");
-    fs::write(&tmp, &wasm_bytes)?;
-    fs::rename(&tmp, dest)?;
-    fs::write(version_file, &version)?;
-    eprintln!("[agentplug] {} installed via npm mirror {package}@{version} (GitHub Releases path failed or was unreachable)", spec.asset_basename);
-    Ok(dest.to_path_buf())
-}
 
 /// `https://github.com/{repo}/releases/latest/download/{asset}` is a plain
 /// redirect served by GitHub's web frontend, not the REST API -- it resolves
@@ -209,7 +123,6 @@ pub fn download_and_verify(url: &str, dest: &Path, expected_sha256_hex: &str) ->
 struct PluginAssetSpec {
     repo: String,
     asset_basename: String,
-    npm_package: Option<String>,
 }
 
 fn gm_asset_basename() -> &'static str {
@@ -218,12 +131,12 @@ fn gm_asset_basename() -> &'static str {
 
 fn builtin_plugin_asset_spec(plugin_name: &str) -> Option<PluginAssetSpec> {
     match plugin_name {
-        "gm" => Some(PluginAssetSpec { repo: "AnEntrypoint/plugkit-bin".to_string(), asset_basename: gm_asset_basename().to_string(), npm_package: Some("plugkit-wasm".to_string()) }),
-        "bert" => Some(PluginAssetSpec { repo: "AnEntrypoint/agentplug-bert-bin".to_string(), asset_basename: "bert".to_string(), npm_package: Some("agentplug-bert-wasm".to_string()) }),
-        "libsql" => Some(PluginAssetSpec { repo: "AnEntrypoint/agentplug-libsql-bin".to_string(), asset_basename: "libsql".to_string(), npm_package: Some("agentplug-libsql-wasm".to_string()) }),
-        "treesitter" => Some(PluginAssetSpec { repo: "AnEntrypoint/agentplug-treesitter-bin".to_string(), asset_basename: "treesitter".to_string(), npm_package: Some("agentplug-treesitter-wasm".to_string()) }),
-        "oxibrowser" => Some(PluginAssetSpec { repo: "AnEntrypoint/obrowser-bin".to_string(), asset_basename: "oxibrowser".to_string(), npm_package: None }),
-        "crux" => Some(PluginAssetSpec { repo: "AnEntrypoint/agentplug-crux-bin".to_string(), asset_basename: "crux".to_string(), npm_package: None }),
+        "gm" => Some(PluginAssetSpec { repo: "AnEntrypoint/plugkit-bin".to_string(), asset_basename: gm_asset_basename().to_string() }),
+        "bert" => Some(PluginAssetSpec { repo: "AnEntrypoint/agentplug-bert-bin".to_string(), asset_basename: "bert".to_string() }),
+        "libsql" => Some(PluginAssetSpec { repo: "AnEntrypoint/agentplug-libsql-bin".to_string(), asset_basename: "libsql".to_string() }),
+        "treesitter" => Some(PluginAssetSpec { repo: "AnEntrypoint/agentplug-treesitter-bin".to_string(), asset_basename: "treesitter".to_string() }),
+        "oxibrowser" => Some(PluginAssetSpec { repo: "AnEntrypoint/obrowser-bin".to_string(), asset_basename: "oxibrowser".to_string() }),
+        "crux" => Some(PluginAssetSpec { repo: "AnEntrypoint/agentplug-crux-bin".to_string(), asset_basename: "crux".to_string() }),
         _ => None,
     }
 }
@@ -264,7 +177,7 @@ fn plugin_asset_spec_for_roots(plugin_name: &str, known_roots: &[PathBuf]) -> Op
     for root in known_roots {
         for spec in project_declared_plugin_specs(root) {
             if spec.name == plugin_name {
-                return Some(PluginAssetSpec { repo: spec.repo, asset_basename: spec.asset_basename, npm_package: None });
+                return Some(PluginAssetSpec { repo: spec.repo, asset_basename: spec.asset_basename });
             }
         }
     }
@@ -760,12 +673,9 @@ pub fn ensure_plugin_installed(plugin_name: &str, explicit_version: Option<&str>
         Ok(path) => Ok(path),
         Err(github_api_err) => match try_ensure_plugin_installed_via_direct_release_latest(&spec, &dest, &version_file) {
             Ok(path) => Ok(path),
-            Err(direct_err) => match try_ensure_plugin_installed_via_npm_mirror(&spec, &dest, &version_file) {
-                Ok(path) => Ok(path),
-                Err(npm_err) => Err(anyhow::anyhow!(
-                    "plugin {plugin_name} install failed on all paths -- GitHub API: {github_api_err:#}; direct release download: {direct_err:#}; npm mirror: {npm_err:#}"
-                )),
-            },
+            Err(direct_err) => Err(anyhow::anyhow!(
+                "plugin {plugin_name} install failed on all paths -- GitHub API: {github_api_err:#}; direct release download: {direct_err:#}"
+            )),
         },
     };
     if explicit_version.is_none() {
