@@ -434,16 +434,36 @@ impl ProjectPlugins {
     pub fn load_plugin(&mut self, engine: &Engine, plugin_name: &str, module: &Module, content_hash: &str) -> anyhow::Result<()> {
         if is_stateless_shared_plugin(plugin_name) {
             let pool = shared_plugin_pool(plugin_name);
-            for slot in pool.slots_for_fill() {
-                if let Ok(mut guard) = slot.try_lock() {
-                    let needs_fill = match guard.as_ref() {
-                        None => true,
-                        Some(existing) => existing.content_hash != content_hash,
-                    };
-                    if needs_fill {
-                        *guard = Some(instantiate_plugin(engine, self.root.clone(), plugin_name, module, content_hash)?);
+            // Revertible-effect discipline: each slot fill is an effect whose inverse is
+            // "put the prior occupant back". If a later slot's instantiate fails, every
+            // slot already filled this call is reverted to its pre-fill state (LIFO) so a
+            // partial swap never leaves the pool straddling old and new content hashes --
+            // a mixed pool would silently route some dispatches to the stale plugin
+            // indefinitely, since is_loaded_current only checks that ANY slot matches.
+            let mut inverses: Vec<(Arc<Mutex<Option<SiblingHandle>>>, Option<SiblingHandle>)> = Vec::new();
+            let fill_result = (|| -> anyhow::Result<()> {
+                for slot in pool.slots_for_fill() {
+                    if let Ok(mut guard) = slot.try_lock() {
+                        let needs_fill = match guard.as_ref() {
+                            None => true,
+                            Some(existing) => existing.content_hash != content_hash,
+                        };
+                        if needs_fill {
+                            let fresh = instantiate_plugin(engine, self.root.clone(), plugin_name, module, content_hash)?;
+                            let prior = guard.replace(fresh);
+                            inverses.push((slot.clone(), prior));
+                        }
                     }
                 }
+                Ok(())
+            })();
+            if let Err(err) = fill_result {
+                for (slot, prior) in inverses.into_iter().rev() {
+                    if let Ok(mut guard) = slot.try_lock() {
+                        *guard = prior;
+                    }
+                }
+                return Err(err);
             }
             self.siblings.lock().unwrap().insert(plugin_name.to_string(), pool);
             return Ok(());
