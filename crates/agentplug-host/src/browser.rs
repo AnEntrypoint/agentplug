@@ -375,6 +375,14 @@ fn session_id_sidecar_path(profile_dir: &Path) -> PathBuf {
     profile_dir.join("chrome.session-id")
 }
 
+fn target_id_sidecar_path(profile_dir: &Path) -> PathBuf {
+    profile_dir.join("chrome.target-id")
+}
+
+fn write_target_id_sidecar(profile_dir: &Path, target_id: &str) {
+    let _ = std::fs::write(target_id_sidecar_path(profile_dir), target_id);
+}
+
 /// Written next to the pid sidecar at every successful chrome spawn so a
 /// LATER daemon process (self-update handoff, idle self-recycle, panic
 /// restart) can re-attach to this chrome instead of reaping it -- pid + CDP
@@ -411,6 +419,10 @@ fn try_adopt_orphaned_session(cwd: &Path, session_id_hint: Option<&str>, profile
     if !pid_is_alive(pid) || !session_cdp_endpoint_responds(port) {
         return None;
     }
+    let target_id = std::fs::read_to_string(target_id_sidecar_path(profile_dir))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
     let key = session_key(cwd, &session_id);
     {
         let mut map = sessions_map().lock().unwrap_or_else(|e| e.into_inner());
@@ -429,7 +441,7 @@ fn try_adopt_orphaned_session(cwd: &Path, session_id_hint: Option<&str>, profile
                 pid,
                 port,
                 last_used: Instant::now(),
-                target_id: None,
+                target_id,
                 owns_process: true,
             },
         );
@@ -1385,6 +1397,7 @@ pub fn run(body: &str, opts: &str, cwd_raw: &Path, session_id: &str) -> Value {
                         let mut map = sessions_map().lock().unwrap_or_else(|e| e.into_inner());
                         map.get_mut(&adopted_key).map(|s| {
                             s.last_used = Instant::now();
+                            known_target_id = s.target_id.clone();
                             s.port
                         })
                     })
@@ -1503,6 +1516,14 @@ pub fn run(body: &str, opts: &str, cwd_raw: &Path, session_id: &str) -> Value {
         if let Some(s) = map.get_mut(&key) {
             s.target_id = Some(resolved_target_id.to_string());
         }
+        // Mirrors pid/port/session-id: without this, a daemon recycle
+        // (self-update handoff, idle self-recycle, panic restart) between
+        // dispatches re-attaches via try_adopt_orphaned_session with
+        // target_id forced to None, so pickPageTarget in cdp_eval.js falls
+        // back to "first real page" or chrome://new-tab-page/ instead of the
+        // page the caller was actually driving -- silently losing navigation
+        // state the adoption path's own log line claims is preserved.
+        write_target_id_sidecar(&browser_chrome_profile_dir(cwd, session_id), resolved_target_id);
     }
 
     cleanup(&[&helper_path, &script_path, &result_path]);
