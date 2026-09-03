@@ -1636,25 +1636,43 @@ pub(crate) fn run_gm_dispatch_to_file(root: &Path, handle: &DispatchHandle, verb
 // fs::read_dir levels deep (plugin, then verb), stopping at the first
 // non-empty verb directory found -- never walks file contents or the full
 // tree, so this stays cheap even called on every cold root every tick.
-fn project_has_pending_dispatch_work(root: &Path) -> bool {
-    let pd_in = root.join(".agentplug").join("plugin-dispatch").join("in");
-    let Ok(plugin_dirs) = fs::read_dir(&pd_in) else { return false };
-    for plugin_entry in plugin_dirs.flatten() {
-        if !plugin_entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+fn dir_has_any_verb_subdir_with_files(base: &Path) -> bool {
+    let Ok(verb_dirs) = fs::read_dir(base) else { return false };
+    for verb_entry in verb_dirs.flatten() {
+        if !verb_entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
             continue;
         }
-        let Ok(verb_dirs) = fs::read_dir(plugin_entry.path()) else { continue };
-        for verb_entry in verb_dirs.flatten() {
-            if !verb_entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+        let Ok(mut files) = fs::read_dir(verb_entry.path()) else { continue };
+        if files.next().is_some() {
+            return true;
+        }
+    }
+    false
+}
+
+// A cold project's real work can arrive on either of two independent
+// dispatch surfaces: .agentplug/plugin-dispatch/in/<plugin>/<verb>/*.txt
+// (try_dispatch_via_daemon's client-side path, checked below) or
+// .gm/exec-spool/in/<verb>/*.txt (gm/plugkit's own spool ABI, the surface
+// dispatch_project itself reads from). Checking only the first left a gm
+// session's freshly-dropped .gm/exec-spool/in/ file invisible to this
+// "genuinely active" probe -- a cold project could sit past every 30s
+// cold-sweep window indefinitely if worker capacity was contended at each
+// tick, since nothing marked it as having real waiting work.
+fn project_has_pending_dispatch_work(root: &Path) -> bool {
+    let pd_in = root.join(".agentplug").join("plugin-dispatch").join("in");
+    if let Ok(plugin_dirs) = fs::read_dir(&pd_in) {
+        for plugin_entry in plugin_dirs.flatten() {
+            if !plugin_entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
                 continue;
             }
-            let Ok(mut files) = fs::read_dir(verb_entry.path()) else { continue };
-            if files.next().is_some() {
+            if dir_has_any_verb_subdir_with_files(&plugin_entry.path()) {
                 return true;
             }
         }
     }
-    false
+    let gm_in = root.join(".gm").join("exec-spool").join("in");
+    dir_has_any_verb_subdir_with_files(&gm_in)
 }
 
 fn dispatch_project(root: &Path, project: &mut ProjectPlugins, plugin_modules: &PluginModules) -> bool {
