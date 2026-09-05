@@ -10,8 +10,12 @@ pub fn install_dir() -> PathBuf {
     base.home_dir().join(".agentplug")
 }
 
-pub fn wasmtime_cache_dir() -> PathBuf {
+pub fn legacy_wasmtime_cache_dir() -> PathBuf {
     install_dir().join("wasmtime-cache")
+}
+
+pub fn precompiled_dir() -> PathBuf {
+    install_dir().join("precompiled")
 }
 
 pub fn plugins_dir() -> PathBuf {
