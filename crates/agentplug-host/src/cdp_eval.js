@@ -31,11 +31,59 @@ function isInternalChromeUrl(url) {
   return url.startsWith('chrome://') || url.startsWith('chrome-untrusted://') || url.startsWith('devtools://');
 }
 
+// lightpanda's CDP HTTP server answers /json/version (with a browser-level
+// webSocketDebuggerUrl) and /json/list (always `[]`, verified live) but has
+// no /json/new at all -- PUT or GET both return a plain-text 404 "Not
+// found", which httpPutJson's JSON.parse failure already collapses to null
+// indistinguishably from a network error. Confirmed live (2026-09-05) that
+// lightpanda's CDP protocol itself is fully working via the STANDARD
+// Target.createTarget + Target.attachToTarget commands sent over that
+// browser-level websocket -- it just doesn't implement Chrome's proprietary
+// HTTP shortcut for the same operation. This creates and attaches a target
+// the protocol-native way and returns a descriptor shaped like a Chrome
+// /json/new response (webSocketDebuggerUrl + sessionId) so the rest of this
+// file's single call site (cdpSession(target.webSocketDebuggerUrl, ...))
+// needs no other change beyond threading sessionId through once it exists.
+async function createTargetViaFlattenedSession(port, startUrl) {
+  const version = await httpJson(`http://127.0.0.1:${port}/json/version`, 2000);
+  const rootWsUrl = version && version.webSocketDebuggerUrl;
+  if (!rootWsUrl) return null;
+  let sess;
+  try {
+    sess = await cdpSession(rootWsUrl, 5000);
+  } catch (_) {
+    return null;
+  }
+  try {
+    const created = await sess.send('Target.createTarget', { url: startUrl || 'about:blank' });
+    const targetId = created && created.targetId;
+    if (!targetId) return null;
+    const attached = await sess.send('Target.attachToTarget', { targetId, flatten: true });
+    const sessionId = attached && attached.sessionId;
+    if (!sessionId) { sess.close(); return null; }
+    // Verified live (2026-09-05): a flattened sessionId is scoped to the
+    // WEBSOCKET CONNECTION that issued Target.attachToTarget -- closing that
+    // connection and reopening a fresh one to the same URL then reusing the
+    // old sessionId answers "Unknown sessionId" (-32001). This connection
+    // must therefore stay open and be reused, not just its URL - bind the
+    // session so every future sess.send() on it carries sessionId
+    // automatically, and hand the live object back via __liveSession so the
+    // caller skips opening a second, useless connection.
+    sess.bindSession(sessionId);
+    return { id: targetId, webSocketDebuggerUrl: rootWsUrl, sessionId, url: startUrl || 'about:blank', __liveSession: sess };
+  } catch (_) {
+    sess.close();
+    return null;
+  }
+}
+
 async function pickPageTarget(port, startUrl, targetId, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
+  let sawWorkingJsonList = false;
   while (Date.now() < deadline) {
     const list = await httpJson(`http://127.0.0.1:${port}/json/list`, 2000);
     if (Array.isArray(list)) {
+      sawWorkingJsonList = true;
       if (targetId) {
         const remembered = list.find((t) => t.id === targetId && t.webSocketDebuggerUrl);
         if (remembered) return remembered;
@@ -51,6 +99,15 @@ async function pickPageTarget(port, startUrl, targetId, timeoutMs) {
     if (startUrl) {
       const created = await httpPutJson(`http://127.0.0.1:${port}/json/new?${encodeURIComponent(startUrl)}`, 3000);
       if (created && created.webSocketDebuggerUrl) return created;
+      // /json/list answered valid JSON (a real CDP server, not "not up yet")
+      // but /json/new did not -- this is the lightpanda shape, not a
+      // transient Chrome startup race. Try the protocol-native path once
+      // immediately instead of burning the rest of the deadline retrying an
+      // HTTP endpoint that will never exist on this engine.
+      if (sawWorkingJsonList) {
+        const flattened = await createTargetViaFlattenedSession(port, startUrl);
+        if (flattened) return flattened;
+      }
     }
     await new Promise((r) => setTimeout(r, 250));
   }
@@ -62,6 +119,7 @@ function cdpSession(wsUrl, timeoutMs) {
     const ws = new WebSocket(wsUrl);
     let opened = false;
     let nextId = 1;
+    let boundSessionId = null;
     const pending = new Map();
     const timer = setTimeout(() => { try { ws.close(); } catch (_) {} reject(new Error('cdp timeout')); }, timeoutMs);
     const rejectAllPendingSendsOnSocketDrop = (reason) => {
@@ -73,9 +131,22 @@ function cdpSession(wsUrl, timeoutMs) {
         const id = nextId++;
         return new Promise((res, rej) => {
           pending.set(id, { res, rej });
-          ws.send(JSON.stringify({ id, method, params: params || {} }));
+          const body = { id, method, params: params || {} };
+          // Set only for a flattened (lightpanda-style) session created via
+          // createTargetViaFlattenedSession -- a plain per-target Chrome
+          // connection never binds one, and every message on it stays
+          // exactly as before this field existed.
+          if (boundSessionId) body.sessionId = boundSessionId;
+          ws.send(JSON.stringify(body));
         });
       },
+      // Scopes every future send() on this connection to a CDP target
+      // session obtained via Target.attachToTarget on this SAME
+      // connection -- a flattened sessionId is invalid on any other
+      // websocket (verified live: reusing one after a reconnect answers
+      // "Unknown sessionId", -32001), so this only ever makes sense called
+      // on the connection that produced the sessionId in the first place.
+      bindSession(sessionId) { boundSessionId = sessionId; },
       close() { clearTimeout(timer); try { ws.close(); } catch (_) {} },
       onIdLessNotification: null,
     };
@@ -326,7 +397,11 @@ async function main() {
     process.exit(1);
   }, watchdogDeadline);
   watchdogTimer.unref();
-  const sess = await cdpSession(target.webSocketDebuggerUrl, timeoutMs);
+  // A flattened (lightpanda-style) target already carries its own live,
+  // attached connection -- opening a second one to the same URL would get a
+  // fresh, unattached socket that cannot use the sessionId that only the
+  // original connection holds (see createTargetViaFlattenedSession).
+  const sess = target.__liveSession || await cdpSession(target.webSocketDebuggerUrl, timeoutMs);
   try {
     await sess.send('Runtime.enable', {});
     await sess.send('Page.enable', {});
