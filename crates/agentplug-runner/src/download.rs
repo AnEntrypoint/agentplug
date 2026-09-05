@@ -103,27 +103,62 @@ fn extract_version_from_release_url(url: &str) -> Option<String> {
     Some(tag.trim_start_matches('v').to_string())
 }
 
-fn try_ensure_plugin_installed_via_direct_release_latest(spec: &PluginAssetSpec, dest: &Path, version_file: &Path) -> anyhow::Result<PathBuf> {
+const DIRECT_LATEST_MARKER_PREFIX: &str = "latest-sha256-";
+
+fn direct_latest_marker_for_sha(sha256_hex: &str) -> String {
+    let short: String = sha256_hex.chars().take(16).collect();
+    format!("{DIRECT_LATEST_MARKER_PREFIX}{short}")
+}
+
+pub fn is_direct_latest_marker(version: &str) -> bool {
+    version.starts_with(DIRECT_LATEST_MARKER_PREFIX)
+}
+
+fn version_label_from_redirect_or_sha(resolved_url: &str, expected_sha: &str) -> String {
+    extract_version_from_release_url(resolved_url).unwrap_or_else(|| direct_latest_marker_for_sha(expected_sha))
+}
+
+fn fetch_direct_latest_sha256(spec: &PluginAssetSpec) -> anyhow::Result<(String, String)> {
     let sha_url = format!("https://github.com/{}/releases/latest/download/{}.wasm.sha256", spec.repo, spec.asset_basename);
     let sha_resp = agentplug_host::shared_agent().get(&sha_url).call()?;
     let resolved_url = sha_resp.get_url().to_string();
-    let version = extract_version_from_release_url(&resolved_url).ok_or_else(|| {
-        anyhow::anyhow!("could not determine release tag from redirect target {resolved_url} (requested {sha_url})")
-    })?;
     let sha_line = sha_resp.into_string()?;
     let expected_sha = sha_line.split_whitespace().next()
         .ok_or_else(|| anyhow::anyhow!("empty sha256 sidecar for {} at {sha_url}", spec.asset_basename))?
         .to_string();
+    Ok((expected_sha, resolved_url))
+}
 
+fn try_ensure_plugin_installed_via_direct_release_latest(spec: &PluginAssetSpec, dest: &Path, version_file: &Path) -> anyhow::Result<PathBuf> {
+    let (expected_sha, resolved_url) = fetch_direct_latest_sha256(spec)?;
+    let version = version_label_from_redirect_or_sha(&resolved_url, &expected_sha);
     let wasm_url = format!("https://github.com/{}/releases/latest/download/{}.wasm", spec.repo, spec.asset_basename);
     snapshot_prev_wasm_and_version(dest, version_file);
     download_and_verify(&wasm_url, dest, &expected_sha)?;
     fs::write(version_file, &version)?;
     eprintln!(
-        "[agentplug] {} installed via direct release-asset download {wasm_url} (api.github.com path failed or was blocked)",
+        "[agentplug] {} installed via direct release-asset download {wasm_url} as {version} (api.github.com path failed or was blocked)",
         spec.asset_basename
     );
     Ok(dest.to_path_buf())
+}
+
+fn refresh_direct_latest_plugin_if_sha_changed(plugin_name: &str, installed_marker: &str) -> anyhow::Result<Option<String>> {
+    let Some(spec) = plugin_asset_spec(plugin_name) else { return Ok(None) };
+    let (remote_sha, _) = fetch_direct_latest_sha256(&spec)?;
+    let remote_marker = direct_latest_marker_for_sha(&remote_sha);
+    if remote_marker == installed_marker {
+        return Ok(None);
+    }
+    let dest = plugin_wasm_path(plugin_name);
+    let version_file = plugin_version_path(plugin_name);
+    try_ensure_plugin_installed_via_direct_release_latest(&spec, &dest, &version_file)?;
+    if plugin_name == "gm" {
+        if let Err(e) = refresh_installed_skill_md() {
+            eprintln!("[agentplug daemon] SKILL.md refresh after gm plugin update to {remote_marker} failed: {e:#}");
+        }
+    }
+    Ok(Some(remote_marker))
 }
 
 fn github_api_request(url: &str) -> ureq::Request {
@@ -354,11 +389,45 @@ pub fn fetch_latest_runner_version() -> anyhow::Result<Option<String>> {
             match agentplug_host::shared_agent().get(&probe_url).call() {
                 Ok(resp) => {
                     let resolved_url = resp.get_url().to_string();
-                    Ok(extract_version_from_release_url(&resolved_url))
+                    if let Some(tag) = extract_version_from_release_url(&resolved_url) {
+                        return Ok(Some(tag));
+                    }
+                    let sha_line = resp.into_string()?;
+                    let remote_sha = sha_line.split_whitespace().next().unwrap_or_default().to_string();
+                    Ok(runner_latest_label_when_redirect_hides_tag(&remote_sha))
                 }
                 Err(_) => Err(describe_github_api_error(&url, api_err)),
             }
         }
+    }
+}
+
+fn running_runner_sha256() -> Option<String> {
+    let exe = std::env::current_exe().ok()?;
+    fs::read(exe).ok().map(|bytes| sha256_hex(&bytes))
+}
+
+fn runner_latest_label_when_redirect_hides_tag(remote_sha: &str) -> Option<String> {
+    if remote_sha.is_empty() {
+        return None;
+    }
+    let up_to_date = running_runner_sha256().is_some_and(|local| local.eq_ignore_ascii_case(remote_sha));
+    if up_to_date {
+        return None;
+    }
+    let marker = direct_latest_marker_for_sha(remote_sha);
+    let already_judged_not_newer = fs::read_to_string(runner_direct_latest_seen_path()).map(|seen| seen.trim() == marker).unwrap_or(false);
+    if already_judged_not_newer {
+        return None;
+    }
+    Some(marker)
+}
+
+fn runner_release_base_url(latest: &str) -> String {
+    if is_direct_latest_marker(latest) {
+        format!("https://github.com/{RUNNER_BIN_REPO}/releases/latest/download")
+    } else {
+        format!("https://github.com/{RUNNER_BIN_REPO}/releases/download/v{latest}")
     }
 }
 
@@ -392,7 +461,7 @@ pub fn stage_runner_self_update() -> anyhow::Result<Option<(PathBuf, String)>> {
     let staged = current_exe.with_extension(
         current_exe.extension().map(|e| format!("{}.{staged_suffix}", e.to_string_lossy())).unwrap_or_else(|| staged_suffix.to_string())
     );
-    let base = format!("https://github.com/{RUNNER_BIN_REPO}/releases/download/v{latest}");
+    let base = runner_release_base_url(&latest);
     let sha_line = agentplug_host::shared_agent().get(&format!("{base}/{asset}.sha256")).call()?.into_string()?;
     let expected_sha = sha_line.split_whitespace().next()
         .ok_or_else(|| anyhow::anyhow!("empty sha256 sidecar for {asset} at {base}"))?.to_string();
@@ -404,7 +473,47 @@ pub fn stage_runner_self_update() -> anyhow::Result<Option<(PathBuf, String)>> {
         perms.set_mode(0o755);
         fs::set_permissions(&staged, perms)?;
     }
-    Ok(Some((staged, latest)))
+    if !is_direct_latest_marker(&latest) {
+        return Ok(Some((staged, latest)));
+    }
+    let staged_version = semver_reported_by_staged_runner(&staged)?;
+    let running = env!("CARGO_PKG_VERSION");
+    if !semver_is_newer(&staged_version, running) {
+        let _ = fs::remove_file(&staged);
+        let _ = fs::write(runner_direct_latest_seen_path(), latest.as_bytes());
+        eprintln!(
+            "[agentplug runner-update] release asset behind the tag-less redirect reports {staged_version}, not newer than this running {running} build -- discarding the staged copy (a locally built runner at the released version number is never replaced by the release's bytes); remembered {latest} so it is not re-downloaded until the release asset changes"
+        );
+        return Ok(None);
+    }
+    Ok(Some((staged, staged_version)))
+}
+
+fn runner_direct_latest_seen_path() -> PathBuf {
+    install_dir().join("runner-direct-latest-seen")
+}
+
+fn semver_parts(version: &str) -> Option<(u64, u64, u64)> {
+    let mut parts = version.trim_start_matches('v').split('.').map(|p| p.parse::<u64>().ok());
+    Some((parts.next()??, parts.next()??, parts.next()??))
+}
+
+fn semver_is_newer(candidate: &str, baseline: &str) -> bool {
+    match (semver_parts(candidate), semver_parts(baseline)) {
+        (Some(c), Some(b)) => c > b,
+        _ => false,
+    }
+}
+
+fn semver_reported_by_staged_runner(staged: &Path) -> anyhow::Result<String> {
+    let out = std::process::Command::new(staged).arg("--version").output()?;
+    let reported = String::from_utf8_lossy(&out.stdout);
+    let version = reported.split_whitespace().last().unwrap_or_default().trim_start_matches('v').to_string();
+    if !is_recognized_release_semver(&version) {
+        let _ = fs::remove_file(staged);
+        anyhow::bail!("staged runner at {} reported a non-semver version {reported:?}; removed it", staged.display());
+    }
+    Ok(version)
 }
 
 fn marker_is_trustworthy_and_current(latest: &str) -> bool {
@@ -599,6 +708,10 @@ pub fn refresh_plugin_if_stale(plugin_name: &str) -> anyhow::Result<Option<Strin
     let Some(installed) = installed_plugin_version(plugin_name) else {
         return Ok(None);
     };
+    if is_direct_latest_marker(&installed) {
+        clear_local_dev_sideload_marker(plugin_name);
+        return refresh_direct_latest_plugin_if_sha_changed(plugin_name, &installed);
+    }
     if !is_recognized_release_semver(&installed) {
         warn_local_dev_sideload_loudly(plugin_name, &installed);
         return Ok(None);

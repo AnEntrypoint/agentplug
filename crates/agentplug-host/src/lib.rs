@@ -6,6 +6,7 @@ mod host_state;
 mod http_agent;
 mod memory_pressure;
 mod oxibrowser_driver;
+mod precompiled;
 mod task;
 mod imports;
 mod install;
@@ -19,16 +20,22 @@ pub use browser::{close_all_sessions, reap_idle_sessions_and_os_orphans_across_e
 pub use host_state::HostState;
 pub use http_agent::{build_agent, shared_agent};
 pub use imports::{git_subprocess_timeout_ms, register_env_imports, register_wasi};
-pub use install::{install_dir, plugins_dir, wasmtime_cache_dir};
-pub use memory_pressure::{process_private_bytes_tracking_retained_wasm_peak_unlike_working_set, reset_shared_dispatch_count, shared_dispatches_since_release};
+pub use install::{install_dir, plugins_dir, precompiled_dir};
+pub use memory_pressure::{
+    process_memory_breakdown, process_private_bytes_tracking_retained_wasm_peak_unlike_working_set, reset_shared_dispatch_count, shared_dispatches_since_release,
+    ProcessMemoryBreakdown,
+};
+pub use precompiled::{load_module_file_backed, precompiled_module_path};
 pub use registry::{
-    advance_plugin_fiber, epoch_ticks_for_seconds, get_active_provider, read_plugin_lifecycle, read_project_plugin_list, release_shared_plugin, set_gm_pool_size, set_side_plugin_pool_size, RELEASABLE_SHARED_PLUGINS,
+    advance_plugin_fiber, ensure_sibling_loaded, epoch_ticks_for_seconds, forget_store_bytes_for_root, forget_store_bytes_for_shared_plugin, get_active_provider,
+    read_plugin_lifecycle, read_project_plugin_list, release_shared_plugin, set_gm_pool_size, set_lazy_module_source, set_side_plugin_pool_size,
+    set_store_linear_memory_ceilings, store_bytes_by_plugin, RELEASABLE_SHARED_PLUGINS,
     note_shared_plugin_bytes_current, request_shared_store_swap, shared_plugin_slot_content_hashes, shared_plugin_swap_pending_hashes,
-    DispatchHandle, GmFairnessGuard, PluginFiberLifecycle, ProjectPlugins, EPOCH_TICK_INTERVAL_MS, PLUGIN_IDLE_EVICT_MS,
+    DispatchHandle, GmFairnessGuard, PluginFiberLifecycle, ProjectPlugins, StoreBytesSummary, EPOCH_TICK_INTERVAL_MS, PLUGIN_IDLE_EVICT_MS,
 };
 
 use std::sync::OnceLock;
-use wasmtime::{Cache, CacheConfig, Config, Engine};
+use wasmtime::{Config, Engine};
 
 static EPOCH_TICKER_STARTED: OnceLock<()> = OnceLock::new();
 
@@ -44,11 +51,6 @@ fn start_epoch_ticker(engine: Engine) {
 
 pub fn build_engine() -> anyhow::Result<Engine> {
     let mut config = Config::new();
-    let mut cache_config = CacheConfig::new();
-    cache_config.with_directory(wasmtime_cache_dir());
-    cache_config.with_files_total_size_soft_limit(256 * 1024 * 1024);
-    cache_config.with_cleanup_interval(std::time::Duration::from_secs(10 * 60));
-    config.cache(Some(Cache::new(cache_config)?));
     config.wasm_backtrace_details(wasmtime::WasmBacktraceDetails::Enable);
     config.epoch_interruption(true);
     let engine = Engine::new(&config).map_err(|e| anyhow::anyhow!(e))?;

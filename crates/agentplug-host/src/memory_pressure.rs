@@ -1,11 +1,27 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
+#[derive(Debug, Clone, Copy, Default, serde::Serialize)]
+pub struct ProcessMemoryBreakdown {
+    pub rss_bytes: u64,
+    pub anon_bytes: u64,
+    pub file_bytes: u64,
+    pub shmem_bytes: u64,
+    pub swap_bytes: u64,
+    pub private_bytes: u64,
+}
+
+pub fn process_memory_breakdown() -> Option<ProcessMemoryBreakdown> {
+    platform::process_memory_breakdown()
+}
+
 pub fn process_private_bytes_tracking_retained_wasm_peak_unlike_working_set() -> Option<u64> {
-    platform::process_private_bytes()
+    platform::process_memory_breakdown().map(|b| b.private_bytes)
 }
 
 #[cfg(windows)]
 mod platform {
+    use super::ProcessMemoryBreakdown;
+
     #[repr(C)]
     #[derive(Default)]
     struct ProcessMemoryCountersEx {
@@ -27,36 +43,59 @@ mod platform {
         fn K32GetProcessMemoryInfo(process: isize, counters: *mut ProcessMemoryCountersEx, cb: u32) -> i32;
     }
 
-    pub fn process_private_bytes() -> Option<u64> {
+    pub fn process_memory_breakdown() -> Option<ProcessMemoryBreakdown> {
         let mut counters = ProcessMemoryCountersEx { cb: std::mem::size_of::<ProcessMemoryCountersEx>() as u32, ..Default::default() };
         let ok = unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut counters, counters.cb) };
         if ok == 0 {
             return None;
         }
-        Some(counters.private_usage as u64)
+        let private = counters.private_usage as u64;
+        let working_set = counters.working_set_size as u64;
+        Some(ProcessMemoryBreakdown {
+            rss_bytes: working_set,
+            anon_bytes: private,
+            file_bytes: working_set.saturating_sub(private),
+            shmem_bytes: 0,
+            swap_bytes: 0,
+            private_bytes: private,
+        })
     }
 }
 
 #[cfg(target_os = "linux")]
 mod platform {
-    pub fn process_private_bytes() -> Option<u64> {
+    use super::ProcessMemoryBreakdown;
+
+    fn kb_field(status: &str, key: &str) -> u64 {
+        status
+            .lines()
+            .find_map(|line| line.strip_prefix(key))
+            .and_then(|rest| rest.trim().trim_end_matches("kB").trim().parse::<u64>().ok())
+            .unwrap_or(0)
+            * 1024
+    }
+
+    pub fn process_memory_breakdown() -> Option<ProcessMemoryBreakdown> {
         let status = std::fs::read_to_string("/proc/self/status").ok()?;
-        let mut anon_kb = None;
-        let mut swap_kb = None;
-        for line in status.lines() {
-            if let Some(rest) = line.strip_prefix("RssAnon:") {
-                anon_kb = rest.trim().trim_end_matches("kB").trim().parse::<u64>().ok();
-            } else if let Some(rest) = line.strip_prefix("VmSwap:") {
-                swap_kb = rest.trim().trim_end_matches("kB").trim().parse::<u64>().ok();
-            }
-        }
-        Some((anon_kb? + swap_kb.unwrap_or(0)) * 1024)
+        let anon = kb_field(&status, "RssAnon:");
+        let shmem = kb_field(&status, "RssShmem:");
+        let swap = kb_field(&status, "VmSwap:");
+        Some(ProcessMemoryBreakdown {
+            rss_bytes: kb_field(&status, "VmRSS:"),
+            anon_bytes: anon,
+            file_bytes: kb_field(&status, "RssFile:"),
+            shmem_bytes: shmem,
+            swap_bytes: swap,
+            private_bytes: anon + shmem + swap,
+        })
     }
 }
 
 #[cfg(not(any(windows, target_os = "linux")))]
 mod platform {
-    pub fn process_private_bytes() -> Option<u64> {
+    use super::ProcessMemoryBreakdown;
+
+    pub fn process_memory_breakdown() -> Option<ProcessMemoryBreakdown> {
         None
     }
 }
