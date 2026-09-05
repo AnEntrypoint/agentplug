@@ -768,15 +768,23 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
             }
 
             let caller_siblings = caller.data().siblings();
-            let sibling_pool = { caller_siblings.lock().unwrap().get(&plugin).cloned() };
-            let Some(sibling_pool) = sibling_pool else {
-                return write_guest_json(
-                    &mut caller,
-                    serde_json::json!({"ok": false, "error": "unknown_plugin", "plugin": plugin}),
-                );
+            let caller_root = caller.data().cwd();
+            let sibling_pool = match crate::registry::ensure_sibling_loaded(&caller_root, &caller_siblings, &plugin) {
+                Ok(Some(pool)) => pool,
+                Ok(None) => {
+                    return write_guest_json(
+                        &mut caller,
+                        serde_json::json!({"ok": false, "error": "unknown_plugin", "plugin": plugin}),
+                    );
+                }
+                Err(e) => {
+                    return write_guest_json(
+                        &mut caller,
+                        serde_json::json!({"ok": false, "error": format!("plugin_load_failed: {e:#}"), "plugin": plugin}),
+                    );
+                }
             };
 
-            let caller_root = caller.data().cwd();
             let acquire_start = std::time::Instant::now();
             let acquire_timeout_ms = crate::registry::SharedPluginPool::ACQUIRE_TIMEOUT_MS;
             let mut guard = sibling_pool.acquire().expect("acquire() always returns Some -- FIFO wait never denies");
@@ -791,8 +799,11 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
                 None => Err(anyhow::anyhow!("plugin_not_loaded_yet")),
                 Some(handle) => crate::registry::dispatch_on(&mut handle.store, handle.instance, &verb, &body, &caller_root, caller_siblings.clone()),
             };
-            // Complete any version swap that deferred behind this call.
-            sibling_pool.evict_if_swap_pending(&mut guard);
+            if result.is_ok() {
+                crate::registry::settle_slot_after_successful_dispatch(&mut guard, &sibling_pool, &caller_root, &plugin, &verb);
+            } else {
+                sibling_pool.evict_if_swap_pending(&mut guard);
+            }
             drop(guard);
 
             match result {
@@ -823,11 +834,15 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
             let body = serde_json::json!({"text": text}).to_string();
 
             let caller_siblings = caller.data().siblings();
-            let sibling_pool = { caller_siblings.lock().unwrap().get("bert").cloned() };
-            let Some(sibling_pool) = sibling_pool else {
-                return -1;
-            };
             let caller_root = caller.data().cwd();
+            let sibling_pool = match crate::registry::ensure_sibling_loaded(&caller_root, &caller_siblings, "bert") {
+                Ok(Some(pool)) => pool,
+                Ok(None) => return -1,
+                Err(e) => {
+                    eprintln!("[agentplug:host_vec_embed] bert could not be instantiated on first use: {e:#}");
+                    return -1;
+                }
+            };
             const EMBED_RETRY_ATTEMPTS: u32 = 3;
             const EMBED_RETRY_BACKOFF_MS: u64 = 500;
             let mut result: anyhow::Result<Vec<f32>> = Err(anyhow::anyhow!("embed not attempted"));
@@ -844,8 +859,7 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
                 if result.is_err() {
                     *guard = None;
                 } else {
-                    // Complete any version swap that deferred behind this call.
-                    sibling_pool.evict_if_swap_pending(&mut guard);
+                    crate::registry::settle_slot_after_successful_dispatch(&mut guard, &sibling_pool, &caller_root, "bert", "embed");
                 }
                 drop(guard);
                 if result.is_ok() {

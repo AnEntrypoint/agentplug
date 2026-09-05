@@ -182,6 +182,7 @@ fn side_plugin_pool_size() -> usize {
 
 pub struct SharedPluginPool {
     slots: Vec<Arc<Mutex<Option<SiblingHandle>>>>,
+    last_observed_slot_hashes: Mutex<Vec<Option<String>>>,
     hashes_to_evict_when_their_in_flight_dispatch_completes: Mutex<std::collections::HashSet<String>>,
     ticket_queue: Mutex<TicketQueue>,
     slot_released: Condvar,
@@ -194,8 +195,10 @@ struct TicketQueue {
 
 impl SharedPluginPool {
     pub fn new(size: usize) -> Self {
+        let size = size.max(1);
         Self {
-            slots: (0..size.max(1)).map(|_| Arc::new(Mutex::new(None))).collect(),
+            slots: (0..size).map(|_| Arc::new(Mutex::new(None))).collect(),
+            last_observed_slot_hashes: Mutex::new(vec![None; size]),
             hashes_to_evict_when_their_in_flight_dispatch_completes: Mutex::new(std::collections::HashSet::new()),
             ticket_queue: Mutex::new(TicketQueue { next_ticket: 0, now_serving: 0 }),
             slot_released: Condvar::new(),
@@ -273,7 +276,13 @@ impl SharedPluginPool {
     }
 
     pub fn slot_content_hashes(&self) -> Vec<Option<String>> {
-        self.slots.iter().map(|s| s.lock().unwrap().as_ref().map(|h| h.content_hash.clone())).collect()
+        let mut observed = self.last_observed_slot_hashes.lock().unwrap_or_else(|e| e.into_inner());
+        for (index, slot) in self.slots.iter().enumerate() {
+            if let Ok(guard) = slot.try_lock() {
+                observed[index] = guard.as_ref().map(|h| h.content_hash.clone());
+            }
+        }
+        observed.clone()
     }
 
     pub(crate) fn any_instantiated_within(&self, timeout_ms: u64) -> bool {
@@ -359,11 +368,209 @@ fn shared_plugin_pool(plugin_name: &str) -> Arc<SharedPluginPool> {
         .clone()
 }
 
+type LazyModuleSource = (Engine, HashMap<String, (Module, String)>);
+static LAZY_MODULE_SOURCE: OnceLock<Mutex<Option<LazyModuleSource>>> = OnceLock::new();
+
+fn lazy_module_source_slot() -> &'static Mutex<Option<LazyModuleSource>> {
+    LAZY_MODULE_SOURCE.get_or_init(|| Mutex::new(None))
+}
+
+pub fn set_lazy_module_source(engine: Engine, modules: HashMap<String, (Module, String)>) {
+    *lazy_module_source_slot().lock().unwrap_or_else(|e| e.into_inner()) = Some((engine, modules));
+}
+
+fn lazy_module_for(plugin_name: &str) -> Option<(Engine, Module, String)> {
+    let guard = lazy_module_source_slot().lock().unwrap_or_else(|e| e.into_inner());
+    let (engine, modules) = guard.as_ref()?;
+    let (module, hash) = modules.get(plugin_name)?;
+    Some((engine.clone(), module.clone(), hash.clone()))
+}
+
+fn append_watcher_log_event(root: &Path, event: serde_json::Value) {
+    let log_path = root.join(".gm").join("exec-spool").join(".watcher.log");
+    let Some(parent) = log_path.parent() else { return };
+    let _ = std::fs::create_dir_all(parent);
+    let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&log_path) else { return };
+    use std::io::Write;
+    let _ = writeln!(f, "evt: {event}");
+}
+
+fn fill_free_slots_needing_content(pool: &SharedPluginPool, engine: &Engine, root: &Path, plugin_name: &str, module: &Module, content_hash: &str) -> anyhow::Result<usize> {
+    let mut filled = 0usize;
+    for slot in pool.slots_for_fill() {
+        if let Ok(mut guard) = slot.try_lock() {
+            let needs_fill = match guard.as_ref() {
+                None => true,
+                Some(existing) => existing.content_hash != content_hash,
+            };
+            if needs_fill {
+                *guard = Some(instantiate_plugin(engine, root.to_path_buf(), plugin_name, module, content_hash)?);
+                filled += 1;
+            }
+        }
+    }
+    Ok(filled)
+}
+
+pub fn ensure_sibling_loaded(
+    root: &Path,
+    siblings: &Arc<Mutex<HashMap<String, Arc<SharedPluginPool>>>>,
+    plugin_name: &str,
+) -> anyhow::Result<Option<Arc<SharedPluginPool>>> {
+    let existing = siblings.lock().unwrap_or_else(|e| e.into_inner()).get(plugin_name).cloned();
+    let Some((engine, module, content_hash)) = lazy_module_for(plugin_name) else { return Ok(existing) };
+    let started = Instant::now();
+    if is_stateless_shared_plugin(plugin_name) {
+        let pool = shared_plugin_pool(plugin_name);
+        let filled = fill_free_slots_needing_content(&pool, &engine, root, plugin_name, &module, &content_hash)?;
+        if filled > 0 {
+            log_lazy_plugin_load(root, plugin_name, "shared", filled, started);
+        }
+        siblings.lock().unwrap_or_else(|e| e.into_inner()).insert(plugin_name.to_string(), pool.clone());
+        return Ok(Some(pool));
+    }
+    let pool = match existing {
+        Some(pool) => pool,
+        None => {
+            let fresh = Arc::new(SharedPluginPool::new(1));
+            siblings.lock().unwrap_or_else(|e| e.into_inner()).entry(plugin_name.to_string()).or_insert(fresh).clone()
+        }
+    };
+    let filled = fill_free_slots_needing_content(&pool, &engine, root, plugin_name, &module, &content_hash)?;
+    if filled > 0 {
+        log_lazy_plugin_load(root, plugin_name, "per-project", filled, started);
+    }
+    Ok(Some(pool))
+}
+
+fn log_lazy_plugin_load(root: &Path, plugin_name: &str, scope: &str, filled: usize, started: Instant) {
+    let ms = started.elapsed().as_millis() as u64;
+    eprintln!("[agentplug registry] lazily instantiated {plugin_name} ({scope}, {filled} slot(s), {ms}ms) for {} on first use", root.display());
+    append_watcher_log_event(root, serde_json::json!({
+        "event": "plugin_lazy_loaded",
+        "plugin": plugin_name,
+        "scope": scope,
+        "slots": filled,
+        "ms": ms,
+        "ts": crate::now_ms(),
+    }));
+}
+
+type CeilingTable = (u64, HashMap<String, u64>);
+static STORE_LINEAR_MEMORY_CEILINGS: OnceLock<Mutex<CeilingTable>> = OnceLock::new();
+
+fn ceiling_table() -> &'static Mutex<CeilingTable> {
+    STORE_LINEAR_MEMORY_CEILINGS.get_or_init(|| Mutex::new((0, HashMap::new())))
+}
+
+pub fn set_store_linear_memory_ceilings(default_bytes: u64, by_name: HashMap<String, u64>) {
+    *ceiling_table().lock().unwrap_or_else(|e| e.into_inner()) = (default_bytes, by_name);
+}
+
+fn store_linear_memory_ceiling_bytes(plugin_name: &str) -> u64 {
+    let table = ceiling_table().lock().unwrap_or_else(|e| e.into_inner());
+    table.1.get(plugin_name).copied().unwrap_or(table.0)
+}
+
+type StoreBytesKey = (String, PathBuf);
+static STORE_BYTES: OnceLock<Mutex<HashMap<StoreBytesKey, u64>>> = OnceLock::new();
+
+fn store_bytes_table() -> &'static Mutex<HashMap<StoreBytesKey, u64>> {
+    STORE_BYTES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn store_bytes_key(plugin_name: &str, root: &Path) -> StoreBytesKey {
+    let scope = if is_stateless_shared_plugin(plugin_name) { PathBuf::new() } else { root.to_path_buf() };
+    (plugin_name.to_string(), scope)
+}
+
+fn note_store_bytes(plugin_name: &str, root: &Path, bytes: u64) {
+    store_bytes_table().lock().unwrap_or_else(|e| e.into_inner()).insert(store_bytes_key(plugin_name, root), bytes);
+}
+
+fn forget_store_bytes(plugin_name: &str, root: &Path) {
+    store_bytes_table().lock().unwrap_or_else(|e| e.into_inner()).remove(&store_bytes_key(plugin_name, root));
+}
+
+pub fn forget_store_bytes_for_root(root: &Path) {
+    store_bytes_table().lock().unwrap_or_else(|e| e.into_inner()).retain(|(_, scope), _| scope != root);
+}
+
+pub fn forget_store_bytes_for_shared_plugin(plugin_name: &str) {
+    store_bytes_table().lock().unwrap_or_else(|e| e.into_inner()).retain(|(name, scope), _| !(name == plugin_name && scope.as_os_str().is_empty()));
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct StoreBytesSummary {
+    pub instances: usize,
+    pub total_bytes: u64,
+    pub max_bytes: u64,
+    pub ceiling_bytes: u64,
+}
+
+pub fn store_bytes_by_plugin() -> HashMap<String, StoreBytesSummary> {
+    let mut out: HashMap<String, StoreBytesSummary> = HashMap::new();
+    for ((name, _), bytes) in store_bytes_table().lock().unwrap_or_else(|e| e.into_inner()).iter() {
+        let entry = out.entry(name.clone()).or_default();
+        entry.instances += 1;
+        entry.total_bytes += *bytes;
+        entry.max_bytes = entry.max_bytes.max(*bytes);
+    }
+    for (name, summary) in out.iter_mut() {
+        summary.ceiling_bytes = store_linear_memory_ceiling_bytes(name);
+    }
+    out
+}
+
+fn linear_memory_bytes(handle: &mut SiblingHandle) -> u64 {
+    handle.instance.get_memory(&mut handle.store, "memory").map(|m| m.data_size(&handle.store) as u64).unwrap_or(0)
+}
+
+pub(crate) fn settle_slot_after_successful_dispatch(
+    guard: &mut std::sync::MutexGuard<'_, Option<SiblingHandle>>,
+    pool: &SharedPluginPool,
+    root: &Path,
+    plugin_name: &str,
+    verb: &str,
+) {
+    pool.evict_if_swap_pending(guard);
+    evict_if_over_linear_memory_ceiling(guard, root, plugin_name, verb);
+}
+
+fn evict_if_over_linear_memory_ceiling(guard: &mut std::sync::MutexGuard<'_, Option<SiblingHandle>>, root: &Path, plugin_name: &str, verb: &str) {
+    let Some(handle) = guard.as_mut() else { return };
+    let bytes = linear_memory_bytes(handle);
+    note_store_bytes(plugin_name, root, bytes);
+    let ceiling = store_linear_memory_ceiling_bytes(plugin_name);
+    if ceiling == 0 || bytes <= ceiling {
+        return;
+    }
+    eprintln!(
+        "[agentplug registry] evicting {plugin_name} Store after verb {verb}: linear memory {}MB exceeds its {}MB ceiling (wasm memory never shrinks in place; the next dispatch re-instantiates from the file-backed module)",
+        bytes / (1024 * 1024),
+        ceiling / (1024 * 1024)
+    );
+    append_watcher_log_event(root, serde_json::json!({
+        "event": "plugin_store_evicted_linear_memory_ceiling",
+        "plugin": plugin_name,
+        "verb": verb,
+        "linear_memory_bytes": bytes,
+        "ceiling_bytes": ceiling,
+        "ts": crate::now_ms(),
+    }));
+    **guard = None;
+    forget_store_bytes(plugin_name, root);
+}
+
 pub fn release_shared_plugin(plugin_name: &str) -> bool {
     if !is_stateless_shared_plugin(plugin_name) {
         return false;
     }
-    shared_plugin_pool(plugin_name).evict_every_currently_free_slot_without_blocking_on_busy_ones()
+    let released = shared_plugin_pool(plugin_name).evict_every_currently_free_slot_without_blocking_on_busy_ones();
+    if released {
+        forget_store_bytes_for_shared_plugin(plugin_name);
+    }
+    released
 }
 
 pub fn request_shared_store_swap(plugin_name: &str, old_hash: &str) -> (usize, usize) {
@@ -380,24 +587,21 @@ pub fn note_shared_plugin_bytes_current(plugin_name: &str, hash: &str) {
     shared_plugin_pool(plugin_name).note_bytes_current(hash);
 }
 
-pub fn shared_plugin_swap_pending_hashes(plugin_name: &str) -> Vec<String> {
+fn existing_shared_plugin_pool(plugin_name: &str) -> Option<Arc<SharedPluginPool>> {
     SHARED_PLUGINS
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .get(plugin_name)
-        .map(|pool| pool.swap_pending_hashes())
-        .unwrap_or_default()
+        .cloned()
+}
+
+pub fn shared_plugin_swap_pending_hashes(plugin_name: &str) -> Vec<String> {
+    existing_shared_plugin_pool(plugin_name).map(|pool| pool.swap_pending_hashes()).unwrap_or_default()
 }
 
 pub fn shared_plugin_slot_content_hashes(plugin_name: &str) -> Vec<Option<String>> {
-    SHARED_PLUGINS
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .unwrap()
-        .get(plugin_name)
-        .map(|pool| pool.slot_content_hashes())
-        .unwrap_or_default()
+    existing_shared_plugin_pool(plugin_name).map(|pool| pool.slot_content_hashes()).unwrap_or_default()
 }
 
 /// The content hash currently answering dispatches for `plugin_name`,
@@ -657,8 +861,18 @@ impl ProjectPlugins {
             if pool.is_some() || attempt + 1 == DISPATCH_LOOKUP_RETRY_ATTEMPTS { break; }
             std::thread::sleep(std::time::Duration::from_millis(DISPATCH_LOOKUP_RETRY_BACKOFF_MS));
         }
-        let pool = pool.ok_or_else(|| PluginDispatchError::NotRegistered { plugin_name: plugin_name.to_string() })?;
+        let pool = match pool {
+            Some(pool) => pool,
+            None => ensure_sibling_loaded(&self.root, &self.siblings, plugin_name)?
+                .ok_or_else(|| PluginDispatchError::NotRegistered { plugin_name: plugin_name.to_string() })?,
+        };
         let (mut guard, _waited_ms) = pool.acquire_within(SharedPluginPool::ACQUIRE_TIMEOUT_MS);
+        if guard.is_none() {
+            drop(guard);
+            let _ = ensure_sibling_loaded(&self.root, &self.siblings, plugin_name)?;
+            let (refilled_guard, _) = pool.acquire_within(SharedPluginPool::ACQUIRE_TIMEOUT_MS);
+            guard = refilled_guard;
+        }
         dispatch_and_evict_on_error(&mut guard, &pool, verb, body, &self.root, &self.siblings, plugin_name)
     }
 
@@ -793,8 +1007,10 @@ fn dispatch_and_evict_on_error(
         eprintln!("[agentplug registry] evicting plugin {plugin_name} slot -- verb {verb} poisoned its Store: {poisoning_error}");
         log_poisoned_store_eviction_event(root, plugin_name, verb, true, &poisoning_error.to_string());
         **guard = None;
+        forget_store_bytes(plugin_name, root);
     } else {
         pool.evict_if_swap_pending(guard);
+        evict_if_over_linear_memory_ceiling(guard, root, plugin_name, verb);
     }
     result
 }

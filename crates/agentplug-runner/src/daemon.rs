@@ -122,6 +122,18 @@ struct DaemonConfig {
     project_idle_evict_secs: Option<u64>,
     #[serde(default)]
     shared_plugin_release_idle_secs: Option<u64>,
+    #[serde(default)]
+    shared_store_recycle_min_interval_secs: Option<u64>,
+    #[serde(default)]
+    plugin_store_linear_memory_ceiling_mb: Option<u64>,
+    #[serde(default)]
+    plugin_store_linear_memory_ceiling_mb_by_name: std::collections::HashMap<String, u64>,
+}
+
+const DEFAULT_PLUGIN_STORE_LINEAR_MEMORY_CEILING_MB: u64 = 512;
+
+fn compiled_default_store_ceilings_mb() -> [(&'static str, u64); 6] {
+    [("gm", 384), ("treesitter", 256), ("libsql", 256), ("oxibrowser", 256), ("crux", 128), ("bert", 768)]
 }
 
 // max_concurrent_projects/gm_concurrency/side_plugin_concurrency/
@@ -186,7 +198,25 @@ impl DaemonConfig {
                 shared_store_recycle_dispatches: None,
                 project_idle_evict_secs: None,
                 shared_plugin_release_idle_secs: None,
+                shared_store_recycle_min_interval_secs: None,
+                plugin_store_linear_memory_ceiling_mb: None,
+                plugin_store_linear_memory_ceiling_mb_by_name: std::collections::HashMap::new(),
             }
+    }
+    fn shared_store_recycle_min_interval(&self) -> Duration {
+        Duration::from_secs(self.shared_store_recycle_min_interval_secs.unwrap_or(120))
+    }
+    fn plugin_store_linear_memory_ceilings(&self) -> (u64, HashMap<String, u64>) {
+        let mb = 1024 * 1024;
+        let default_bytes = self.plugin_store_linear_memory_ceiling_mb.unwrap_or(DEFAULT_PLUGIN_STORE_LINEAR_MEMORY_CEILING_MB) * mb;
+        let mut by_name: HashMap<String, u64> = compiled_default_store_ceilings_mb()
+            .iter()
+            .map(|(name, ceiling_mb)| (name.to_string(), ceiling_mb * mb))
+            .collect();
+        for (name, ceiling_mb) in &self.plugin_store_linear_memory_ceiling_mb_by_name {
+            by_name.insert(name.clone(), ceiling_mb * mb);
+        }
+        (default_bytes, by_name)
     }
     fn registry_poll_interval(&self) -> Duration { Duration::from_secs(self.registry_poll_interval_secs.unwrap_or(5)) }
     fn heartbeat_interval(&self) -> Duration { Duration::from_secs(self.heartbeat_interval_secs.unwrap_or(10)) }
@@ -377,6 +407,68 @@ impl DaemonConfig {
         const MIN_SECS: u64 = 5 * 60;
         self.shared_plugin_release_idle_secs.unwrap_or(DEFAULT_SECS).max(MIN_SECS) * 1000
     }
+}
+
+fn last_shared_store_release() -> &'static Mutex<Option<serde_json::Value>> {
+    static SLOT: OnceLock<Mutex<Option<serde_json::Value>>> = OnceLock::new();
+    SLOT.get_or_init(|| Mutex::new(None))
+}
+
+fn last_pressure_release_instant() -> &'static Mutex<Option<Instant>> {
+    static SLOT: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
+    SLOT.get_or_init(|| Mutex::new(None))
+}
+
+fn pressure_release_suppressed_by_min_interval(cfg: &DaemonConfig) -> Option<u64> {
+    let last = *last_pressure_release_instant().lock().unwrap_or_else(|e| e.into_inner());
+    let since = last?.elapsed();
+    let min_interval = cfg.shared_store_recycle_min_interval();
+    if since < min_interval {
+        Some((min_interval - since).as_secs())
+    } else {
+        None
+    }
+}
+
+fn release_shared_stores_under_pressure(cfg: &DaemonConfig, reason: &str, trigger: &str, keep: Option<&str>) -> Vec<&'static str> {
+    if let Some(remaining_secs) = pressure_release_suppressed_by_min_interval(cfg) {
+        if remaining_secs % 30 == 0 {
+            eprintln!(
+                "[agentplug daemon] {reason} -- not releasing shared Stores again for {remaining_secs}s (shared_store_recycle_min_interval_secs guards against a release-reload loop when the resident baseline sits above the threshold; raise shared_store_recycle_private_mb if this repeats)"
+            );
+        }
+        return Vec::new();
+    }
+    let before = agentplug_host::process_memory_breakdown();
+    let mut released: Vec<&'static str> = Vec::new();
+    for plugin_name in agentplug_host::RELEASABLE_SHARED_PLUGINS {
+        if keep == Some(plugin_name) {
+            continue;
+        }
+        if agentplug_host::release_shared_plugin(plugin_name) {
+            released.push(plugin_name);
+        }
+    }
+    agentplug_host::reset_shared_dispatch_count();
+    *last_pressure_release_instant().lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
+    let after = agentplug_host::process_memory_breakdown();
+    *last_shared_store_release().lock().unwrap_or_else(|e| e.into_inner()) = Some(serde_json::json!({
+        "ts": now_ms(),
+        "trigger": trigger,
+        "reason": reason,
+        "released": released,
+        "private_bytes_before": before.map(|b| b.private_bytes),
+        "private_bytes_after": after.map(|b| b.private_bytes),
+    }));
+    if !released.is_empty() {
+        eprintln!(
+            "[agentplug daemon] released shared Stores [{}] under {reason} ({trigger}) -- private bytes {}MB -> {}MB; the compiled Module stays mapped from its file, so the next call re-instantiates cheaply",
+            released.join(", "),
+            before.map(|b| b.private_bytes / (1024 * 1024)).unwrap_or(0),
+            after.map(|b| b.private_bytes / (1024 * 1024)).unwrap_or(0)
+        );
+    }
+    released
 }
 
 fn shared_store_recycle_reason_independent_of_daemon_idle_state(cfg: &DaemonConfig) -> Option<String> {
@@ -960,6 +1052,10 @@ fn write_daemon_heartbeat(project_count: usize, plugin_module_count: usize) {
             "last_handoff_attempt_ts": handoff_attempt.as_ref().map(|(ts, _)| serde_json::json!(ts)).unwrap_or(serde_json::Value::Null),
             "last_handoff_error": handoff_attempt.as_ref().and_then(|(_, err)| err.clone()),
             "last_completed_runner_swap": read_last_completed_runner_swap().unwrap_or(serde_json::Value::Null),
+            "memory": agentplug_host::process_memory_breakdown().map(|b| serde_json::json!(b)).unwrap_or(serde_json::Value::Null),
+            "plugin_store_bytes": agentplug_host::store_bytes_by_plugin(),
+            "shared_dispatches_since_release": agentplug_host::shared_dispatches_since_release(),
+            "last_shared_store_release": last_shared_store_release().lock().unwrap_or_else(|e| e.into_inner()).clone().unwrap_or(serde_json::Value::Null),
         })
         .to_string(),
     );
@@ -1321,20 +1417,22 @@ impl PluginModules {
                     );
                 }
             }
-            eprintln!("[agentplug daemon] compiling {plugin_name}.wasm (shared across every project that uses it)...");
-            let module = Module::from_file(&self.engine, &wasm_path)?;
+            eprintln!("[agentplug daemon] loading {plugin_name}.wasm (shared across every project that uses it)...");
+            let module = agentplug_host::load_module_file_backed(&self.engine, &wasm_path, plugin_name, &on_disk_hash)?;
             self.modules.insert(plugin_name.to_string(), module);
             self.loaded_content_hash.insert(plugin_name.to_string(), on_disk_hash.clone());
             loaded_plugin_content_hashes()
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .insert(plugin_name.to_string(), on_disk_hash.clone());
-            // Rollback safety: if these exact bytes were previously deferred
-            // behind an in-flight dispatch and are now current again, Stores
-            // carrying them must stop being evicted on completion.
             agentplug_host::note_shared_plugin_bytes_current(plugin_name, &on_disk_hash);
+            self.publish_lazy_module_source();
         }
         Ok(())
+    }
+
+    fn publish_lazy_module_source(&self) {
+        agentplug_host::set_lazy_module_source(self.engine.clone(), self.modules_with_hashes());
     }
 
     fn module_with_hash(&self, plugin_name: &str) -> Option<(&Module, &str)> {
@@ -1582,6 +1680,10 @@ pub fn sweep_unconsumable_spool_files(root: &Path) {
 /// than it needed to be for occasional/non-hot-path callers.
 const RAW_PLUGIN_SPOOL_VERBS: &[&str] = &["libsql", "bert"];
 
+fn eagerly_loaded_plugins() -> Vec<String> {
+    vec!["gm".to_string()]
+}
+
 pub(crate) fn run_gm_dispatch_to_file(root: &Path, handle: &DispatchHandle, verb: &str, task: &str, body: &str, out_dir: &Path) {
     let _fairness_guard = GmFairnessGuard::acquire(root);
     let plugin_name = if RAW_PLUGIN_SPOOL_VERBS.contains(&verb) { verb } else { "gm" };
@@ -1764,22 +1866,7 @@ fn dispatch_project(root: &Path, project: &mut ProjectPlugins, plugin_modules: &
     // and the failure names the plugin that WAS listed rather than the one
     // that went missing, which makes it hard to attribute. Listing a plugin
     // should only ever add reach, never remove it.
-    let requested_plugins = {
-        let mut list = vec![
-            "gm".to_string(),
-            "libsql".to_string(),
-            "bert".to_string(),
-            "treesitter".to_string(),
-            "oxibrowser".to_string(),
-            "crux".to_string(),
-        ];
-        for extra in read_project_plugin_list(root) {
-            if !list.contains(&extra) {
-                list.push(extra);
-            }
-        }
-        list
-    };
+    let requested_plugins = eagerly_loaded_plugins();
 
     let mut gm_requests: Vec<ClaimedRequest> = Vec::with_capacity(claimed.len());
     let mut bg_convert_requests: Vec<ClaimedRequest> = Vec::new();
@@ -2087,19 +2174,9 @@ fn dispatch_project(root: &Path, project: &mut ProjectPlugins, plugin_modules: &
                     }
                 }
 
-                if let Some(reason) = shared_store_recycle_reason_independent_of_daemon_idle_state(&DaemonConfig::load()) {
-                    let mut released: Vec<&str> = Vec::new();
-                    for shared_name in agentplug_host::RELEASABLE_SHARED_PLUGINS {
-                        if shared_name != plugin_name && agentplug_host::release_shared_plugin(shared_name) {
-                            released.push(shared_name);
-                        }
-                    }
-                    agentplug_host::reset_shared_dispatch_count();
-                    if !released.is_empty() {
-                        eprintln!(
-                            "[agentplug daemon] pre-dispatch release of shared Stores {released:?} before {plugin_name}/{verb} -- {reason}"
-                        );
-                    }
+                let pd_cfg = DaemonConfig::load();
+                if let Some(reason) = shared_store_recycle_reason_independent_of_daemon_idle_state(&pd_cfg) {
+                    release_shared_stores_under_pressure(&pd_cfg, &reason, "pre-plugin-dispatch", Some(&plugin_name));
                 }
 
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| project.dispatch(&plugin_name, &verb, &body)));
@@ -2230,6 +2307,13 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
     );
     agentplug_host::set_gm_pool_size(daemon_cfg.gm_pool_size());
     agentplug_host::set_side_plugin_pool_size(daemon_cfg.side_plugin_concurrency());
+    let (ceiling_default_bytes, ceilings_by_name) = daemon_cfg.plugin_store_linear_memory_ceilings();
+    eprintln!(
+        "[agentplug daemon] plugin Store linear-memory ceilings: default={}MB by_name={:?} (a Store over its ceiling is evicted after the dispatch that grew it)",
+        ceiling_default_bytes / (1024 * 1024),
+        ceilings_by_name.iter().map(|(k, v)| format!("{k}={}MB", v / (1024 * 1024))).collect::<Vec<_>>()
+    );
+    agentplug_host::set_store_linear_memory_ceilings(ceiling_default_bytes, ceilings_by_name);
 
     // A rename failure in download_and_verify (self-update staging, plugin
     // hot-swap) deliberately leaves its sha256-verified tmp.<pid> file on
@@ -2538,6 +2622,7 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
         for root in to_evict {
             eprintln!("[agentplug daemon] evicting idle project {}", root.display());
             projects.remove(&root);
+            agentplug_host::forget_store_bytes_for_root(&root);
         }
 
         let forced_refresh_request = take_forced_plugin_refresh_request();
@@ -2662,20 +2747,8 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
         }
 
         if let Some(reason) = shared_store_recycle_reason_independent_of_daemon_idle_state(&daemon_cfg) {
-            let mut released: Vec<&str> = Vec::new();
-            for plugin_name in agentplug_host::RELEASABLE_SHARED_PLUGINS {
-                if agentplug_host::release_shared_plugin(plugin_name) {
-                    released.push(plugin_name);
-                }
-            }
-            agentplug_host::reset_shared_dispatch_count();
+            release_shared_stores_under_pressure(&daemon_cfg, &reason, "main-loop", None);
             last_shared_release = Instant::now();
-            if !released.is_empty() {
-                eprintln!(
-                    "[agentplug daemon] released shared Stores [{}] under {reason} -- wasm linear memory only grows, so the retained embed peak is only reclaimable by dropping the Store; the compiled Module stays cached in the Engine, so the next call re-instantiates cheaply",
-                    released.join(", ")
-                );
-            }
         }
 
         if any_work {
@@ -2693,6 +2766,13 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
                     released.join(", "),
                     shared_plugin_release_idle_ms
                 );
+                *last_shared_store_release().lock().unwrap_or_else(|e| e.into_inner()) = Some(serde_json::json!({
+                    "ts": now_ms(),
+                    "trigger": "idle",
+                    "reason": format!("{shared_plugin_release_idle_ms}ms quiet"),
+                    "released": released,
+                    "private_bytes_after": agentplug_host::process_memory_breakdown().map(|b| b.private_bytes),
+                }));
             }
             last_shared_release = Instant::now();
         }

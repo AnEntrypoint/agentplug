@@ -47,7 +47,7 @@ fn reconcile_plugin_manifest(
             Err(_) => continue,
         };
         let content_hash = download::sha256_hex(&bytes);
-        let module = match Module::from_file(engine, &wasm) {
+        let module = match agentplug_host::load_module_file_backed(engine, &wasm, name, &content_hash) {
             Ok(m) => m,
             Err(_) => {
                 advance_plugin_fiber(name, false, None);
@@ -136,7 +136,7 @@ fn main() -> anyhow::Result<()> {
             let wasm = download::ensure_plugin_installed("gm", None)?;
             let content_hash = download::sha256_hex(&std::fs::read(&wasm)?);
             let engine = build_engine()?;
-            let module = Module::from_file(&engine, &wasm)?;
+            let module = agentplug_host::load_module_file_backed(&engine, &wasm, "gm", &content_hash)?;
             let mut project = ProjectPlugins::new(cwd);
             project.load_plugin(&engine, "gm", &module, &content_hash)?;
             run_spool_watcher_single_process(&mut project, &spool_dir)
@@ -177,7 +177,7 @@ fn main() -> anyhow::Result<()> {
             let wasm = download::ensure_plugin_installed(&plugin, None)?;
             let content_hash = download::sha256_hex(&std::fs::read(&wasm)?);
             let engine = build_engine()?;
-            let module = Module::from_file(&engine, &wasm)?;
+            let module = agentplug_host::load_module_file_backed(&engine, &wasm, &plugin, &content_hash)?;
             let mut project = ProjectPlugins::new(cwd);
             project.load_plugin(&engine, &plugin, &module, &content_hash)?;
             let siblings: Vec<(&str, Option<&str>)> = ["libsql", "bert", "treesitter"]
