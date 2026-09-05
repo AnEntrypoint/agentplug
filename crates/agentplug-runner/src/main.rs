@@ -19,18 +19,6 @@ fn suppress_crash_dialogs() {
 #[cfg(not(windows))]
 fn suppress_crash_dialogs() {}
 
-/// Declarative component-loader reconciliation (Cordis paper Section
-/// 5.2.1): given a desired plugin roster, diffs each against its
-/// `installed_plugin_version` and drives only the ones that differ
-/// through `ProjectPlugins::load_plugin`, skipping an unchanged plugin
-/// entirely rather than reloading it. `load_plugin` itself already
-/// no-ops on a matching content hash (`registry.rs`'s `needs_fill` check),
-/// so this function's own value is naming the reconciliation loop as one
-/// entry point instead of an inline unlabeled per-side loop -- the same
-/// incremental-reconciliation guarantee Theorem 73 (confluence) licenses:
-/// whatever order the desired roster is driven in, the quiescent state
-/// answers to the roster alone, so skipping an already-current plugin
-/// changes nothing about where the system ends up.
 fn reconcile_plugin_manifest(
     project: &mut ProjectPlugins,
     engine: &wasmtime::Engine,
@@ -57,14 +45,6 @@ fn reconcile_plugin_manifest(
         let load_result = project.load_plugin(engine, name, &module, &content_hash);
         advance_plugin_fiber(name, load_result.is_ok(), Some(&content_hash));
         if load_result.is_ok() {
-            // Recovery-exactness spot-check (paper Theorem 61): after a
-            // reload, the service broker's active provider for this
-            // plugin should be the content hash just installed. A shared
-            // pool with multiple slots can still show a stale hash if
-            // another slot answered first (pool_size > 1 fills lazily
-            // per-slot, only the touched slot updates), so this is
-            // logged as a signal for a genuinely stuck pool, not treated
-            // as a hard failure of an otherwise-successful load.
             if let Some(active) = get_active_provider(name) {
                 if active != content_hash {
                     eprintln!(
