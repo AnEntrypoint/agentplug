@@ -222,6 +222,19 @@ pub fn run(
         if nav.get("ok").and_then(|b| b.as_bool()) != Some(true) {
             return nav;
         }
+        // The prefixes are documented as stacking, so `dom=` alongside `url=`
+        // has to run the dom-query AFTER navigating. Previously this branch
+        // returned before the dom_selector branch below could ever be reached,
+        // so a body carrying both silently dropped the dom-query -- and worse,
+        // a `dom=` written after the `url=` line fell through to `after_url`
+        // and got evaluated as JavaScript, surfacing as a baffling
+        // "reference: h1 is not defined" rather than a selector query.
+        if let Some(selector) = dom_selector {
+            return match call_oxibrowser(cwd, siblings, "dom-query", &json!({"selector": selector})) {
+                Ok(v) => v,
+                Err(e) => json!({"ok": false, "error": e.to_string()}),
+            };
+        }
         if after_url.trim().is_empty() {
             return json!({"ok": true, "navigated": true, "url": nav});
         }
