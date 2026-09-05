@@ -7,6 +7,7 @@ mod http_agent;
 mod memory_pressure;
 mod oxibrowser_driver;
 mod precompiled;
+mod subprocess;
 mod task;
 mod imports;
 mod install;
