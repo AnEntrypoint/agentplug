@@ -259,7 +259,7 @@ fn selfcheck_inflight_cleanup() -> anyhow::Result<()> {
         .unwrap_or_else(|e| e.into_inner())
         .insert(key.clone(), daemon::InFlightHandle { detach: Arc::new(AtomicBool::new(false)) });
 
-    daemon::run_gm_dispatch_to_file(&root, &handle, "verbX", "taskY", "{}", &out_dir);
+    daemon::run_gm_dispatch_to_file(&root, &handle, "verbX", "taskY", "{}", &out_dir, 0);
 
     let entry_remains = daemon::in_flight_map().lock().unwrap_or_else(|e| e.into_inner()).get(&key).is_some();
     let out_written = out_dir.join("verbX-taskY.json").exists();

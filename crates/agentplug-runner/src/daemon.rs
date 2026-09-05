@@ -1044,6 +1044,7 @@ fn write_project_heartbeat_with_queue_info(spool_dir: &Path, busy_until: Option<
         payload["queue_position"] = serde_json::json!(position);
         payload["queue_depth"] = serde_json::json!(total);
     }
+    payload["queue_wait_ms"] = serde_json::json!(last_measured_dispatch_queue_wait_ms());
     if let Some((staged_at_ms, _len)) = staged_runner_awaiting_handoff() {
         payload["runner_update_in_progress"] = serde_json::json!(true);
         payload["runner_update_waiting_ms"] = serde_json::json!(now_ms().saturating_sub(staged_at_ms));
@@ -1582,7 +1583,39 @@ pub fn sweep_unconsumable_spool_files(root: &Path) {
 /// than it needed to be for occasional/non-hot-path callers.
 const RAW_PLUGIN_SPOOL_VERBS: &[&str] = &["libsql", "bert"];
 
-pub(crate) fn run_gm_dispatch_to_file(root: &Path, handle: &DispatchHandle, verb: &str, task: &str, body: &str, out_dir: &Path) {
+fn extract_session_id(body: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()?
+        .get("session_id")?
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+}
+
+fn session_id_task_mismatch_rejection(verb: &str, task: &str, body: &str) -> Option<String> {
+    let declared_session_id = extract_session_id(body)?;
+    let expected_prefix = format!("{declared_session_id}-");
+    if task.starts_with(&expected_prefix) {
+        return None;
+    }
+    Some(serde_json::json!({
+        "ok": false,
+        "error": "session_id_task_mismatch",
+        "reason": format!(
+            "dispatch body declared session_id {declared_session_id:?} but task id {task:?} does not start with {expected_prefix:?} -- the spool ABI requires task ids of the form <session_id>-<local-counter> so the daemon can partition claims per session; re-dispatch with a correctly prefixed task id"
+        ),
+        "verb": verb,
+    }).to_string())
+}
+
+static LAST_MEASURED_DISPATCH_QUEUE_WAIT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub(crate) fn last_measured_dispatch_queue_wait_ms() -> u64 {
+    LAST_MEASURED_DISPATCH_QUEUE_WAIT_MS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub(crate) fn run_gm_dispatch_to_file(root: &Path, handle: &DispatchHandle, verb: &str, task: &str, body: &str, out_dir: &Path, queue_wait_ms: u64) {
+    LAST_MEASURED_DISPATCH_QUEUE_WAIT_MS.store(queue_wait_ms, std::sync::atomic::Ordering::Relaxed);
     let _fairness_guard = GmFairnessGuard::acquire(root);
     let plugin_name = if RAW_PLUGIN_SPOOL_VERBS.contains(&verb) { verb } else { "gm" };
     let inner_verb_owned: String = if plugin_name == "gm" {
@@ -1702,6 +1735,7 @@ fn dispatch_project(root: &Path, project: &mut ProjectPlugins, plugin_modules: &
         verb: String,
         task: String,
         body: String,
+        claimed_at: Instant,
     }
     let mut claimed: Vec<ClaimedRequest> = Vec::new();
     let in_dir_scan = fs::read_dir(&in_dir);
@@ -1724,9 +1758,10 @@ fn dispatch_project(root: &Path, project: &mut ProjectPlugins, plugin_modules: &
                     continue;
                 }
                 did_work = true;
+                let claimed_at = Instant::now();
                 let task = file_path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
                 let body = fs::read_to_string(&claim_path).unwrap_or_default();
-                claimed.push(ClaimedRequest { verb: verb.clone(), task, body });
+                claimed.push(ClaimedRequest { verb: verb.clone(), task, body, claimed_at });
             }
         }
     }
@@ -1785,6 +1820,12 @@ fn dispatch_project(root: &Path, project: &mut ProjectPlugins, plugin_modules: &
     let mut bg_convert_requests: Vec<ClaimedRequest> = Vec::new();
     let mut plugin_refresh_requests: Vec<ClaimedRequest> = Vec::new();
     for req in claimed {
+        if let Some(out_body) = session_id_task_mismatch_rejection(&req.verb, &req.task, &req.body) {
+            let out_name = format!("{}-{}.json", req.verb, req.task);
+            write_spool_out(&out_dir, &out_name, &out_body);
+            let _ = fs::remove_file(inflight_claim_path(&in_dir, &req.verb, &req.task));
+            continue;
+        }
         if req.verb == "background-convert" {
             bg_convert_requests.push(req);
         } else if req.verb == "plugin-refresh" {
@@ -1894,8 +1935,9 @@ fn dispatch_project(root: &Path, project: &mut ProjectPlugins, plugin_modules: &
                 let thread_task = req.task.clone();
                 let thread_body = req.body.clone();
                 let thread_out_dir = out_dir.clone();
+                let queue_wait_ms = req.claimed_at.elapsed().as_millis() as u64;
                 let join_handle = std::thread::spawn(move || {
-                    run_gm_dispatch_to_file(&thread_root, &self_healing_dispatch_handle, &thread_verb, &thread_task, &thread_body, &thread_out_dir);
+                    run_gm_dispatch_to_file(&thread_root, &self_healing_dispatch_handle, &thread_verb, &thread_task, &thread_body, &thread_out_dir, queue_wait_ms);
                 });
                 spawned.push(Spawned { key, join_handle: Some(join_handle), detach_flag, spawned_at: Instant::now() });
             }
@@ -1998,8 +2040,16 @@ fn dispatch_project(root: &Path, project: &mut ProjectPlugins, plugin_modules: &
                                     if fs::rename(&file_path, &claim_path).is_err() {
                                         continue;
                                     }
+                                    let claimed_at = Instant::now();
                                     let task = file_path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
                                     let body = fs::read_to_string(&claim_path).unwrap_or_default();
+
+                                    if let Some(out_body) = session_id_task_mismatch_rejection(&verb, &task, &body) {
+                                        let out_name = format!("{verb}-{task}.json");
+                                        write_spool_out(&out_dir, &out_name, &out_body);
+                                        let _ = fs::remove_file(&claim_path);
+                                        continue;
+                                    }
 
                                     let self_healing_dispatch_handle = project.dispatch_handle_with_reload(Some((plugin_modules.engine.clone(), plugin_modules.modules_with_hashes())));
                                     let detach_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -2011,8 +2061,9 @@ fn dispatch_project(root: &Path, project: &mut ProjectPlugins, plugin_modules: &
                                     let thread_task = task.clone();
                                     let thread_body = body;
                                     let thread_out_dir = out_dir.clone();
+                                    let queue_wait_ms = claimed_at.elapsed().as_millis() as u64;
                                     let join_handle = std::thread::spawn(move || {
-                                        run_gm_dispatch_to_file(&thread_root, &self_healing_dispatch_handle, &thread_verb, &thread_task, &thread_body, &thread_out_dir);
+                                        run_gm_dispatch_to_file(&thread_root, &self_healing_dispatch_handle, &thread_verb, &thread_task, &thread_body, &thread_out_dir, queue_wait_ms);
                                     });
                                     spawned.push(Spawned { key, join_handle: Some(join_handle), detach_flag, spawned_at: Instant::now() });
                                 }
