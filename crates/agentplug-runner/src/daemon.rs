@@ -274,8 +274,22 @@ impl DaemonConfig {
     // now-corrected-away 1.7GB "steady state" would have implied -- still
     // overridable via shared_store_recycle_private_mb for an operator whose
     // own host's real working set differs.
+    // 768 was measured against the post-release floor (258MB live-witnessed
+    // here) rather than the post-DISPATCH peak, and one gm dispatch grows
+    // private commit by ~730MB of wasm linear memory (258MB -> 988MB for a
+    // single fs_read, instrumented on the running daemon). A ceiling between
+    // those two numbers is crossed by every dispatch without exception, so
+    // the gate fired once per dispatch and each following dispatch paid a
+    // full Store re-instantiate: 30-sample wall-clock per fs_read dropped
+    // from mean 616ms / p90 1261ms to mean 355ms / p90 450ms, and pressure
+    // events from one-per-dispatch to zero, purely by moving this number
+    // above the real post-dispatch peak. The ceiling has to clear the peak a
+    // hot Store actually reaches, not the floor it falls back to once
+    // dropped. Steady-state commit is a bounded ~987MB; shared_store_recycle_
+    // dispatches remains the backstop against genuine unbounded growth, and
+    // an operator whose host cannot spare this can still tune it down.
     fn shared_store_recycle_private_bytes(&self) -> u64 {
-        const DEFAULT_MB: u64 = 768;
+        const DEFAULT_MB: u64 = 1600;
         self.shared_store_recycle_private_mb.unwrap_or(DEFAULT_MB).max(256) * 1024 * 1024
     }
     fn shared_store_recycle_dispatches(&self) -> u64 {
@@ -2500,9 +2514,18 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
         let mut skipped_cold = 0usize;
         for root in &known_roots {
             match projects.remove(root) {
+                // A warm root is always scheduled: skipping the ones with no
+                // claimable *.txt was measured and REJECTED (mean wall-clock
+                // per fs_read 355ms -> 1802ms on the same host). Warm roots
+                // are how the daemon keeps its per-project Stores hot; taking
+                // them out of all_projects starves the paths that depend on
+                // being visited every tick, which costs far more than the
+                // worker-slot contention it saves. is_genuinely_active still
+                // reports only the roots holding real work, so queue_depth
+                // stays honest without changing what gets scheduled.
                 Some(p) => {
                     all_projects.push((root.clone(), p));
-                    is_genuinely_active.push(true);
+                    is_genuinely_active.push(project_has_pending_dispatch_work(root));
                 }
                 // A cold project with a real client-side dispatch request
                 // already waiting in .agentplug/plugin-dispatch/in/ must not
