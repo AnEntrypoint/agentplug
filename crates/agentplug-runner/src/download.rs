@@ -42,6 +42,7 @@ fn gc_stale_tmp_files_in(dir: &Path, min_age: Duration) {
 
 pub fn gc_stale_tmp_files(min_age: Duration) {
     gc_stale_tmp_files_in(&install_dir().join("plugins"), min_age);
+    gc_stale_tmp_files_in(&agentplug_host::precompiled_dir(), min_age);
     if let Ok(exe) = std::env::current_exe() {
         if let Some(exe_dir) = exe.parent() {
             gc_stale_tmp_files_in(exe_dir, min_age);
@@ -104,6 +105,10 @@ fn refresh_direct_latest_plugin_if_sha_changed(plugin_name: &str, installed_mark
     if remote_marker == installed_marker {
         return Ok(None);
     }
+    if read_known_bad_versions(plugin_name).contains(&remote_marker) {
+        eprintln!("[agentplug daemon] plugin {plugin_name} direct-latest asset {remote_marker} is a previously-recorded known-bad version for this runner -- staying on {installed_marker} until the asset changes or this runner updates");
+        return Ok(None);
+    }
     let dest = plugin_wasm_path(plugin_name);
     let version_file = plugin_version_path(plugin_name);
     try_ensure_plugin_installed_via_direct_release_latest(&spec, &dest, &version_file)?;
@@ -113,6 +118,29 @@ fn refresh_direct_latest_plugin_if_sha_changed(plugin_name: &str, installed_mark
         }
     }
     Ok(Some(remote_marker))
+}
+
+fn adopt_release_tag_for_marker_installed_plugin(plugin_name: &str, installed_marker: &str, latest: &str) -> anyhow::Result<Option<String>> {
+    if read_known_bad_versions(plugin_name).contains(&latest.to_string()) {
+        eprintln!("[agentplug daemon] plugin {plugin_name} latest release {latest} is a previously-recorded known-bad version for this runner -- staying on {installed_marker}");
+        return Ok(None);
+    }
+    let same_bytes_as_release = match (fetch_remote_wasm_sha256(plugin_name, latest), installed_wasm_sha256(plugin_name)) {
+        (Ok(remote_sha), Some(local_sha)) => remote_sha.eq_ignore_ascii_case(&local_sha),
+        _ => false,
+    };
+    if same_bytes_as_release {
+        fs::write(plugin_version_path(plugin_name), latest)?;
+        eprintln!("[agentplug daemon] plugin {plugin_name} installed as {installed_marker} carries the bytes of release {latest} -- recording that tag so ordinary release polling resumes");
+        return Ok(None);
+    }
+    ensure_plugin_installed(plugin_name, Some(latest))?;
+    if plugin_name == "gm" {
+        if let Err(e) = refresh_installed_skill_md() {
+            eprintln!("[agentplug daemon] SKILL.md refresh after gm plugin update to {latest} failed: {e:#}");
+        }
+    }
+    Ok(Some(latest.to_string()))
 }
 
 fn github_api_request(url: &str) -> ureq::Request {
@@ -569,7 +597,10 @@ pub fn refresh_plugin_if_stale(plugin_name: &str) -> anyhow::Result<Option<Strin
     };
     if is_direct_latest_marker(&installed) {
         clear_local_dev_sideload_marker(plugin_name);
-        return refresh_direct_latest_plugin_if_sha_changed(plugin_name, &installed);
+        return match fetch_latest_plugin_version(plugin_name) {
+            Ok(Some(latest)) => adopt_release_tag_for_marker_installed_plugin(plugin_name, &installed, &latest),
+            _ => refresh_direct_latest_plugin_if_sha_changed(plugin_name, &installed),
+        };
     }
     if !is_recognized_release_semver(&installed) {
         warn_local_dev_sideload_loudly(plugin_name, &installed);

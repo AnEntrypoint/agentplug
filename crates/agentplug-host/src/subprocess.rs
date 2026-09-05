@@ -17,6 +17,21 @@ impl PipeDrain {
     pub fn take_so_far(&self) -> Vec<u8> {
         std::mem::take(&mut *self.buffer.lock().unwrap_or_else(|e| e.into_inner()))
     }
+
+    pub fn settle_within(&mut self, wait: std::time::Duration) -> Vec<u8> {
+        let deadline = std::time::Instant::now() + wait;
+        while let Some(reader) = self.reader.as_ref() {
+            if reader.is_finished() {
+                let _ = self.reader.take().map(|r| r.join());
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        self.take_so_far()
+    }
 }
 
 pub fn drain_pipe_on_its_own_thread<R: Read + Send + 'static>(pipe: Option<R>) -> PipeDrain {
