@@ -9,6 +9,7 @@ use wait_timeout::ChildExt;
 use wasmtime::{AsContextMut, Caller, Linker, Memory};
 
 use crate::host_state::HostState;
+use crate::subprocess::drain_pipe_on_its_own_thread;
 
 fn fetch_agent() -> &'static ureq::Agent {
     crate::http_agent::shared_agent()
@@ -929,31 +930,37 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
                 git_cmd.creation_flags(CREATE_NO_WINDOW);
             }
             let v = match git_cmd.spawn() {
-                Ok(mut child) => match child.wait_timeout(Duration::from_millis(git_subprocess_timeout_ms())) {
-                    Ok(Some(status)) => {
-                        let mut stdout = Vec::new();
-                        let mut stderr = Vec::new();
-                        if let Some(mut o) = child.stdout.take() { let _ = std::io::Read::read_to_end(&mut o, &mut stdout); }
-                        if let Some(mut e) = child.stderr.take() { let _ = std::io::Read::read_to_end(&mut e, &mut stderr); }
-                        serde_json::json!({
-                            "stdout": String::from_utf8_lossy(&stdout),
-                            "stderr": String::from_utf8_lossy(&stderr),
-                            "exit_code": status.code().unwrap_or(-1),
-                        })
+                Ok(mut child) => {
+                    let stdout_drain = drain_pipe_on_its_own_thread(child.stdout.take());
+                    let stderr_drain = drain_pipe_on_its_own_thread(child.stderr.take());
+                    match child.wait_timeout(Duration::from_millis(git_subprocess_timeout_ms())) {
+                        Ok(Some(status)) => {
+                            let stdout = stdout_drain.join();
+                            let stderr = stderr_drain.join();
+                            serde_json::json!({
+                                "stdout": String::from_utf8_lossy(&stdout),
+                                "stderr": String::from_utf8_lossy(&stderr),
+                                "exit_code": status.code().unwrap_or(-1),
+                            })
+                        }
+                        Ok(None) => {
+                            let _ = child.kill();
+                            let _ = child.wait();
+                            let _ = stdout_drain.join();
+                            let _ = stderr_drain.join();
+                            serde_json::json!({
+                                "stdout": "", "stderr": format!("git {argv:?} timed out after {}ms, killed", git_subprocess_timeout_ms()),
+                                "exit_code": -1,
+                            })
+                        }
+                        Err(e) => {
+                            let _ = child.kill();
+                            let _ = stdout_drain.join();
+                            let _ = stderr_drain.join();
+                            serde_json::json!({"stdout": "", "stderr": format!("wait_timeout failed: {e}"), "exit_code": -1})
+                        }
                     }
-                    Ok(None) => {
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        serde_json::json!({
-                            "stdout": "", "stderr": format!("git {argv:?} timed out after {}ms, killed", git_subprocess_timeout_ms()),
-                            "exit_code": -1,
-                        })
-                    }
-                    Err(e) => {
-                        let _ = child.kill();
-                        serde_json::json!({"stdout": "", "stderr": format!("wait_timeout failed: {e}"), "exit_code": -1})
-                    }
-                },
+                }
                 Err(e) => serde_json::json!({"stdout": "", "stderr": e.to_string(), "exit_code": 1}),
             };
             write_guest_json(&mut caller, v)

@@ -1,13 +1,16 @@
 use std::collections::HashMap;
-use std::io::Read;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Mutex, OnceLock};
 
 use serde_json::{json, Value};
 
+use crate::subprocess::{drain_pipe_on_its_own_thread, PipeDrain};
+
 struct TaskEntry {
     child: Child,
+    stdout_drain: PipeDrain,
+    stderr_drain: PipeDrain,
     lang: String,
     started_ms: u64,
     timeout_ms: u64,
@@ -15,6 +18,11 @@ struct TaskEntry {
     stderr: Vec<u8>,
     exit_code: Option<i32>,
     finished_ms: Option<u64>,
+}
+
+fn absorb_drained_output(entry: &mut TaskEntry) {
+    entry.stdout.extend(entry.stdout_drain.take_so_far());
+    entry.stderr.extend(entry.stderr_drain.take_so_far());
 }
 
 type Registry = Mutex<HashMap<String, TaskEntry>>;
@@ -41,25 +49,16 @@ fn poll_entry(entry: &mut TaskEntry) {
     }
     match entry.child.try_wait() {
         Ok(Some(status)) => {
-            if let Some(mut out) = entry.child.stdout.take() {
-                let _ = out.read_to_end(&mut entry.stdout);
-            }
-            if let Some(mut err) = entry.child.stderr.take() {
-                let _ = err.read_to_end(&mut entry.stderr);
-            }
+            absorb_drained_output(entry);
             entry.exit_code = status.code();
             entry.finished_ms = Some(now_ms());
         }
         Ok(None) => {
+            absorb_drained_output(entry);
             if now_ms().saturating_sub(entry.started_ms) > entry.timeout_ms {
                 let _ = entry.child.kill();
                 let _ = entry.child.wait();
-                if let Some(mut out) = entry.child.stdout.take() {
-                    let _ = out.read_to_end(&mut entry.stdout);
-                }
-                if let Some(mut err) = entry.child.stderr.take() {
-                    let _ = err.read_to_end(&mut entry.stderr);
-                }
+                absorb_drained_output(entry);
                 entry.exit_code = Some(-1);
                 entry.finished_ms = Some(now_ms());
             }
@@ -79,11 +78,13 @@ fn entry_summary(id: &str, entry: &TaskEntry) -> Value {
     })
 }
 
-pub fn adopt_running(child: std::process::Child, lang: &str, started: std::time::Instant, timeout_ms: u64) -> String {
+pub fn adopt_running(child: std::process::Child, stdout_drain: PipeDrain, stderr_drain: PipeDrain, lang: &str, started: std::time::Instant, timeout_ms: u64) -> String {
     let started_ms = now_ms().saturating_sub(started.elapsed().as_millis() as u64);
     let id = next_id(started_ms ^ (child.id() as u64));
     let entry = TaskEntry {
         child,
+        stdout_drain,
+        stderr_drain,
         lang: lang.to_string(),
         started_ms,
         timeout_ms,
@@ -123,14 +124,18 @@ fn spawn(params: &Value, cwd: &Path) -> Value {
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         command.creation_flags(CREATE_NO_WINDOW);
     }
-    let child = match command.spawn() {
+    let mut child = match command.spawn() {
         Ok(c) => c,
         Err(e) => return json!({"ok": false, "error": format!("spawn failed: {e}")}),
     };
+    let stdout_drain = drain_pipe_on_its_own_thread(child.stdout.take());
+    let stderr_drain = drain_pipe_on_its_own_thread(child.stderr.take());
     let started = now_ms();
     let id = next_id(started ^ (child.id() as u64));
     let entry = TaskEntry {
         child,
+        stdout_drain,
+        stderr_drain,
         lang: lang.to_string(),
         started_ms: started,
         timeout_ms,

@@ -77,9 +77,11 @@ pub fn run(code: &str, opts: &Value, cwd: &Path) -> Value {
         }
     };
 
+    let stdout_drain = crate::subprocess::drain_pipe_on_its_own_thread(child.stdout.take());
+    let stderr_drain = crate::subprocess::drain_pipe_on_its_own_thread(child.stderr.take());
     let still_running = matches!(child.wait_timeout(Duration::from_millis(timeout_ms)), Ok(None));
     if still_running {
-        let task_id = crate::task::adopt_running(child, lang, t0, timeout_ms);
+        let task_id = crate::task::adopt_running(child, stdout_drain, stderr_drain, lang, t0, timeout_ms);
         return json!({
             "ok": true,
             "timed_out": true,
@@ -91,14 +93,8 @@ pub fn run(code: &str, opts: &Value, cwd: &Path) -> Value {
     }
 
     let duration_ms = t0.elapsed().as_millis() as u64;
-    let mut stdout_buf = Vec::new();
-    let mut stderr_buf = Vec::new();
-    if let Some(mut out) = child.stdout.take() {
-        let _ = std::io::Read::read_to_end(&mut out, &mut stdout_buf);
-    }
-    if let Some(mut err) = child.stderr.take() {
-        let _ = std::io::Read::read_to_end(&mut err, &mut stderr_buf);
-    }
+    let stdout_buf = stdout_drain.join();
+    let stderr_buf = stderr_drain.join();
     let exit_code = child.wait().ok().and_then(|s| s.code()).unwrap_or(-1);
 
     if let Some(f) = script_file {
