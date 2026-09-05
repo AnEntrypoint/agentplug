@@ -307,6 +307,15 @@ struct BrowserSession {
     /// instead of pid_is_alive/kill_pid, which would otherwise operate on a
     /// meaningless local pid.
     owns_process: bool,
+    /// Which engine actually backs this session. The session key is
+    /// (cwd, session_id) with NO engine component, so without this field a
+    /// `cdp` dispatch (engine=chrome) silently reused whatever `browser`
+    /// (engine=lightpanda) had already created under the same session id --
+    /// answering ok:true from the wrong engine, with lightpanda's UA and a
+    /// getComputedStyle that returns transparent for everything. That defect
+    /// only became reachable once lightpanda started working at all; before
+    /// that a `browser` dispatch never established a reusable session.
+    engine: crate::browser_engine::Engine,
 }
 
 static SESSIONS: OnceLock<Mutex<HashMap<String, BrowserSession>>> = OnceLock::new();
@@ -443,6 +452,10 @@ fn try_adopt_orphaned_session(cwd: &Path, session_id_hint: Option<&str>, profile
                 last_used: Instant::now(),
                 target_id,
                 owns_process: true,
+                // Adoption only ever scans `browser-chrome-profile-*` dirs
+                // (see the strip_prefix above), so an adopted orphan is a
+                // Chrome session by construction.
+                engine: crate::browser_engine::Engine::Chrome,
             },
         );
     }
@@ -945,6 +958,7 @@ fn session_new(cwd: &Path, session_id: &str, cfg: &BrowserConfig, engine: crate:
                     last_used: Instant::now(),
                     target_id: None,
                     owns_process: acquired.owns_process,
+                    engine,
                 },
             );
             json!({"ok": true, "stdout": "", "exit_code": 0, "stderr": "", "session_id": session_id, "port": port})
@@ -974,6 +988,9 @@ fn session_list(cwd: &Path) -> Value {
                 "alive": true,
                 "idle_ms": s.last_used.elapsed().as_millis() as u64,
                 "target_id": s.target_id,
+                // Which engine actually backs it -- without this a caller
+                // cannot tell a chrome session from a lightpanda one.
+                "engine": format!("{:?}", s.engine),
             }));
         }
     }
@@ -1338,6 +1355,25 @@ pub fn run(body: &str, opts: &str, cwd_raw: &Path, session_id: &str) -> Value {
     let key = session_key(cwd, session_id);
     let lifecycle_lock = session_lifecycle_lock_for_key(&key);
     let _lifecycle_guard_serializes_reuse_check_launch_and_insert = lifecycle_lock.lock().unwrap_or_else(|e| e.into_inner());
+    // A session tracked under this key that was created by a DIFFERENT engine
+    // must never serve this dispatch: `cdp` promises real Chrome (full CSS and
+    // layout fidelity, real screenshots) and `browser` promises lightpanda/steel.
+    // Reusing across that boundary answered ok:true from the wrong engine with
+    // no disclosure at all. Evict and relaunch under the engine actually asked
+    // for -- correctness over keeping a warm process.
+    let engine_mismatch = {
+        let map = sessions_map().lock().unwrap_or_else(|e| e.into_inner());
+        map.get(&key).map(|s| s.engine).filter(|&e| e != engine)
+    };
+    if let Some(prior_engine) = engine_mismatch {
+        let stale = sessions_map().lock().unwrap_or_else(|e| e.into_inner()).remove(&key);
+        if let Some(session) = stale {
+            eprintln!(
+                "[agentplug browser] session {key} was created under {prior_engine:?} but this dispatch asked for {engine:?} -- evicting and relaunching rather than answering from the wrong engine"
+            );
+            kill_session(session);
+        }
+    }
     let candidate_port = {
         let mut map = sessions_map().lock().unwrap_or_else(|e| e.into_inner());
         let reuse_port = map.get_mut(&key).and_then(|s| {
@@ -1426,6 +1462,7 @@ pub fn run(body: &str, opts: &str, cwd_raw: &Path, session_id: &str) -> Value {
                             last_used: Instant::now(),
                             target_id: None,
                             owns_process: acquired.owns_process,
+                            engine,
                         },
                     );
                     new_port
