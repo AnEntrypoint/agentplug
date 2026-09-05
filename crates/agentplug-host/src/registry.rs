@@ -53,16 +53,6 @@ fn is_stateless_shared_plugin(plugin_name: &str) -> bool {
     STATELESS_SHARED_PLUGIN_NAMES.contains(&plugin_name)
 }
 
-/// A sibling wasm plugin's lifecycle state (paper Section 4.3, Definition
-/// 49), the same three-state reduction `discipline_note.rs::FiberLifecycle`
-/// uses for disciplines (gm has no async load step for either -- a plugin
-/// load is one synchronous `Module::from_file` + `load_plugin` call, so
-/// there is no `Reloading` window to model). Generalizes the fiber
-/// lifecycle abstraction beyond disciplines to gm's OTHER real component
-/// family: `Inactive` (never loaded, or evicted), `Active` (a pool slot
-/// currently holds this plugin's content), `Unloading` (a load attempt
-/// failed or the plugin was evicted, one dispatch before the state
-/// collapses back to `Inactive`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PluginFiberLifecycle {
@@ -98,14 +88,6 @@ fn write_plugin_fiber_state(plugin_name: &str, state: PluginFiberLifecycle, cont
     }
 }
 
-/// Advances one plugin's persisted lifecycle by exactly one transition,
-/// given whether `load_plugin` just succeeded. Mirrors the discipline
-/// fiber's `advance_fiber`: `Inactive -> Active` on success,
-/// `Active -> Unloading` on failure (a load attempt that fails leaves the
-/// prior content in place structurally via `load_plugin`'s own LIFO
-/// revert, but the LIFECYCLE marks the attempt as a withdrawal-in-
-/// progress), `Unloading -> Inactive` on the following call regardless of
-/// outcome.
 pub fn advance_plugin_fiber(plugin_name: &str, load_succeeded: bool, content_hash: Option<&str>) {
     let current = read_plugin_fiber_state(plugin_name).state;
     let next = match (current, load_succeeded) {
@@ -205,23 +187,12 @@ impl SharedPluginPool {
         }
     }
 
-    /// Diagnostic-only ceiling: how long a FIFO-fair wait may run before it is reported as
-    /// abnormally long. Crossing it never denies the request -- the wait keeps going. The real
-    /// backstop against a truly wedged pool is each dispatch's own outer call deadline
-    /// (`DISPATCH_CALL_DEADLINE_SECS`), which aborts the holder and frees its slot.
     pub const ACQUIRE_TIMEOUT_MS: u64 = 60_000;
 
     pub fn acquire(&self) -> Option<std::sync::MutexGuard<'_, Option<SiblingHandle>>> {
         Some(self.acquire_within(Self::ACQUIRE_TIMEOUT_MS).0)
     }
 
-    /// FIFO-fair, non-denying slot acquisition. Every caller draws a ticket and is served in
-    /// arrival order -- no unordered `try_lock` race across waiters, so a project's own repeat
-    /// requests drain against each other in the order they were issued instead of restarting
-    /// the race each poll tick. `timeout_ms` is retained as the elapsed-time figure reported to
-    /// the caller for observability; it no longer terminates the wait early. A genuinely stuck
-    /// holder (wasm trap, deadlock) is bounded by its own dispatch-call deadline elsewhere, not
-    /// by this wait giving up.
     pub fn acquire_within(&self, timeout_ms: u64) -> (std::sync::MutexGuard<'_, Option<SiblingHandle>>, u64) {
         let start = std::time::Instant::now();
         let my_ticket = {
@@ -604,20 +575,6 @@ pub fn shared_plugin_slot_content_hashes(plugin_name: &str) -> Vec<Option<String
     existing_shared_plugin_pool(plugin_name).map(|pool| pool.slot_content_hashes()).unwrap_or_default()
 }
 
-/// The content hash currently answering dispatches for `plugin_name`,
-/// mirroring the paper's `provider_k(gamma)` (Definition 46): each shared
-/// plugin is a singleton service (bert/libsql/treesitter each have exactly
-/// one logical identity, unlike the paper's multi-provider services), so
-/// its `SharedPluginPool` -- every dispatch resolving through the pool's
-/// slots regardless of which slot happens to be free -- already IS the
-/// stable entrypoint a Cordis service broker (Section 6.2) provides: a
-/// caller never names a concrete slot, only the plugin name, and the pool
-/// decouples that name from which of its N pooled instances actually
-/// answers. Returns `None` when no slot has been filled yet (the service
-/// has no active provider). A pool with mixed content hashes across slots
-/// (a swap in progress) returns the hash the FIRST filled slot carries --
-/// callers wanting the full in-flight picture use
-/// `shared_plugin_slot_content_hashes` instead.
 pub fn get_active_provider(plugin_name: &str) -> Option<String> {
     shared_plugin_slot_content_hashes(plugin_name)
         .into_iter()
@@ -625,29 +582,6 @@ pub fn get_active_provider(plugin_name: &str) -> Option<String> {
         .next()
 }
 
-/// The real integration point for Cordis paper Section 6.2 service
-/// multiplexing: every dispatch call site (`ProjectPlugins::dispatch`,
-/// `DispatchHandle::dispatch`) routes the caller-named `plugin_name` through
-/// here before doing the `siblings` map lookup. `plugin_name` doubles as the
-/// broker's `service_key` -- a caller wanting broker semantics for a
-/// capability registers >=2 provider instances under that same key via
-/// `broker::register_provider`, each provider's `provider_id` naming a
-/// DISTINCT key already present in `self.siblings` (a separately-loaded
-/// plugin instance). `broker::route` selects one such `provider_id` per its
-/// configured policy and the returned `RouteLease` names the sibling-map key
-/// to dispatch on. Zero or one registered provider (the default, unchanged
-/// from before this function existed) returns `(plugin_name, None)` --
-/// exclusive binding (`SharedPluginPool`/`get_active_provider`, Definition
-/// 45/46) stays the default single-provider path with no behavior change.
-///
-/// The caller MUST hold the returned `RouteLease` alive for the full
-/// duration of the actual dispatch call and drop it only once that call
-/// returns. Dropping it early (e.g. right after reading `provider_id` out
-/// of it) decrements `in_flight` before the real wasm call even starts,
-/// which defeats `LeastLoaded` selection (every provider would read as
-/// idle regardless of genuine concurrent load) and lets
-/// `unregister_provider`'s in-flight safety check race a still-running
-/// dispatch into believing the provider is safe to drop mid-call.
 fn resolve_routed_plugin_name(plugin_name: &str) -> (String, Option<crate::broker::RouteLease>) {
     match crate::broker::route(plugin_name) {
         Some(lease) => {
@@ -781,12 +715,6 @@ impl ProjectPlugins {
         self.siblings.lock().unwrap().get(plugin_name).map(|p| p.all_instantiated()).unwrap_or(false)
     }
 
-    /// Like `is_loaded`, but for non-shared (stateful, per-session) plugins a
-    /// loaded instance whose content hash no longer matches `content_hash` is
-    /// treated as not-loaded, so a rebuilt `.wasm` is picked up on the next
-    /// dispatch instead of being served stale forever. Shared plugins already
-    /// self-refresh their hash inside `load_plugin`'s pool-fill check, so this
-    /// only changes behavior for the non-shared path.
     pub fn is_loaded_current(&self, plugin_name: &str, content_hash: &str) -> bool {
         if is_stateless_shared_plugin(plugin_name) {
             return self.is_loaded(plugin_name);
@@ -802,13 +730,7 @@ impl ProjectPlugins {
     pub fn load_plugin(&mut self, engine: &Engine, plugin_name: &str, module: &Module, content_hash: &str) -> anyhow::Result<()> {
         if is_stateless_shared_plugin(plugin_name) {
             let pool = shared_plugin_pool(plugin_name);
-            // Revertible-effect discipline: each slot fill is an effect whose inverse is
-            // "put the prior occupant back". If a later slot's instantiate fails, every
-            // slot already filled this call is reverted to its pre-fill state (LIFO) so a
-            // partial swap never leaves the pool straddling old and new content hashes --
-            // a mixed pool would silently route some dispatches to the stale plugin
-            // indefinitely, since is_loaded_current only checks that ANY slot matches.
-            let mut inverses: Vec<(Arc<Mutex<Option<SiblingHandle>>>, Option<SiblingHandle>)> = Vec::new();
+            let mut lifo_revert_stack: Vec<(Arc<Mutex<Option<SiblingHandle>>>, Option<SiblingHandle>)> = Vec::new();
             let fill_result = (|| -> anyhow::Result<()> {
                 for slot in pool.slots_for_fill() {
                     if let Ok(mut guard) = slot.try_lock() {
@@ -819,14 +741,14 @@ impl ProjectPlugins {
                         if needs_fill {
                             let fresh = instantiate_plugin(engine, self.root.clone(), plugin_name, module, content_hash)?;
                             let prior = guard.replace(fresh);
-                            inverses.push((slot.clone(), prior));
+                            lifo_revert_stack.push((slot.clone(), prior));
                         }
                     }
                 }
                 Ok(())
             })();
             if let Err(err) = fill_result {
-                for (slot, prior) in inverses.into_iter().rev() {
+                for (slot, prior) in lifo_revert_stack.into_iter().rev() {
                     if let Ok(mut guard) = slot.try_lock() {
                         *guard = prior;
                     }
@@ -851,7 +773,7 @@ impl ProjectPlugins {
 
     pub fn dispatch(&mut self, plugin_name: &str, verb: &str, body: &str) -> anyhow::Result<String> {
         self.last_active = Instant::now();
-        let (routed_name, _route_lease) = resolve_routed_plugin_name(plugin_name);
+        let (routed_name, _route_lease_held_until_dispatch_returns) = resolve_routed_plugin_name(plugin_name);
         let plugin_name = routed_name.as_str();
         const DISPATCH_LOOKUP_RETRY_ATTEMPTS: u32 = 3;
         const DISPATCH_LOOKUP_RETRY_BACKOFF_MS: u64 = 200;
@@ -930,7 +852,7 @@ impl DispatchHandle {
     }
 
     pub fn dispatch(&self, plugin_name: &str, verb: &str, body: &str) -> anyhow::Result<String> {
-        let (routed_name, _route_lease) = resolve_routed_plugin_name(plugin_name);
+        let (routed_name, _route_lease_held_until_dispatch_returns) = resolve_routed_plugin_name(plugin_name);
         let plugin_name = routed_name.as_str();
         const REGISTRATION_LOOKUP_RETRY_ATTEMPTS: u32 = 3;
         const REGISTRATION_LOOKUP_RETRY_BACKOFF_MS: u64 = 200;
