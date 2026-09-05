@@ -12,28 +12,11 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
     hasher.finalize().iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// `download_and_verify`'s tmp file is always a sibling of its `dest`
-/// (`dest.with_extension(format!("tmp.{}", pid))`), so the extension is
-/// always the LAST dot-segment and always parses as `tmp.<digits>` --
-/// anchored, not a bare substring match, so this can't collide with an
-/// unrelated file that merely contains ".tmp." elsewhere in its name (e.g.
-/// a literal "backup.tmp.old").
 fn is_download_tmp_name(name: &str) -> bool {
     let Some(suffix) = name.rsplit_once(".tmp.").map(|(_, s)| s) else { return false };
     !suffix.is_empty() && suffix.bytes().all(|b| b.is_ascii_digit())
 }
 
-/// Sweeps one directory (non-recursive) for `*.tmp.<pid>` files
-/// `download_and_verify` left behind on a rename failure (deliberately not
-/// deleted at the time, since the bytes are sha256-verified and a caller
-/// could in principle retry the rename against the same path -- but no
-/// caller does today, so without this sweep every rename failure leaks one
-/// file forever). Only removes files older than `min_age` so an in-flight
-/// write from a concurrent download_and_verify call (own or another
-/// process) is never touched -- age, not pid liveness, is the safety check,
-/// since a pid can be reused by an unrelated process after the writer
-/// exits. Best-effort: read/stat/remove errors are logged and swept past,
-/// never propagated.
 fn gc_stale_tmp_files_in(dir: &Path, min_age: Duration) {
     let Ok(entries) = fs::read_dir(dir) else { return };
     let now = std::time::SystemTime::now();
@@ -57,23 +40,6 @@ fn gc_stale_tmp_files_in(dir: &Path, min_age: Duration) {
     }
 }
 
-/// Sweeps every real directory `download_and_verify` can leave an orphaned
-/// tmp file in: `install_dir()/plugins` (plugin `.wasm` downloads, via
-/// `plugin_wasm_path`) and the directory holding the currently-running
-/// runner executable (self-update staging, via `stage_runner_self_update`'s
-/// `current_exe`-derived `staged` path) -- two DIFFERENT directories on a
-/// real install (`~/.agentplug/plugins/` vs wherever `agentplug-runner.exe`
-/// itself lives), not the same tree. Call once at daemon startup.
-///
-/// Known residual gap: the exe-dir sweep uses THIS run's `current_exe()` as
-/// a proxy for every directory the runner has ever staged an update from.
-/// If the runner binary is relocated (reinstalled to a new path) between a
-/// leaked rename failure and the next daemon startup, the old location's
-/// leaked tmp file is never found -- there is no durable record of prior
-/// install locations to sweep instead. Accepted: this daemon's install path
-/// is stable in normal operation (fixed per-machine location, not
-/// relocated between runs), so this only matters across an actual
-/// reinstall-to-a-new-path event, not routine self-updates in place.
 pub fn gc_stale_tmp_files(min_age: Duration) {
     gc_stale_tmp_files_in(&install_dir().join("plugins"), min_age);
     if let Ok(exe) = std::env::current_exe() {
@@ -83,18 +49,6 @@ pub fn gc_stale_tmp_files(min_age: Duration) {
     }
 }
 
-
-/// `https://github.com/{repo}/releases/latest/download/{asset}` is a plain
-/// redirect served by GitHub's web frontend, not the REST API -- it resolves
-/// "latest" to the current non-prerelease tag and 302s straight to the
-/// asset's `objects.githubusercontent.com` URL. Environments that proxy or
-/// scope `api.github.com` (this runner's own dev sandbox included: a
-/// session-scoped GitHub proxy 403s `api.github.com/repos/.../releases/latest`
-/// for any repo outside its allowlist, and unauthenticated `api.github.com`
-/// calls exhaust the 60/hr rate limit fast when many agents share one egress
-/// IP) still serve this path, because it never touches `api.github.com` at
-/// all. This is the second-tier fallback below, needing no version
-/// pre-resolution.
 fn extract_version_from_release_url(url: &str) -> Option<String> {
     let idx = url.find("/releases/download/")?;
     let rest = &url[idx + "/releases/download/".len()..];
@@ -216,14 +170,6 @@ pub fn download_and_verify(url: &str, dest: &Path, expected_sha256_hex: &str) ->
         fs::create_dir_all(parent)?;
     }
     let tmp = dest.with_extension(format!("tmp.{}", std::process::id()));
-    // A distinct pid-suffixed tmp path per call means a failed write/rename
-    // never collides with a later successful run's own tmp file. On write
-    // failure tmp is incomplete/corrupt and is removed. On rename failure
-    // (e.g. Windows ERROR_SHARING_VIOLATION when dest is locked/mapped by a
-    // running process -- the normal case for self-update staging and
-    // plugin hot-swap) tmp still holds the sha256-verified bytes and is
-    // deliberately left in place rather than deleted, so a caller retrying
-    // the rename doesn't have to re-download+re-verify from scratch.
     let write_result = (|| -> anyhow::Result<()> {
         let mut f = fs::File::create(&tmp)?;
         f.write_all(&bytes)?;
@@ -264,14 +210,6 @@ fn builtin_plugin_asset_spec(plugin_name: &str) -> Option<PluginAssetSpec> {
     }
 }
 
-/// A project-declared extra plugin, read from `.agentplug/plugins.json` in
-/// the project root (sibling to `read_project_plugin_list`'s own
-/// `.agentplug/plugins.txt`, which already names extra plugins to LOAD but
-/// has no way to say where to DOWNLOAD one from). Format: a JSON array of
-/// `{"name", "repo", "asset_basename"}` objects, one per extra plugin --
-/// `repo` is an `owner/repo` GitHub Releases source, `asset_basename` the
-/// asset name prefix (`{base}.wasm`/`{base}.wasm.sha256` at the release tag),
-/// mirroring the 4 built-ins' own shape exactly.
 #[derive(serde::Deserialize)]
 struct ProjectPluginSpec {
     name: String,
@@ -291,11 +229,6 @@ fn project_declared_plugin_specs(project_root: &Path) -> Vec<ProjectPluginSpec> 
     }
 }
 
-/// Resolve a plugin name to its download spec: a project's own declared spec
-/// (from ANY currently-known project root's `.agentplug/plugins.json`) wins
-/// over the 4 hardcoded built-ins, so a project can even re-point `gm`/`bert`/
-/// `libsql`/`treesitter` at a fork if it explicitly declares one -- otherwise
-/// falls through to the compiled-in built-in spec.
 fn plugin_asset_spec_for_roots(plugin_name: &str, known_roots: &[PathBuf]) -> Option<PluginAssetSpec> {
     for root in known_roots {
         for spec in project_declared_plugin_specs(root) {
@@ -309,11 +242,6 @@ fn plugin_asset_spec_for_roots(plugin_name: &str, known_roots: &[PathBuf]) -> Op
 
 fn plugin_asset_spec(plugin_name: &str) -> Option<PluginAssetSpec> {
     let mut roots = crate::daemon::read_known_project_roots();
-    // A one-shot `plugin`/`dispatch` CLI invocation never populates the
-    // daemon's own known-roots registry (that only fills in via the daemon's
-    // own registry-poll loop) -- always also check the current process's own
-    // cwd so a single-shot command scoped to one project still honors that
-    // project's own .agentplug/plugins.json.
     if let Ok(cwd) = std::env::current_dir() {
         if !roots.contains(&cwd) {
             roots.push(cwd);
@@ -330,15 +258,6 @@ fn plugin_version_path(plugin_name: &str) -> PathBuf {
     install_dir().join("plugins").join(format!("{plugin_name}.version"))
 }
 
-/// Snapshot `dest` (the plugin's `.wasm`) and `version_file` (its `.version`) to `.wasm.prev`/
-/// `.version.prev` before a new download overwrites them, if `dest` already exists from a prior
-/// install. Called from every install path
-/// (`ensure_plugin_installed_via_github`/`try_ensure_plugin_installed_via_direct_release_latest`)
-/// right before it writes the new version, so
-/// [`record_plugin_load_failure_and_rollback`] can always restore a matching (wasm, version) pair
-/// together -- restoring only the `.wasm` bytes while leaving `.version` pointing at the new,
-/// failed release tag would make `refresh_plugin_if_stale` believe the (rolled-back, older) binary
-/// on disk IS already the latest version and stop checking for updates entirely.
 fn snapshot_prev_wasm_and_version(dest: &Path, version_file: &Path) {
     if dest.exists() {
         let _ = fs::copy(dest, dest.with_extension("wasm.prev"));
@@ -377,12 +296,6 @@ pub fn fetch_latest_runner_version() -> anyhow::Result<Option<String>> {
             let body: serde_json::Value = serde_json::from_str(&resp.into_string()?)?;
             Ok(body.get("tag_name").and_then(|v| v.as_str()).map(|s| s.trim_start_matches('v').to_string()))
         }
-        // api.github.com can be scoped/blocked or rate-limited independently
-        // of the plain releases-download redirect (see
-        // try_ensure_plugin_installed_via_direct_release_latest's doc comment
-        // for why) -- fall back to resolving "latest" via that redirect
-        // instead of surfacing the API error and skipping the self-update
-        // check for the rest of this process's lifetime.
         Err(api_err) => {
             let Some(asset) = runner_asset_name() else { return Err(describe_github_api_error(&url, api_err)) };
             let probe_url = format!("https://github.com/{RUNNER_BIN_REPO}/releases/latest/download/{asset}.sha256");
@@ -445,21 +358,9 @@ pub fn stage_runner_self_update() -> anyhow::Result<Option<(PathBuf, String)>> {
     while current_exe.extension().map(|e| e.eq_ignore_ascii_case("new")).unwrap_or(false) {
         current_exe = current_exe.with_extension("");
     }
-    // A process that is ITSELF still executing from a `.new`-suffixed path
-    // (its own promote_staged_exe_to_canonical copied its bytes onto the
-    // canonical path, but a running process's OWN loaded executable image
-    // stays locked to whatever file it was launched from -- Windows refuses
-    // to rename/overwrite the backing file of a live process's mapped image
-    // with "Access is denied", and that lock never clears for this
-    // process's whole lifetime) must stage the NEXT update under a
-    // DIFFERENT filename than `.new`, or every subsequent self-update
-    // attempt would try to rename onto the exact path this process is
-    // itself locked onto and fail identically forever. `.new2` sidesteps
-    // that collision; a process legitimately running from the canonical
-    // path (the common case) is unaffected and keeps using `.new` as before.
-    let staged_suffix = if running_from_staged_path { "new2" } else { "new" };
+    let staged_suffix_not_locked_by_this_process_image = if running_from_staged_path { "new2" } else { "new" };
     let staged = current_exe.with_extension(
-        current_exe.extension().map(|e| format!("{}.{staged_suffix}", e.to_string_lossy())).unwrap_or_else(|| staged_suffix.to_string())
+        current_exe.extension().map(|e| format!("{}.{staged_suffix_not_locked_by_this_process_image}", e.to_string_lossy())).unwrap_or_else(|| staged_suffix_not_locked_by_this_process_image.to_string())
     );
     let base = runner_release_base_url(&latest);
     let sha_line = agentplug_host::shared_agent().get(&format!("{base}/{asset}.sha256")).call()?.into_string()?;
@@ -538,32 +439,10 @@ pub fn record_runner_version(version: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Some `PluginAssetSpec.repo`s (e.g. `AnEntrypoint/plugkit-bin`) are shared
-/// across more than one plugin family that each publish their own releases
-/// into the same repo under their own asset basename (rs-plugkit's `gm` and
-/// rs-codeinsight both publish to `plugkit-bin`). `GET /releases/latest`
-/// returns the single most-recently-created release in the WHOLE repo,
-/// with no regard for which asset it carries -- so the other family's
-/// release can silently shadow this plugin's own latest the moment it
-/// publishes, and every subsequent poll 404s on `{asset_basename}.wasm`
-/// (witnessed live: `gm`'s own v0.1.1243 masked by a same-day rs-codeinsight
-/// v0.3.48 release in the same repo, both of which sort as GitHub's "latest"
-/// but only one contains a `plugkit-slim.wasm` asset). Fetch the recent
-/// releases list instead and pick the newest one whose assets actually
-/// include this plugin's basename -- `plugkit-slim` also accepts the `plugkit`
-/// fallback name, mirroring `ensure_plugin_installed_via_github`'s own
-/// slim/fat fallback.
 pub fn fetch_latest_plugin_version(plugin_name: &str) -> anyhow::Result<Option<String>> {
     let Some(spec) = plugin_asset_spec(plugin_name) else {
         anyhow::bail!("unknown plugin {plugin_name} -- not registered in agentplug-runner's plugin_asset_spec map");
     };
-    // per_page=100 (GitHub's max): a repo shared with a high-cadence sibling
-    // (rs-codeinsight has published 50+ releases in the time rs-plugkit
-    // published 1) can bury this plugin's own latest release deep past a
-    // smaller page -- witnessed live: the top 20 most-recent releases in
-    // plugkit-bin were ALL rs-codeinsight, zero of which carry a
-    // plugkit-slim/plugkit asset; 100 was enough to surface gm's actual
-    // latest at position ~21.
     let url = format!("https://api.github.com/repos/{}/releases?per_page=100", spec.repo);
     let resp = github_api_call(&url).map_err(|e| describe_github_api_error(&url, e))?;
     let body: serde_json::Value = serde_json::from_str(&resp.into_string()?)?;
@@ -572,8 +451,6 @@ pub fn fetch_latest_plugin_version(plugin_name: &str) -> anyhow::Result<Option<S
     };
     let wanted_names: [String; 2] = [
         format!("{}.wasm", spec.asset_basename),
-        // plugkit-slim's own release step also uploads the fat `plugkit.wasm` --
-        // accept either so a release step is not double-special-cased here.
         if spec.asset_basename == "plugkit-slim" { "plugkit.wasm".to_string() } else { format!("{}.wasm", spec.asset_basename) },
     ];
     for release in releases {
@@ -640,15 +517,6 @@ fn known_bad_version_marker_path(plugin_name: &str) -> PathBuf {
     install_dir().join("plugins").join(format!("{plugin_name}.known-bad-versions.json"))
 }
 
-/// A plugin version's `known-bad` mark records a host-ABI incompatibility, not
-/// a defect in the plugin content itself -- record_known_bad_version's own doc
-/// comment names the resolution path as "this runner itself is updated to a
-/// compatible host ABI." A runner self-update handoff is exactly that event,
-/// so every plugin's blacklist is cleared here to let refresh_plugin_if_stale
-/// genuinely re-test each previously-blacklisted version against the new host
-/// on its next poll tick, rather than staying permanently stuck on whichever
-/// plugin version happened to be installed before the incompatibility was
-/// fixed.
 pub fn clear_all_known_bad_version_markers() {
     for plugin_name in ["gm", "bert", "libsql", "treesitter"] {
         let path = known_bad_version_marker_path(plugin_name);
@@ -669,15 +537,6 @@ fn read_known_bad_versions(plugin_name: &str) -> std::collections::HashSet<Strin
         .unwrap_or_default()
 }
 
-/// Records `version` as known-bad for `plugin_name` so [`ensure_plugin_installed_via_github`]'s
-/// stale check (called from [`refresh_plugin_if_stale`] on every poll tick) never re-fetches the
-/// exact same broken release tag again -- without this, a plugin release that fails to
-/// instantiate against this runner's own compiled-in host ABI (see
-/// [`record_plugin_load_failure_and_rollback`]'s doc comment) gets silently re-downloaded on the
-/// very next poll cycle, because "the release tag changed" and "the release tag is loadable" are
-/// two different questions this runner previously only asked the first of. Appends rather than
-/// overwrites -- a plugin can accumulate more than one known-bad tag across separate publish
-/// mistakes upstream, and every one of them must stay excluded, not just the most recent.
 fn record_known_bad_version(plugin_name: &str, version: &str) {
     let mut versions = read_known_bad_versions(plugin_name);
     if versions.insert(version.to_string()) {
@@ -732,14 +591,6 @@ pub fn refresh_plugin_if_stale(plugin_name: &str) -> anyhow::Result<Option<Strin
         }
     }
     if read_known_bad_versions(plugin_name).contains(&latest) {
-        // The "latest" release tag this poll resolved to is one this runner already tried and
-        // failed to instantiate (see record_plugin_load_failure_and_rollback) -- almost always a
-        // real upstream ABI mismatch (the plugin repo published a release built against a newer
-        // host-import contract than this runner's own compiled-in rs-plugkit version implements)
-        // rather than something a retry fixes. Re-fetching it every poll tick would just repeat
-        // the same failed load forever; skip until either a NEWER tag appears (the normal
-        // resolution: upstream publishes a fix) or this runner itself is updated to a compatible
-        // host ABI (self-update already runs on its own schedule, independent of this check).
         eprintln!(
             "[agentplug daemon] plugin {plugin_name} latest release {latest} is a previously-recorded known-bad version for this runner (host ABI mismatch) -- staying on {installed} until either a newer release appears or this runner updates"
         );
@@ -754,22 +605,6 @@ pub fn refresh_plugin_if_stale(plugin_name: &str) -> anyhow::Result<Option<Strin
     Ok(Some(latest))
 }
 
-/// Called from the daemon's plugin-instantiation failure path (see
-/// `daemon.rs`'s `load_plugin` error handling) when a freshly-downloaded plugin version fails to
-/// load against this runner's own compiled-in host ABI -- observed live as `agentplug`'s
-/// per-plugin release channel (e.g. `AnEntrypoint/plugkit-bin` for `gm`) outpacing
-/// `agentplug-bin`'s own release cadence, so a plugin built against a newer host-import contract
-/// (a changed function signature such as `host_browser_exec`/`host_fs_cas_write`) gets published
-/// and auto-fetched before this runner itself has a matching update -- rather than leaving the
-/// project permanently unable to dispatch anything until a human notices and manually restores
-/// `plugin.wasm.prev`, roll back automatically to the last version that DID load (the `.prev`
-/// backup `ensure_plugin_installed_via_github` always writes before overwriting `dest`, see that
-/// function's own `prev_dest` handling) and record the failed version so
-/// [`refresh_plugin_if_stale`]'s poll loop does not immediately re-fetch and re-fail the exact
-/// same tag on its next tick. Returns `Ok(true)` if a rollback file existed and was restored,
-/// `Ok(false)` if there was nothing to roll back to (e.g. this was the plugin's first-ever
-/// install and it failed) -- the caller should treat `Ok(false)` as "still broken, no prior
-/// version to fall back to" and surface the original error rather than retry.
 pub fn record_plugin_load_failure_and_rollback(plugin_name: &str) -> anyhow::Result<bool> {
     if let Some(failed_version) = installed_plugin_version(plugin_name) {
         record_known_bad_version(plugin_name, &failed_version);
@@ -780,11 +615,6 @@ pub fn record_plugin_load_failure_and_rollback(plugin_name: &str) -> anyhow::Res
         return Ok(false);
     }
     fs::copy(&prev_dest, &dest)?;
-    // Restore the matching `.version` alongside the rolled-back `.wasm` bytes (see
-    // `snapshot_prev_wasm_and_version`'s doc comment for why the two must move together) --
-    // best-effort: an older install predating this rollback support may have a `.wasm.prev` with
-    // no matching `.version.prev` sibling, in which case the `.version` file is left as-is rather
-    // than failing the whole rollback over a file that was never written in the first place.
     let version_file = plugin_version_path(plugin_name);
     let prev_version_file = version_file.with_extension("version.prev");
     if prev_version_file.exists() {
@@ -886,23 +716,8 @@ pub fn refresh_installed_skill_md() -> anyhow::Result<Vec<PathBuf>> {
     Ok(refreshed)
 }
 
-// get_or_compile calls ensure_plugin_installed on every daemon main-loop tick
-// (100ms) for every configured plugin, unconditionally -- with no gate here, a
-// plugin that fails to install (bad token, exhausted rate limit, network down)
-// gets re-attempted at ~10Hz forever, which itself exhausts GitHub's
-// unauthenticated 60/hr rate limit in under two seconds and keeps it exhausted.
-// This is the bounded-retry/circuit-breaker the install path was missing.
 const PLUGIN_INSTALL_RETRY_COOLDOWN: Duration = Duration::from_secs(30);
 
-// Persisted to disk, not an in-process Mutex<HashMap>: the daemon's own
-// self-update handoff (stage_runner_self_update/run_takeover) launches the
-// staged runner as a genuinely separate OS process to pre-warm every plugin
-// before the old process hands off, and any one-shot CLI `plugin`/`dispatch`
-// invocation is its own process too -- an in-memory clock is invisible across
-// that process boundary, so a takeover landing mid-cooldown would immediately
-// re-attempt the network install with no memory of the still-live backoff,
-// reintroducing the exact burst this cooldown exists to prevent. A shared
-// timestamp file next to the plugin's own wasm/version files fixes that.
 fn plugin_install_failure_marker_path(plugin_name: &str) -> PathBuf {
     install_dir().join("plugins").join(format!("{plugin_name}.install-backoff-ts"))
 }
