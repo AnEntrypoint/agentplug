@@ -728,16 +728,15 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
                 }
             };
 
-            let acquire_start = std::time::Instant::now();
-            let acquire_timeout_ms = crate::registry::SharedPluginPool::ACQUIRE_TIMEOUT_MS;
-            let mut guard = sibling_pool.acquire().expect("acquire() always returns Some -- FIFO wait never denies");
-            if guard.is_none() {
-                drop(guard);
-                let remaining_ms = acquire_timeout_ms.saturating_sub(acquire_start.elapsed().as_millis() as u64);
-                sibling_pool.any_instantiated_within(remaining_ms);
-                let remaining_ms = acquire_timeout_ms.saturating_sub(acquire_start.elapsed().as_millis() as u64);
-                guard = sibling_pool.acquire_within(remaining_ms).0;
-            }
+            let mut guard = match crate::registry::acquire_filled_slot(&sibling_pool, &caller_root, &caller_siblings, &plugin) {
+                Ok(guard) => guard,
+                Err(_) => {
+                    return write_guest_json(
+                        &mut caller,
+                        serde_json::json!({"ok": false, "error": "plugin_not_loaded_yet", "plugin": plugin}),
+                    );
+                }
+            };
             let result = match guard.as_mut() {
                 None => Err(anyhow::anyhow!("plugin_not_loaded_yet")),
                 Some(handle) => crate::registry::dispatch_on(&mut handle.store, handle.instance, &verb, &body, &caller_root, caller_siblings.clone()),
@@ -790,7 +789,16 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
             const EMBED_RETRY_BACKOFF_MS: u64 = 500;
             let mut result: anyhow::Result<Vec<f32>> = Err(anyhow::anyhow!("embed not attempted"));
             for attempt in 0..EMBED_RETRY_ATTEMPTS {
-                let mut guard = sibling_pool.acquire().expect("acquire() always returns Some -- FIFO wait never denies");
+                let mut guard = match crate::registry::acquire_filled_slot(&sibling_pool, &caller_root, &caller_siblings, "bert") {
+                    Ok(guard) => guard,
+                    Err(e) => {
+                        result = Err(e);
+                        if attempt + 1 < EMBED_RETRY_ATTEMPTS {
+                            std::thread::sleep(std::time::Duration::from_millis(EMBED_RETRY_BACKOFF_MS));
+                        }
+                        continue;
+                    }
+                };
                 result = match guard.as_mut() {
                     None => Err(anyhow::anyhow!("bert not loaded yet")),
                     Some(handle) => crate::registry::dispatch_on(&mut handle.store, handle.instance, "embed", &body, &caller_root, caller_siblings.clone()).and_then(|resp| {

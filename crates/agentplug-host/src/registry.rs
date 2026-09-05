@@ -256,24 +256,6 @@ impl SharedPluginPool {
         observed.clone()
     }
 
-    pub(crate) fn any_instantiated_within(&self, timeout_ms: u64) -> bool {
-        const POLL_INTERVAL_MS: u64 = 25;
-        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
-        loop {
-            for slot in &self.slots {
-                if let Ok(guard) = slot.try_lock() {
-                    if guard.is_some() {
-                        return true;
-                    }
-                }
-            }
-            if std::time::Instant::now() >= deadline {
-                return self.slots.iter().any(|s| s.lock().unwrap().is_some());
-            }
-            std::thread::sleep(std::time::Duration::from_millis(POLL_INTERVAL_MS));
-        }
-    }
-
     fn evict_every_currently_free_slot_without_blocking_on_busy_ones(&self) -> bool {
         let mut released = false;
         for slot in &self.slots {
@@ -301,9 +283,7 @@ impl SharedPluginPool {
                 Err(_) => deferred += 1,
             }
         }
-        if deferred > 0 {
-            self.hashes_to_evict_when_their_in_flight_dispatch_completes.lock().unwrap_or_else(|e| e.into_inner()).insert(old_hash.to_string());
-        }
+        self.hashes_to_evict_when_their_in_flight_dispatch_completes.lock().unwrap_or_else(|e| e.into_inner()).insert(old_hash.to_string());
         (evicted, deferred)
     }
 
@@ -414,6 +394,29 @@ pub fn ensure_sibling_loaded(
     Ok(Some(pool))
 }
 
+const SLOT_REFILL_ATTEMPTS: usize = 4;
+const SLOT_REFILL_BACKOFF_MS: u64 = 50;
+
+pub fn acquire_filled_slot<'a>(
+    pool: &'a Arc<SharedPluginPool>,
+    root: &Path,
+    siblings: &Arc<Mutex<HashMap<String, Arc<SharedPluginPool>>>>,
+    plugin_name: &str,
+) -> anyhow::Result<std::sync::MutexGuard<'a, Option<SiblingHandle>>> {
+    for attempt in 0..SLOT_REFILL_ATTEMPTS {
+        let (guard, _waited_ms) = pool.acquire_within(SharedPluginPool::ACQUIRE_TIMEOUT_MS);
+        if guard.is_some() {
+            return Ok(guard);
+        }
+        drop(guard);
+        ensure_sibling_loaded(root, siblings, plugin_name)?;
+        if attempt + 1 < SLOT_REFILL_ATTEMPTS {
+            std::thread::sleep(std::time::Duration::from_millis(SLOT_REFILL_BACKOFF_MS));
+        }
+    }
+    Err(anyhow::anyhow!("plugin_not_loaded_yet: {plugin_name} slot stayed empty after {SLOT_REFILL_ATTEMPTS} refill attempts"))
+}
+
 fn log_lazy_plugin_load(root: &Path, plugin_name: &str, scope: &str, filled: usize, started: Instant) {
     let ms = started.elapsed().as_millis() as u64;
     eprintln!("[agentplug registry] lazily instantiated {plugin_name} ({scope}, {filled} slot(s), {ms}ms) for {} on first use", root.display());
@@ -477,6 +480,22 @@ pub struct StoreBytesSummary {
     pub total_bytes: u64,
     pub max_bytes: u64,
     pub ceiling_bytes: u64,
+    pub ceiling_evictions: u64,
+    pub last_evicted_bytes: u64,
+}
+
+type EvictionTally = (u64, u64);
+static CEILING_EVICTIONS: OnceLock<Mutex<HashMap<String, EvictionTally>>> = OnceLock::new();
+
+fn ceiling_evictions_table() -> &'static Mutex<HashMap<String, EvictionTally>> {
+    CEILING_EVICTIONS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn record_ceiling_eviction(plugin_name: &str, bytes: u64) {
+    let mut table = ceiling_evictions_table().lock().unwrap_or_else(|e| e.into_inner());
+    let tally = table.entry(plugin_name.to_string()).or_insert((0, 0));
+    tally.0 += 1;
+    tally.1 = bytes;
 }
 
 pub fn store_bytes_by_plugin() -> HashMap<String, StoreBytesSummary> {
@@ -486,6 +505,11 @@ pub fn store_bytes_by_plugin() -> HashMap<String, StoreBytesSummary> {
         entry.instances += 1;
         entry.total_bytes += *bytes;
         entry.max_bytes = entry.max_bytes.max(*bytes);
+    }
+    for (name, tally) in ceiling_evictions_table().lock().unwrap_or_else(|e| e.into_inner()).iter() {
+        let entry = out.entry(name.clone()).or_default();
+        entry.ceiling_evictions = tally.0;
+        entry.last_evicted_bytes = tally.1;
     }
     for (name, summary) in out.iter_mut() {
         summary.ceiling_bytes = store_linear_memory_ceiling_bytes(name);
@@ -531,6 +555,7 @@ fn evict_if_over_linear_memory_ceiling(guard: &mut std::sync::MutexGuard<'_, Opt
     }));
     **guard = None;
     forget_store_bytes(plugin_name, root);
+    record_ceiling_eviction(plugin_name, bytes);
 }
 
 pub fn release_shared_plugin(plugin_name: &str) -> bool {
@@ -788,13 +813,7 @@ impl ProjectPlugins {
             None => ensure_sibling_loaded(&self.root, &self.siblings, plugin_name)?
                 .ok_or_else(|| PluginDispatchError::NotRegistered { plugin_name: plugin_name.to_string() })?,
         };
-        let (mut guard, _waited_ms) = pool.acquire_within(SharedPluginPool::ACQUIRE_TIMEOUT_MS);
-        if guard.is_none() {
-            drop(guard);
-            let _ = ensure_sibling_loaded(&self.root, &self.siblings, plugin_name)?;
-            let (refilled_guard, _) = pool.acquire_within(SharedPluginPool::ACQUIRE_TIMEOUT_MS);
-            guard = refilled_guard;
-        }
+        let mut guard = acquire_filled_slot(&pool, &self.root, &self.siblings, plugin_name)?;
         dispatch_and_evict_on_error(&mut guard, &pool, verb, body, &self.root, &self.siblings, plugin_name)
     }
 

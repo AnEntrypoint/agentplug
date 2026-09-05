@@ -25,6 +25,13 @@ fn absorb_drained_output(entry: &mut TaskEntry) {
     entry.stderr.extend(entry.stderr_drain.take_so_far());
 }
 
+const EXITED_TASK_DRAIN_SETTLE: std::time::Duration = std::time::Duration::from_millis(2_000);
+
+fn absorb_output_of_exited_task(entry: &mut TaskEntry) {
+    entry.stdout.extend(entry.stdout_drain.settle_within(EXITED_TASK_DRAIN_SETTLE));
+    entry.stderr.extend(entry.stderr_drain.settle_within(EXITED_TASK_DRAIN_SETTLE));
+}
+
 type Registry = Mutex<HashMap<String, TaskEntry>>;
 
 fn registry() -> &'static Registry {
@@ -49,7 +56,7 @@ fn poll_entry(entry: &mut TaskEntry) {
     }
     match entry.child.try_wait() {
         Ok(Some(status)) => {
-            absorb_drained_output(entry);
+            absorb_output_of_exited_task(entry);
             entry.exit_code = status.code();
             entry.finished_ms = Some(now_ms());
         }
@@ -58,7 +65,7 @@ fn poll_entry(entry: &mut TaskEntry) {
             if now_ms().saturating_sub(entry.started_ms) > entry.timeout_ms {
                 let _ = entry.child.kill();
                 let _ = entry.child.wait();
-                absorb_drained_output(entry);
+                absorb_output_of_exited_task(entry);
                 entry.exit_code = Some(-1);
                 entry.finished_ms = Some(now_ms());
             }
@@ -198,6 +205,7 @@ fn stop(params: &Value) -> Value {
     };
     let _ = entry.child.kill();
     let _ = entry.child.wait();
+    absorb_output_of_exited_task(&mut entry);
     json!({"ok": true, "id": id, "stopped": true})
 }
 
