@@ -95,13 +95,6 @@ struct DaemonConfig {
     heartbeat_interval_secs: Option<u64>,
     #[serde(default)]
     plugin_update_poll_interval_secs: Option<u64>,
-    /// Per-plugin poll-CHECK cadence overrides (e.g. `{"bert": 3600}`),
-    /// keyed by plugin name -- unlisted plugins use
-    /// `plugin_update_poll_interval_secs`. Independent of per-plugin RELOAD
-    /// independence (already unconditional: `refresh_plugin_if_stale` only
-    /// reloads a plugin whose own content hash actually changed) -- this
-    /// field controls how often the poll-check itself fires per plugin, not
-    /// whether a check that finds nothing new still reloads something.
     #[serde(default)]
     plugin_update_poll_interval_secs_by_name: std::collections::HashMap<String, u64>,
     #[serde(default)]
@@ -136,16 +129,6 @@ fn compiled_default_store_ceilings_mb() -> [(&'static str, u64); 6] {
     [("gm", 384), ("treesitter", 256), ("libsql", 256), ("oxibrowser", 256), ("crux", 128), ("bert", 768)]
 }
 
-// max_concurrent_projects/gm_concurrency/side_plugin_concurrency/
-// shared_store_recycle_private_mb/shared_store_recycle_dispatches are
-// deliberately absent here: leaving them unset lets DaemonConfig's accessors
-// derive a default from this machine's actual available_parallelism() (the
-// first three directly, the last two via gm_concurrency()'s pool size) at
-// every boot. Baking a literal number into this scaffold (as used to happen)
-// would freeze that number into daemon-config.json on the very first run and
-// make every future boot re-read the same static value forever, regardless
-// of how many cores the host actually has -- an operator who wants a fixed
-// value can still add these keys back by hand.
 const DAEMON_CONFIG_EXAMPLE: &str = r#"{
   "registry_poll_interval_secs": 5,
   "heartbeat_interval_secs": 10,
@@ -227,83 +210,14 @@ impl DaemonConfig {
             None => self.plugin_update_poll_interval(),
         }
     }
-    // Runner binaries update least often by design: they are the sole spool
-    // loader and every project's daemon depends on one staying stable, so a
-    // longer default poll cadence than plugin updates (600s) is deliberate,
-    // not an oversight -- 1hr default, still fully overridable.
     fn runner_update_poll_interval(&self) -> Duration { Duration::from_secs(self.runner_update_poll_interval_secs.unwrap_or(3600)) }
-    // Explicit interval for the per-project .gm/instructions/source.json sync,
-    // previously coupled only incidentally to plugin_update_poll_interval's
-    // Duration value (same number, not the same timer) -- an independent key
-    // so tuning one cadence never silently retunes the other.
     fn instruction_source_poll_interval(&self) -> Duration { Duration::from_secs(self.instruction_source_poll_interval_secs.unwrap_or(600)) }
     fn max_concurrent_projects(&self) -> usize { self.max_concurrent_projects.unwrap_or_else(host_available_parallelism).max(1) }
-    // gm_concurrency still legitimately scales with core count -- it feeds
-    // shared_store_recycle_dispatches' scaling and (via max_concurrent_
-    // projects) the worker-THREAD pool that dispatches across different
-    // PROJECTS in parallel, which is genuine, independent CPU-bound work
-    // that benefits from oversubscription. It no longer sizes the gm
-    // plugin's own Store pool -- see gm_pool_size below, same reasoning as
-    // side_plugin_concurrency: one project's gm dispatch and another
-    // project's gm dispatch are serialized work against the SAME plugin
-    // binary's semantics, not independent CPU-bound work multiplied by
-    // core count, and each pool slot is its own memory-costly Store copy.
     fn gm_concurrency(&self) -> usize { self.gm_concurrency.unwrap_or_else(|| self.max_concurrent_projects()).max(1) }
-    // Every plugin type gets exactly ONE hot, warm-resident Store instance,
-    // serializing calls through it -- not one-per-worker-slot. A single
-    // instance stays loaded between calls (no repeated cold-reload cost, so
-    // per-call latency stays fast) while never duplicating a plugin's
-    // resident memory across multiple concurrent copies; throughput under
-    // genuinely heavy concurrent load is serial rather than parallel, which
-    // is the intended tradeoff -- these plugins are memory-costly-but-fast
-    // (per-call latency live-measured at 600ms-1.4s), not CPU-bound work
-    // that benefits from N-way oversubscription.
     fn gm_pool_size(&self) -> usize { 1 }
-    // Side plugins (bert/libsql/treesitter) used to default to half the
-    // host's cores (a throughput optimization: avoid serializing every call
-    // behind one slot on a many-core host) -- but each filled slot holds its
-    // OWN independent copy of that plugin's instantiated Store, and for
-    // bert specifically that means its own copy of the loaded
-    // BAAI/bge-small-en-v1.5 embedding model's real weights in linear
-    // memory, not just cheap dispatch state. On a 16-core host this derived
-    // 8 slots per side plugin -- live-witnessed: bert alone filling even 2-3
-    // of its 8 slots under real (not even unusually heavy) concurrent use
-    // pushed process memory from a ~300MB single-slot baseline past 1.7GB.
-    // Same fix as gm_pool_size above and for the same reason: one hot,
-    // warm-resident instance per plugin, serialized -- stays loaded between
-    // calls (fast per-call latency, live-measured 600ms-1.4s, no repeated
-    // cold-reload), never duplicated across concurrent slots. Throughput
-    // under heavy concurrent load is serial, which is the accepted tradeoff
-    // for a memory-costly-but-fast plugin instead of a CPU-bound one.
     fn side_plugin_concurrency(&self) -> usize {
         self.side_plugin_concurrency.unwrap_or(1).max(1)
     }
-    // The recycle threshold used to scale with gm_concurrency() (400MB per
-    // worker slot, uncapped) on the theory that "how much is normal before
-    // recycling" should track how many concurrent Store slots exist -- on a
-    // 16-core host that derived a 6400MB ceiling, well past what real
-    // system-wide memory pressure can tolerate alongside everything else
-    // running on the same machine (live-witnessed 2026-08-24: this daemon's
-    // own restart churn correlating with the host down to ~3GB free of
-    // 15.6GB total).
-    //
-    // The 1.7GB "steady state" this default was originally calibrated
-    // against (an earlier commit on the same day set this to 2048MB with
-    // headroom above that number) turned out to be itself a symptom, not a
-    // legitimate baseline: side_plugin_concurrency/gm_pool_size (see above)
-    // defaulted to core-count-scaled pool sizes (8 slots for bert/
-    // treesitter on this 16-core host, each an independent full copy of
-    // that plugin's Store -- for bert specifically, its own copy of the
-    // loaded BAAI/bge-small-en-v1.5 model's real weights), so what looked
-    // like "real multi-project load" was substantially N redundant copies
-    // of the same plugin state. With pool sizes fixed to one hot instance
-    // per plugin, live-witnessed real single-slot baseline is ~300MB
-    // (matches this daemon's own documented normal-operation memory). Set
-    // with real headroom above that corrected baseline, still a small
-    // fraction of what either the old core-scaled formula (6400MB) or the
-    // now-corrected-away 1.7GB "steady state" would have implied -- still
-    // overridable via shared_store_recycle_private_mb for an operator whose
-    // own host's real working set differs.
     fn shared_store_recycle_private_bytes(&self) -> u64 {
         const DEFAULT_MB: u64 = 768;
         self.shared_store_recycle_private_mb.unwrap_or(DEFAULT_MB).max(256) * 1024 * 1024
@@ -312,98 +226,12 @@ impl DaemonConfig {
         let default = 500u64.saturating_mul(self.gm_concurrency() as u64).max(100);
         self.shared_store_recycle_dispatches.unwrap_or(default).max(1)
     }
-    // The real blowup mechanism, not the recycle-threshold gate above: the
-    // shared plugins (bert/treesitter/gm) are the ones that gate polices, but
-    // each project's OWN non-shared plugins (libsql/oxibrowser/crux -- see
-    // agentplug-host's is_stateless_shared_plugin, which does NOT include
-    // these three) get a dedicated Store per project, held alive by
-    // agentplug_host::PLUGIN_IDLE_EVICT_MS (30 minutes, a hard-coded constant
-    // in a different crate this daemon calls into, not previously
-    // configurable). register_project() only ever drops a project once its
-    // path stops existing on disk -- never on inactivity -- so a machine that
-    // has served 100+ projects across many sessions keeps ALL of them
-    // registered forever, and any project touched even once in the last 30
-    // minutes stays fully warm with its own per-project Store set live. On a
-    // shared multi-session machine (live-witnessed: 103 registered projects,
-    // nearly all warm simultaneously, 1.7GB real process memory) that 30-
-    // minute window is generous enough that the warm set rarely shrinks at
-    // all under continuous multi-session use -- this is the actual growth
-    // mechanism the byte-recycle gate above can only clean up AFTER the fact,
-    // never prevent. Making the window configurable (in agentplug-runner, the
-    // only caller of the eviction check, since agentplug-host's own constant
-    // has no config plumbing to reach) is the real fix -- an operator who has
-    // actually measured their own fleet's idle-time distribution can tune it
-    // down. The DEFAULT stays at the original, long-proven-safe 30 minutes:
-    // adversarial review of an earlier draft (300s default) correctly found
-    // that number was an unvalidated guess with no idle-time-distribution
-    // evidence behind it (unlike shared_store_recycle_private_bytes's 2048MB,
-    // which cites a real observed steady-state), and that a session doing
-    // normal human-in-the-loop interactive dispatches every 60-90s would
-    // never register the win a short window is meant to provide anyway
-    // (active-use polling keeps last_active fresh far more often than any
-    // reasonable window) -- so a lower default trades a real, proven-safe
-    // baseline for an unproven one with no offsetting benefit demonstrated
-    // for the actual workload. The floor is likewise raised from 30 SECONDS
-    // (a genuine footgun: any interactive cadence slower than the floor
-    // evicts and cold-reloads on literally every dispatch, strictly worse
-    // than no fix at all) to 60 seconds, still enforced, but no longer able
-    // to silently produce worse-than-baseline behavior from a single-digit
-    // misconfiguration.
     fn project_idle_evict_ms(&self) -> u64 {
-        const DEFAULT_SECS: u64 = 30 * 60; // unchanged from the prior hard-coded constant
+        const DEFAULT_SECS: u64 = 30 * 60;
         self.project_idle_evict_secs.unwrap_or(DEFAULT_SECS).max(60) * 1000
     }
-    // The prior 120s (2min) hardcoded default cold-dropped the hot bert/
-    // treesitter/gm pool slots on every ordinary lull between bursts of
-    // dispatch activity -- live-witnessed firing 10+ times across one
-    // session with 103 registered projects, each drop costing a real
-    // wasm-instantiate + first-forward-pass warmup (bert alone measured at
-    // 5.5s for one embed call right after a reload) stacked on top of
-    // whatever queue wait already existed, intermittently exceeding even a
-    // widened client-side timeout. That 120s figure predates the pool_size=1
-    // "always keep exactly one hot instance" design (an earlier fix, when
-    // pools scaled with core count) and was never revisited when the design
-    // changed to deliberately favor latency over idle memory reclaim -- this
-    // is the SAME architectural conflict project_idle_evict_ms's own history
-    // above already fixed once for per-project non-shared plugins, now fixed
-    // for the shared bert/treesitter/gm pool too. The memory-pressure
-    // recycle gate (shared_store_recycle_private_bytes/_dispatches) remains
-    // the real safety valve against unbounded wasm linear-memory growth;
-    // this time-based release only needs to matter for a GENUINELY long
-    // idle stretch, not an ordinary multi-minute gap between turns.
     fn shared_plugin_release_idle_ms(&self) -> u64 {
-        // 30 minutes, matching project_idle_evict_ms's default -- not a
-        // borrowed number left unexamined, but independently right for the
-        // same reason that mechanism's default is right: this daemon has NO
-        // idle-time-distribution evidence for the shared-plugin-specific
-        // case beyond the single 120s-was-too-short data point (10+ evictions
-        // in one session), which only bounds the problem from below, not
-        // above. Absent a second real number to anchor a different default,
-        // matching the one mechanism in this file that DOES have a validated
-        // default (project_idle_evict_ms: adversarial review already rejected
-        // a lower unproven guess there for the identical reason -- no
-        // offsetting benefit demonstrated for the actual workload) is the
-        // defensible choice, not an unexamined copy.
         const DEFAULT_SECS: u64 = 30 * 60;
-        // A 60s floor (project_idle_evict_ms's own floor, a DIFFERENT
-        // mechanism -- that one evicts a whole idle PROJECT, gated on
-        // per-project last-active time; this one releases a plugin SHARED
-        // across every active project, so "quiet" here means the entire
-        // daemon saw zero dispatch work across ALL 100+ registered projects,
-        // a materially rarer condition than any single project going quiet.
-        // A 60s floor would let this specific mechanism react to an ordinary
-        // cross-project lull the sibling mechanism's own 60s floor was never
-        // exposed to) -- re-derived here instead: 5 minutes is comfortably
-        // longer than a normal pause between bursts of dispatch activity
-        // across the WHOLE daemon, so a value below it can only be a
-        // deliberate choice to prioritize idle memory reclaim over latency,
-        // not an accidental near-zero misconfiguration. Not starvable by
-        // bursty traffic alone: shared_store_recycle_dispatches (checked
-        // independent of idle state, every loop tick) still reclaims on
-        // cumulative dispatch count even if the daemon is never quiet long
-        // enough for THIS idle-based path to fire -- the two mechanisms
-        // cover disjoint conditions (quiet-but-not-yet-pressured vs
-        // busy-and-pressured), not the same one twice.
         const MIN_SECS: u64 = 5 * 60;
         self.shared_plugin_release_idle_secs.unwrap_or(DEFAULT_SECS).max(MIN_SECS) * 1000
     }
@@ -537,20 +365,6 @@ pub fn claim_ownership() -> bool {
         return existing_pid == Some(my_pid);
     }
 
-    // The owner looks stale/dead -- but so can any number of concurrent
-    // challengers see the exact same thing at once (observed live 2026-08-24:
-    // 3 daemons launched within ~80ms of a fresh Windows boot, each reading a
-    // pre-reboot owner pid as dead, each unconditionally overwriting
-    // daemon-owner.lock in turn with no re-check against what the OTHER
-    // challengers just wrote -- authority volleys between them and the
-    // heartbeat ticker's own periodic recheck never finds a stable winner to
-    // converge on, so none of them ever self-exits). Two things close this:
-    // (1) a deterministic tie-break -- lowest pid wins a multi-challenger
-    // race -- so every challenger computes the SAME winner from the same
-    // observed candidate set instead of whoever's rename lands last, and
-    // (2) only overwrite the file if it still names a stale/dead pid AT THE
-    // MOMENT of the write, immediately before the rename, shrinking the
-    // read-then-write window to as close to zero as fs operations allow.
     let recheck_pid = read_owner_pid();
     let recheck_still_stale = recheck_pid.map(|p| !pid_is_alive(p)).unwrap_or(true)
         || fs::read_to_string(daemon_status_path())
@@ -566,11 +380,6 @@ pub fn claim_ownership() -> bool {
     }
     if let Some(other_pid) = recheck_pid {
         if other_pid != my_pid && other_pid < my_pid && pid_is_alive(other_pid) {
-            // A lower-pid'd live challenger is also contending this same
-            // stale-owner window -- defer to it rather than racing a rename;
-            // it will either win outright or itself defer further up the
-            // chain, so exactly one process in any concurrent group ends up
-            // writing, instead of every process taking a turn.
             return false;
         }
     }
@@ -613,20 +422,6 @@ pub fn ensure_daemon_running() -> anyhow::Result<bool> {
         let _ = fs::remove_file(&lock_path);
         return Ok(false);
     }
-    // Hold the spawn lock across spawn_detached_daemon() AND the freshness wait,
-    // not just the spawn call itself. Releasing it right after spawn_detached_daemon()
-    // returns (its previous position) opened a real TOCTOU window: a concurrent
-    // ensure_daemon_running() caller could see the lock file gone, is_daemon_fresh()
-    // still false (the just-spawned process hasn't written its first heartbeat to
-    // daemon-status.json yet -- process startup + wasm load is real wall-clock time),
-    // re-acquire the now-free lock, and spawn a SECOND daemon. Observed live: 4
-    // separate agentplug-runner.exe processes running simultaneously from a handful
-    // of `bun x gm-plugkit@latest spool` calls a few minutes apart, each missing the
-    // freshness window the previous spawn's daemon hadn't cleared yet. Keeping the
-    // lock held through the same wait-for-fresh loop this function already runs
-    // (previously only for the "someone else is spawning" branch above) closes the
-    // window: any concurrent caller now blocks on the lock file instead of racing
-    // past a released-but-not-yet-fresh gap.
     let spawn_result = spawn_detached_daemon();
     let result = match spawn_result {
         Ok(()) => {
@@ -984,11 +779,6 @@ pub fn run_takeover(version: &str) -> anyhow::Result<()> {
             let promoted = promote_staged_exe_to_canonical(version);
             if promoted {
                 if let Some(canonical) = canonical_runner_exe_path() {
-                    // This process is still bound to the staged `.new` executable image for its
-                    // whole lifetime (Windows keeps a live process's own backing file locked), so
-                    // continuing in-process would leave that file permanently un-removable and
-                    // collide with every future self-update's staging path. Re-exec from the
-                    // freshly-promoted canonical path and let this process exit instead.
                     release_ownership_for_handoff();
                     reexec_from_canonical_and_exit(&canonical);
                 }
@@ -1065,11 +855,6 @@ fn last_completed_runner_swap_path() -> PathBuf {
     install_dir().join("last-completed-runner-swap.json")
 }
 
-/// Written the instant a staged runner build is promoted onto the canonical
-/// exe path -- distinct from `staged_runner_awaiting_handoff` (which only
-/// signals a swap IS pending), this is the durable "a swap just happened"
-/// record an agent can diff against its own last-seen value to learn the
-/// runner updated, without needing to poll daemon-status.json continuously.
 fn record_completed_runner_swap(version: &str) {
     let _ = fs::write(
         last_completed_runner_swap_path(),
@@ -1171,10 +956,6 @@ fn set_known_project_roots(roots: &[PathBuf]) {
     *known_project_roots().lock().unwrap_or_else(|e| e.into_inner()) = roots.to_vec();
 }
 
-/// Snapshot of every project root this daemon currently knows about, for
-/// `download.rs`'s project-declared-plugin-spec lookup -- a project's own
-/// `.agentplug/plugins.json` can only be found by scanning roots the daemon
-/// has already discovered via its registry poll.
 pub fn read_known_project_roots() -> Vec<PathBuf> {
     known_project_roots().lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
@@ -1339,18 +1120,6 @@ struct PluginModules {
     engine: Engine,
     modules: HashMap<String, Module>,
     loaded_content_hash: HashMap<String, String>,
-    // (mtime, len) of the wasm file the LAST time its content hash was
-    // actually computed, keyed by plugin name -- lets get_or_compile skip
-    // the full fs::read+sha256 (a 136MB read for bert.wasm, 56MB for
-    // treesitter.wasm on this machine) on every call when the file plainly
-    // has not changed since the last check. Root-caused 2026-08-14:
-    // get_or_compile ran unconditionally once per sweep tick with no
-    // cadence gate, so this was ~200MB of disk read + hashing on the main
-    // sweep thread, serialized before any project's worker pool dispatch
-    // even started -- directly on the path that made a freshly-dropped
-    // spool file wait multiple seconds for its own dispatch to begin, on a
-    // daemon whose actual per-call dispatch work (12-160ms, per
-    // dispatch.end) was never the bottleneck.
     last_hash_check_stat: HashMap<String, (std::time::SystemTime, u64)>,
 }
 
@@ -1380,17 +1149,6 @@ impl PluginModules {
         let current_stat = wasm_file_stat(&wasm_path);
         let stat_unchanged = current_stat.is_some()
             && current_stat == self.last_hash_check_stat.get(plugin_name).copied();
-        // Already compiled AND the file's (mtime, len) matches what it was
-        // the last time the content hash was actually computed: skip the
-        // read+hash entirely, this call cost one fs::metadata stat. A
-        // genuinely swapped file with the SAME mtime+len as before (a
-        // pathological same-second same-size rewrite) is not distinguished
-        // from an unchanged file here -- acceptable because
-        // ensure_plugin_installed's own download path always advances
-        // mtime and almost always changes len for a real content swap, and
-        // this is a staleness OPTIMIZATION layered on top of the already-
-        // existing hash check, not a replacement for it: the very next call
-        // whose stat differs still does the full re-hash.
         if stat_unchanged && self.modules.contains_key(plugin_name) {
             return Ok(());
         }
@@ -1640,44 +1398,6 @@ pub fn sweep_unconsumable_spool_files(root: &Path) {
     }
 }
 
-/// Spool verb-directories reserved to bypass the `gm` plugin and dispatch
-/// straight to a raw daemon-loaded plugin instead. A caller drops
-/// `in/libsql/<N>.txt` with the actual libsql verb (`exec`/`query`/...)
-/// carried INSIDE the JSON body as `"verb"` -- the directory name IS the
-/// plugin name here, unlike every other spool verb-directory where the
-/// directory name is a `gm` orchestrator verb and the plugin is implicitly
-/// `gm`. This exists so a plain host process (no wasm runtime of its own,
-/// e.g. freddie's Node.js) can reach a raw plugin like `libsql` through the
-/// same file-drop spool protocol gm-skill itself already uses, instead of
-/// spawning `agentplug-runner dispatch <plugin> <verb>` as a fresh subprocess
-/// per call.
-///
-/// LATENCY, ROOT-CAUSED AND FIXED (2026-08-14): a wall-clock ~0.8-2.5s per
-/// call was measured on this path (and identically on `gm`'s own verbs via
-/// the same spool). The plugin's own internal `dispatch.end` log timing was
-/// 12-160ms for the SAME calls, so the gap was not dispatch/wasm cost --
-/// tracing further found the true dominant cost was `PluginModules::
-/// get_or_compile` running unconditionally once per outer sweep tick,
-/// serialized on the main sweep thread BEFORE any project's worker pool even
-/// started, doing a full `fs::read` + SHA-256 hash of every default plugin's
-/// `.wasm` file on every single call regardless of whether the file had
-/// changed (bert.wasm is 136MB, treesitter.wasm 56MB on this machine -- that
-/// is ~200MB of disk read + hashing on the critical path per tick). Fixed by
-/// caching each plugin's `(mtime, len)` at the time its hash was last
-/// actually computed and skipping the read+hash entirely when a fresh
-/// `fs::metadata` stat matches -- reduces the common case to one cheap stat
-/// call. A secondary, smaller contributor was `dispatch_project` paying a
-/// `create_dir_all`x2 + heartbeat write + `plugins.txt` read for every
-/// registered project on every tick even when that project's spool `in/`
-/// directory was empty; also fixed with a read-first fast path that returns
-/// immediately for the idle case. Measured post-fix on this machine: steady-
-/// state calls to this path (after the first, which still pays the one-time
-/// cold-compile cost per plugin) dropped from 900ms-2.5s to 128-183ms.
-/// Neither the shared-daemon design (every project always shares one
-/// process) nor the ~130-180ms remaining per-call floor changed -- this
-/// spool path is still not a substitute for an in-process client library on
-/// freddie's session-write hot path, just no longer pathologically slower
-/// than it needed to be for occasional/non-hot-path callers.
 const RAW_PLUGIN_SPOOL_VERBS: &[&str] = &["libsql", "bert"];
 
 fn eagerly_loaded_plugins() -> Vec<String> {
@@ -1718,26 +1438,10 @@ pub(crate) fn run_gm_dispatch_to_file(root: &Path, handle: &DispatchHandle, verb
     write_spool_out(out_dir, &out_name, &out_body);
     let in_dir = root.join(".gm").join("exec-spool").join("in");
     let _ = fs::remove_file(inflight_claim_path(&in_dir, verb, task));
-    // Remove our own in-flight entry on completion. The dispatch loop's join
-    // path (below, in dispatch_project) only removes entries whose join handle
-    // it still owns -- a worker auto-detached after WORKER_AUTO_DETACH_AFTER_MS
-    // has its handle dropped with the entry left behind, which used to leak it
-    // PERMANENTLY: detached_still_running stayed true forever, so every later
-    // runner self-update went down the 10-minute starve path and force-handed
-    // off "despite N in-flight dispatch(es)" where N counted long-dead
-    // entries, killing whatever real dispatches were running at that moment
-    // (their callers saw dispatch_orphaned).
     let key: InFlightKey = (root.to_path_buf(), verb.to_string(), task.to_string());
     in_flight_map().lock().unwrap_or_else(|e| e.into_inner()).remove(&key);
 }
 
-// Cheap probe for whether a cold project (no warm ProjectPlugins entry this
-// tick) has a genuine client-side request already waiting in
-// .agentplug/plugin-dispatch/in/<plugin>/<verb>/*.txt -- the same directory
-// try_dispatch_via_daemon() polls with its own 30s MAX_WAIT_MS. Two
-// fs::read_dir levels deep (plugin, then verb), stopping at the first
-// non-empty verb directory found -- never walks file contents or the full
-// tree, so this stays cheap even called on every cold root every tick.
 fn dir_has_any_verb_subdir_with_files(base: &Path) -> bool {
     let Ok(verb_dirs) = fs::read_dir(base) else { return false };
     for verb_entry in verb_dirs.flatten() {
@@ -1752,15 +1456,6 @@ fn dir_has_any_verb_subdir_with_files(base: &Path) -> bool {
     false
 }
 
-// A cold project's real work can arrive on either of two independent
-// dispatch surfaces: .agentplug/plugin-dispatch/in/<plugin>/<verb>/*.txt
-// (try_dispatch_via_daemon's client-side path, checked below) or
-// .gm/exec-spool/in/<verb>/*.txt (gm/plugkit's own spool ABI, the surface
-// dispatch_project itself reads from). Checking only the first left a gm
-// session's freshly-dropped .gm/exec-spool/in/ file invisible to this
-// "genuinely active" probe -- a cold project could sit past every 30s
-// cold-sweep window indefinitely if worker capacity was contended at each
-// tick, since nothing marked it as having real waiting work.
 fn project_has_pending_dispatch_work(root: &Path) -> bool {
     let pd_in = root.join(".agentplug").join("plugin-dispatch").join("in");
     if let Ok(plugin_dirs) = fs::read_dir(&pd_in) {
@@ -1784,22 +1479,6 @@ fn dispatch_project(root: &Path, project: &mut ProjectPlugins, plugin_modules: &
     let in_dir = spool_dir.join("in");
     let out_dir = spool_dir.join("out");
 
-    // Fast path for the overwhelmingly common case (an idle project with
-    // nothing claimed this tick): try the scan-and-claim pass FIRST, against
-    // whatever in_dir already exists on disk, before paying for
-    // create_dir_all x2 + a heartbeat write + a plugins.txt read. On a
-    // machine serving many registered projects (87 observed live), this
-    // per-project setup cost was paid unconditionally by every worker for
-    // every project on every sweep tick regardless of whether that project
-    // had any pending work -- with a small fixed worker pool, that idle-cost
-    // multiplied by "many idle projects" is what queued a freshly-dropped
-    // spool file behind every other project's turn before its own dispatch
-    // even started (root-caused 2026-08-14: wall-clock 0.8-2.5s per call vs.
-    // a 12-160ms internal dispatch.end timing for the SAME calls). Cutting
-    // the idle case down to one read_dir attempt (no directory creation, no
-    // heartbeat write, no plugins.txt read) shortens every idle worker's
-    // turn, which shortens how long a busy project waits in the shared work
-    // queue for a free worker.
     struct ClaimedRequest {
         verb: String,
         task: String,
@@ -1833,39 +1512,15 @@ fn dispatch_project(root: &Path, project: &mut ProjectPlugins, plugin_modules: &
         }
     }
 
-    // Nothing claimed and the directory already existed (the common steady-
-    // state idle case): skip create_dir_all/heartbeat/plugins.txt entirely,
-    // this project cost one read_dir call this tick.
-    //
-    // MUST also check project_has_pending_dispatch_work before returning: the
-    // .agentplug/plugin-dispatch/in/<plugin>/<verb>/ scan loop below (the one
-    // try_dispatch_via_daemon's CLI `dispatch` clients actually poll against,
-    // e.g. `agentplug-runner dispatch bert embed`) sits textually AFTER this
-    // early return. Without this check, a project whose .gm/exec-spool/in is
-    // idle (the common case for a bare CLI dispatch with no gm skill session
-    // running) returns here EVERY tick and the plugin-dispatch scan is never
-    // reached at all -- the client's own file sits unclaimed for the full 30s
-    // MAX_WAIT_MS, times out, deletes its request, and falls through to a
-    // full cold wasm reload. Root-caused 2026-08-24 via exact 34s-latency
-    // reproduction matching MAX_WAIT_MS + cold-reload overhead precisely.
     if claimed.is_empty() && in_dir_existed && !project_has_pending_dispatch_work(root) {
         return did_work;
     }
 
-    // Either in_dir didn't exist yet (first tick for this project, or it was
-    // removed) or there is real work to do -- pay the setup cost now, exactly
-    // as before this fast path was added.
     if fs::create_dir_all(&in_dir).is_err() || fs::create_dir_all(&out_dir).is_err() {
         return did_work;
     }
     write_project_heartbeat(&spool_dir, None);
 
-    // Additive, never replacing. A non-empty .agentplug/plugins.txt used to
-    // REPLACE this set, so a project naming the three side plugins silently
-    // dropped `gm` itself and every dispatch failed to load -- observed live,
-    // and the failure names the plugin that WAS listed rather than the one
-    // that went missing, which makes it hard to attribute. Listing a plugin
-    // should only ever add reach, never remove it.
     let requested_plugins = eagerly_loaded_plugins();
 
     let mut gm_requests: Vec<ClaimedRequest> = Vec::with_capacity(claimed.len());
@@ -1917,18 +1572,6 @@ fn dispatch_project(root: &Path, project: &mut ProjectPlugins, plugin_modules: &
             if let Err(e) = project.load_plugin(&plugin_modules.engine, plugin_name, module, content_hash) {
                 let reason = format!("failed to instantiate plugin {plugin_name} for {}: {e:#}", root.display());
                 eprintln!("[agentplug daemon] {reason}");
-                // A load/instantiate failure here (as opposed to a compile failure, already
-                // handled above) means the plugin's *bytes* are fine but its host-import contract
-                // doesn't match what this runner itself implements -- almost always the plugin's
-                // own release channel having published a newer build than this runner's compiled-
-                // in host ABI supports (see `record_plugin_load_failure_and_rollback`'s doc
-                // comment for the full mechanism and how it was diagnosed). Roll back to the last
-                // version that DID load, if one exists, so the project recovers on its own rather
-                // than staying permanently broken until a human notices and manually restores
-                // `plugin_name.wasm.prev` -- `get_or_compile`'s own content-hash staleness check
-                // (this same loop's earlier `plugin_modules.module_with_hash` call, on ITS next
-                // invocation) picks up the rolled-back bytes and recompiles automatically, no
-                // separate cache-eviction call needed here.
                 match crate::download::record_plugin_load_failure_and_rollback(plugin_name) {
                     Ok(true) => {
                         eprintln!(
@@ -1991,28 +1634,6 @@ fn dispatch_project(root: &Path, project: &mut ProjectPlugins, plugin_modules: &
 
             const WORKER_AUTO_DETACH_AFTER_MS: u64 = 45_000;
             const STATUS_REFRESH_INTERVAL_MS: u64 = 5_000;
-            // Bounds how long this call keeps ABSORBING newly-arriving requests
-            // for this one project before it stops looking for more and just
-            // drains what it already has. Without this bound, a project under
-            // sustained concurrent load (many sessions dispatching in a steady
-            // stream) can keep the `while` loop below permanently non-empty --
-            // every existing entry auto-detaches at its own +45s mark, but a
-            // fresh one is added before that ever makes the loop's exit
-            // condition true. Since the caller (`run_daemon_body`) runs a fixed
-            // `worker_count` of these calls via `thread::scope` + `join()` over
-            // ALL registered projects, one project that never returns from this
-            // function permanently occupies one worker slot and -- once enough
-            // busy projects do this to exceed `worker_count` -- starves every
-            // OTHER registered project from ever being serviced by this shared
-            // daemon, indefinitely. Witnessed live: 26 concurrent subagent
-            // sessions hammering one project's spool wedged the whole daemon,
-            // including unrelated projects with zero pending work of their own.
-            // Once this deadline passes we stop claiming new `.txt` files (the
-            // two rescans below) but keep waiting for already-spawned work,
-            // which is itself bounded by WORKER_AUTO_DETACH_AFTER_MS -- so this
-            // call now returns within a bounded window regardless of how much
-            // new work keeps arriving, and the next outer tick picks the
-            // project back up to continue draining it.
             const PROJECT_BATCH_ABSORB_WINDOW_MS: u64 = 3_000;
             let batch_deadline = Instant::now() + Duration::from_millis(PROJECT_BATCH_ABSORB_WINDOW_MS);
             let mut last_status_refresh = Instant::now();
@@ -2315,12 +1936,6 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
     );
     agentplug_host::set_store_linear_memory_ceilings(ceiling_default_bytes, ceilings_by_name);
 
-    // A rename failure in download_and_verify (self-update staging, plugin
-    // hot-swap) deliberately leaves its sha256-verified tmp.<pid> file on
-    // disk rather than destroying it -- nothing today retries the rename
-    // against that same file, so left unswept it leaks forever. 1 hour is
-    // comfortably longer than any real download_and_verify call could still
-    // be in flight, so this never touches a concurrent writer's own tmp file.
     crate::download::gc_stale_tmp_files(Duration::from_secs(60 * 60));
 
     const COLD_PROJECT_SWEEP_INTERVAL: Duration = Duration::from_secs(30);
@@ -2340,11 +1955,6 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
 
     let plugin_update_poll_interval = daemon_cfg.plugin_update_poll_interval();
     let instruction_source_poll_interval = daemon_cfg.instruction_source_poll_interval();
-    // The outer gate uses the SHORTEST configured interval across the
-    // default and every per-plugin override, so no plugin's own poll is ever
-    // delayed past its configured cadence by a longer default -- the actual
-    // per-plugin decision (skip a not-yet-due plugin this tick) happens
-    // inside the loop below via last_plugin_specific_poll.
     let shortest_plugin_poll_interval = daemon_cfg
         .plugin_update_poll_interval_secs_by_name
         .values()
@@ -2489,38 +2099,11 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
             }
         }
 
-        // A project with an in-memory ProjectPlugins entry has dispatched
-        // something within the last PLUGIN_IDLE_EVICT_MS (that's what keeps
-        // it from being evicted, below) -- warm, checked every tick. A
-        // project with none, and that this daemon has already seen in a
-        // prior registry poll, has been silent for that whole window --
-        // cold. On a machine that accumulates every project directory it has
-        // ever served (register_project only drops an entry once its path
-        // stops existing on disk, never on inactivity) the cold set
-        // dominates the registry almost immediately. Scanning all of it
-        // every tick pays a read_dir per cold project per tick for work that
-        // essentially never arrives there, which is exactly the
-        // queue-depth-looks-deep-but-isn't-real symptom this sweep interval
-        // exists to cut: cold projects are swept far less often, so a small
-        // worker pool spends its ticks on roots actually worth checking. A
-        // root that is genuinely new this registry poll (roots_new_this_
-        // registry_poll) is force-included regardless of the cold-sweep
-        // cadence -- a fresh project's very first dispatch must not wait for
-        // the next 30s sweep just because it has no ProjectPlugins entry yet.
         let sweep_cold_this_tick = last_cold_project_sweep.elapsed() >= COLD_PROJECT_SWEEP_INTERVAL;
         if sweep_cold_this_tick {
             last_cold_project_sweep = Instant::now();
         }
         let mut all_projects: Vec<(PathBuf, ProjectPlugins)> = Vec::with_capacity(known_roots.len());
-        // Tracks, in parallel with all_projects, whether each entry has a genuine
-        // reason to be scheduled THIS tick (an existing warm ProjectPlugins, a
-        // root new this registry poll, or real pending dispatch work) versus
-        // being pulled in only because sweep_cold_this_tick fired for the whole
-        // tick. all_projects/worker_count/queue itself stay exactly as before
-        // (scheduling must still cold-refresh everything on the sweep cadence) --
-        // this only separates what gets REPORTED as queue_depth/queue_position
-        // from what gets scheduled, so a routine cold-sweep tick does not report
-        // the full lifetime project registry as live backlog.
         let mut is_genuinely_active: Vec<bool> = Vec::with_capacity(known_roots.len());
         let mut skipped_cold = 0usize;
         for root in &known_roots {
@@ -2529,30 +2112,11 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
                     all_projects.push((root.clone(), p));
                     is_genuinely_active.push(true);
                 }
-                // A cold project with a real client-side dispatch request
-                // already waiting in .agentplug/plugin-dispatch/in/ must not
-                // sit unprocessed until the next 30s cold-sweep -- that races
-                // directly against try_dispatch_via_daemon's own 30s
-                // MAX_WAIT_MS client timeout, and a cold project under
-                // multi-project contention (several sibling daemons'
-                // projects consuming max_concurrent_projects worker slots
-                // every tick) can lose that race on nearly every call,
-                // falling through to a full cold wasm-module reload every
-                // single dispatch even though the daemon was alive and idle
-                // the whole time. project_has_pending_dispatch_work is a
-                // cheap fs::read_dir emptiness probe, not a full directory
-                // walk, so checking it on every cold root every tick stays
-                // negligible relative to the 50ms+ tick cadence elsewhere in
-                // this loop.
                 None if sweep_cold_this_tick
                     || roots_new_this_registry_poll.contains(root)
                     || project_has_pending_dispatch_work(root) =>
                 {
                     all_projects.push((root.clone(), ProjectPlugins::new(root.clone())));
-                    // Genuinely active only if it's new-this-poll or has real
-                    // pending work -- a root pulled in purely by the cold-sweep
-                    // cadence (sweep_cold_this_tick, no pending work of its own)
-                    // is a staleness-refresh, not backlog.
                     is_genuinely_active.push(
                         roots_new_this_registry_poll.contains(root) || project_has_pending_dispatch_work(root),
                     );
@@ -2637,12 +2201,6 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
             };
             let mut cycle_errors: Vec<String> = Vec::new();
             for plugin_name in targets {
-                // Forced refresh always bypasses this plugin's own cadence
-                // (the agent explicitly asked for it now); the ordinary tick
-                // only polls a plugin whose OWN interval has actually
-                // elapsed -- a project setting bert to 3600s no longer gets
-                // its poll-check re-fired every time libsql's shorter
-                // interval trips the outer gate.
                 let forced = matches!(&forced_refresh_request, Some(Some(name)) if name == &plugin_name);
                 if !forced {
                     let due = last_plugin_specific_poll
@@ -2697,25 +2255,7 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
         let self_update_starved = pending_self_update_staged_at
             .map(|staged_at| staged_at.elapsed() >= Duration::from_millis(SELF_UPDATE_MAX_STARVED_MS))
             .unwrap_or(false);
-        // `any_work` only covers dispatches this loop iteration still owns a
-        // join handle for. An auto-detached dispatch (WORKER_AUTO_DETACH_AFTER_MS)
-        // keeps running on a thread the loop has let go of, so `any_work` goes
-        // false while a real call is still executing -- handing off there kills
-        // it and the caller gets a `dispatch_orphaned` whose text blames a wasm
-        // trap/OOM/Store-recycle rather than the handoff that actually did it.
-        // in_flight_map keeps the detached entry until its thread is joined, so
-        // it is the signal that survives detachment.
         let detached_still_running = !in_flight_map().lock().unwrap_or_else(|e| e.into_inner()).is_empty();
-        // A runner self-update is never urgent -- the current binary keeps serving
-        // correctly, this is purely picking up a newer build. Once starved, a
-        // second, longer grace period gives whatever's still genuinely in-flight
-        // (heavy verbs like `instruction` running a codeinsight rebuild routinely
-        // take 15-30s+) a chance to finish naturally on later loop iterations
-        // instead of being killed the instant the first deadline passes -- that
-        // instant-kill was the recurring `instruction`-specific dispatch_orphaned
-        // pattern this comment used to just document as an unavoidable cost. The
-        // hard cap still forces the handoff eventually so a genuinely wedged
-        // dispatch cannot block updates forever.
         const SELF_UPDATE_HARD_CAP_MS: u64 = SELF_UPDATE_MAX_STARVED_MS + 60_000;
         let self_update_hard_capped = pending_self_update_staged_at
             .map(|staged_at| staged_at.elapsed() >= Duration::from_millis(SELF_UPDATE_HARD_CAP_MS))
@@ -2780,12 +2320,6 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
         if any_work {
             last_any_dispatch = Instant::now();
         } else if last_any_dispatch.elapsed() >= Duration::from_millis(SELF_RECYCLE_IDLE_MS) && !detached_still_running {
-            // detached_still_running is the in_flight_map signal that survives
-            // worker auto-detachment -- the same gap the self-update handoff
-            // gate above already guards. Without it, a >45s dispatch that
-            // outlives its join handle is invisible to `any_work`, and this
-            // idle self-recycle exits the process out from under it (its
-            // caller gets dispatch_orphaned blamed on a wasm trap/OOM).
             eprintln!(
                 "[agentplug daemon] self-recycling after {}ms fully idle -- reclaims shared-plugin peak wasm memory (monotonic linear memory, no in-place shrink); next real dispatch spawns a fresh process",
                 SELF_RECYCLE_IDLE_MS
