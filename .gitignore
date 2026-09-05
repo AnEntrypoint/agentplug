@@ -1,2 +1,5 @@
 /target
 Cargo.lock
+.gm/
+.agentplug/
+.agentplug-kv/
