@@ -40,17 +40,26 @@ pub fn precompiled_module_path(engine: &Engine, plugin_name: &str, content_hash:
     precompiled_dir().join(precompiled_file_name(plugin_name, content_hash, &engine_compatibility_key(engine)))
 }
 
-fn remove_superseded_artifacts_for(plugin_name: &str, keep: &Path) {
+fn is_hex_of_len(s: &str, len: usize) -> bool {
+    s.len() == len && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+fn is_superseded_artifact_of(name: &str, plugin_name: &str, compat_key: &str) -> bool {
+    let Some(rest) = name.strip_prefix(plugin_name).and_then(|r| r.strip_prefix('-')) else { return false };
+    let Some(rest) = rest.strip_suffix(&format!(".{PRECOMPILED_EXTENSION}")) else { return false };
+    let Some((content_part, key_part)) = rest.rsplit_once('-') else { return false };
+    is_hex_of_len(content_part, 16) && key_part == compat_key
+}
+
+fn remove_superseded_artifacts_for(plugin_name: &str, compat_key: &str, keep: &Path) {
     let Ok(entries) = std::fs::read_dir(precompiled_dir()) else { return };
-    let prefix = format!("{plugin_name}-");
     for entry in entries.flatten() {
         let path = entry.path();
         if path == keep {
             continue;
         }
         let name = entry.file_name().to_string_lossy().into_owned();
-        let is_this_plugins_artifact = name.starts_with(&prefix) && name.ends_with(PRECOMPILED_EXTENSION);
-        if is_this_plugins_artifact {
+        if is_superseded_artifact_of(&name, plugin_name, compat_key) {
             let _ = std::fs::remove_file(&path);
         }
     }
@@ -103,7 +112,7 @@ pub fn load_module_file_backed(engine: &Engine, wasm_path: &Path, plugin_name: &
     }
     let started = std::time::Instant::now();
     write_precompiled_artifact(engine, wasm_path, &artifact_path)?;
-    remove_superseded_artifacts_for(plugin_name, &artifact_path);
+    remove_superseded_artifacts_for(plugin_name, &engine_compatibility_key(engine), &artifact_path);
     let artifact_len = std::fs::metadata(&artifact_path).map(|m| m.len()).unwrap_or(0);
     eprintln!(
         "[agentplug precompiled] {plugin_name} compiled to {} ({} MB, {}ms) -- later loads map this file instead of copying the artifact into anonymous memory",
