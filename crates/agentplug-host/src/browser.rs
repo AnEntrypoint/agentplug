@@ -459,17 +459,13 @@ const ORPHAN_SCAN_SUBPROCESS_TIMEOUT_MS: u64 = 30_000;
 #[cfg(windows)]
 fn run_bounded_capturing_stdout(cmd: &mut Command) -> Option<Vec<u8>> {
     let mut child = cmd.stdout(std::process::Stdio::piped()).spawn().ok()?;
+    let stdout_drain = crate::subprocess::drain_pipe_on_its_own_thread(child.stdout.take());
     match child.wait_timeout(Duration::from_millis(ORPHAN_SCAN_SUBPROCESS_TIMEOUT_MS)) {
-        Ok(Some(_)) => {
-            let mut stdout = Vec::new();
-            if let Some(mut o) = child.stdout.take() {
-                let _ = std::io::Read::read_to_end(&mut o, &mut stdout);
-            }
-            Some(stdout)
-        }
+        Ok(Some(_)) => Some(stdout_drain.join()),
         _ => {
             let _ = child.kill();
             let _ = child.wait();
+            let _ = stdout_drain.join();
             None
         }
     }
@@ -1476,6 +1472,8 @@ pub fn run(body: &str, opts: &str, cwd_raw: &Path, session_id: &str) -> Value {
         }
     };
 
+    let stdout_drain = crate::subprocess::drain_pipe_on_its_own_thread(child.stdout.take());
+    let stderr_drain = crate::subprocess::drain_pipe_on_its_own_thread(child.stderr.take());
     let timed_out = match child.wait_timeout(Duration::from_millis(timeout_ms + browser_cfg.eval_timeout_grace())) {
         Ok(Some(_)) => false,
         Ok(None) => {
@@ -1500,10 +1498,8 @@ pub fn run(body: &str, opts: &str, cwd_raw: &Path, session_id: &str) -> Value {
         }
     }
 
-    let mut stderr_buf = Vec::new();
-    if let Some(mut err) = child.stderr.take() {
-        let _ = std::io::Read::read_to_end(&mut err, &mut stderr_buf);
-    }
+    let _ = stdout_drain.join();
+    let stderr_buf = stderr_drain.join();
     let exit_code = child.wait().ok().and_then(|s| s.code()).unwrap_or(-1);
 
     let result_value: Value = std::fs::read_to_string(&result_path)
