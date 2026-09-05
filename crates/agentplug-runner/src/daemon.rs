@@ -320,6 +320,13 @@ fn shared_store_recycle_reason_independent_of_daemon_idle_state(cfg: &DaemonConf
 
 const DAEMON_STALE_MS: u64 = 20_000;
 
+fn write_heartbeat_atomically(path: &Path, body: String) {
+    let tmp = path.with_extension(format!("json.tmp.{}", std::process::id()));
+    if fs::write(&tmp, body).is_ok() && fs::rename(&tmp, path).is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+}
+
 fn daemon_status_path() -> PathBuf {
     install_dir().join("daemon-status.json")
 }
@@ -820,8 +827,8 @@ fn write_daemon_heartbeat(project_count: usize, plugin_module_count: usize) {
     let runner_poll_error = last_runner_poll_error().lock().unwrap_or_else(|e| e.into_inner()).clone();
     let staged_runner = staged_runner_awaiting_handoff();
     let handoff_attempt = last_handoff_attempt().lock().unwrap_or_else(|e| e.into_inner()).clone();
-    let _ = fs::write(
-        daemon_status_path(),
+    write_heartbeat_atomically(
+        &daemon_status_path(),
         serde_json::json!({
             "pid": std::process::id(),
             "ts": now_ms(),
