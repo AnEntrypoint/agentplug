@@ -1667,17 +1667,25 @@ pub(crate) fn run_gm_dispatch_to_file(root: &Path, handle: &DispatchHandle, verb
 // .agentplug/plugin-dispatch/in/<plugin>/<verb>/*.txt -- the same directory
 // try_dispatch_via_daemon() polls with its own 30s MAX_WAIT_MS. Two
 // fs::read_dir levels deep (plugin, then verb), stopping at the first
-// non-empty verb directory found -- never walks file contents or the full
-// tree, so this stays cheap even called on every cold root every tick.
-fn dir_has_any_verb_subdir_with_files(base: &Path) -> bool {
+// claimable *.txt -- never walks file contents or the full tree, so this
+// stays cheap even called on every cold root every tick. Matching only
+// *.txt is load-bearing, not tidiness: the claim protocol renames
+// <task>.txt to <task>.txt.inflight in place inside the same verb dir, so
+// an any-entry probe reports every root that has ever dispatched as
+// permanently pending. Measured live against a 103-root registry: 14 roots
+// false-positive under any-entry, 0 under *.txt -- each force-scheduled
+// into the bounded worker pool every tick ahead of real work.
+fn dir_has_any_verb_subdir_with_claimable_txt(base: &Path) -> bool {
     let Ok(verb_dirs) = fs::read_dir(base) else { return false };
     for verb_entry in verb_dirs.flatten() {
         if !verb_entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
             continue;
         }
-        let Ok(mut files) = fs::read_dir(verb_entry.path()) else { continue };
-        if files.next().is_some() {
-            return true;
+        let Ok(files) = fs::read_dir(verb_entry.path()) else { continue };
+        for file_entry in files.flatten() {
+            if file_entry.path().extension().and_then(|e| e.to_str()) == Some("txt") {
+                return true;
+            }
         }
     }
     false
@@ -1699,13 +1707,13 @@ fn project_has_pending_dispatch_work(root: &Path) -> bool {
             if !plugin_entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
                 continue;
             }
-            if dir_has_any_verb_subdir_with_files(&plugin_entry.path()) {
+            if dir_has_any_verb_subdir_with_claimable_txt(&plugin_entry.path()) {
                 return true;
             }
         }
     }
     let gm_in = root.join(".gm").join("exec-spool").join("in");
-    dir_has_any_verb_subdir_with_files(&gm_in)
+    dir_has_any_verb_subdir_with_claimable_txt(&gm_in)
 }
 
 fn dispatch_project(root: &Path, project: &mut ProjectPlugins, plugin_modules: &PluginModules) -> bool {
