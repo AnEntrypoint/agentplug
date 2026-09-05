@@ -28,6 +28,17 @@ pub(crate) struct BrowserRuntimeConfig {
 
 type BrowserConfig = BrowserRuntimeConfig;
 
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+fn host_has_no_display_server() -> bool {
+    let display_set = |var: &str| std::env::var_os(var).map(|v| !v.is_empty()).unwrap_or(false);
+    !display_set("DISPLAY") && !display_set("WAYLAND_DISPLAY")
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+fn host_has_no_display_server() -> bool {
+    false
+}
+
 impl BrowserRuntimeConfig {
     fn load(cwd: &Path) -> Self {
         let path = cwd.join(".gm").join("browser-config.json");
@@ -47,7 +58,7 @@ impl BrowserRuntimeConfig {
     fn cdp_poll_interval(&self) -> Duration { Duration::from_millis(self.cdp_poll_interval_ms.unwrap_or(250)) }
     pub(crate) fn chrome_ready_deadline(&self) -> Duration { Duration::from_millis(self.chrome_ready_deadline_ms.unwrap_or(30_000)) }
     fn eval_timeout_grace(&self) -> u64 { self.eval_timeout_grace_ms.unwrap_or(6000) }
-    fn headless(&self) -> bool { self.headless.unwrap_or(false) }
+    fn headless(&self) -> bool { self.headless.unwrap_or_else(host_has_no_display_server) }
     fn session_idle_timeout(&self) -> Duration {
         Duration::from_millis(self.session_idle_timeout_ms.unwrap_or(30 * 60 * 1000))
     }
