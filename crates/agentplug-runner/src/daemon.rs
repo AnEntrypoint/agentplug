@@ -950,7 +950,7 @@ fn write_daemon_heartbeat(project_count: usize, plugin_module_count: usize) {
     let boot_ts = HEARTBEAT_DAEMON_BOOT_TS.load(std::sync::atomic::Ordering::Relaxed);
     let plugin_poll_error = last_plugin_poll_error().lock().unwrap_or_else(|e| e.into_inner()).clone();
     let runner_poll_error = last_runner_poll_error().lock().unwrap_or_else(|e| e.into_inner()).clone();
-    let staged_runner = staged_runner_awaiting_handoff();
+    let staged_runner = refresh_staged_runner_cache();
     let handoff_attempt = last_handoff_attempt().lock().unwrap_or_else(|e| e.into_inner()).clone();
     let _ = fs::write(
         daemon_status_path(),
@@ -1038,6 +1038,24 @@ fn staged_runner_awaiting_handoff() -> Option<(u64, u64)> {
     Some((staged_at_ms, meta.len()))
 }
 
+fn staged_runner_cache() -> &'static Mutex<Option<(u64, u64)>> {
+    static SLOT: OnceLock<Mutex<Option<(u64, u64)>>> = OnceLock::new();
+    SLOT.get_or_init(|| Mutex::new(None))
+}
+
+/// Full exe compare belongs on the 10s machine-wide ticker, never the 3s
+/// per-project heartbeat (102 roots × read-and-compare runner bytes stalled
+/// this project's `.status.json` `ts` while daemon-status.json kept moving).
+fn refresh_staged_runner_cache() -> Option<(u64, u64)> {
+    let value = staged_runner_awaiting_handoff();
+    *staged_runner_cache().lock().unwrap_or_else(|e| e.into_inner()) = value;
+    value
+}
+
+fn cached_staged_runner() -> Option<(u64, u64)> {
+    *staged_runner_cache().lock().unwrap_or_else(|e| e.into_inner())
+}
+
 fn write_project_heartbeat(spool_dir: &Path, busy_until: Option<u64>) {
     write_project_heartbeat_with_queue_info(spool_dir, busy_until, None);
 }
@@ -1059,24 +1077,9 @@ fn write_project_heartbeat_with_queue_info(spool_dir: &Path, busy_until: Option<
         payload["queue_depth"] = serde_json::json!(total);
     }
     payload["queue_wait_ms"] = serde_json::json!(last_measured_dispatch_queue_wait_ms());
-    if let Some((staged_at_ms, _len)) = staged_runner_awaiting_handoff() {
+    if let Some((staged_at_ms, _len)) = cached_staged_runner() {
         payload["runner_update_in_progress"] = serde_json::json!(true);
         payload["runner_update_waiting_ms"] = serde_json::json!(now_ms().saturating_sub(staged_at_ms));
-    }
-    if let Some(swap) = read_last_completed_runner_swap() {
-        payload["last_completed_runner_swap"] = swap;
-    }
-    let pending_store_swaps = pending_store_swaps_by_plugin();
-    if !pending_store_swaps.is_empty() {
-        payload["pending_store_swaps"] = serde_json::Value::Object(pending_store_swaps);
-    }
-    let loaded_plugin_versions_informational_only_not_a_recovery_signal: serde_json::Map<String, serde_json::Value> =
-        ["gm", "bert", "libsql", "treesitter"]
-            .iter()
-            .filter_map(|name| installed_plugin_version(name).map(|v| (name.to_string(), serde_json::json!(v))))
-            .collect();
-    if !loaded_plugin_versions_informational_only_not_a_recovery_signal.is_empty() {
-        payload["loaded_plugin_versions"] = serde_json::Value::Object(loaded_plugin_versions_informational_only_not_a_recovery_signal);
     }
     let _ = fs::write(&status_path, payload.to_string());
 }
