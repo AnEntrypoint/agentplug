@@ -103,13 +103,40 @@ fn extract_version_from_release_url(url: &str) -> Option<String> {
     Some(tag.trim_start_matches('v').to_string())
 }
 
+/// Second-tier fallback's OWN fallback: GitHub has started routing some asset
+/// redirects through `release-assets.githubusercontent.com` with an opaque
+/// object id and a presigned query string (no `/releases/download/{tag}/`
+/// segment anywhere in the path), which `extract_version_from_release_url`
+/// -- written for the older `objects.githubusercontent.com` / direct
+/// `/releases/download/{tag}/{asset}` redirect shape -- cannot parse at all.
+/// Live-witnessed: `agentplug-bert-bin`'s asset redirect resolved to
+/// `release-assets.githubusercontent.com/github-production-release-asset/...
+/// ?...&rscd=attachment%3B+filename%3Dbert.wasm.sha256&...`, which encodes
+/// the asset's FILENAME in `rscd` but never the release tag anywhere.
+/// GitHub's `/releases/latest` page redirect is a separate, stable contract
+/// (always 302s to `/releases/tag/{tag}`, never touches `api.github.com`,
+/// so it isn't subject to the same API-only proxy/rate-limit restrictions
+/// the first-tier resolver hits) -- ask it directly instead of trying to
+/// reverse-engineer the asset CDN's redirect shape.
+fn resolve_latest_tag_via_release_page(repo: &str) -> Option<String> {
+    let page_url = format!("https://github.com/{repo}/releases/latest");
+    let resp = agentplug_host::shared_agent().get(&page_url).call().ok()?;
+    let resolved_url = resp.get_url();
+    let idx = resolved_url.find("/releases/tag/")?;
+    let tag = resolved_url[idx + "/releases/tag/".len()..].split('/').next()?;
+    if tag.is_empty() { return None; }
+    Some(tag.trim_start_matches('v').to_string())
+}
+
 fn try_ensure_plugin_installed_via_direct_release_latest(spec: &PluginAssetSpec, dest: &Path, version_file: &Path) -> anyhow::Result<PathBuf> {
     let sha_url = format!("https://github.com/{}/releases/latest/download/{}.wasm.sha256", spec.repo, spec.asset_basename);
     let sha_resp = agentplug_host::shared_agent().get(&sha_url).call()?;
     let resolved_url = sha_resp.get_url().to_string();
-    let version = extract_version_from_release_url(&resolved_url).ok_or_else(|| {
-        anyhow::anyhow!("could not determine release tag from redirect target {resolved_url} (requested {sha_url})")
-    })?;
+    let version = extract_version_from_release_url(&resolved_url)
+        .or_else(|| resolve_latest_tag_via_release_page(&spec.repo))
+        .ok_or_else(|| {
+            anyhow::anyhow!("could not determine release tag from redirect target {resolved_url} (requested {sha_url}), and the releases/latest page fallback also failed")
+        })?;
     let sha_line = sha_resp.into_string()?;
     let expected_sha = sha_line.split_whitespace().next()
         .ok_or_else(|| anyhow::anyhow!("empty sha256 sidecar for {} at {sha_url}", spec.asset_basename))?
