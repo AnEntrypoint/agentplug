@@ -889,7 +889,7 @@ fn reexec_from_canonical_and_exit(canonical: &std::path::Path) -> ! {
 pub fn run_takeover(version: &str) -> anyhow::Result<()> {
     eprintln!("[agentplug daemon] takeover: building engine for version {version}");
     let mut plugin_modules = PluginModules::new()?;
-    for plugin_name in ["gm", "bert", "libsql", "treesitter"] {
+    for plugin_name in ["gm", "bert", "libsql", "treesitter", "oxibrowser", "crux"] {
         if let Err(e) = plugin_modules.get_or_compile(plugin_name) {
             eprintln!("[agentplug daemon] takeover: pre-warm of {plugin_name} failed (non-fatal, will lazy-compile on first use): {e}");
         }
@@ -952,6 +952,8 @@ fn write_daemon_heartbeat(project_count: usize, plugin_module_count: usize) {
     let runner_poll_error = last_runner_poll_error().lock().unwrap_or_else(|e| e.into_inner()).clone();
     let staged_runner = refresh_staged_runner_cache();
     let handoff_attempt = last_handoff_attempt().lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let plugin_compile_failures: HashMap<String, String> =
+        last_plugin_compile_failure().lock().unwrap_or_else(|e| e.into_inner()).clone();
     let _ = fs::write(
         daemon_status_path(),
         serde_json::json!({
@@ -964,6 +966,7 @@ fn write_daemon_heartbeat(project_count: usize, plugin_module_count: usize) {
             "last_runner_update_poll_ts": if last_runner_poll_ts == 0 { serde_json::Value::Null } else { serde_json::json!(last_runner_poll_ts) },
             "last_plugin_update_poll_error": plugin_poll_error,
             "last_runner_update_poll_error": runner_poll_error,
+            "plugin_compile_failures": plugin_compile_failures,
             "loaded_plugin_content_sha256": loaded_content_hashes,
             "shared_pool_slot_content_sha256": shared_pool_slot_hashes,
             "mixed_version_pools": mixed_version_pools,
@@ -1062,15 +1065,19 @@ fn write_project_heartbeat(spool_dir: &Path, busy_until: Option<u64>) {
 
 fn write_project_heartbeat_with_queue_info(spool_dir: &Path, busy_until: Option<u64>, queue_info: Option<(usize, usize)>) {
     let status_path = spool_dir.join(".status.json");
-    let mut payload = serde_json::json!({
-        "pid": std::process::id(),
-        "ts": now_ms(),
-        "daemon": true,
-        "shared_process": true,
-        "runtime": "agentplug",
-    });
+    let mut payload = match fs::read_to_string(&status_path).ok().and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok()) {
+        Some(serde_json::Value::Object(map)) => serde_json::Value::Object(map),
+        _ => serde_json::json!({}),
+    };
+    payload["pid"] = serde_json::json!(std::process::id());
+    payload["ts"] = serde_json::json!(now_ms());
+    payload["daemon"] = serde_json::json!(true);
+    payload["shared_process"] = serde_json::json!(true);
+    payload["runtime"] = serde_json::json!("agentplug");
     if let Some(busy_until) = busy_until {
         payload["busy_until"] = serde_json::json!(busy_until);
+    } else {
+        payload.as_object_mut().map(|m| m.remove("busy_until"));
     }
     if let Some((position, total)) = queue_info {
         payload["queue_position"] = serde_json::json!(position);
@@ -1080,6 +1087,12 @@ fn write_project_heartbeat_with_queue_info(spool_dir: &Path, busy_until: Option<
     if let Some((staged_at_ms, _len)) = cached_staged_runner() {
         payload["runner_update_in_progress"] = serde_json::json!(true);
         payload["runner_update_waiting_ms"] = serde_json::json!(now_ms().saturating_sub(staged_at_ms));
+    }
+    let failures = last_plugin_compile_failure().lock().unwrap_or_else(|e| e.into_inner()).clone();
+    if failures.is_empty() {
+        payload.as_object_mut().map(|m| m.remove("plugin_compile_failures"));
+    } else {
+        payload["plugin_compile_failures"] = serde_json::json!(failures);
     }
     let _ = fs::write(&status_path, payload.to_string());
 }
@@ -1113,9 +1126,51 @@ fn spawn_project_heartbeat_ticker(interval: Duration) -> std::thread::JoinHandle
             if !spool_dir.exists() {
                 continue;
             }
-            write_project_heartbeat(&spool_dir, None);
+            // Preserve a still-future busy_until written by dispatch_project.
+            // Passing None here used to clobber it every ticker interval, so
+            // gm-client classified a live inflight codesearch as hung.
+            write_project_heartbeat(&spool_dir, busy_until_for_project_ticker(&spool_dir));
         }
     })
+}
+
+/// `busy_until` from `.status.json` when it is still in the future.
+fn read_status_busy_until_if_future(spool_dir: &Path) -> Option<u64> {
+    let text = fs::read_to_string(spool_dir.join(".status.json")).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let busy_until = value.get("busy_until")?.as_u64()?;
+    (busy_until > now_ms()).then_some(busy_until)
+}
+
+/// How far ahead a ticker refresh extends `busy_until` while spool in-files exist.
+const TICKER_BUSY_UNTIL_EXTEND_MS: u64 = 60_000;
+
+/// `busy_until` the project ticker should write: extend while claimed or
+/// unclaimed in-files exist so auto-detach cannot drop the wait-license.
+fn busy_until_for_project_ticker(spool_dir: &Path) -> Option<u64> {
+    if spool_has_queued_work(spool_dir) {
+        return Some(now_ms() + TICKER_BUSY_UNTIL_EXTEND_MS);
+    }
+    read_status_busy_until_if_future(spool_dir)
+}
+
+fn spool_has_queued_work(spool_dir: &Path) -> bool {
+    let in_dir = spool_dir.join("in");
+    let Ok(verbs) = fs::read_dir(&in_dir) else { return false };
+    for verb_entry in verbs.flatten() {
+        if !verb_entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let Ok(files) = fs::read_dir(verb_entry.path()) else { continue };
+        for file_entry in files.flatten() {
+            let name = file_entry.file_name();
+            let name = name.to_string_lossy();
+            if name.ends_with(".inflight") || name.ends_with(".txt") {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 static HEARTBEAT_PROJECT_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -1816,7 +1871,7 @@ fn dispatch_project(root: &Path, project: &mut ProjectPlugins, plugin_modules: &
     if fs::create_dir_all(&in_dir).is_err() || fs::create_dir_all(&out_dir).is_err() {
         return did_work;
     }
-    write_project_heartbeat(&spool_dir, None);
+    write_project_heartbeat(&spool_dir, read_status_busy_until_if_future(&spool_dir));
 
     // Additive, never replacing. A non-empty .agentplug/plugins.txt used to
     // REPLACE this set, so a project naming the three side plugins silently
@@ -2013,6 +2068,7 @@ fn dispatch_project(root: &Path, project: &mut ProjectPlugins, plugin_modules: &
                         );
                         s.detach_flag.store(true, std::sync::atomic::Ordering::SeqCst);
                         s.join_handle = None;
+                        write_project_heartbeat(&spool_dir, Some(now_ms() + TICKER_BUSY_UNTIL_EXTEND_MS));
                     }
                 }
                 for s in spawned.iter_mut() {
@@ -2468,7 +2524,7 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
                 });
             }
         }
-        for plugin_name in ["gm", "libsql", "bert", "treesitter"] {
+        for plugin_name in ["gm", "libsql", "bert", "treesitter", "oxibrowser", "crux"] {
             if plugin_compile_in_backoff(plugin_name) {
                 continue;
             }
@@ -2577,7 +2633,7 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
             for (position, (_, root)) in active_roots.iter().enumerate() {
                 let spool_dir = root.join(".gm").join("exec-spool");
                 if fs::create_dir_all(&spool_dir).is_ok() {
-                    write_project_heartbeat_with_queue_info(&spool_dir, None, Some((position, reported_queue_total)));
+                    write_project_heartbeat_with_queue_info(&spool_dir, read_status_busy_until_if_future(&spool_dir), Some((position, reported_queue_total)));
                 }
             }
         }
@@ -2606,7 +2662,7 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
             if reported_queue_total > worker_count {
                 let spool_dir = root.join(".gm").join("exec-spool");
                 if fs::create_dir_all(&spool_dir).is_ok() {
-                    write_project_heartbeat_with_queue_info(&spool_dir, None, Some((0, 0)));
+                    write_project_heartbeat_with_queue_info(&spool_dir, read_status_busy_until_if_future(&spool_dir), Some((0, 0)));
                 }
             }
             projects.insert(root, project);
