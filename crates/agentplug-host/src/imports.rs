@@ -823,11 +823,24 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
             let body = serde_json::json!({"text": text}).to_string();
 
             let caller_siblings = caller.data().siblings();
-            let sibling_pool = { caller_siblings.lock().unwrap().get("bert").cloned() };
+            let sibling_pool = { caller_siblings.lock().unwrap_or_else(|e| e.into_inner()).get("bert").cloned() };
+            let caller_root = caller.data().cwd();
             let Some(sibling_pool) = sibling_pool else {
+                // Previously a bare `return -1` with nothing logged anywhere, which
+                // made it the one failure mode of this import that left no trace at
+                // all: the guest only sees rc != EMBED_DIM and a slim gm build then
+                // reports "host_vec_embed must be implemented by the host", blaming
+                // the host's candle path rather than a missing sibling registration.
+                // The live case is a standalone spool watcher that loaded only `gm`
+                // into its project: every embedding-dependent verb hard-fails for as
+                // long as it serves that project.
+                let registered: Vec<String> = caller_siblings.lock().unwrap_or_else(|e| e.into_inner()).keys().cloned().collect();
+                eprintln!(
+                    "[agentplug:host_vec_embed] no `bert` sibling registered for {} (caller plugin {caller_plugin}); this process has {registered:?} loaded -- the embedder is unreachable, so every embedding-dependent verb will fail until bert is loaded into the SAME siblings map as the caller",
+                    caller_root.display()
+                );
                 return -1;
             };
-            let caller_root = caller.data().cwd();
             const EMBED_RETRY_ATTEMPTS: u32 = 3;
             const EMBED_RETRY_BACKOFF_MS: u64 = 500;
             let mut result: anyhow::Result<Vec<f32>> = Err(anyhow::anyhow!("embed not attempted"));

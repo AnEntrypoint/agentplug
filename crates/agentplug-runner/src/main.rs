@@ -204,6 +204,16 @@ fn main() -> anyhow::Result<()> {
             let module = Module::from_file(&engine, &wasm)?;
             let mut project = ProjectPlugins::new(cwd);
             project.load_plugin(&engine, "gm", &module, &content_hash)?;
+            // The side plugins belong in the SAME siblings map as gm, exactly as
+            // the `dispatch` subcommand already does. Loading only gm here made
+            // every embedding-dependent verb hard-fail for as long as a
+            // standalone watcher served the project: host_vec_embed looks up
+            // "bert" in the caller's own siblings map, finds nothing, and a slim
+            // gm build reports the failure as "host_vec_embed must be
+            // implemented by the host" -- so memorize-fire refused every write
+            // and recall fell back to keyword-only, with the real cause (a
+            // watcher that loaded one plugin) named nowhere.
+            let _ = reconcile_plugin_manifest(&mut project, &engine, &[("libsql", None), ("bert", None), ("treesitter", None)]);
             run_spool_watcher_single_process(&mut project, &spool_dir)
         }
         "daemon" => daemon::run_daemon(),
