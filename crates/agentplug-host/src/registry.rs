@@ -180,24 +180,142 @@ fn side_plugin_pool_size() -> usize {
     *SIDE_PLUGIN_POOL_SIZE.get_or_init(|| 1)
 }
 
+/// Whether a verb's dispatch is expected to hold its pool slot for a short,
+/// bounded time or for tens of seconds to minutes. Measured on this machine
+/// against the real daemon, which is why the heavy set is a literal list and
+/// not a guess: `recall` cold start 166607ms vs 195-216ms warm, `health`
+/// 90842-193039ms reproducibly on a quiet host, a `code_index` embed batch
+/// 7124ms per batch over 500 files. A `codesearch`/`instruction`/`git_*`/
+/// `prd-*` dispatch is sub-second to a few seconds on the same host.
+///
+/// The distinction is load-bearing, not descriptive: `Heavy` dispatches are
+/// admitted at most `slots - 1` at a time, so at least one slot always stays
+/// reachable by a `Cheap` one. Without it, four concurrent heavy dispatches
+/// filled a four-slot `gm` pool and every cheap verb behind them waited on
+/// the heavy work -- live-observed as six waiters (tickets #4-#9) held
+/// 195000-460000ms against a pool whose four served tickets were all heavy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DispatchCostClass {
+    Cheap,
+    Heavy,
+}
+
+const HEAVY_DISPATCH_VERBS: &[&str] = &[
+    "code_index",
+    "embed",
+    "health",
+    "index",
+    "memorize",
+    "memorize-fire",
+    "memorize-prune",
+    "recall",
+    "scan_deps",
+    "background-convert",
+    "bert",
+    "libsql",
+];
+
+pub fn cost_class_for_verb(verb: &str) -> DispatchCostClass {
+    if HEAVY_DISPATCH_VERBS.contains(&verb) {
+        DispatchCostClass::Heavy
+    } else {
+        DispatchCostClass::Cheap
+    }
+}
+
+/// A panic that unwinds through a held slot guard leaves that `Mutex`
+/// poisoned, and `try_lock` on a poisoned mutex returns `Err` FOREVER, not
+/// just while it is held. Treating that `Err` as "busy" (the previous
+/// behavior) permanently removed the slot from the pool, and once every slot
+/// had been poisoned once the FIFO head could never be served again -- an
+/// unrecoverable pool wedge produced by a single guest panic, indistinguishable
+/// from legitimate saturation. Recovering the guard restores the slot; a
+/// genuinely broken Store then fails its next dispatch and is evicted by
+/// `dispatch_and_evict_on_error` as usual.
+fn try_lock_slot_recovering_from_poison(slot: &Mutex<Option<SiblingHandle>>) -> Option<std::sync::MutexGuard<'_, Option<SiblingHandle>>> {
+    match slot.try_lock() {
+        Ok(guard) => Some(guard),
+        Err(std::sync::TryLockError::Poisoned(poisoned)) => Some(poisoned.into_inner()),
+        Err(std::sync::TryLockError::WouldBlock) => None,
+    }
+}
+
+/// What one pool slot holds, as observed WITHOUT waiting for a dispatch to
+/// release it. `BusyWithDispatchInFlight` is a real third answer, not a
+/// stand-in for unknown: it says a dispatch is executing in that slot right
+/// now, which is exactly what a diagnostic reader wants to know and what a
+/// blocking read can only report by stalling until it is no longer true.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SlotContentSnapshot {
+    Empty,
+    Loaded { content_hash: String },
+    BusyWithDispatchInFlight,
+}
+
 pub struct SharedPluginPool {
+    plugin_name: String,
     slots: Vec<Arc<Mutex<Option<SiblingHandle>>>>,
     hashes_to_evict_when_their_in_flight_dispatch_completes: Mutex<std::collections::HashSet<String>>,
     ticket_queue: Mutex<TicketQueue>,
     slot_released: Condvar,
 }
 
-struct TicketQueue {
+struct ClassTicketQueue {
     next_ticket: u64,
     now_serving: u64,
 }
 
+impl ClassTicketQueue {
+    fn waiting(&self) -> u64 {
+        self.next_ticket.saturating_sub(self.now_serving)
+    }
+}
+
+struct TicketQueue {
+    cheap: ClassTicketQueue,
+    heavy: ClassTicketQueue,
+    heavy_inflight: usize,
+}
+
+impl TicketQueue {
+    fn class(&mut self, class: DispatchCostClass) -> &mut ClassTicketQueue {
+        match class {
+            DispatchCostClass::Cheap => &mut self.cheap,
+            DispatchCostClass::Heavy => &mut self.heavy,
+        }
+    }
+}
+
+/// Decrements the pool's heavy-dispatch admission count when the dispatch it
+/// was taken for finishes. Held alongside the slot guard for the whole
+/// dispatch, so the cap counts dispatches actually executing rather than
+/// tickets merely drawn.
+pub struct HeavyDispatchAdmission {
+    pool: Option<Arc<SharedPluginPool>>,
+}
+
+impl Drop for HeavyDispatchAdmission {
+    fn drop(&mut self) {
+        let Some(pool) = self.pool.take() else { return };
+        {
+            let mut q = pool.ticket_queue.lock().unwrap_or_else(|e| e.into_inner());
+            q.heavy_inflight = q.heavy_inflight.saturating_sub(1);
+        }
+        pool.slot_released.notify_all();
+    }
+}
+
 impl SharedPluginPool {
-    pub fn new(size: usize) -> Self {
+    pub fn new(plugin_name: &str, size: usize) -> Self {
         Self {
+            plugin_name: plugin_name.to_string(),
             slots: (0..size.max(1)).map(|_| Arc::new(Mutex::new(None))).collect(),
             hashes_to_evict_when_their_in_flight_dispatch_completes: Mutex::new(std::collections::HashSet::new()),
-            ticket_queue: Mutex::new(TicketQueue { next_ticket: 0, now_serving: 0 }),
+            ticket_queue: Mutex::new(TicketQueue {
+                cheap: ClassTicketQueue { next_ticket: 0, now_serving: 0 },
+                heavy: ClassTicketQueue { next_ticket: 0, now_serving: 0 },
+                heavy_inflight: 0,
+            }),
             slot_released: Condvar::new(),
         }
     }
@@ -208,34 +326,80 @@ impl SharedPluginPool {
     /// (`DISPATCH_CALL_DEADLINE_SECS`), which aborts the holder and frees its slot.
     pub const ACQUIRE_TIMEOUT_MS: u64 = 60_000;
 
+    /// How many slots heavy dispatches may occupy at once. One slot is always
+    /// withheld from them so a cheap verb's wait is bounded by other cheap
+    /// verbs alone. A single-slot pool (every side plugin, by default) cannot
+    /// reserve anything and is left unrestricted.
+    fn heavy_admission_limit(&self) -> usize {
+        self.slots.len().saturating_sub(1).max(1)
+    }
+
+    pub fn admit(pool: &Arc<SharedPluginPool>, class: DispatchCostClass) -> HeavyDispatchAdmission {
+        if class != DispatchCostClass::Heavy || pool.slots.len() < 2 {
+            return HeavyDispatchAdmission { pool: None };
+        }
+        let limit = pool.heavy_admission_limit();
+        let start = std::time::Instant::now();
+        loop {
+            {
+                let mut q = pool.ticket_queue.lock().unwrap_or_else(|e| e.into_inner());
+                if q.heavy_inflight < limit {
+                    q.heavy_inflight += 1;
+                    return HeavyDispatchAdmission { pool: Some(pool.clone()) };
+                }
+            }
+            let guard = pool.ticket_queue.lock().unwrap_or_else(|e| e.into_inner());
+            let _ = pool
+                .slot_released
+                .wait_timeout(guard, std::time::Duration::from_millis(25))
+                .unwrap_or_else(|e| e.into_inner());
+            let waited = start.elapsed().as_millis() as u64;
+            if waited > Self::ACQUIRE_TIMEOUT_MS && waited % 5_000 < 30 {
+                eprintln!(
+                    "[agentplug registry] {} heavy-dispatch admission waiting {waited}ms -- {limit} of {} slots already hold heavy work, one slot stays reserved for cheap verbs",
+                    pool.plugin_name,
+                    pool.slots.len()
+                );
+            }
+        }
+    }
+
     pub fn acquire(&self) -> Option<std::sync::MutexGuard<'_, Option<SiblingHandle>>> {
         Some(self.acquire_within(Self::ACQUIRE_TIMEOUT_MS).0)
     }
 
-    /// FIFO-fair, non-denying slot acquisition. Every caller draws a ticket and is served in
-    /// arrival order -- no unordered `try_lock` race across waiters, so a project's own repeat
-    /// requests drain against each other in the order they were issued instead of restarting
-    /// the race each poll tick. `timeout_ms` is retained as the elapsed-time figure reported to
-    /// the caller for observability; it no longer terminates the wait early. A genuinely stuck
-    /// holder (wasm trap, deadlock) is bounded by its own dispatch-call deadline elsewhere, not
-    /// by this wait giving up.
     pub fn acquire_within(&self, timeout_ms: u64) -> (std::sync::MutexGuard<'_, Option<SiblingHandle>>, u64) {
+        self.acquire_within_for_class(timeout_ms, DispatchCostClass::Cheap)
+    }
+
+    /// FIFO-fair, non-denying slot acquisition, fair WITHIN a cost class rather than across
+    /// all callers. Every caller draws a ticket from its own class's queue and is served in
+    /// arrival order against that class alone -- so a cheap verb never queues behind a heavy
+    /// one, which combined with `admit`'s reservation of one slot is what bounds a cheap
+    /// wait by cheap work only. `timeout_ms` is retained as the elapsed-time figure reported
+    /// to the caller for observability; it no longer terminates the wait early. A genuinely
+    /// stuck holder (wasm trap, deadlock) is bounded by its own dispatch-call deadline
+    /// elsewhere, not by this wait giving up.
+    pub fn acquire_within_for_class(
+        &self,
+        timeout_ms: u64,
+        class: DispatchCostClass,
+    ) -> (std::sync::MutexGuard<'_, Option<SiblingHandle>>, u64) {
         let start = std::time::Instant::now();
         let my_ticket = {
-            let mut q = self.ticket_queue.lock().unwrap();
-            let t = q.next_ticket;
-            q.next_ticket += 1;
+            let mut q = self.ticket_queue.lock().unwrap_or_else(|e| e.into_inner());
+            let queue = q.class(class);
+            let t = queue.next_ticket;
+            queue.next_ticket += 1;
             t
         };
         loop {
             {
-                let q = self.ticket_queue.lock().unwrap();
-                if q.now_serving == my_ticket {
+                let mut q = self.ticket_queue.lock().unwrap_or_else(|e| e.into_inner());
+                if q.class(class).now_serving == my_ticket {
                     for slot in &self.slots {
-                        if let Ok(guard) = slot.try_lock() {
-                            drop(q);
-                            let mut q = self.ticket_queue.lock().unwrap();
-                            q.now_serving += 1;
+                        if let Some(guard) = try_lock_slot_recovering_from_poison(slot) {
+                            q.class(class).now_serving += 1;
                             drop(q);
                             self.slot_released.notify_all();
                             return (guard, start.elapsed().as_millis() as u64);
@@ -243,15 +407,21 @@ impl SharedPluginPool {
                     }
                 }
             }
-            let guard = self.ticket_queue.lock().unwrap();
+            let guard = self.ticket_queue.lock().unwrap_or_else(|e| e.into_inner());
             let _ = self
                 .slot_released
                 .wait_timeout(guard, std::time::Duration::from_millis(25))
-                .unwrap();
+                .unwrap_or_else(|e| e.into_inner());
             let waited = start.elapsed().as_millis() as u64;
             if waited > timeout_ms && waited % 5_000 < 30 {
+                let (cheap_waiting, heavy_waiting, heavy_inflight) = {
+                    let q = self.ticket_queue.lock().unwrap_or_else(|e| e.into_inner());
+                    (q.cheap.waiting(), q.heavy.waiting(), q.heavy_inflight)
+                };
                 eprintln!(
-                    "[agentplug registry] pool wait exceeded diagnostic threshold ({waited}ms > {timeout_ms}ms) -- still waiting, ticket #{my_ticket}, not denying"
+                    "[agentplug registry] pool wait exceeded diagnostic threshold ({waited}ms > {timeout_ms}ms) -- still waiting, plugin={} class={class:?} ticket #{my_ticket}, slots={} heavy_inflight={heavy_inflight} waiting(cheap={cheap_waiting} heavy={heavy_waiting}), not denying",
+                    self.plugin_name,
+                    self.slots.len()
                 );
             }
         }
@@ -262,9 +432,9 @@ impl SharedPluginPool {
     }
 
     fn all_instantiated(&self) -> bool {
-        self.slots.iter().all(|s| match s.try_lock() {
-            Ok(g) => g.is_some(),
-            Err(_) => true,
+        self.slots.iter().all(|s| match try_lock_slot_recovering_from_poison(s) {
+            Some(g) => g.is_some(),
+            None => true,
         })
     }
 
@@ -272,8 +442,32 @@ impl SharedPluginPool {
         &self.slots
     }
 
+    /// Never blocks on a slot a dispatch currently holds, so a caller polling
+    /// it on a timer keeps its own cadence. `slot_content_hashes` takes each
+    /// slot's mutex, which makes the caller wait out whatever dispatch holds
+    /// it -- live-observed as the daemon's own heartbeat (a 10s ticker that
+    /// publishes these hashes) going 76 SECONDS stale while a single-slot `gm`
+    /// pool served one long verb. Every client then read `daemon-status.json`
+    /// as stale, concluded the daemon was dead, and spawned a competing one,
+    /// which is the daemon start/exit churn that follows a slow dispatch.
+    pub fn slot_snapshot_without_blocking(&self) -> Vec<SlotContentSnapshot> {
+        self.slots
+            .iter()
+            .map(|s| match try_lock_slot_recovering_from_poison(s) {
+                Some(guard) => match guard.as_ref() {
+                    Some(handle) => SlotContentSnapshot::Loaded { content_hash: handle.content_hash.clone() },
+                    None => SlotContentSnapshot::Empty,
+                },
+                None => SlotContentSnapshot::BusyWithDispatchInFlight,
+            })
+            .collect()
+    }
+
     pub fn slot_content_hashes(&self) -> Vec<Option<String>> {
-        self.slots.iter().map(|s| s.lock().unwrap().as_ref().map(|h| h.content_hash.clone())).collect()
+        self.slots
+            .iter()
+            .map(|s| s.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|h| h.content_hash.clone()))
+            .collect()
     }
 
     pub(crate) fn any_instantiated_within(&self, timeout_ms: u64) -> bool {
@@ -281,14 +475,14 @@ impl SharedPluginPool {
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
         loop {
             for slot in &self.slots {
-                if let Ok(guard) = slot.try_lock() {
+                if let Some(guard) = try_lock_slot_recovering_from_poison(slot) {
                     if guard.is_some() {
                         return true;
                     }
                 }
             }
             if std::time::Instant::now() >= deadline {
-                return self.slots.iter().any(|s| s.lock().unwrap().is_some());
+                return self.slots.iter().any(|s| s.lock().unwrap_or_else(|e| e.into_inner()).is_some());
             }
             std::thread::sleep(std::time::Duration::from_millis(POLL_INTERVAL_MS));
         }
@@ -297,7 +491,7 @@ impl SharedPluginPool {
     fn evict_every_currently_free_slot_without_blocking_on_busy_ones(&self) -> bool {
         let mut released = false;
         for slot in &self.slots {
-            if let Ok(mut guard) = slot.try_lock() {
+            if let Some(mut guard) = try_lock_slot_recovering_from_poison(slot) {
                 if guard.is_some() {
                     *guard = None;
                     released = true;
@@ -311,14 +505,14 @@ impl SharedPluginPool {
         let mut evicted = 0usize;
         let mut deferred = 0usize;
         for slot in &self.slots {
-            match slot.try_lock() {
-                Ok(mut guard) => {
+            match try_lock_slot_recovering_from_poison(slot) {
+                Some(mut guard) => {
                     if guard.as_ref().is_some_and(|h| h.content_hash == old_hash) {
                         *guard = None;
                         evicted += 1;
                     }
                 }
-                Err(_) => deferred += 1,
+                None => deferred += 1,
             }
         }
         if deferred > 0 {
@@ -355,7 +549,7 @@ fn shared_plugin_pool(plugin_name: &str) -> Arc<SharedPluginPool> {
         .lock()
         .unwrap()
         .entry(plugin_name.to_string())
-        .or_insert_with(|| Arc::new(SharedPluginPool::new(pool_size)))
+        .or_insert_with(|| Arc::new(SharedPluginPool::new(plugin_name, pool_size)))
         .clone()
 }
 
@@ -394,9 +588,19 @@ pub fn shared_plugin_slot_content_hashes(plugin_name: &str) -> Vec<Option<String
     SHARED_PLUGINS
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .get(plugin_name)
         .map(|pool| pool.slot_content_hashes())
+        .unwrap_or_default()
+}
+
+pub fn shared_plugin_slot_snapshot_without_blocking(plugin_name: &str) -> Vec<SlotContentSnapshot> {
+    SHARED_PLUGINS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(plugin_name)
+        .map(|pool| pool.slot_snapshot_without_blocking())
         .unwrap_or_default()
 }
 
@@ -607,7 +811,7 @@ impl ProjectPlugins {
             let mut inverses: Vec<(Arc<Mutex<Option<SiblingHandle>>>, Option<SiblingHandle>)> = Vec::new();
             let fill_result = (|| -> anyhow::Result<()> {
                 for slot in pool.slots_for_fill() {
-                    if let Ok(mut guard) = slot.try_lock() {
+                    if let Some(mut guard) = try_lock_slot_recovering_from_poison(slot) {
                         let needs_fill = match guard.as_ref() {
                             None => true,
                             Some(existing) => existing.content_hash != content_hash,
@@ -623,7 +827,7 @@ impl ProjectPlugins {
             })();
             if let Err(err) = fill_result {
                 for (slot, prior) in inverses.into_iter().rev() {
-                    if let Ok(mut guard) = slot.try_lock() {
+                    if let Some(mut guard) = try_lock_slot_recovering_from_poison(&slot) {
                         *guard = prior;
                     }
                 }
@@ -639,7 +843,7 @@ impl ProjectPlugins {
             .lock()
             .unwrap()
             .entry(plugin_name.to_string())
-            .or_insert_with(|| Arc::new(SharedPluginPool::new(1)))
+            .or_insert_with(|| Arc::new(SharedPluginPool::new(plugin_name, 1)))
             .clone();
         *pool.acquire().expect("acquire() always returns Some -- FIFO wait never denies") = Some(instantiated);
         Ok(())
@@ -658,7 +862,9 @@ impl ProjectPlugins {
             std::thread::sleep(std::time::Duration::from_millis(DISPATCH_LOOKUP_RETRY_BACKOFF_MS));
         }
         let pool = pool.ok_or_else(|| PluginDispatchError::NotRegistered { plugin_name: plugin_name.to_string() })?;
-        let (mut guard, _waited_ms) = pool.acquire_within(SharedPluginPool::ACQUIRE_TIMEOUT_MS);
+        let cost_class = cost_class_for_verb(verb);
+        let _heavy_admission = SharedPluginPool::admit(&pool, cost_class);
+        let (mut guard, _waited_ms) = pool.acquire_within_for_class(SharedPluginPool::ACQUIRE_TIMEOUT_MS, cost_class);
         dispatch_and_evict_on_error(&mut guard, &pool, verb, body, &self.root, &self.siblings, plugin_name)
     }
 
@@ -709,7 +915,7 @@ impl DispatchHandle {
             .lock()
             .unwrap()
             .entry(plugin_name.to_string())
-            .or_insert_with(|| Arc::new(SharedPluginPool::new(1)))
+            .or_insert_with(|| Arc::new(SharedPluginPool::new(plugin_name, 1)))
             .clone();
         *pool.acquire().expect("acquire() always returns Some -- FIFO wait never denies") = Some(instantiated);
         Ok(())
@@ -731,7 +937,9 @@ impl DispatchHandle {
             pool = self.siblings.lock().unwrap().get(plugin_name).cloned();
         }
         let pool = pool.ok_or_else(|| PluginDispatchError::NotRegistered { plugin_name: plugin_name.to_string() })?;
-        let (mut guard, _waited_ms) = pool.acquire_within(SharedPluginPool::ACQUIRE_TIMEOUT_MS);
+        let cost_class = cost_class_for_verb(verb);
+        let _heavy_admission = SharedPluginPool::admit(&pool, cost_class);
+        let (mut guard, _waited_ms) = pool.acquire_within_for_class(SharedPluginPool::ACQUIRE_TIMEOUT_MS, cost_class);
         if guard.is_none() {
             drop(guard);
             const REINSTANTIATION_RETRY_ATTEMPTS: u32 = 3;
@@ -767,7 +975,7 @@ impl DispatchHandle {
                 log_poisoned_store_eviction_event(&self.root, plugin_name, verb, false, &format!("reinstantiation failed after {REINSTANTIATION_RETRY_ATTEMPTS} attempts: {detail}"));
                 return Err(PluginDispatchError::EvictedOrPoisoned { plugin_name: plugin_name.to_string() }.into());
             };
-            let (mut final_guard, _final_waited_ms) = refilled_pool.acquire_within(SharedPluginPool::ACQUIRE_TIMEOUT_MS);
+            let (mut final_guard, _final_waited_ms) = refilled_pool.acquire_within_for_class(SharedPluginPool::ACQUIRE_TIMEOUT_MS, cost_class);
             return dispatch_and_evict_on_error(&mut final_guard, &refilled_pool, verb, body, &self.root, &self.siblings, plugin_name);
         }
         dispatch_and_evict_on_error(&mut guard, &pool, verb, body, &self.root, &self.siblings, plugin_name)

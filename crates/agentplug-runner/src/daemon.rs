@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -115,6 +115,8 @@ struct DaemonConfig {
     #[serde(default)]
     side_plugin_concurrency: Option<usize>,
     #[serde(default)]
+    gm_pool_size: Option<usize>,
+    #[serde(default)]
     shared_store_recycle_private_mb: Option<u64>,
     #[serde(default)]
     shared_store_recycle_dispatches: Option<u64>,
@@ -182,6 +184,7 @@ impl DaemonConfig {
                 max_concurrent_projects: None,
                 gm_concurrency: None,
                 side_plugin_concurrency: None,
+                gm_pool_size: None,
                 shared_store_recycle_private_mb: None,
                 shared_store_recycle_dispatches: None,
                 project_idle_evict_secs: None,
@@ -228,7 +231,20 @@ impl DaemonConfig {
     // is the intended tradeoff -- these plugins are memory-costly-but-fast
     // (per-call latency live-measured at 600ms-1.4s), not CPU-bound work
     // that benefits from N-way oversubscription.
-    fn gm_pool_size(&self) -> usize { 1 }
+    // TWO slots, not one: the memory argument above is why this is not
+    // core-count-scaled, but at exactly one slot EVERY gm dispatch across
+    // every registered project serializes behind whichever verb holds it, and
+    // the slow verbs are slow by minutes, not milliseconds (`health` 90842-
+    // 193039ms on a quiet host, `recall` cold start 166607ms, `code_index`
+    // 7124ms per embed batch). Live-observed consequence on a one-slot pool:
+    // nine queued tickets, six of them waiting 195000-460000ms behind a single
+    // holder. The second slot exists specifically so `registry.rs`'s heavy-
+    // dispatch admission (capped at slots-1, so exactly one heavy dispatch at
+    // a time, unchanged from one-slot throughput) always leaves a slot a cheap
+    // verb can take -- a reservation is arithmetically impossible with one
+    // slot. Cost is one additional resident gm Store against a live-measured
+    // ~300MB single-slot baseline and a 1600MB recycle ceiling.
+    fn gm_pool_size(&self) -> usize { self.gm_pool_size.unwrap_or(2).max(1) }
     // Side plugins (bert/libsql/treesitter) used to default to half the
     // host's cores (a throughput optimization: avoid serializing every call
     // behind one slot on a many-core host) -- but each filled slot holds its
@@ -508,6 +524,93 @@ pub fn claim_ownership() -> bool {
     read_owner_pid() == Some(my_pid)
 }
 
+/// The exact condition under which `claim_ownership` refuses a process that is
+/// not already the owner: the owner lock names ANOTHER live pid whose
+/// daemon-status heartbeat is still fresh. Reading it before any setup work
+/// makes losing the race cost two file reads instead of a registry announce
+/// plus a `gh auth token` subprocess -- live-observed as six consecutive
+/// daemon starts, each logging "starting, registry ..." and "seeded GH_TOKEN"
+/// before discovering pid 1660 already owned the daemon and exiting.
+pub fn shared_daemon_owner_that_would_refuse_this_process() -> Option<u64> {
+    let owner_pid = read_owner_pid()?;
+    if owner_pid == std::process::id() as u64 {
+        return None;
+    }
+    let heartbeat_fresh = fs::read_to_string(daemon_status_path())
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .map(|v| {
+            let pid = v.get("pid").and_then(|p| p.as_u64());
+            let ts = v.get("ts").and_then(|t| t.as_u64()).unwrap_or(0);
+            now_ms().saturating_sub(ts) < DAEMON_STALE_MS && pid == Some(owner_pid)
+        })
+        .unwrap_or(false);
+    if heartbeat_fresh && pid_is_alive(owner_pid) {
+        Some(owner_pid)
+    } else {
+        None
+    }
+}
+
+fn daemon_spawn_backoff_path() -> PathBuf {
+    install_dir().join("daemon-spawn-backoff.json")
+}
+
+/// A daemon start that exits without claiming ownership is pure waste: the
+/// process launch, the registry announce and (until the ordering fix above)
+/// a `gh auth token` subprocess, all to discover a healthy daemon already
+/// owns the lock. A caller that re-checks on a fixed interval -- gm-mcp's
+/// 15s-per-root `ensureSpoolRunnerRunning`, one interval per registered
+/// project -- turns that waste into a continuous respawn loop whenever the
+/// owner's heartbeat oscillates across DAEMON_STALE_MS while it is busy.
+/// Each wasted start doubles the window in which no further start is
+/// attempted, and the window is only honored while the owner lock names a
+/// LIVE pid, so a genuinely dead daemon is still replaced immediately.
+const WASTED_DAEMON_START_BACKOFF_BASE_MS: u64 = 5_000;
+
+const WASTED_DAEMON_START_BACKOFF_CEILING_MS: u64 = 120_000;
+
+fn read_wasted_daemon_start_backoff() -> (u64, u32) {
+    fs::read_to_string(daemon_spawn_backoff_path())
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .map(|v| {
+            (
+                v.get("ts").and_then(|t| t.as_u64()).unwrap_or(0),
+                v.get("wasted_starts").and_then(|c| c.as_u64()).unwrap_or(0) as u32,
+            )
+        })
+        .unwrap_or((0, 0))
+}
+
+fn record_wasted_daemon_start() {
+    let (_, wasted_starts) = read_wasted_daemon_start_backoff();
+    let path = daemon_spawn_backoff_path();
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let payload = serde_json::json!({ "ts": now_ms(), "wasted_starts": wasted_starts.saturating_add(1) });
+    let _ = fs::write(&path, payload.to_string());
+}
+
+fn clear_wasted_daemon_start_backoff() {
+    let _ = fs::remove_file(daemon_spawn_backoff_path());
+}
+
+fn wasted_daemon_start_backoff_remaining_ms() -> u64 {
+    if shared_daemon_owner_that_would_refuse_this_process().is_none() {
+        return 0;
+    }
+    let (ts, wasted_starts) = read_wasted_daemon_start_backoff();
+    if ts == 0 || wasted_starts == 0 {
+        return 0;
+    }
+    let window = WASTED_DAEMON_START_BACKOFF_BASE_MS
+        .saturating_mul(1u64 << wasted_starts.min(5))
+        .min(WASTED_DAEMON_START_BACKOFF_CEILING_MS);
+    window.saturating_sub(now_ms().saturating_sub(ts))
+}
+
 fn holds_heartbeat_authority() -> bool {
     match read_owner_pid() {
         None => claim_ownership(),
@@ -519,6 +622,14 @@ fn holds_heartbeat_authority() -> bool {
 pub fn ensure_daemon_running() -> anyhow::Result<bool> {
     if is_daemon_fresh() {
         return Ok(true);
+    }
+    let backoff_remaining = wasted_daemon_start_backoff_remaining_ms();
+    if backoff_remaining > 0 {
+        eprintln!(
+            "[agentplug] not spawning a daemon for another {backoff_remaining}ms -- a recent start already lost the ownership claim to live pid {:?}, whose daemon-status heartbeat is fresh even though it has not gone fresh inside this call's window",
+            read_owner_pid()
+        );
+        return Ok(false);
     }
     let lock_path = daemon_lock_path();
     if let Some(parent) = lock_path.parent() {
@@ -736,7 +847,14 @@ fn sync_instruction_source_if_configured(root: &Path) -> anyhow::Result<()> {
 }
 
 fn staged_binary_self_check(staged_exe: &Path, expected_version: &str) -> bool {
-    let output = std::process::Command::new(staged_exe).arg("--version").output();
+    let mut cmd = std::process::Command::new(staged_exe);
+    cmd.arg("--version");
+    #[cfg(windows)]
+    {
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    let output = cmd.output();
     match output {
         Ok(out) if out.status.success() => {
             let text = String::from_utf8_lossy(&out.stdout);
@@ -939,14 +1057,38 @@ fn write_daemon_heartbeat(project_count: usize, plugin_module_count: usize) {
     let last_runner_poll_ts = HEARTBEAT_LAST_RUNNER_POLL_TS.load(std::sync::atomic::Ordering::Relaxed);
     let loaded_content_hashes: HashMap<String, String> =
         loaded_plugin_content_hashes().lock().unwrap_or_else(|e| e.into_inner()).clone();
-    let shared_pool_slot_hashes: HashMap<String, Vec<Option<String>>> = ["gm", "bert", "libsql", "treesitter"]
+    let shared_pool_slots: HashMap<String, Vec<agentplug_host::SlotContentSnapshot>> = ["gm", "bert", "libsql", "treesitter"]
         .iter()
-        .map(|name| (name.to_string(), agentplug_host::shared_plugin_slot_content_hashes(name)))
+        .map(|name| (name.to_string(), agentplug_host::shared_plugin_slot_snapshot_without_blocking(name)))
         .collect();
-    let mixed_version_pools: Vec<String> = shared_pool_slot_hashes
+    let mixed_version_pools: Vec<String> = shared_pool_slots
         .iter()
-        .filter(|(_, hashes)| hashes.iter().flatten().collect::<std::collections::HashSet<_>>().len() > 1)
+        .filter(|(_, slots)| {
+            slots
+                .iter()
+                .filter_map(|s| match s {
+                    agentplug_host::SlotContentSnapshot::Loaded { content_hash } => Some(content_hash),
+                    _ => None,
+                })
+                .collect::<std::collections::HashSet<_>>()
+                .len()
+                > 1
+        })
         .map(|(name, _)| name.clone())
+        .collect();
+    let shared_pool_slot_hashes: HashMap<String, Vec<serde_json::Value>> = shared_pool_slots
+        .into_iter()
+        .map(|(name, slots)| {
+            let rendered = slots
+                .into_iter()
+                .map(|slot| match slot {
+                    agentplug_host::SlotContentSnapshot::Empty => serde_json::Value::Null,
+                    agentplug_host::SlotContentSnapshot::Loaded { content_hash } => serde_json::json!(content_hash),
+                    agentplug_host::SlotContentSnapshot::BusyWithDispatchInFlight => serde_json::json!("busy-dispatch-in-flight"),
+                })
+                .collect();
+            (name, rendered)
+        })
         .collect();
     let boot_ts = HEARTBEAT_DAEMON_BOOT_TS.load(std::sync::atomic::Ordering::Relaxed);
     let plugin_poll_error = last_plugin_poll_error().lock().unwrap_or_else(|e| e.into_inner()).clone();
@@ -1394,6 +1536,8 @@ fn spawn_heartbeat_ticker(heartbeat_interval: Duration) -> std::thread::JoinHand
             );
             HEARTBEAT_AUTHORITY_LOST.store(true, std::sync::atomic::Ordering::Relaxed);
             agentplug_host::close_all_sessions();
+            let requeued = hand_claims_to_live_successor("heartbeat-authority-holder");
+            eprintln!("[agentplug daemon] heartbeat ticker: re-queued {requeued} in-flight claim(s) for the daemon that holds authority -- exiting without orphaning them");
             std::process::exit(0);
         }
         write_daemon_heartbeat(
@@ -1611,7 +1755,22 @@ fn take_forced_runner_refresh_request() -> bool {
     }
 }
 
-fn write_spool_out(out_dir: &Path, out_name: &str, out_body: &str) {
+pub fn shared_daemon_is_serving() -> bool {
+    is_daemon_fresh()
+}
+
+/// The claim half of the spool protocol, exposed so the standalone
+/// single-process watcher takes requests exactly the way the shared daemon
+/// does. Without it a standalone watcher read `<task>.txt` and left it in
+/// place for the duration of the dispatch, so a shared daemon coming back
+/// mid-call claimed and ran the SAME request a second time, and a crash
+/// mid-call left a claimless request no sweep could attribute.
+pub fn claim_spool_request_in_place(txt_path: &Path) -> Option<PathBuf> {
+    let claim_path = txt_path.with_extension(format!("txt.{ORPHAN_CLAIM_EXT}"));
+    fs::rename(txt_path, &claim_path).ok().map(|_| claim_path)
+}
+
+pub fn write_spool_out(out_dir: &Path, out_name: &str, out_body: &str) {
     let tmp = out_dir.join(format!("{out_name}.tmp.{}", std::process::id()));
     if fs::write(&tmp, out_body).is_ok() {
         let _ = fs::rename(&tmp, out_dir.join(out_name));
@@ -1625,7 +1784,139 @@ fn inflight_claim_path(in_dir: &Path, verb: &str, task: &str) -> PathBuf {
     in_dir.join(verb).join(format!("{task}.txt.{ORPHAN_CLAIM_EXT}"))
 }
 
+fn queued_request_path(in_dir: &Path, verb: &str, task: &str) -> PathBuf {
+    in_dir.join(verb).join(format!("{task}.txt"))
+}
+
+fn project_in_dir(root: &Path) -> PathBuf {
+    root.join(".gm").join("exec-spool").join("in")
+}
+
+type AbandonedClaim = (PathBuf, String, String);
+
+/// The claim protocol renames `<task>.txt` to `<task>.txt.inflight` in place and
+/// never rewrites the body, so renaming back is a complete re-queue: the next
+/// claim loop picks the request up unchanged. This is the only correct answer
+/// for a claim whose owner went away while a LIVE successor exists, and it is
+/// why a handoff costs the caller extra latency rather than a failed dispatch.
+fn requeue_claim(in_dir: &Path, verb: &str, task: &str) -> bool {
+    let claim = inflight_claim_path(in_dir, verb, task);
+    let queued = queued_request_path(in_dir, verb, task);
+    if queued.exists() {
+        let _ = fs::remove_file(&claim);
+        return true;
+    }
+    fs::rename(&claim, &queued).is_ok()
+}
+
+fn snapshot_in_flight_claims() -> Vec<AbandonedClaim> {
+    in_flight_map().lock().unwrap_or_else(|e| e.into_inner()).keys().cloned().collect()
+}
+
+fn requeue_claims_for_live_successor(claims: &[AbandonedClaim]) -> usize {
+    claims.iter().filter(|(root, verb, task)| requeue_claim(&project_in_dir(root), verb, task)).count()
+}
+
+/// Give up every claim this daemon holds to a successor that is already serving.
+/// The marker covers the claims whose re-queue rename fails (a locked file, a
+/// vanished spool dir): the successor's own sweep then finds the claim still
+/// `.inflight` and re-queues it there instead of answering dispatch_orphaned.
+fn hand_claims_to_live_successor(successor: &str) -> usize {
+    let claims = snapshot_in_flight_claims();
+    write_handoff_inherited_claims(successor, &claims);
+    requeue_claims_for_live_successor(&claims)
+}
+
+/// Claims this daemon is about to abandon to a CONFIRMED-READY successor
+/// process, as opposed to claims a crash left behind with nobody to finish
+/// them. Written before ownership is released and consumed by the successor's
+/// first orphan sweep, so the successor can re-queue exactly these and keep
+/// reporting `dispatch_orphaned` for everything else. Same state directory and
+/// same marker shape as `runner_update_escalation_path()`.
+fn handoff_inherited_claims_path() -> PathBuf {
+    install_dir().join("handoff-inherited-claims.json")
+}
+
+/// Past this age the marker no longer describes a handoff anyone is still
+/// completing: the successor's own takeover wait caps at 120s and its pre-warm
+/// compile at a few more, so anything older means the successor never arrived
+/// and a still-unanswered claim is genuinely orphaned.
+const HANDOFF_INHERITED_CLAIMS_MAX_AGE_MS: u64 = 15 * 60 * 1000;
+
+fn write_handoff_inherited_claims(version: &str, claims: &[AbandonedClaim]) {
+    let path = handoff_inherited_claims_path();
+    if claims.is_empty() {
+        let _ = fs::remove_file(&path);
+        return;
+    }
+    let payload = serde_json::json!({
+        "version": version,
+        "pid": std::process::id(),
+        "ts": now_ms(),
+        "claims": claims
+            .iter()
+            .map(|(root, verb, task)| serde_json::json!({
+                "root": root.to_string_lossy(),
+                "verb": verb,
+                "task": task,
+            }))
+            .collect::<Vec<_>>(),
+    });
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let _ = fs::write(&path, payload.to_string());
+}
+
+fn clear_handoff_inherited_claims() {
+    let _ = fs::remove_file(handoff_inherited_claims_path());
+}
+
+fn read_handoff_inherited_claims() -> HashSet<AbandonedClaim> {
+    let Ok(raw) = fs::read_to_string(handoff_inherited_claims_path()) else { return HashSet::new() };
+    let Ok(marker) = serde_json::from_str::<serde_json::Value>(&raw) else { return HashSet::new() };
+    let describes_a_handoff_still_in_progress = marker
+        .get("ts")
+        .and_then(|t| t.as_u64())
+        .map(|ts| now_ms().saturating_sub(ts) <= HANDOFF_INHERITED_CLAIMS_MAX_AGE_MS)
+        .unwrap_or(false);
+    if !describes_a_handoff_still_in_progress {
+        return HashSet::new();
+    }
+    marker
+        .get("claims")
+        .and_then(|c| c.as_array())
+        .map(|rows| {
+            rows.iter()
+                .filter_map(|row| {
+                    Some((
+                        PathBuf::from(row.get("root")?.as_str()?),
+                        row.get("verb")?.as_str()?.to_string(),
+                        row.get("task")?.as_str()?.to_string(),
+                    ))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 pub fn sweep_orphaned_claims(root: &Path) {
+    sweep_orphaned_claims_distinguishing_handoff_from_crash(root, &read_handoff_inherited_claims());
+}
+
+/// Sweep every registered root under ONE reading of the handoff marker, then
+/// consume it. Reading it per-root would either consume another root's
+/// inheritance or leave the marker live long enough to re-queue a later crash's
+/// claims silently.
+pub fn sweep_orphaned_claims_across_roots(roots: &[PathBuf]) {
+    let inherited = read_handoff_inherited_claims();
+    for root in roots {
+        sweep_orphaned_claims_distinguishing_handoff_from_crash(root, &inherited);
+    }
+    clear_handoff_inherited_claims();
+}
+
+fn sweep_orphaned_claims_distinguishing_handoff_from_crash(root: &Path, inherited: &HashSet<AbandonedClaim>) {
     let spool_dir = root.join(".gm").join("exec-spool");
     let in_dir = spool_dir.join("in");
     let out_dir = spool_dir.join("out");
@@ -1652,12 +1943,19 @@ pub fn sweep_orphaned_claims(root: &Path) {
                 let _ = fs::remove_file(&path);
                 continue;
             }
+            if inherited.contains(&(root.to_path_buf(), verb.clone(), task.clone())) {
+                if requeue_claim(&in_dir, &verb, &task) {
+                    eprintln!("[agentplug daemon] re-queued claim {verb}/{task} for {} -- a version handoff to a confirmed-ready successor abandoned it, so it is inherited work, not orphaned work; the caller waits longer and never sees dispatch_orphaned", root.display());
+                    continue;
+                }
+                eprintln!("[agentplug daemon] could not re-queue handoff-inherited claim {verb}/{task} for {} -- falling through to dispatch_orphaned rather than swallowing it", root.display());
+            }
             let out_name = format!("{verb}-{task}.json");
             if !out_dir.join(&out_name).exists() {
                 let out_body = serde_json::json!({
                     "ok": false,
                     "error_code": "dispatch_orphaned",
-                    "error": format!("verb {verb} (task {task}) was claimed by a daemon that died before answering -- a wasm trap, an out-of-memory abort, a shared-Store recycle during the call, or a self-update handoff that exited while this dispatch was still running (check ~/.agentplug/daemon.log for a 'handed off to version' line at the matching time). The request was NOT completed and no partial work should be assumed. Re-dispatch it."),
+                    "error": format!("verb {verb} (task {task}) was claimed by a daemon that died before answering -- a wasm trap, an out-of-memory abort, or a shared-Store recycle during the call. A version handoff is NOT a cause of this error: a handoff re-queues its claims for the incoming daemon, which completes them. The request was NOT completed and no partial work should be assumed. Re-dispatch it."),
                     "verb": verb,
                     "task": task,
                     "sweeping_pid": std::process::id(),
@@ -2396,7 +2694,14 @@ fn seed_github_token_from_gh_cli_if_unset() {
     if std::env::var_os("GITHUB_TOKEN").is_some() || std::env::var_os("GH_TOKEN").is_some() {
         return;
     }
-    let Ok(output) = std::process::Command::new("gh").args(["auth", "token"]).output() else {
+    let mut gh_cmd = std::process::Command::new("gh");
+    gh_cmd.args(["auth", "token"]);
+    #[cfg(windows)]
+    {
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        gh_cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    let Ok(output) = gh_cmd.output() else {
         return;
     };
     if !output.status.success() {
@@ -2411,10 +2716,18 @@ fn seed_github_token_from_gh_cli_if_unset() {
 }
 
 pub fn run_daemon() -> anyhow::Result<()> {
+    if let Some(owner_pid) = shared_daemon_owner_that_would_refuse_this_process() {
+        record_wasted_daemon_start();
+        eprintln!(
+            "[agentplug daemon] shared daemon pid {owner_pid} already owns the ownership lock and its heartbeat is fresh -- exiting before the registry announce and the `gh auth token` seed, nothing shared was touched"
+        );
+        return Ok(());
+    }
+
     eprintln!("[agentplug daemon] starting, registry {}", registry_path().display());
-    seed_github_token_from_gh_cli_if_unset();
 
     if !claim_ownership() {
+        record_wasted_daemon_start();
         let existing_pid = read_owner_pid();
         eprintln!(
             "[agentplug daemon] lost the atomic ownership claim -- pid {:?} already owns the shared daemon, exiting before touching any shared plugin state",
@@ -2422,6 +2735,9 @@ pub fn run_daemon() -> anyhow::Result<()> {
         );
         return Ok(());
     }
+
+    clear_wasted_daemon_start_backoff();
+    seed_github_token_from_gh_cli_if_unset();
 
     let plugin_modules = PluginModules::new()?;
     let previously_recorded_version = installed_runner_version();
@@ -2516,7 +2832,14 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
             c.with_extension(c.extension().map(|e| format!("{}.new", e.to_string_lossy())).unwrap_or_else(|| "new".to_string()))
         }) {
             let staged_age = now_ms().saturating_sub(staged_at_ms);
-            match std::process::Command::new(&staged_path).arg("--version").output() {
+            let mut boot_check_cmd = std::process::Command::new(&staged_path);
+            boot_check_cmd.arg("--version");
+            #[cfg(windows)]
+            {
+                const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+                boot_check_cmd.creation_flags(CREATE_NO_WINDOW);
+            }
+            match boot_check_cmd.output() {
                 Ok(out) if out.status.success() => {
                     let version = String::from_utf8_lossy(&out.stdout).trim().trim_start_matches('v').to_string();
                     eprintln!(
@@ -2559,10 +2882,14 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
     loop {
         if heartbeat_authority_lost() {
             agentplug_host::close_all_sessions();
-            for root in &known_roots {
-                sweep_orphaned_claims(root);
-            }
-            eprintln!("[agentplug daemon] heartbeat authority held by another daemon -- exiting before serving further work");
+            // The daemon that took authority is a live successor, exactly like a
+            // version handoff's incoming process, so this daemon's own claims are
+            // inherited work. Re-queue them directly rather than through the
+            // marker: that successor is already past its first-registry-poll
+            // sweep and will never read one.
+            let requeued = hand_claims_to_live_successor("heartbeat-authority-holder");
+            sweep_orphaned_claims_across_roots(&known_roots);
+            eprintln!("[agentplug daemon] heartbeat authority held by another daemon -- re-queued {requeued} in-flight claim(s) for it and exiting before serving further work");
             return Ok(());
         }
 
@@ -2575,8 +2902,8 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
             roots_new_this_registry_poll = known_roots.iter().filter(|r| !previous_roots.contains(*r)).cloned().collect();
             set_known_project_roots(&known_roots);
             if sweep_orphans_left_by_whatever_daemon_died_before_answering {
+                sweep_orphaned_claims_across_roots(&known_roots);
                 for root in &known_roots {
-                    sweep_orphaned_claims(root);
                     sweep_unconsumable_spool_files(root);
                 }
             }
@@ -2849,11 +3176,10 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
         // `any_work` only covers dispatches this loop iteration still owns a
         // join handle for. An auto-detached dispatch (WORKER_AUTO_DETACH_AFTER_MS)
         // keeps running on a thread the loop has let go of, so `any_work` goes
-        // false while a real call is still executing -- handing off there kills
-        // it and the caller gets a `dispatch_orphaned` whose text blames a wasm
-        // trap/OOM/Store-recycle rather than the handoff that actually did it.
-        // in_flight_map keeps the detached entry until its thread is joined, so
-        // it is the signal that survives detachment.
+        // false while a real call is still executing. in_flight_map keeps the
+        // detached entry until its thread is joined, so it is the signal that
+        // survives detachment and the only complete list of what a handoff
+        // would abandon.
         let detached_still_running = !in_flight_map().lock().unwrap_or_else(|e| e.into_inner()).is_empty();
         // A runner self-update is never urgent -- the current binary keeps serving
         // correctly, this is purely picking up a newer build. Once starved, a
@@ -2873,11 +3199,18 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
         let force_handoff_never_idle = self_update_starved && self_update_hard_capped && !detached_still_running && any_work;
         if (!any_work && !detached_still_running) || force_handoff_despite_in_flight || force_handoff_never_idle {
             if let Some((staged, version)) = pending_self_update.take() {
+                // Written BEFORE the handoff attempt, not after: the attempt
+                // itself waits up to 10s for the successor's readiness marker,
+                // and this process can be killed inside that window. The marker
+                // on disk is what lets the successor tell inherited work from
+                // crash-orphaned work, so it must already exist by then.
+                let claims_the_successor_inherits = snapshot_in_flight_claims();
+                write_handoff_inherited_claims(&version, &claims_the_successor_inherits);
                 if force_handoff_despite_in_flight {
                     eprintln!(
-                        "[agentplug daemon] self-update to {version} starved for {}ms with in-flight dispatches still running after the extra grace window -- forcing handoff despite {} in-flight dispatch(es); their callers will see dispatch_orphaned",
+                        "[agentplug daemon] self-update to {version} starved for {}ms with in-flight dispatches still running after the extra grace window -- forcing handoff and re-queueing {} in-flight dispatch(es) for the incoming version; their callers wait longer and never see dispatch_orphaned",
                         SELF_UPDATE_HARD_CAP_MS,
-                        in_flight_map().lock().unwrap_or_else(|e| e.into_inner()).len()
+                        claims_the_successor_inherits.len()
                     );
                 }
                 if force_handoff_never_idle {
@@ -2888,9 +3221,14 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
                 }
                 if attempt_self_update_handoff(&staged, &version) {
                     agentplug_host::close_all_sessions();
-                    eprintln!("[agentplug daemon] handed off to version {version} -- exiting");
+                    let requeued = requeue_claims_for_live_successor(&claims_the_successor_inherits);
+                    eprintln!(
+                        "[agentplug daemon] handed off to version {version} -- re-queued {requeued} of {} inherited claim(s) for the incoming daemon, exiting",
+                        claims_the_successor_inherits.len()
+                    );
                     return Ok(());
                 }
+                clear_handoff_inherited_claims();
                 pending_self_update = Some((staged, version));
             }
         }
@@ -2938,8 +3276,9 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
             // worker auto-detachment -- the same gap the self-update handoff
             // gate above already guards. Without it, a >45s dispatch that
             // outlives its join handle is invisible to `any_work`, and this
-            // idle self-recycle exits the process out from under it (its
-            // caller gets dispatch_orphaned blamed on a wasm trap/OOM).
+            // idle self-recycle exits the process out from under it. Unlike a
+            // handoff there is no successor to inherit the claim here, so the
+            // caller would get a truthful but avoidable dispatch_orphaned.
             eprintln!(
                 "[agentplug daemon] self-recycling after {}ms fully idle -- reclaims shared-plugin peak wasm memory (monotonic linear memory, no in-place shrink); next real dispatch spawns a fresh process",
                 SELF_RECYCLE_IDLE_MS
