@@ -243,6 +243,7 @@ fn main() -> anyhow::Result<()> {
         "selfcheck-registry" => selfcheck_registry(),
         "selfcheck-inflight" => selfcheck_inflight_cleanup(),
         "selfcheck-pool-fairness" => selfcheck_pool_fairness(),
+        "selfcheck-spool-claim" => selfcheck_spool_claim(),
         other => {
             eprintln!(
                 "agentplug-runner: unknown command '{other}'. Usage: agentplug-runner <plugin <name> [version]|spool|daemon|takeover <version>|dispatch [plugin] <verb> [body]|reap-orphans|sweep-spool [root]|selfcheck-registry|selfcheck-inflight|version>"
@@ -401,6 +402,40 @@ fn selfcheck_inflight_cleanup() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Drives the real claim predicate against the three shapes a shell-redirect
+/// write passes through, so the torn-body guard is witnessed by execution rather
+/// than argued from the diff: the empty file a redirect creates first, the
+/// just-written file whose body may still be growing, and the settled file.
+fn selfcheck_spool_claim() -> anyhow::Result<()> {
+    use std::fs;
+    use std::time::{Duration, SystemTime};
+
+    let in_dir = std::env::temp_dir()
+        .join(format!("agentplug-selfcheck-claim-{}-{}", std::process::id(), agentplug_host::now_ms()))
+        .join("codesearch");
+    fs::create_dir_all(&in_dir)?;
+    let txt = in_dir.join("s-1.txt");
+
+    fs::write(&txt, b"")?;
+    let empty_claimed = daemon::claim_spool_request_in_place(&txt).is_some();
+
+    fs::write(&txt, br#"{"session_id":"s","query":"x"}"#)?;
+    let fresh_claimed = daemon::claim_spool_request_in_place(&txt).is_some();
+
+    let settled = SystemTime::now() - Duration::from_millis(2_000);
+    fs::File::options().write(true).open(&txt)?.set_modified(settled)?;
+    let settled_claimed = daemon::claim_spool_request_in_place(&txt).is_some();
+
+    println!("[selfcheck-spool-claim] empty_claimed={empty_claimed} fresh_claimed={fresh_claimed} settled_claimed={settled_claimed}");
+    assert!(!empty_claimed, "an empty in-file is the first half of a shell redirect, never a request: claiming it dispatches a torn body");
+    assert!(!fresh_claimed, "an in-file written this instant may still be growing: claiming it dispatches a torn body");
+    assert!(settled_claimed, "a non-empty in-file that has sat unmodified past the settle interval MUST still be claimable, or no dispatch ever runs");
+
+    let _ = fs::remove_dir_all(in_dir.parent().unwrap_or(&in_dir));
+    println!("[selfcheck-spool-claim] witnessed live against the real claim predicate: PASS");
+    Ok(())
+}
+
 /// Merge into whatever `.status.json` already holds instead of replacing it.
 /// A bare three-key overwrite dropped every field the shared daemon publishes
 /// (`busy_until`, `queue_wait_ms`, `plugin_compile_failures`,
@@ -485,6 +520,12 @@ fn run_spool_watcher_single_process(project: &mut ProjectPlugins, spool_dir: &st
                         let _ = fs::remove_file(&claim_path);
                         continue;
                     };
+                    // Torn write backstop, same as the shared daemon's claim
+                    // loop: re-queue rather than dispatch an empty body.
+                    if body.trim().is_empty() {
+                        let _ = fs::rename(&claim_path, &path);
+                        continue;
+                    }
                     let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
                     let result = project
                         .dispatch("gm", &verb, &body)

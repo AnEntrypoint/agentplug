@@ -552,6 +552,27 @@ pub fn shared_daemon_owner_that_would_refuse_this_process() -> Option<u64> {
     }
 }
 
+/// The owner lock names another process that is still alive, whatever its
+/// heartbeat says. Deliberately weaker than
+/// `shared_daemon_owner_that_would_refuse_this_process`: the churn case is an
+/// owner that is alive but whose `daemon-status.json` has gone stale because
+/// its heartbeat thread was blocked, and a challenger launched in that window
+/// still loses the claim because the heartbeat refreshes before the challenger
+/// gets to check. Gating the backoff on the FRESH predicate would make it
+/// unreachable -- a fresh owner already satisfies `is_daemon_fresh()` and the
+/// spawn is never attempted at all.
+fn live_foreign_daemon_owner_pid() -> Option<u64> {
+    let pid = read_owner_pid()?;
+    if pid == std::process::id() as u64 {
+        return None;
+    }
+    if pid_is_alive(pid) {
+        Some(pid)
+    } else {
+        None
+    }
+}
+
 fn daemon_spawn_backoff_path() -> PathBuf {
     install_dir().join("daemon-spawn-backoff.json")
 }
@@ -598,7 +619,7 @@ fn clear_wasted_daemon_start_backoff() {
 }
 
 fn wasted_daemon_start_backoff_remaining_ms() -> u64 {
-    if shared_daemon_owner_that_would_refuse_this_process().is_none() {
+    if live_foreign_daemon_owner_pid().is_none() {
         return 0;
     }
     let (ts, wasted_starts) = read_wasted_daemon_start_backoff();
@@ -626,7 +647,7 @@ pub fn ensure_daemon_running() -> anyhow::Result<bool> {
     let backoff_remaining = wasted_daemon_start_backoff_remaining_ms();
     if backoff_remaining > 0 {
         eprintln!(
-            "[agentplug] not spawning a daemon for another {backoff_remaining}ms -- a recent start already lost the ownership claim to live pid {:?}, whose daemon-status heartbeat is fresh even though it has not gone fresh inside this call's window",
+            "[agentplug] not spawning a daemon for another {backoff_remaining}ms -- a recent start already lost the ownership claim to live pid {:?}, which is alive but publishing a stale heartbeat; spawning again at this rate only burns processes",
             read_owner_pid()
         );
         return Ok(false);
@@ -1800,6 +1821,39 @@ pub fn live_foreign_spool_sweeper(spool_dir: &Path) -> Option<u64> {
     Some(pid)
 }
 
+/// How long a spool in-file must sit unmodified before it is claimable.
+///
+/// The documented raw fallback protocol has agents write `in/<verb>/<N>.txt`
+/// with an ordinary shell redirect (`cat > ...`, `printf > ...`), which is not
+/// atomic: the file appears empty and is filled a moment later. A claim landing
+/// inside that window renames away a half-written file and dispatches a torn
+/// body, so the caller gets a validation error naming a field it demonstrably
+/// did supply -- witnessed live 2026-09-10 as two dispatches answered "query
+/// required" with an identical `request_fingerprint` (the fingerprint of the
+/// same empty body) for in-files that contained a `query`. Worse, the error is
+/// indistinguishable from a genuinely malformed body.
+///
+/// One settle interval plus the empty-body re-queue below closes it without
+/// changing the on-disk protocol (no `.ready` marker to add, so every session
+/// already in flight keeps working) and without assuming JSON, which the
+/// plain-text-body verbs (`exec_js`, `serp`, `browser`, `cdp`) do not send.
+const SPOOL_WRITE_SETTLE_MS: u64 = 200;
+
+fn spool_in_file_write_has_settled(txt_path: &Path) -> bool {
+    let Ok(metadata) = fs::metadata(txt_path) else { return false };
+    // An empty file is never a settled request: it is the first half of a
+    // redirect that has not written its body yet.
+    if metadata.len() == 0 {
+        return false;
+    }
+    metadata
+        .modified()
+        .ok()
+        .and_then(|m| m.elapsed().ok())
+        .map(|age| age.as_millis() as u64 >= SPOOL_WRITE_SETTLE_MS)
+        .unwrap_or(true)
+}
+
 /// The claim half of the spool protocol, exposed so the standalone
 /// single-process watcher takes requests exactly the way the shared daemon
 /// does. Without it a standalone watcher read `<task>.txt` and left it in
@@ -1807,6 +1861,9 @@ pub fn live_foreign_spool_sweeper(spool_dir: &Path) -> Option<u64> {
 /// mid-call claimed and ran the SAME request a second time, and a crash
 /// mid-call left a claimless request no sweep could attribute.
 pub fn claim_spool_request_in_place(txt_path: &Path) -> Option<PathBuf> {
+    if !spool_in_file_write_has_settled(txt_path) {
+        return None;
+    }
     let claim_path = txt_path.with_extension(format!("txt.{ORPHAN_CLAIM_EXT}"));
     fs::rename(txt_path, &claim_path).ok().map(|_| claim_path)
 }
@@ -2296,14 +2353,27 @@ fn dispatch_project(root: &Path, project: &mut ProjectPlugins, plugin_modules: &
                 if file_path.extension().and_then(|e| e.to_str()) != Some("txt") {
                     continue;
                 }
+                // Never claim a file whose write is still in progress -- see
+                // spool_in_file_write_has_settled for the torn-body failure that
+                // produced validation errors naming fields the caller did send.
+                if !spool_in_file_write_has_settled(&file_path) {
+                    continue;
+                }
                 let claim_path = file_path.with_extension(format!("txt.{ORPHAN_CLAIM_EXT}"));
                 if fs::rename(&file_path, &claim_path).is_err() {
                     continue;
                 }
-                did_work = true;
                 let claimed_at = Instant::now();
                 let task = file_path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
                 let body = fs::read_to_string(&claim_path).unwrap_or_default();
+                // Backstop for a tear the settle interval did not catch (a very
+                // slow or paused write): put it back rather than dispatch an
+                // empty body, and let a later tick claim the finished file.
+                if body.trim().is_empty() {
+                    let _ = fs::rename(&claim_path, &file_path);
+                    continue;
+                }
+                did_work = true;
                 claimed.push(ClaimedRequest { verb: verb.clone(), task, body, claimed_at });
             }
         }
