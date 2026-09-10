@@ -1759,6 +1759,47 @@ pub fn shared_daemon_is_serving() -> bool {
     is_daemon_fresh()
 }
 
+/// How long a project `.status.json` heartbeat keeps naming a sweeper that is
+/// still presumed to own this spool. Deliberately far looser than
+/// `DAEMON_STALE_MS`: that constant decides whether to try to BECOME the shared
+/// daemon (cheap to lose, the loser just exits), while this one decides whether
+/// a second long-lived sweeper starts on a spool someone else is already
+/// draining (expensive to get wrong -- see `live_foreign_spool_sweeper`). A busy
+/// sweeper's heartbeat legitimately oscillates past 20s while one dispatch
+/// occupies it, so a 20s threshold here reads a healthy-but-busy owner as
+/// absent.
+const FOREIGN_SWEEPER_STALE_MS: u64 = 120_000;
+
+/// The pid of another LIVE process whose heartbeat says it is already sweeping
+/// this project's spool, if there is one.
+///
+/// Two sweepers on one spool do not share work, they corrupt each other's: each
+/// keeps its own in-flight map, so every claim the other holds looks abandoned
+/// to `sweep_orphaned_claims`, which answers `dispatch_orphaned` and deletes a
+/// claim whose real owner is still running it. Witnessed live 2026-09-10 on one
+/// project: SEVEN concurrent `agentplug-runner spool` standalone watchers (each
+/// spawned by a different session's gm-mcp `ensureSpoolRunnerRunning` tick while
+/// the shared daemon's heartbeat oscillated across DAEMON_STALE_MS under load),
+/// producing a `dispatch_orphaned` storm with a `sweeping_pid` that rotated
+/// between watchers, out-files that never arrived, and a machine saturated by
+/// seven copies of the gm wasm pool.
+pub fn live_foreign_spool_sweeper(spool_dir: &Path) -> Option<u64> {
+    let status = fs::read_to_string(spool_dir.join(".status.json")).ok()?;
+    let value = serde_json::from_str::<serde_json::Value>(&status).ok()?;
+    let pid = value.get("pid").and_then(|p| p.as_u64())?;
+    if pid == std::process::id() as u64 {
+        return None;
+    }
+    let ts = value.get("ts").and_then(|t| t.as_u64()).unwrap_or(0);
+    if now_ms().saturating_sub(ts) >= FOREIGN_SWEEPER_STALE_MS {
+        return None;
+    }
+    if !pid_is_alive(pid) {
+        return None;
+    }
+    Some(pid)
+}
+
 /// The claim half of the spool protocol, exposed so the standalone
 /// single-process watcher takes requests exactly the way the shared daemon
 /// does. Without it a standalone watcher read `<task>.txt` and left it in
@@ -1916,12 +1957,41 @@ pub fn sweep_orphaned_claims_across_roots(roots: &[PathBuf]) {
     clear_handoff_inherited_claims();
 }
 
+/// Youngest a claim may be and still be called orphaned. A claim is only
+/// evidence of a DEAD owner once no live owner could plausibly still be running
+/// it, and a legitimate dispatch routinely outlives every internal bound: the
+/// worker pool auto-detaches at 45s and lets the dispatch keep running to
+/// completion, and a cold codesearch index/embed pass on a large repo takes
+/// minutes (which is why the gm MCP tool ships a `resume_task` argument at all).
+/// Sweeping on sight instead answered `dispatch_orphaned` for work that was
+/// still running and deleted the claim under its owner, so the real result
+/// landed -- if at all -- after the caller had already been told it was lost.
+const MIN_ORPHAN_CLAIM_AGE_MS: u64 = 600_000;
+
+fn claim_age_ms(path: &Path) -> Option<u64> {
+    let modified = fs::metadata(path).ok()?.modified().ok()?;
+    Some(modified.elapsed().ok()?.as_millis() as u64)
+}
+
 fn sweep_orphaned_claims_distinguishing_handoff_from_crash(root: &Path, inherited: &HashSet<AbandonedClaim>) {
     let spool_dir = root.join(".gm").join("exec-spool");
     let in_dir = spool_dir.join("in");
     let out_dir = spool_dir.join("out");
     if fs::create_dir_all(&out_dir).is_err() {
         return;
+    }
+    // Another live process's heartbeat on this spool means its claims are its
+    // own to finish or abandon, not ours to adjudicate -- we cannot see its
+    // in-flight map, so every claim it holds would read as orphaned here. The
+    // handoff path below is the one sanctioned way a claim changes owner.
+    if let Some(sweeper_pid) = live_foreign_spool_sweeper(&spool_dir) {
+        if inherited.is_empty() {
+            eprintln!(
+                "[agentplug daemon] skipping orphan sweep for {} -- pid {sweeper_pid} holds a live heartbeat on this spool, so its in-flight claims are not orphans this process can see",
+                root.display()
+            );
+            return;
+        }
     }
     let Ok(verb_dirs) = fs::read_dir(&in_dir) else { return };
     for verb_entry in verb_dirs.flatten() {
@@ -1949,6 +2019,9 @@ fn sweep_orphaned_claims_distinguishing_handoff_from_crash(root: &Path, inherite
                     continue;
                 }
                 eprintln!("[agentplug daemon] could not re-queue handoff-inherited claim {verb}/{task} for {} -- falling through to dispatch_orphaned rather than swallowing it", root.display());
+            }
+            if claim_age_ms(&path).map(|age| age < MIN_ORPHAN_CLAIM_AGE_MS).unwrap_or(false) {
+                continue;
             }
             let out_name = format!("{verb}-{task}.json");
             if !out_dir.join(&out_name).exists() {
