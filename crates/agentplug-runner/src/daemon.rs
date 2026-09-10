@@ -561,7 +561,7 @@ pub fn shared_daemon_owner_that_would_refuse_this_process() -> Option<u64> {
 /// gets to check. Gating the backoff on the FRESH predicate would make it
 /// unreachable -- a fresh owner already satisfies `is_daemon_fresh()` and the
 /// spawn is never attempted at all.
-fn live_foreign_daemon_owner_pid() -> Option<u64> {
+pub fn live_foreign_daemon_owner_pid() -> Option<u64> {
     let pid = read_owner_pid()?;
     if pid == std::process::id() as u64 {
         return None;
@@ -616,6 +616,15 @@ fn record_wasted_daemon_start() {
 
 fn clear_wasted_daemon_start_backoff() {
     let _ = fs::remove_file(daemon_spawn_backoff_path());
+}
+
+pub fn daemon_spawn_backoff_remaining_ms_if_active() -> Option<u64> {
+    let remaining = wasted_daemon_start_backoff_remaining_ms();
+    if remaining > 0 {
+        Some(remaining)
+    } else {
+        None
+    }
 }
 
 fn wasted_daemon_start_backoff_remaining_ms() -> u64 {
