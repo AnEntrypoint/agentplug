@@ -2028,7 +2028,7 @@ fn sweep_orphaned_claims_distinguishing_handoff_from_crash(root: &Path, inherite
                 let out_body = serde_json::json!({
                     "ok": false,
                     "error_code": "dispatch_orphaned",
-                    "error": format!("verb {verb} (task {task}) was claimed by a daemon that died before answering -- a wasm trap, an out-of-memory abort, or a shared-Store recycle during the call. A version handoff is NOT a cause of this error: a handoff re-queues its claims for the incoming daemon, which completes them. The request was NOT completed and no partial work should be assumed. Re-dispatch it."),
+                    "error": format!("verb {verb} (task {task}) was claimed by a daemon that stopped answering -- a wasm trap, an out-of-memory abort, or a shared-Store recycle during the call. A version handoff is NOT a cause of this error: a handoff re-queues its claims for the incoming daemon, which completes them. The outcome is UNVERIFIED, not known to be unperformed: a side-effecting verb (git_commit/git_finalize/git_push/fs_write/memorize-fire) may already have applied some or all of its work, so read the real state (git log, git status, the file, the store) before re-dispatching. Re-dispatch straight away only for a read-only verb."),
                     "verb": verb,
                     "task": task,
                     "sweeping_pid": std::process::id(),
