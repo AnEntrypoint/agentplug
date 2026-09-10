@@ -55,7 +55,12 @@ jobs:
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             asset: agentplug-runner-linux-arm64
-          - os: macos-13
+          # macos-13 (Intel-hosted) GitHub runners are capacity-constrained
+          # to the point of queuing indefinitely (confirmed live: 26+ minutes
+          # queued, never started). Cross-compiling x86_64 from the arm64
+          # macos-14 runner is the standard, reliable alternative -- Xcode's
+          # linker and SDK on Apple Silicon already support both slices.
+          - os: macos-14
             target: x86_64-apple-darwin
             asset: agentplug-runner-macos-x64
           - os: macos-14
