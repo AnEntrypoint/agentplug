@@ -137,6 +137,19 @@ fn main() -> anyhow::Result<()> {
                 return Ok(());
             }
 
+            // Still inside the wasted-start backoff window: the last attempt
+            // already lost the claim to this same live owner, so another
+            // attempt buys nothing and a standalone watcher below would take
+            // the project away from a daemon that is merely slow. Registration
+            // already happened; stop here and let the next call try.
+            if let Some(remaining_ms) = daemon::daemon_spawn_backoff_remaining_ms_if_active() {
+                eprintln!(
+                    "[agentplug] a recent daemon start already lost the ownership claim and the backoff has {remaining_ms}ms left -- {} stays registered, no further start attempt and no standalone watcher this call",
+                    cwd.display()
+                );
+                return Ok(());
+            }
+
             eprintln!("[agentplug] shared daemon not yet visible, attempting to become it before falling back");
             daemon::run_daemon()?;
 
@@ -148,9 +161,19 @@ fn main() -> anyhow::Result<()> {
                 return Ok(());
             }
 
-            if let Some(owner_pid) = daemon::shared_daemon_owner_that_would_refuse_this_process() {
+            // Deliberately the LIVE-pid test, not the fresh-heartbeat one: a
+            // daemon process that is alive still holds the plugin pool and
+            // still claims from this spool, it is just behind. A standalone
+            // watcher started alongside it double-claims the same requests, and
+            // its `.status.json` rewrite is what flips a project's runtime from
+            // `agentplug` to `agentplug-runner-standalone` mid-session. Taking
+            // over from a genuinely WEDGED daemon still works: run_daemon above
+            // takes ownership whenever the heartbeat is stale, at a rate the
+            // wasted-start backoff bounds. Only a dead owner reaches the
+            // standalone fallback.
+            if let Some(owner_pid) = daemon::live_foreign_daemon_owner_pid() {
                 eprintln!(
-                    "[agentplug] shared daemon pid {owner_pid} claimed ownership while this process was starting -- {} stays registered with it, no standalone watcher started",
+                    "[agentplug] daemon pid {owner_pid} is alive and owns the shared lock -- {} stays registered with it, no standalone watcher started (a second sweeper on one spool double-claims its requests)",
                     cwd.display()
                 );
                 return Ok(());
