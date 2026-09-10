@@ -23,8 +23,8 @@ pub use install::{install_dir, plugins_dir, wasmtime_cache_dir};
 pub use memory_pressure::{process_private_bytes_tracking_retained_wasm_peak_unlike_working_set, reset_shared_dispatch_count, shared_dispatches_since_release};
 pub use registry::{
     advance_plugin_fiber, epoch_ticks_for_seconds, get_active_provider, read_plugin_lifecycle, read_project_plugin_list, release_shared_plugin, set_gm_pool_size, set_side_plugin_pool_size, RELEASABLE_SHARED_PLUGINS,
-    note_shared_plugin_bytes_current, request_shared_store_swap, shared_plugin_slot_content_hashes, shared_plugin_swap_pending_hashes,
-    DispatchHandle, GmFairnessGuard, PluginFiberLifecycle, ProjectPlugins, EPOCH_TICK_INTERVAL_MS, PLUGIN_IDLE_EVICT_MS,
+    note_shared_plugin_bytes_current, request_shared_store_swap, shared_plugin_slot_content_hashes, shared_plugin_slot_snapshot_without_blocking, shared_plugin_swap_pending_hashes,
+    cost_class_for_verb, DispatchCostClass, DispatchHandle, GmFairnessGuard, PluginFiberLifecycle, ProjectPlugins, SharedPluginPool, SlotContentSnapshot, EPOCH_TICK_INTERVAL_MS, PLUGIN_IDLE_EVICT_MS,
 };
 
 use std::sync::OnceLock;
