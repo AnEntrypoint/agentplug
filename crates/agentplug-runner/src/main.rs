@@ -121,12 +121,36 @@ fn main() -> anyhow::Result<()> {
                 );
                 return Ok(());
             }
+            // A live owner whose heartbeat is fresh will refuse this process's
+            // ownership claim, so becoming the daemon is impossible and taking
+            // over this project's spool as a standalone watcher would compete
+            // with a healthy daemon for the same request files. The project is
+            // already registered; that daemon services it. Checked before
+            // run_daemon() so a busy owner whose daemon-status.json merely did
+            // not go fresh inside ensure_daemon_running()'s wait window does
+            // not produce a fresh wasted daemon start on every spool call.
+            if let Some(owner_pid) = daemon::shared_daemon_owner_that_would_refuse_this_process() {
+                eprintln!(
+                    "[agentplug] shared daemon pid {owner_pid} owns the daemon lock with a fresh heartbeat -- {} stays registered with it, no competing daemon or standalone watcher started",
+                    cwd.display()
+                );
+                return Ok(());
+            }
+
             eprintln!("[agentplug] shared daemon not yet visible, attempting to become it before falling back");
             daemon::run_daemon()?;
 
             if daemon::ensure_daemon_running()? {
                 eprintln!(
                     "[agentplug] registered {} with the shared system-wide daemon (converged after retry) -- no dedicated per-project process spawned",
+                    cwd.display()
+                );
+                return Ok(());
+            }
+
+            if let Some(owner_pid) = daemon::shared_daemon_owner_that_would_refuse_this_process() {
+                eprintln!(
+                    "[agentplug] shared daemon pid {owner_pid} claimed ownership while this process was starting -- {} stays registered with it, no standalone watcher started",
                     cwd.display()
                 );
                 return Ok(());
@@ -200,6 +224,7 @@ fn main() -> anyhow::Result<()> {
         }
         "selfcheck-registry" => selfcheck_registry(),
         "selfcheck-inflight" => selfcheck_inflight_cleanup(),
+        "selfcheck-pool-fairness" => selfcheck_pool_fairness(),
         other => {
             eprintln!(
                 "agentplug-runner: unknown command '{other}'. Usage: agentplug-runner <plugin <name> [version]|spool|daemon|takeover <version>|dispatch [plugin] <verb> [body]|reap-orphans|sweep-spool [root]|selfcheck-registry|selfcheck-inflight|version>"
@@ -229,9 +254,15 @@ fn selfcheck_registry() -> anyhow::Result<()> {
     assert_eq!(out, "ok", "fresh slot must serve a real dispatch through the compiled module");
     println!("[selfcheck-registry] fresh gm slot dispatched and returned {out:?}");
 
+    // One assertion per SLOT, not a hardcoded 1: `gm` is a pooled shared plugin
+    // (gm_pool_size, 4 by default) and `load_plugin` fills every slot it can
+    // lock, so a swap against an idle pool evicts all of them. The literal 1
+    // predates the pool and made this selfcheck fail on every build that
+    // actually had a multi-slot gm pool.
+    let gm_slot_count = shared_plugin_slot_content_hashes("gm").len();
     let (evicted_now, deferred) = request_shared_store_swap("gm", "hash-a");
-    println!("[selfcheck-registry] swap request against idle slot: evicted_now={evicted_now} deferred={deferred}");
-    assert_eq!((evicted_now, deferred), (1, 0), "an idle slot holding the old hash must be evicted immediately, nothing deferred");
+    println!("[selfcheck-registry] swap request against {gm_slot_count} idle slot(s): evicted_now={evicted_now} deferred={deferred}");
+    assert_eq!((evicted_now, deferred), (gm_slot_count, 0), "every idle slot holding the old hash must be evicted immediately, nothing deferred");
     assert!(shared_plugin_slot_content_hashes("gm").iter().all(|h| h.is_none()), "evicted slot must show no content hash");
 
     project.load_plugin(&engine, "gm", &module, "hash-b")?;
@@ -242,6 +273,82 @@ fn selfcheck_registry() -> anyhow::Result<()> {
     note_shared_plugin_bytes_current("gm", "hash-b");
     assert!(shared_plugin_swap_pending_hashes("gm").is_empty(), "marking hash-b current must leave no pending swap hashes");
     println!("[selfcheck-registry] all invariants witnessed live through real wasmtime dispatch: PASS");
+    Ok(())
+}
+
+/// Witnesses the cheap-verb reservation against the real pool: real
+/// `SharedPluginPool`, real mutex slots, real condvar, real threads. Parks
+/// `heavy_admission_limit` heavy dispatches in the pool (each genuinely holding
+/// a slot guard, exactly as a long `code_index`/`recall` would) and then times a
+/// cheap acquisition. Before the class split this acquisition waited behind the
+/// parked heavy work; the reservation of one slot is what makes it return.
+fn selfcheck_pool_fairness() -> anyhow::Result<()> {
+    use agentplug_host::{cost_class_for_verb, DispatchCostClass, SharedPluginPool};
+    use std::sync::mpsc;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    assert_eq!(cost_class_for_verb("code_index"), DispatchCostClass::Heavy, "code_index must classify as heavy");
+    assert_eq!(cost_class_for_verb("recall"), DispatchCostClass::Heavy, "recall must classify as heavy");
+    assert_eq!(cost_class_for_verb("codesearch"), DispatchCostClass::Cheap, "codesearch must classify as cheap");
+    assert_eq!(cost_class_for_verb("instruction"), DispatchCostClass::Cheap, "instruction must classify as cheap");
+    println!("[selfcheck-pool-fairness] verb classification: code_index/recall heavy, codesearch/instruction cheap");
+
+    const POOL_SIZE: usize = 4;
+    let pool = Arc::new(SharedPluginPool::new("gm", POOL_SIZE));
+    let heavy_slots_expected = POOL_SIZE - 1;
+
+    let (parked_tx, parked_rx) = mpsc::channel::<usize>();
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    let release_rx = Arc::new(std::sync::Mutex::new(release_rx));
+    let mut heavy_threads = Vec::new();
+    for n in 0..heavy_slots_expected {
+        let pool = pool.clone();
+        let parked_tx = parked_tx.clone();
+        let release_rx = release_rx.clone();
+        heavy_threads.push(std::thread::spawn(move || {
+            let _admission = SharedPluginPool::admit(&pool, DispatchCostClass::Heavy);
+            let (_guard, _waited) = pool.acquire_within_for_class(SharedPluginPool::ACQUIRE_TIMEOUT_MS, DispatchCostClass::Heavy);
+            let _ = parked_tx.send(n);
+            let _ = release_rx.lock().unwrap().recv();
+        }));
+    }
+    for _ in 0..heavy_slots_expected {
+        let parked = parked_rx.recv_timeout(Duration::from_secs(10)).map_err(|e| anyhow::anyhow!("a heavy dispatch never acquired its slot: {e}"))?;
+        println!("[selfcheck-pool-fairness] heavy dispatch {parked} parked holding a real slot guard");
+    }
+
+    let extra_heavy_pool = pool.clone();
+    let (extra_admitted_tx, extra_admitted_rx) = mpsc::channel::<()>();
+    let extra_heavy = std::thread::spawn(move || {
+        let _admission = SharedPluginPool::admit(&extra_heavy_pool, DispatchCostClass::Heavy);
+        let _ = extra_admitted_tx.send(());
+    });
+    assert!(
+        extra_admitted_rx.recv_timeout(Duration::from_millis(1500)).is_err(),
+        "a {}th heavy dispatch must NOT be admitted into a {POOL_SIZE}-slot pool -- one slot stays reserved for cheap verbs",
+        heavy_slots_expected + 1
+    );
+    println!("[selfcheck-pool-fairness] a further heavy dispatch is held at admission, so it cannot take the reserved slot");
+
+    let cheap_start = Instant::now();
+    let (cheap_guard, cheap_waited_ms) = pool.acquire_within_for_class(SharedPluginPool::ACQUIRE_TIMEOUT_MS, DispatchCostClass::Cheap);
+    let cheap_elapsed = cheap_start.elapsed();
+    assert!(
+        cheap_elapsed < Duration::from_millis(500),
+        "a cheap dispatch waited {cheap_elapsed:?} behind parked heavy work -- the reserved slot was not honored"
+    );
+    println!("[selfcheck-pool-fairness] cheap dispatch acquired the reserved slot in {cheap_waited_ms}ms while {heavy_slots_expected} heavy dispatches stayed parked");
+    drop(cheap_guard);
+
+    for _ in 0..heavy_slots_expected {
+        let _ = release_tx.send(());
+    }
+    for t in heavy_threads {
+        let _ = t.join();
+    }
+    let _ = extra_heavy.join();
+    println!("[selfcheck-pool-fairness] witnessed live against the real SharedPluginPool: PASS");
     Ok(())
 }
 
@@ -276,6 +383,43 @@ fn selfcheck_inflight_cleanup() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Merge into whatever `.status.json` already holds instead of replacing it.
+/// A bare three-key overwrite dropped every field the shared daemon publishes
+/// (`busy_until`, `queue_wait_ms`, `plugin_compile_failures`,
+/// `runner_update_in_progress`) and flipped `runtime` from `agentplug` to
+/// `agentplug-runner-standalone` with `daemon`/`shared_process` left stale at
+/// `true` -- a reader could not tell which process was actually serving.
+fn write_standalone_status(status_path: &std::path::Path) {
+    use std::fs;
+    let mut payload = match fs::read_to_string(status_path).ok().and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok()) {
+        Some(serde_json::Value::Object(map)) => serde_json::Value::Object(map),
+        _ => serde_json::json!({}),
+    };
+    payload["pid"] = serde_json::json!(std::process::id());
+    payload["ts"] = serde_json::json!(agentplug_host::now_ms());
+    payload["runtime"] = serde_json::json!("agentplug-runner-standalone");
+    payload["daemon"] = serde_json::json!(false);
+    payload["shared_process"] = serde_json::json!(false);
+    let _ = fs::write(status_path, payload.to_string());
+}
+
+/// Drop the standalone process's own markers so a reader polling
+/// `.status.json` during the handover is never told a standalone watcher is
+/// serving after this process has stopped serving. The shared daemon's own
+/// per-project heartbeat restores `runtime`/`daemon`/`shared_process` on its
+/// next tick.
+fn clear_standalone_status(status_path: &std::path::Path) {
+    use std::fs;
+    let Some(serde_json::Value::Object(mut map)) = fs::read_to_string(status_path).ok().and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok()) else {
+        return;
+    };
+    map.remove("runtime");
+    map.remove("daemon");
+    map.remove("shared_process");
+    map.insert("ts".to_string(), serde_json::json!(agentplug_host::now_ms()));
+    let _ = fs::write(status_path, serde_json::Value::Object(map).to_string());
+}
+
 fn run_spool_watcher_single_process(project: &mut ProjectPlugins, spool_dir: &std::path::Path) -> anyhow::Result<()> {
     use std::fs;
     use std::time::Duration;
@@ -287,10 +431,22 @@ fn run_spool_watcher_single_process(project: &mut ProjectPlugins, spool_dir: &st
     let status_path = spool_dir.join(".status.json");
 
     loop {
-        let _ = fs::write(
-            &status_path,
-            serde_json::json!({"pid": std::process::id(), "ts": agentplug_host::now_ms(), "runtime": "agentplug-runner-standalone"}).to_string(),
-        );
+        // Checked at the top of every tick, never only at startup: a standalone
+        // watcher is a fallback for a missing shared daemon, not a permanent
+        // takeover of the project. Yielding between dispatches (rather than
+        // mid-dispatch) means no claim is ever in flight at this point, so
+        // there is nothing to re-queue and nothing for the returning daemon's
+        // sweep to orphan.
+        if daemon::shared_daemon_is_serving() {
+            clear_standalone_status(&status_path);
+            eprintln!(
+                "[agentplug] shared daemon is serving again -- standalone watcher for {} exiting between dispatches, leaving every unclaimed request in the spool for it",
+                spool_dir.display()
+            );
+            return Ok(());
+        }
+
+        write_standalone_status(&status_path);
 
         let mut work_done = false;
         if let Ok(verb_dirs) = fs::read_dir(&in_dir) {
@@ -306,14 +462,17 @@ fn run_spool_watcher_single_process(project: &mut ProjectPlugins, spool_dir: &st
                     if path.extension().and_then(|e| e.to_str()) != Some("txt") {
                         continue;
                     }
-                    let Ok(body) = fs::read_to_string(&path) else { continue };
+                    let Some(claim_path) = daemon::claim_spool_request_in_place(&path) else { continue };
+                    let Ok(body) = fs::read_to_string(&claim_path) else {
+                        let _ = fs::remove_file(&claim_path);
+                        continue;
+                    };
                     let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
                     let result = project
                         .dispatch("gm", &verb, &body)
                         .unwrap_or_else(|e| serde_json::json!({"ok": false, "verb": verb, "error": e.to_string()}).to_string());
-                    let out_path = out_dir.join(format!("{verb}-{stem}.json"));
-                    fs::write(&out_path, result)?;
-                    let _ = fs::remove_file(&path);
+                    daemon::write_spool_out(&out_dir, &format!("{verb}-{stem}.json"), &result);
+                    let _ = fs::remove_file(&claim_path);
                     work_done = true;
                 }
             }
