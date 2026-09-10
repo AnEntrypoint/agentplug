@@ -223,6 +223,19 @@ pub fn cost_class_for_verb(verb: &str) -> DispatchCostClass {
     }
 }
 
+pub fn cost_class_for_dispatch(verb: &str, body: &str) -> DispatchCostClass {
+    if verb != "codesearch" {
+        return cost_class_for_verb(verb);
+    }
+    let mode = serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|value| value.get("mode").and_then(serde_json::Value::as_str));
+    match mode {
+        None | Some("dual") => DispatchCostClass::Heavy,
+        Some(_) => DispatchCostClass::Cheap,
+    }
+}
+
 /// A panic that unwinds through a held slot guard leaves that `Mutex`
 /// poisoned, and `try_lock` on a poisoned mutex returns `Err` FOREVER, not
 /// just while it is held. Treating that `Err` as "busy" (the previous
@@ -862,7 +875,7 @@ impl ProjectPlugins {
             std::thread::sleep(std::time::Duration::from_millis(DISPATCH_LOOKUP_RETRY_BACKOFF_MS));
         }
         let pool = pool.ok_or_else(|| PluginDispatchError::NotRegistered { plugin_name: plugin_name.to_string() })?;
-        let cost_class = cost_class_for_verb(verb);
+        let cost_class = cost_class_for_dispatch(verb, body);
         let _heavy_admission = SharedPluginPool::admit(&pool, cost_class);
         let (mut guard, _waited_ms) = pool.acquire_within_for_class(SharedPluginPool::ACQUIRE_TIMEOUT_MS, cost_class);
         dispatch_and_evict_on_error(&mut guard, &pool, verb, body, &self.root, &self.siblings, plugin_name)
@@ -937,7 +950,7 @@ impl DispatchHandle {
             pool = self.siblings.lock().unwrap().get(plugin_name).cloned();
         }
         let pool = pool.ok_or_else(|| PluginDispatchError::NotRegistered { plugin_name: plugin_name.to_string() })?;
-        let cost_class = cost_class_for_verb(verb);
+        let cost_class = cost_class_for_dispatch(verb, body);
         let _heavy_admission = SharedPluginPool::admit(&pool, cost_class);
         let (mut guard, _waited_ms) = pool.acquire_within_for_class(SharedPluginPool::ACQUIRE_TIMEOUT_MS, cost_class);
         if guard.is_none() {
@@ -1074,4 +1087,3 @@ pub fn read_project_plugin_list(root: &Path) -> Vec<String> {
         .filter(|l| !l.is_empty())
         .collect()
 }
-

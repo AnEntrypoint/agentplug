@@ -335,14 +335,17 @@ fn selfcheck_registry() -> anyhow::Result<()> {
 /// cheap acquisition. Before the class split this acquisition waited behind the
 /// parked heavy work; the reservation of one slot is what makes it return.
 fn selfcheck_pool_fairness() -> anyhow::Result<()> {
-    use agentplug_host::{cost_class_for_verb, DispatchCostClass, SharedPluginPool};
+    use agentplug_host::{cost_class_for_dispatch, cost_class_for_verb, DispatchCostClass, SharedPluginPool};
     use std::sync::mpsc;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
     assert_eq!(cost_class_for_verb("code_index"), DispatchCostClass::Heavy, "code_index must classify as heavy");
     assert_eq!(cost_class_for_verb("recall"), DispatchCostClass::Heavy, "recall must classify as heavy");
-    assert_eq!(cost_class_for_verb("codesearch"), DispatchCostClass::Cheap, "codesearch must classify as cheap");
+    assert_eq!(cost_class_for_verb("codesearch"), DispatchCostClass::Cheap, "the verb-only compatibility classifier must stay cheap");
+    assert_eq!(cost_class_for_dispatch("codesearch", r#"{"mode":"literal"}"#), DispatchCostClass::Cheap, "literal codesearch must preserve a slot for responsive tool work");
+    assert_eq!(cost_class_for_dispatch("codesearch", r#"{"mode":"regex"}"#), DispatchCostClass::Cheap, "regex codesearch must preserve a slot for responsive tool work");
+    assert_eq!(cost_class_for_dispatch("codesearch", r#"{"query":"semantic search"}"#), DispatchCostClass::Heavy, "default codesearch can rebuild and embed, so it must not consume the responsive slot");
     assert_eq!(cost_class_for_verb("instruction"), DispatchCostClass::Cheap, "instruction must classify as cheap");
     println!("[selfcheck-pool-fairness] verb classification: code_index/recall heavy, codesearch/instruction cheap");
 
