@@ -3,8 +3,6 @@ name: release
 on:
   push:
     branches: [main]
-    paths-ignore:
-      - '.github/workflows/**'
 
 concurrency:
   group: agentplug-release
