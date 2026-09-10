@@ -767,13 +767,13 @@ fn staged_binary_self_check(staged_exe: &Path, expected_version: &str) -> bool {
 fn attempt_self_update_handoff(staged_exe: &Path, version: &str) -> bool {
     if !staged_binary_self_check(staged_exe, version) {
         let _ = fs::remove_file(staged_exe);
-        record_handoff_attempt(Some(format!("staged_binary_self_check failed for {version}, staged exe removed")));
+        record_handoff_failure(version, format!("staged_binary_self_check failed for {version}, staged exe removed"));
         return false;
     }
     let ready_path = takeover_ready_path();
     let _ = fs::remove_file(&ready_path);
     if let Err(e) = spawn_detached(staged_exe, &["takeover", version]) {
-        record_handoff_attempt(Some(format!("spawn_detached of staged {version} failed: {e}")));
+        record_handoff_failure(version, format!("spawn_detached of staged {version} failed: {e}"));
         return false;
     }
     for _ in 0..40 {
@@ -783,6 +783,7 @@ fn attempt_self_update_handoff(staged_exe: &Path, version: &str) -> bool {
                 if v.get("version").and_then(|x| x.as_str()) == Some(version) {
                     eprintln!("[agentplug daemon] new version {version} confirmed ready -- releasing ownership for handoff");
                     record_handoff_attempt(None);
+                    clear_handoff_escalation(version);
                     release_ownership_for_handoff();
                     return true;
                 }
@@ -790,7 +791,7 @@ fn attempt_self_update_handoff(staged_exe: &Path, version: &str) -> bool {
         }
     }
     eprintln!("[agentplug daemon] self-update to {version} did not confirm ready in time -- staying on current version, will retry next poll");
-    record_handoff_attempt(Some(format!("staged {version} did not write a matching readiness marker within 10s")));
+    record_handoff_failure(version, format!("staged {version} did not write a matching readiness marker within 10s"));
     false
 }
 
@@ -1206,6 +1207,96 @@ fn last_handoff_attempt() -> &'static Mutex<Option<HandoffAttempt>> {
 
 fn record_handoff_attempt(error: Option<String>) {
     *last_handoff_attempt().lock().unwrap_or_else(|e| e.into_inner()) = Some((now_ms(), error));
+}
+
+/// Consecutive same-version handoff failures. A version change resets the
+/// count: it means a newer release superseded the one that was stuck, which
+/// is progress, not the same failure repeating.
+fn consecutive_handoff_failures() -> &'static Mutex<(String, u32)> {
+    static SLOT: OnceLock<Mutex<(String, u32)>> = OnceLock::new();
+    SLOT.get_or_init(|| Mutex::new((String::new(), 0)))
+}
+
+/// Same-version handoff failures the runner will absorb silently (retried on
+/// the next hourly poll, per `runner_update_poll_interval`) before it
+/// concludes it cannot apply this update on its own and escalates. Three
+/// hourly attempts rules out a single transient network blip or a momentarily
+/// locked file without leaving a real problem unreported for a long stretch.
+const HANDOFF_ESCALATION_THRESHOLD: u32 = 3;
+
+fn runner_update_escalation_path() -> PathBuf {
+    install_dir().join("runner-update-escalation.json")
+}
+
+/// Overlay the runner's own update-escalation marker onto a `gm` plugin's
+/// `instruction` response, at the native layer -- not inside the wasm guest.
+/// The guest's own `host_fs_read` is scoped to its project cwd plus roots
+/// carrying a project marker (`.git`/`.gm`/`package.json`/etc, see
+/// `has_project_marker` in agentplug-host); `~/.agentplug` is the runner's
+/// own state directory, not a project, so it can never pass that gate and a
+/// wasm-side read of this file always returns null (confirmed live: an
+/// earlier plugkit-bin release tried exactly this, reverted in v0.1.1284).
+/// Patching the already-serialized response here, after the wasm call
+/// returns, needs no new host-import ABI and no guest-side capability grant.
+pub(crate) fn patch_update_available_from_escalation(plugin: &str, verb: &str, response: String) -> String {
+    if plugin != "gm" || verb != "instruction" {
+        return response;
+    }
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&response) else { return response };
+    let Some(obj) = value.as_object_mut() else { return response };
+    if !matches!(obj.get("update_available"), Some(serde_json::Value::Null) | None) {
+        return response;
+    }
+    let Ok(marker_raw) = fs::read_to_string(runner_update_escalation_path()) else { return response };
+    let Ok(marker) = serde_json::from_str::<serde_json::Value>(&marker_raw) else { return response };
+    obj.insert("update_available".to_string(), marker);
+    value.to_string()
+}
+
+/// Record one failed handoff attempt for `version`. Past the escalation
+/// threshold, write a durable marker naming the exact fallback command --
+/// re-running the installer, which fetches, checksums, and replaces the
+/// binary independently of whatever the in-process staging path just failed
+/// at -- so an agent reading `update_available` on a served `instruction`
+/// response gets something concrete to run instead of a silent retry loop.
+fn record_handoff_failure(version: &str, reason: String) {
+    record_handoff_attempt(Some(reason.clone()));
+    let mut slot = consecutive_handoff_failures().lock().unwrap_or_else(|e| e.into_inner());
+    if slot.0 != version {
+        *slot = (version.to_string(), 1);
+    } else {
+        slot.1 += 1;
+    }
+    if slot.1 < HANDOFF_ESCALATION_THRESHOLD {
+        return;
+    }
+    let command = if cfg!(windows) {
+        r#"irm https://raw.githubusercontent.com/AnEntrypoint/gm/main/install.ps1 | iex"#
+    } else {
+        "curl -fsSL https://raw.githubusercontent.com/AnEntrypoint/gm/main/install.sh | sh -s -- spool"
+    };
+    let marker = serde_json::json!({
+        "version": version,
+        "consecutive_failures": slot.1,
+        "reason": reason,
+        "command": command,
+        "since_ts": now_ms(),
+    });
+    if let Some(parent) = runner_update_escalation_path().parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let _ = fs::write(runner_update_escalation_path(), marker.to_string());
+}
+
+/// Clear the escalation marker (and the failure count behind it) once a
+/// handoff for `version` actually succeeds -- an agent must never see a
+/// fallback command for a problem that already resolved itself.
+fn clear_handoff_escalation(version: &str) {
+    let mut slot = consecutive_handoff_failures().lock().unwrap_or_else(|e| e.into_inner());
+    if slot.0 == version {
+        *slot = (String::new(), 0);
+    }
+    let _ = fs::remove_file(runner_update_escalation_path());
 }
 
 fn persisted_plugin_poll_ts_path() -> PathBuf {
@@ -1717,6 +1808,7 @@ pub(crate) fn run_gm_dispatch_to_file(root: &Path, handle: &DispatchHandle, verb
             serde_json::json!({"ok": false, "error": format!("dispatch panicked: {msg}"), "verb": verb}).to_string()
         }
     };
+    let out_body = patch_update_available_from_escalation(plugin_name, verb, out_body);
     let out_name = format!("{verb}-{task}.json");
     write_spool_out(out_dir, &out_name, &out_body);
     let in_dir = root.join(".gm").join("exec-spool").join("in");
@@ -2250,6 +2342,7 @@ fn dispatch_project(root: &Path, project: &mut ProjectPlugins, plugin_modules: &
                         serde_json::json!({"ok": false, "error": format!("dispatch panicked: {msg}"), "verb": verb}).to_string()
                     }
                 };
+                let out_body = patch_update_available_from_escalation(&plugin_name, &verb, out_body);
                 write_pd_out(&out_name, &out_body);
             }
         }
