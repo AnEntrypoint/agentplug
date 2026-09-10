@@ -156,6 +156,24 @@ fn main() -> anyhow::Result<()> {
                 return Ok(());
             }
 
+            // A standalone watcher is a long-lived, serial, gm-wasm-holding
+            // sweeper of THIS spool. Starting a second one on a spool another
+            // live process is already sweeping is never a fallback, it is
+            // corruption: the two cannot see each other's in-flight claims, so
+            // each one's orphan sweep answers dispatch_orphaned for the other's
+            // running work and deletes the claim under it. The shared-daemon
+            // checks above only rule out a fresh DAEMON owner; nothing ruled out
+            // a sibling standalone watcher, which is how seven of them
+            // accumulated on one project (see live_foreign_spool_sweeper).
+            if let Some(sweeper_pid) = daemon::live_foreign_spool_sweeper(&spool_dir) {
+                eprintln!(
+                    "[agentplug] pid {sweeper_pid} is already sweeping {} with a live heartbeat -- {} stays registered with it, no second standalone watcher started (two sweepers on one spool orphan each other's in-flight claims)",
+                    spool_dir.display(),
+                    cwd.display()
+                );
+                return Ok(());
+            }
+
             eprintln!("[agentplug] shared daemon still unavailable after retry -- falling back to a standalone watcher for this project");
             let wasm = download::ensure_plugin_installed("gm", None)?;
             let content_hash = download::sha256_hex(&std::fs::read(&wasm)?);
