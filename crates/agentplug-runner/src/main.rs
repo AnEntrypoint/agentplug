@@ -173,6 +173,9 @@ fn main() -> anyhow::Result<()> {
                 println!("{out}");
                 return Ok(());
             }
+            // Note: try_dispatch_via_daemon's own out-file is already patched
+            // at the daemon side (see patch_update_available_from_escalation);
+            // only the fully-local fallback below needs patching here.
 
             let wasm = download::ensure_plugin_installed(&plugin, None)?;
             let content_hash = download::sha256_hex(&std::fs::read(&wasm)?);
@@ -187,6 +190,7 @@ fn main() -> anyhow::Result<()> {
                 .collect();
             let _ = reconcile_plugin_manifest(&mut project, &engine, &siblings)?;
             let out = project.dispatch(&plugin, &verb, &body)?;
+            let out = daemon::patch_update_available_from_escalation(&plugin, &verb, out);
             println!("{out}");
             Ok(())
         }
