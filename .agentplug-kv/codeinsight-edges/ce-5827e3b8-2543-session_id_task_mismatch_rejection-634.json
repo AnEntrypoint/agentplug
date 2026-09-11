@@ -1,0 +1,1 @@
+{"callee_symbol":"session_id_task_mismatch_rejection","caller_path":"crates/agentplug-runner/src/daemon.rs","caller_symbol":"dispatch_project","line":2543}

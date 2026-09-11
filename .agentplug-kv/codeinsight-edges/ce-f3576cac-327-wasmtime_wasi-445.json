@@ -1,0 +1,1 @@
+{"callee_symbol":"wasmtime_wasi","caller_path":"crates/agentplug-host/src/imports.rs","caller_symbol":"register_wasi","line":327}

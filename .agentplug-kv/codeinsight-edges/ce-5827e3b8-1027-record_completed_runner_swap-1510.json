@@ -1,0 +1,1 @@
+{"callee_symbol":"record_completed_runner_swap","caller_path":"crates/agentplug-runner/src/daemon.rs","caller_symbol":"promote_staged_exe_to_canonical","line":1027}

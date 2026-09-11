@@ -1,0 +1,1 @@
+{"callee_symbol":"gh_cmd","caller_path":"crates/agentplug-runner/src/daemon.rs","caller_symbol":"seed_github_token_from_gh_cli_if_unset","line":2958}

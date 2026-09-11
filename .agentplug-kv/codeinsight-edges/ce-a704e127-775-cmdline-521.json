@@ -1,0 +1,1 @@
+{"callee_symbol":"cmdline","caller_path":"crates/agentplug-host/src/browser.rs","caller_symbol":"is_headless_root_chrome_process","line":775}

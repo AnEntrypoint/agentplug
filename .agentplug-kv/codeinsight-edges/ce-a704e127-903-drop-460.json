@@ -1,0 +1,1 @@
+{"callee_symbol":"drop","caller_path":"crates/agentplug-host/src/browser.rs","caller_symbol":"reap_sessions_for_deregistered_roots","line":903}

@@ -1,0 +1,1 @@
+{"callee_symbol":"serde_json","caller_path":"crates/agentplug-host/src/imports.rs","caller_symbol":"load_capability_allowlist_config","line":34}

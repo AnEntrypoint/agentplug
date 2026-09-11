@@ -1,0 +1,1 @@
+{"callee_symbol":"daemon_status_path","caller_path":"crates/agentplug-runner/src/daemon.rs","caller_symbol":"write_daemon_heartbeat","line":1176}

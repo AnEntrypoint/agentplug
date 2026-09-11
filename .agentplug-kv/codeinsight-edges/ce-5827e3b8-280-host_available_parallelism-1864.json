@@ -1,0 +1,1 @@
+{"callee_symbol":"host_available_parallelism","caller_path":"crates/agentplug-runner/src/daemon.rs","caller_symbol":"gm_pool_size","line":280}

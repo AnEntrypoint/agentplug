@@ -1,0 +1,1 @@
+{"callee_symbol":"read_known_bad_versions","caller_path":"crates/agentplug-runner/src/download.rs","caller_symbol":"refresh_plugin_if_stale","line":648}

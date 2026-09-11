@@ -1,0 +1,1 @@
+{"callee_symbol":"spool_in_file_write_has_settled","caller_path":"crates/agentplug-runner/src/daemon.rs","caller_symbol":"claim_spool_request_in_place","line":1961}

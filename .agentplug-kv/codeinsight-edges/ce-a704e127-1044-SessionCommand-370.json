@@ -1,0 +1,1 @@
+{"callee_symbol":"SessionCommand","caller_path":"crates/agentplug-host/src/browser.rs","caller_symbol":"parse_session_command","line":1044}

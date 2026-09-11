@@ -1,0 +1,1 @@
+{"callee_symbol":"write_handoff_inherited_claims","caller_path":"crates/agentplug-runner/src/daemon.rs","caller_symbol":"hand_claims_to_live_successor","line":2021}

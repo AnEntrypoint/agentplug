@@ -1,0 +1,1 @@
+{"callee_symbol":"lock","caller_path":"crates/agentplug-host/src/imports.rs","caller_symbol":"atomic_write_locked","line":125}

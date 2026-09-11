@@ -1,0 +1,1 @@
+{"callee_symbol":"platform","caller_path":"crates/agentplug-host/src/memory_pressure.rs","caller_symbol":"process_private_bytes_tracking_retained_wasm_peak_unlike_working_set","line":4}

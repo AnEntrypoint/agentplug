@@ -1,0 +1,1 @@
+{"callee_symbol":"try_lock_slot_recovering_from_poison","caller_path":"crates/agentplug-host/src/registry.rs","caller_symbol":"acquire_within_for_class","line":414}

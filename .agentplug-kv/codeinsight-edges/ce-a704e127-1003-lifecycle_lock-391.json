@@ -1,0 +1,1 @@
+{"callee_symbol":"lifecycle_lock","caller_path":"crates/agentplug-host/src/browser.rs","caller_symbol":"session_close","line":1003}

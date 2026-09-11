@@ -1,0 +1,1 @@
+{"callee_symbol":"guard","caller_path":"crates/agentplug-host/src/registry.rs","caller_symbol":"evict_every_currently_free_slot_without_blocking_on_busy_ones","line":516}

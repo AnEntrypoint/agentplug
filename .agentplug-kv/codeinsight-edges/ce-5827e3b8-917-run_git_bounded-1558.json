@@ -1,0 +1,1 @@
+{"callee_symbol":"run_git_bounded","caller_path":"crates/agentplug-runner/src/daemon.rs","caller_symbol":"sync_instruction_source_if_configured","line":917}

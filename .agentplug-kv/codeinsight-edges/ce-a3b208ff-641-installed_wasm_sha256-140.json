@@ -1,0 +1,1 @@
+{"callee_symbol":"installed_wasm_sha256","caller_path":"crates/agentplug-runner/src/download.rs","caller_symbol":"refresh_plugin_if_stale","line":641}

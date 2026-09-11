@@ -1,0 +1,1 @@
+{"callee_symbol":"sweep_orphaned_claims_distinguishing_handoff_from_crash","caller_path":"crates/agentplug-runner/src/daemon.rs","caller_symbol":"sweep_orphaned_claims_across_roots","line":2109}

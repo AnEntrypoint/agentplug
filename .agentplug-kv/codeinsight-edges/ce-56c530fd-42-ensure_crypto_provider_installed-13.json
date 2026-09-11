@@ -1,0 +1,1 @@
+{"callee_symbol":"ensure_crypto_provider_installed","caller_path":"crates/agentplug-host/src/http_agent.rs","caller_symbol":"build_agent","line":42}

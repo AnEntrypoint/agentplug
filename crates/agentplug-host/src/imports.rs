@@ -451,7 +451,10 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
                         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                         .map(|d| d.as_millis() as u64)
                         .unwrap_or(0);
-                    let v = serde_json::json!({"isDirectory": md.is_dir(), "isFile": md.is_file(), "size": md.len(), "mtimeMs": mtime_ms, "mtime_ms": mtime_ms});
+                    let canonical_path = fs::canonicalize(&full)
+                        .ok()
+                        .map(|path| path.to_string_lossy().into_owned());
+                    let v = serde_json::json!({"isDirectory": md.is_dir(), "isFile": md.is_file(), "size": md.len(), "mtimeMs": mtime_ms, "mtime_ms": mtime_ms, "canonicalPath": canonical_path});
                     write_guest_json(&mut caller, v)
                 }
                 Err(_) => 0,

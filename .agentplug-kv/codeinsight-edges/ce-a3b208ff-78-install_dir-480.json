@@ -1,0 +1,1 @@
+{"callee_symbol":"install_dir","caller_path":"crates/agentplug-runner/src/download.rs","caller_symbol":"gc_stale_tmp_files","line":78}

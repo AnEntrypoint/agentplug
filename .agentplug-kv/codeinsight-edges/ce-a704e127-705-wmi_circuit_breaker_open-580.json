@@ -1,0 +1,1 @@
+{"callee_symbol":"wmi_circuit_breaker_open","caller_path":"crates/agentplug-host/src/browser.rs","caller_symbol":"list_chrome_processes","line":705}

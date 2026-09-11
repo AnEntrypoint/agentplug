@@ -1,0 +1,1 @@
+{"callee_symbol":"record_handoff_failure","caller_path":"crates/agentplug-runner/src/daemon.rs","caller_symbol":"attempt_self_update_handoff","line":963}

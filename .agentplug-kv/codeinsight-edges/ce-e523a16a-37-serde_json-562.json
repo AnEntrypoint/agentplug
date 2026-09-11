@@ -1,0 +1,1 @@
+{"callee_symbol":"serde_json","caller_path":"crates/agentplug-host/src/registry.rs","caller_symbol":"caller_supplied_deadline_secs","line":37}

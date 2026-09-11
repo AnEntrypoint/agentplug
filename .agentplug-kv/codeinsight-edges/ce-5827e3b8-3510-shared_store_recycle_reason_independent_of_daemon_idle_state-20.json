@@ -1,0 +1,1 @@
+{"callee_symbol":"shared_store_recycle_reason_independent_of_daemon_idle_state","caller_path":"crates/agentplug-runner/src/daemon.rs","caller_symbol":"run_daemon_body","line":3510}

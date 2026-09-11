@@ -1,0 +1,1 @@
+{"callee_symbol":"is_stateless_shared_plugin","caller_path":"crates/agentplug-host/src/registry.rs","caller_symbol":"load_plugin","line":830}

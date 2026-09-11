@@ -1,0 +1,1 @@
+{"callee_symbol":"spool_dir","caller_path":"crates/agentplug-runner/src/daemon.rs","caller_symbol":"spawn_project_heartbeat_ticker","line":1350}

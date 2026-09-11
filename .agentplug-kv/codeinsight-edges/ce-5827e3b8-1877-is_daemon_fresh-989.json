@@ -1,0 +1,1 @@
+{"callee_symbol":"is_daemon_fresh","caller_path":"crates/agentplug-runner/src/daemon.rs","caller_symbol":"shared_daemon_is_serving","line":1877}

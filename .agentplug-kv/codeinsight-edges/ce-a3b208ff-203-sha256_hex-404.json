@@ -1,0 +1,1 @@
+{"callee_symbol":"sha256_hex","caller_path":"crates/agentplug-runner/src/download.rs","caller_symbol":"download_and_verify","line":203}

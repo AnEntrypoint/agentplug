@@ -1,0 +1,1 @@
+{"callee_symbol":"plugin_update_poll_interval_secs","caller_path":"crates/agentplug-runner/src/daemon.rs","caller_symbol":"plugin_update_poll_interval","line":221}

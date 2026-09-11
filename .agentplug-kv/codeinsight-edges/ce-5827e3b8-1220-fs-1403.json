@@ -1,0 +1,1 @@
+{"callee_symbol":"fs","caller_path":"crates/agentplug-runner/src/daemon.rs","caller_symbol":"read_last_completed_runner_swap","line":1220}

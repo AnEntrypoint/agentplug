@@ -1,0 +1,1 @@
+{"callee_symbol":"hand_claims_to_live_successor","caller_path":"crates/agentplug-runner/src/daemon.rs","caller_symbol":"spawn_heartbeat_ticker","line":1649}

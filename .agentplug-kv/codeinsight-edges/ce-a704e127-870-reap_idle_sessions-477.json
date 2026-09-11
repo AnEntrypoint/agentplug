@@ -1,0 +1,1 @@
+{"callee_symbol":"reap_idle_sessions","caller_path":"crates/agentplug-host/src/browser.rs","caller_symbol":"reap_idle_sessions_and_os_orphans_across_every_known_project_root","line":870}
