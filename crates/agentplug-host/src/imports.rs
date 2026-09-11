@@ -10,8 +10,8 @@ use wasmtime::{AsContextMut, Caller, Linker, Memory};
 
 use crate::host_state::HostState;
 
-fn fetch_agent() -> &'static ureq::Agent {
-    crate::http_agent::shared_agent()
+fn fetch_agent(timeout: Duration) -> ureq::Agent {
+    crate::http_agent::build_agent(timeout)
 }
 
 const GIT_SUBPROCESS_TIMEOUT_MS_DEFAULT_AMPLE_FOR_SLOW_PUSH_FETCH_OR_FIRST_CLONE: u64 = 300_000;
@@ -537,7 +537,13 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
                 if opts_str.is_empty() { serde_json::json!({}) } else { serde_json::from_str(&opts_str).unwrap_or(serde_json::json!({})) };
             let method = opts.get("method").and_then(|v| v.as_str()).unwrap_or("GET").to_uppercase();
             let body = opts.get("body").and_then(|v| v.as_str());
-            let mut req = fetch_agent().request(&method, &url);
+            let timeout = opts
+                .get("timeoutMs")
+                .and_then(|v| v.as_u64())
+                .map(Duration::from_millis)
+                .unwrap_or(Duration::from_secs(10));
+            let fetch_agent = fetch_agent(timeout);
+            let mut req = fetch_agent.request(&method, &url);
             if let Some(headers) = opts.get("headers").and_then(|v| v.as_object()) {
                 for (k, v) in headers {
                     if let Some(vs) = v.as_str() {
@@ -545,9 +551,7 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
                     }
                 }
             }
-            if let Some(timeout_ms) = opts.get("timeoutMs").and_then(|v| v.as_u64()) {
-                req = req.timeout(std::time::Duration::from_millis(timeout_ms));
-            }
+            req = req.timeout(timeout);
             let resp = match body {
                 Some(b) => req.send_string(b),
                 None => req.call(),
