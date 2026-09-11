@@ -1,0 +1,1 @@
+{"callee_symbol":"std","caller_path":"crates/agentplug-runner/src/daemon.rs","caller_symbol":"release_ownership_for_handoff","line":992}

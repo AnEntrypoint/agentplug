@@ -1,0 +1,1 @@
+{"callee_symbol":"serde_json","caller_path":"crates/agentplug-runner/src/daemon.rs","caller_symbol":"claim_ownership","line":541}

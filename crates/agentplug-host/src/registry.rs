@@ -451,6 +451,14 @@ impl SharedPluginPool {
         })
     }
 
+    fn any_instantiated_without_blocking(&self) -> bool {
+        self.slots.iter().any(|slot| {
+            try_lock_slot_recovering_from_poison(slot)
+                .map(|guard| guard.is_some())
+                .unwrap_or(true)
+        })
+    }
+
     pub(crate) fn slots_for_fill(&self) -> &[Arc<Mutex<Option<SiblingHandle>>>] {
         &self.slots
     }
@@ -791,7 +799,13 @@ impl ProjectPlugins {
     }
 
     pub fn is_loaded(&self, plugin_name: &str) -> bool {
-        self.siblings.lock().unwrap().get(plugin_name).map(|p| p.all_instantiated()).unwrap_or(false)
+        self.siblings.lock().unwrap().get(plugin_name).map(|pool| {
+            if is_stateless_shared_plugin(plugin_name) {
+                pool.any_instantiated_without_blocking()
+            } else {
+                pool.all_instantiated()
+            }
+        }).unwrap_or(false)
     }
 
     /// Like `is_loaded`, but for non-shared (stateful, per-session) plugins a
@@ -815,36 +829,19 @@ impl ProjectPlugins {
     pub fn load_plugin(&mut self, engine: &Engine, plugin_name: &str, module: &Module, content_hash: &str) -> anyhow::Result<()> {
         if is_stateless_shared_plugin(plugin_name) {
             let pool = shared_plugin_pool(plugin_name);
-            // Revertible-effect discipline: each slot fill is an effect whose inverse is
-            // "put the prior occupant back". If a later slot's instantiate fails, every
-            // slot already filled this call is reverted to its pre-fill state (LIFO) so a
-            // partial swap never leaves the pool straddling old and new content hashes --
-            // a mixed pool would silently route some dispatches to the stale plugin
-            // indefinitely, since is_loaded_current only checks that ANY slot matches.
-            let mut inverses: Vec<(Arc<Mutex<Option<SiblingHandle>>>, Option<SiblingHandle>)> = Vec::new();
-            let fill_result = (|| -> anyhow::Result<()> {
+            let has_current = pool.slots_for_fill().iter().any(|slot| {
+                try_lock_slot_recovering_from_poison(slot)
+                    .map(|guard| guard.as_ref().is_some_and(|handle| handle.content_hash == content_hash))
+                    .unwrap_or(true)
+            });
+            if !has_current {
                 for slot in pool.slots_for_fill() {
-                    if let Some(mut guard) = try_lock_slot_recovering_from_poison(slot) {
-                        let needs_fill = match guard.as_ref() {
-                            None => true,
-                            Some(existing) => existing.content_hash != content_hash,
-                        };
-                        if needs_fill {
-                            let fresh = instantiate_plugin(engine, self.root.clone(), plugin_name, module, content_hash)?;
-                            let prior = guard.replace(fresh);
-                            inverses.push((slot.clone(), prior));
-                        }
+                    let Some(mut guard) = try_lock_slot_recovering_from_poison(slot) else { continue };
+                    if guard.is_none() {
+                        *guard = Some(instantiate_plugin(engine, self.root.clone(), plugin_name, module, content_hash)?);
+                        break;
                     }
                 }
-                Ok(())
-            })();
-            if let Err(err) = fill_result {
-                for (slot, prior) in inverses.into_iter().rev() {
-                    if let Some(mut guard) = try_lock_slot_recovering_from_poison(&slot) {
-                        *guard = prior;
-                    }
-                }
-                return Err(err);
             }
             self.siblings.lock().unwrap().insert(plugin_name.to_string(), pool);
             return Ok(());
@@ -1020,26 +1017,34 @@ fn dispatch_and_evict_on_error(
     result
 }
 
-#[derive(serde::Deserialize, Default)]
-struct ProjectDaemonConfig {
-    #[serde(default)]
-    gm_concurrency_limit: Option<usize>,
-}
-
-impl ProjectDaemonConfig {
-    fn load(root: &Path) -> Self {
-        let path = root.join(".gm").join("daemon-project-config.json");
-        std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|s| serde_json::from_str::<ProjectDaemonConfig>(&s).ok())
-            .unwrap_or_default()
-    }
-}
-
 static GM_INFLIGHT_BY_PROJECT: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
+
+static GM_PROJECT_STEP_RELEASED: OnceLock<Condvar> = OnceLock::new();
+
+struct ToolQueue {
+    next_ticket: u64,
+    now_serving: u64,
+    active: bool,
+}
+
+static TOOL_INFLIGHT: OnceLock<Mutex<HashMap<String, ToolQueue>>> = OnceLock::new();
+
+static TOOL_STEP_RELEASED: OnceLock<Condvar> = OnceLock::new();
 
 fn gm_inflight_map() -> &'static Mutex<HashMap<PathBuf, usize>> {
     GM_INFLIGHT_BY_PROJECT.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn gm_project_step_released() -> &'static Condvar {
+    GM_PROJECT_STEP_RELEASED.get_or_init(Condvar::new)
+}
+
+fn tool_inflight() -> &'static Mutex<HashMap<String, ToolQueue>> {
+    TOOL_INFLIGHT.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn tool_step_released() -> &'static Condvar {
+    TOOL_STEP_RELEASED.get_or_init(Condvar::new)
 }
 
 pub struct GmFairnessGuard {
@@ -1049,20 +1054,15 @@ pub struct GmFairnessGuard {
 
 impl GmFairnessGuard {
     pub fn acquire(root: &Path) -> Self {
-        let limit = match ProjectDaemonConfig::load(root).gm_concurrency_limit {
-            Some(n) if n > 0 => n,
-            _ => return Self { root: root.to_path_buf(), limited: false },
-        };
+        let root = root.to_path_buf();
+        let mut map = gm_inflight_map().lock().unwrap_or_else(|e| e.into_inner());
         loop {
-            {
-                let mut map = gm_inflight_map().lock().unwrap();
-                let count = map.entry(root.to_path_buf()).or_insert(0);
-                if *count < limit {
-                    *count += 1;
-                    return Self { root: root.to_path_buf(), limited: true };
-                }
+            let count = map.entry(root.clone()).or_insert(0);
+            if *count == 0 {
+                *count = 1;
+                return Self { root, limited: true };
             }
-            std::thread::sleep(std::time::Duration::from_millis(25));
+            map = gm_project_step_released().wait(map).unwrap_or_else(|e| e.into_inner());
         }
     }
 }
@@ -1072,10 +1072,59 @@ impl Drop for GmFairnessGuard {
         if !self.limited {
             return;
         }
-        let mut map = gm_inflight_map().lock().unwrap();
+        let mut map = gm_inflight_map().lock().unwrap_or_else(|e| e.into_inner());
         if let Some(count) = map.get_mut(&self.root) {
             *count = count.saturating_sub(1);
+            if *count == 0 {
+                map.remove(&self.root);
+            }
         }
+        drop(map);
+        gm_project_step_released().notify_all();
+    }
+}
+
+pub struct ToolDispatchGuard {
+    key: String,
+}
+
+impl ToolDispatchGuard {
+    pub fn acquire(plugin: &str, verb: &str) -> Self {
+        let key = format!("{plugin}\u{0}{verb}");
+        let mut active = tool_inflight().lock().unwrap_or_else(|e| e.into_inner());
+        let ticket = {
+            let queue = active.entry(key.clone()).or_insert(ToolQueue {
+                next_ticket: 0,
+                now_serving: 0,
+                active: false,
+            });
+            let ticket = queue.next_ticket;
+            queue.next_ticket += 1;
+            ticket
+        };
+        loop {
+            let queue = active.get_mut(&key).expect("tool queue exists for its assigned ticket");
+            if queue.now_serving == ticket && !queue.active {
+                queue.now_serving += 1;
+                queue.active = true;
+                return Self { key };
+            }
+            active = tool_step_released().wait(active).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+}
+
+impl Drop for ToolDispatchGuard {
+    fn drop(&mut self) {
+        let mut active = tool_inflight().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(queue) = active.get_mut(&self.key) {
+            queue.active = false;
+            if queue.next_ticket == queue.now_serving {
+                active.remove(&self.key);
+            }
+        }
+        drop(active);
+        tool_step_released().notify_all();
     }
 }
 

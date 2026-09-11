@@ -1,0 +1,1 @@
+{"callee_symbol":"modules","caller_path":"crates/agentplug-host/src/registry.rs","caller_symbol":"reinstantiate_plugin_into_pool_slot_if_reload_source_available","line":903}

@@ -1,0 +1,1 @@
+{"callee_symbol":"read_plugin_fiber_state","caller_path":"crates/agentplug-host/src/registry.rs","caller_symbol":"read_plugin_lifecycle","line":122}

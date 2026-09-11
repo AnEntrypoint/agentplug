@@ -1,0 +1,1 @@
+{"callee_symbol":"locks","caller_path":"crates/agentplug-host/src/browser.rs","caller_symbol":"evict_session_lifecycle_locks_with_no_active_holder","line":932}

@@ -1,0 +1,1 @@
+{"callee_symbol":"heavy_threads","caller_path":"crates/agentplug-runner/src/main.rs","caller_symbol":"selfcheck_pool_fairness","line":364}

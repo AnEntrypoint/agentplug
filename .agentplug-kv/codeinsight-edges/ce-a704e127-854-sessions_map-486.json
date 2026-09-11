@@ -1,0 +1,1 @@
+{"callee_symbol":"sessions_map","caller_path":"crates/agentplug-host/src/browser.rs","caller_symbol":"close_all_sessions","line":854}

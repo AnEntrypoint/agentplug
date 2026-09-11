@@ -19,18 +19,6 @@ fn suppress_crash_dialogs() {
 #[cfg(not(windows))]
 fn suppress_crash_dialogs() {}
 
-/// Declarative component-loader reconciliation (Cordis paper Section
-/// 5.2.1): given a desired plugin roster, diffs each against its
-/// `installed_plugin_version` and drives only the ones that differ
-/// through `ProjectPlugins::load_plugin`, skipping an unchanged plugin
-/// entirely rather than reloading it. `load_plugin` itself already
-/// no-ops on a matching content hash (`registry.rs`'s `needs_fill` check),
-/// so this function's own value is naming the reconciliation loop as one
-/// entry point instead of an inline unlabeled per-side loop -- the same
-/// incremental-reconciliation guarantee Theorem 73 (confluence) licenses:
-/// whatever order the desired roster is driven in, the quiescent state
-/// answers to the roster alone, so skipping an already-current plugin
-/// changes nothing about where the system ends up.
 fn reconcile_plugin_manifest(
     project: &mut ProjectPlugins,
     engine: &wasmtime::Engine,
@@ -57,14 +45,6 @@ fn reconcile_plugin_manifest(
         let load_result = project.load_plugin(engine, name, &module, &content_hash);
         advance_plugin_fiber(name, load_result.is_ok(), Some(&content_hash));
         if load_result.is_ok() {
-            // Recovery-exactness spot-check (paper Theorem 61): after a
-            // reload, the service broker's active provider for this
-            // plugin should be the content hash just installed. A shared
-            // pool with multiple slots can still show a stale hash if
-            // another slot answered first (pool_size > 1 fills lazily
-            // per-slot, only the touched slot updates), so this is
-            // logged as a signal for a genuinely stuck pool, not treated
-            // as a hard failure of an otherwise-successful load.
             if let Some(active) = get_active_provider(name) {
                 if active != content_hash {
                     eprintln!(
@@ -121,14 +101,6 @@ fn main() -> anyhow::Result<()> {
                 );
                 return Ok(());
             }
-            // A live owner whose heartbeat is fresh will refuse this process's
-            // ownership claim, so becoming the daemon is impossible and taking
-            // over this project's spool as a standalone watcher would compete
-            // with a healthy daemon for the same request files. The project is
-            // already registered; that daemon services it. Checked before
-            // run_daemon() so a busy owner whose daemon-status.json merely did
-            // not go fresh inside ensure_daemon_running()'s wait window does
-            // not produce a fresh wasted daemon start on every spool call.
             if let Some(owner_pid) = daemon::shared_daemon_owner_that_would_refuse_this_process() {
                 eprintln!(
                     "[agentplug] shared daemon pid {owner_pid} owns the daemon lock with a fresh heartbeat -- {} stays registered with it, no competing daemon or standalone watcher started",
@@ -137,11 +109,6 @@ fn main() -> anyhow::Result<()> {
                 return Ok(());
             }
 
-            // Still inside the wasted-start backoff window: the last attempt
-            // already lost the claim to this same live owner, so another
-            // attempt buys nothing and a standalone watcher below would take
-            // the project away from a daemon that is merely slow. Registration
-            // already happened; stop here and let the next call try.
             if let Some(remaining_ms) = daemon::daemon_spawn_backoff_remaining_ms_if_active() {
                 eprintln!(
                     "[agentplug] a recent daemon start already lost the ownership claim and the backoff has {remaining_ms}ms left -- {} stays registered, no further start attempt and no standalone watcher this call",
@@ -161,16 +128,6 @@ fn main() -> anyhow::Result<()> {
                 return Ok(());
             }
 
-            // Deliberately the LIVE-pid test, not the fresh-heartbeat one: a
-            // daemon process that is alive still holds the plugin pool and
-            // still claims from this spool, it is just behind. A standalone
-            // watcher started alongside it double-claims the same requests, and
-            // its `.status.json` rewrite is what flips a project's runtime from
-            // `agentplug` to `agentplug-runner-standalone` mid-session. Taking
-            // over from a genuinely WEDGED daemon still works: run_daemon above
-            // takes ownership whenever the heartbeat is stale, at a rate the
-            // wasted-start backoff bounds. Only a dead owner reaches the
-            // standalone fallback.
             if let Some(owner_pid) = daemon::live_foreign_daemon_owner_pid() {
                 eprintln!(
                     "[agentplug] daemon pid {owner_pid} is alive and owns the shared lock -- {} stays registered with it, no standalone watcher started (a second sweeper on one spool double-claims its requests)",
@@ -179,15 +136,6 @@ fn main() -> anyhow::Result<()> {
                 return Ok(());
             }
 
-            // A standalone watcher is a long-lived, serial, gm-wasm-holding
-            // sweeper of THIS spool. Starting a second one on a spool another
-            // live process is already sweeping is never a fallback, it is
-            // corruption: the two cannot see each other's in-flight claims, so
-            // each one's orphan sweep answers dispatch_orphaned for the other's
-            // running work and deletes the claim under it. The shared-daemon
-            // checks above only rule out a fresh DAEMON owner; nothing ruled out
-            // a sibling standalone watcher, which is how seven of them
-            // accumulated on one project (see live_foreign_spool_sweeper).
             if let Some(sweeper_pid) = daemon::live_foreign_spool_sweeper(&spool_dir) {
                 eprintln!(
                     "[agentplug] pid {sweeper_pid} is already sweeping {} with a live heartbeat -- {} stays registered with it, no second standalone watcher started (two sweepers on one spool orphan each other's in-flight claims)",
@@ -204,15 +152,6 @@ fn main() -> anyhow::Result<()> {
             let module = Module::from_file(&engine, &wasm)?;
             let mut project = ProjectPlugins::new(cwd);
             project.load_plugin(&engine, "gm", &module, &content_hash)?;
-            // The side plugins belong in the SAME siblings map as gm, exactly as
-            // the `dispatch` subcommand already does. Loading only gm here made
-            // every embedding-dependent verb hard-fail for as long as a
-            // standalone watcher served the project: host_vec_embed looks up
-            // "bert" in the caller's own siblings map, finds nothing, and a slim
-            // gm build reports the failure as "host_vec_embed must be
-            // implemented by the host" -- so memorize-fire refused every write
-            // and recall fell back to keyword-only, with the real cause (a
-            // watcher that loaded one plugin) named nowhere.
             let _ = reconcile_plugin_manifest(&mut project, &engine, &[("libsql", None), ("bert", None), ("treesitter", None)]);
             run_spool_watcher_single_process(&mut project, &spool_dir)
         }
@@ -248,10 +187,6 @@ fn main() -> anyhow::Result<()> {
                 println!("{out}");
                 return Ok(());
             }
-            // Note: try_dispatch_via_daemon's own out-file is already patched
-            // at the daemon side (see patch_update_available_from_escalation);
-            // only the fully-local fallback below needs patching here.
-
             let wasm = download::ensure_plugin_installed(&plugin, None)?;
             let content_hash = download::sha256_hex(&std::fs::read(&wasm)?);
             let engine = build_engine()?;
@@ -306,11 +241,6 @@ fn selfcheck_registry() -> anyhow::Result<()> {
     assert_eq!(out, "ok", "fresh slot must serve a real dispatch through the compiled module");
     println!("[selfcheck-registry] fresh gm slot dispatched and returned {out:?}");
 
-    // One assertion per SLOT, not a hardcoded 1: `gm` is a pooled shared plugin
-    // (gm_pool_size, 4 by default) and `load_plugin` fills every slot it can
-    // lock, so a swap against an idle pool evicts all of them. The literal 1
-    // predates the pool and made this selfcheck fail on every build that
-    // actually had a multi-slot gm pool.
     let gm_slot_count = shared_plugin_slot_content_hashes("gm").len();
     let (evicted_now, deferred) = request_shared_store_swap("gm", "hash-a");
     println!("[selfcheck-registry] swap request against {gm_slot_count} idle slot(s): evicted_now={evicted_now} deferred={deferred}");
@@ -328,12 +258,6 @@ fn selfcheck_registry() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Witnesses the cheap-verb reservation against the real pool: real
-/// `SharedPluginPool`, real mutex slots, real condvar, real threads. Parks
-/// `heavy_admission_limit` heavy dispatches in the pool (each genuinely holding
-/// a slot guard, exactly as a long `code_index`/`recall` would) and then times a
-/// cheap acquisition. Before the class split this acquisition waited behind the
-/// parked heavy work; the reservation of one slot is what makes it return.
 fn selfcheck_pool_fairness() -> anyhow::Result<()> {
     use agentplug_host::{cost_class_for_dispatch, cost_class_for_verb, DispatchCostClass, SharedPluginPool};
     use std::sync::mpsc;
@@ -438,10 +362,6 @@ fn selfcheck_inflight_cleanup() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Drives the real claim predicate against the three shapes a shell-redirect
-/// write passes through, so the torn-body guard is witnessed by execution rather
-/// than argued from the diff: the empty file a redirect creates first, the
-/// just-written file whose body may still be growing, and the settled file.
 fn selfcheck_spool_claim() -> anyhow::Result<()> {
     use std::fs;
     use std::time::{Duration, SystemTime};
@@ -472,12 +392,6 @@ fn selfcheck_spool_claim() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Merge into whatever `.status.json` already holds instead of replacing it.
-/// A bare three-key overwrite dropped every field the shared daemon publishes
-/// (`busy_until`, `queue_wait_ms`, `plugin_compile_failures`,
-/// `runner_update_in_progress`) and flipped `runtime` from `agentplug` to
-/// `agentplug-runner-standalone` with `daemon`/`shared_process` left stale at
-/// `true` -- a reader could not tell which process was actually serving.
 fn write_standalone_status(status_path: &std::path::Path) {
     use std::fs;
     let mut payload = match fs::read_to_string(status_path).ok().and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok()) {
@@ -492,11 +406,6 @@ fn write_standalone_status(status_path: &std::path::Path) {
     let _ = fs::write(status_path, payload.to_string());
 }
 
-/// Drop the standalone process's own markers so a reader polling
-/// `.status.json` during the handover is never told a standalone watcher is
-/// serving after this process has stopped serving. The shared daemon's own
-/// per-project heartbeat restores `runtime`/`daemon`/`shared_process` on its
-/// next tick.
 fn clear_standalone_status(status_path: &std::path::Path) {
     use std::fs;
     let Some(serde_json::Value::Object(mut map)) = fs::read_to_string(status_path).ok().and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok()) else {
@@ -520,12 +429,6 @@ fn run_spool_watcher_single_process(project: &mut ProjectPlugins, spool_dir: &st
     let status_path = spool_dir.join(".status.json");
 
     loop {
-        // Checked at the top of every tick, never only at startup: a standalone
-        // watcher is a fallback for a missing shared daemon, not a permanent
-        // takeover of the project. Yielding between dispatches (rather than
-        // mid-dispatch) means no claim is ever in flight at this point, so
-        // there is nothing to re-queue and nothing for the returning daemon's
-        // sweep to orphan.
         if daemon::shared_daemon_is_serving() {
             clear_standalone_status(&status_path);
             eprintln!(
@@ -556,8 +459,6 @@ fn run_spool_watcher_single_process(project: &mut ProjectPlugins, spool_dir: &st
                         let _ = fs::remove_file(&claim_path);
                         continue;
                     };
-                    // Torn write backstop, same as the shared daemon's claim
-                    // loop: re-queue rather than dispatch an empty body.
                     if body.trim().is_empty() {
                         let _ = fs::rename(&claim_path, &path);
                         continue;

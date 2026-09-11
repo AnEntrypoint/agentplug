@@ -1,0 +1,1 @@
+{"callee_symbol":"libc","caller_path":"crates/agentplug-host/src/browser.rs","caller_symbol":"running_as_unix_root","line":1055}

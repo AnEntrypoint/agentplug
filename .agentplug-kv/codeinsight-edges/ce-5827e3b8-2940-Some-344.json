@@ -1,0 +1,1 @@
+{"callee_symbol":"Some","caller_path":"crates/agentplug-runner/src/daemon.rs","caller_symbol":"try_dispatch_via_daemon","line":2940}

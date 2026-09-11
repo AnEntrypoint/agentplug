@@ -1,0 +1,1 @@
+{"callee_symbol":"serde_json","caller_path":"crates/agentplug-runner/src/daemon.rs","caller_symbol":"read_handoff_inherited_claims","line":2072}

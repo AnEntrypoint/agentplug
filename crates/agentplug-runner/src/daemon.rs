@@ -8,12 +8,39 @@ use std::os::windows::process::CommandExt;
 
 use wasmtime::{Engine, Module, Trap};
 
-use agentplug_host::{build_engine, install_dir, now_ms, read_project_plugin_list, DispatchHandle, GmFairnessGuard, ProjectPlugins};
+use agentplug_host::{build_engine, install_dir, now_ms, read_project_plugin_list, DispatchHandle, GmFairnessGuard, ProjectPlugins, ToolDispatchGuard};
 
 use crate::download::{ensure_plugin_installed, installed_plugin_version, installed_runner_version, is_recognized_release_semver, record_runner_version};
 
 fn registry_path() -> PathBuf {
     install_dir().join("daemon-registry.txt")
+}
+
+const GM_SPOOL_VERBS: &[&str] = &[
+    "instruction", "transition", "phase-status", "prd-add", "prd-list", "prd-resolve",
+    "prd-status", "mutable-add", "mutable-list", "mutable-resolve", "fs_read", "fs_write",
+    "fs_readdir", "fs_stat", "scan_deps", "fetch", "env_get", "kv_get", "kv_put",
+    "kv_query", "exec_js", "lang", "serp", "browser", "cdp", "health",
+    "config_resolve", "config-sync-now", "dataflow_resolve", "sql_open", "sql_close",
+    "sql_list_dbs", "sql_exec", "sql_query", "sql_smoke", "sql_serialize",
+    "sql_deserialize", "cache_get", "cache_put", "cache_invalidate", "cache_stats",
+    "codeinsight_index", "codesearch", "callers", "callees", "impact", "memorize",
+    "memorize-prune", "memorize-vacuum", "memorize-retention", "recall",
+    "tencentdb-compat-probe", "tencentdb-memory-import", "python", "bash", "powershell",
+    "ssh", "go", "rust", "c", "cpp", "java", "deno", "status", "wait", "close",
+    "filter", "git_status", "branch_status", "git_push", "git_add", "git_commit",
+    "git_finalize", "git_log", "git_diff", "git_show", "git_fetch", "git_pull",
+    "ci-status", "git_branch", "git_checkout", "git_merge", "git_merge_abort",
+    "git_branch_delete", "git_rm", "git_revert", "git_reset", "git_poll", "forget",
+    "discipline",
+];
+
+fn provision_gm_spool_verb_dirs(cwd: &Path) -> anyhow::Result<()> {
+    let in_dir = cwd.join(".gm").join("exec-spool").join("in");
+    for verb in GM_SPOOL_VERBS {
+        fs::create_dir_all(in_dir.join(verb))?;
+    }
+    Ok(())
 }
 
 fn cwd_is_inside_a_spool_tree(cwd: &Path) -> bool {
@@ -28,6 +55,7 @@ pub fn register_project(cwd: &Path) -> anyhow::Result<()> {
             cwd.display()
         );
     }
+    provision_gm_spool_verb_dirs(cwd)?;
     let path = registry_path();
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -109,8 +137,6 @@ struct DaemonConfig {
     #[serde(default)]
     instruction_source_poll_interval_secs: Option<u64>,
     #[serde(default)]
-    max_concurrent_projects: Option<usize>,
-    #[serde(default)]
     gm_concurrency: Option<usize>,
     #[serde(default)]
     side_plugin_concurrency: Option<usize>,
@@ -181,7 +207,6 @@ impl DaemonConfig {
                 plugin_update_poll_interval_secs_by_name: std::collections::HashMap::new(),
                 runner_update_poll_interval_secs: None,
                 instruction_source_poll_interval_secs: None,
-                max_concurrent_projects: None,
                 gm_concurrency: None,
                 side_plugin_concurrency: None,
                 gm_pool_size: None,
@@ -210,7 +235,7 @@ impl DaemonConfig {
     // Duration value (same number, not the same timer) -- an independent key
     // so tuning one cadence never silently retunes the other.
     fn instruction_source_poll_interval(&self) -> Duration { Duration::from_secs(self.instruction_source_poll_interval_secs.unwrap_or(600)) }
-    fn max_concurrent_projects(&self) -> usize { self.max_concurrent_projects.unwrap_or_else(host_available_parallelism).max(1) }
+    fn max_concurrent_projects(&self) -> usize { 4 }
     // gm_concurrency still legitimately scales with core count -- it feeds
     // shared_store_recycle_dispatches' scaling and (via max_concurrent_
     // projects) the worker-THREAD pool that dispatches across different
@@ -244,7 +269,22 @@ impl DaemonConfig {
     // verb can take -- a reservation is arithmetically impossible with one
     // slot. Cost is one additional resident gm Store against a live-measured
     // ~300MB single-slot baseline and a 1600MB recycle ceiling.
-    fn gm_pool_size(&self) -> usize { self.gm_pool_size.unwrap_or(2).max(1) }
+    fn gm_pool_size(&self) -> usize {
+        self.gm_pool_size
+            .unwrap_or(4)
+            .min(host_available_parallelism())
+            .min(4)
+            .max(1)
+    }
+
+    fn gm_pool_capacity_reason(&self) -> String {
+        let capacity = self.gm_pool_size();
+        if capacity == 4 {
+            "four processors admitted by host capacity".to_string()
+        } else {
+            format!("limited to {capacity} processor(s) by configured or host capacity")
+        }
+    }
     // Side plugins (bert/libsql/treesitter) used to default to half the
     // host's cores (a throughput optimization: avoid serializing every call
     // behind one slot on a many-core host) -- but each filled slot holds its
@@ -1256,6 +1296,13 @@ fn write_project_heartbeat_with_queue_info(spool_dir: &Path, busy_until: Option<
         payload["queue_position"] = serde_json::json!(position);
         payload["queue_depth"] = serde_json::json!(total);
     }
+    let (queued_steps, claimed_steps) = spool_step_counts(spool_dir);
+    payload["queued_step_count"] = serde_json::json!(queued_steps);
+    payload["claimed_step_count"] = serde_json::json!(claimed_steps);
+    payload["gm_processor_capacity"] = serde_json::json!(GM_PROCESSOR_CAPACITY.load(std::sync::atomic::Ordering::Relaxed));
+    payload["gm_processor_capacity_reason"] = serde_json::json!(gm_processor_capacity_reason().lock().unwrap_or_else(|e| e.into_inner()).clone());
+    payload["shared_store_recycle_limit_mb"] = serde_json::json!(SHARED_STORE_RECYCLE_LIMIT_MB.load(std::sync::atomic::Ordering::Relaxed));
+    payload["tool_serialization"] = serde_json::json!("fifo per plugin and verb");
     payload["queue_wait_ms"] = serde_json::json!(last_measured_dispatch_queue_wait_ms());
     if let Some((staged_at_ms, _len)) = cached_staged_runner() {
         payload["runner_update_in_progress"] = serde_json::json!(true);
@@ -1346,11 +1393,41 @@ fn spool_has_queued_work(spool_dir: &Path) -> bool {
     false
 }
 
+fn spool_step_counts(spool_dir: &Path) -> (usize, usize) {
+    let mut queued = 0usize;
+    let mut claimed = 0usize;
+    let in_dir = spool_dir.join("in");
+    let Ok(verbs) = fs::read_dir(in_dir) else { return (queued, claimed) };
+    for verb_entry in verbs.flatten() {
+        if !verb_entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let Ok(files) = fs::read_dir(verb_entry.path()) else { continue };
+        for file_entry in files.flatten() {
+            let name = file_entry.file_name();
+            let name = name.to_string_lossy();
+            if name.ends_with(".txt") {
+                queued += 1;
+            } else if name.ends_with(".inflight") {
+                claimed += 1;
+            }
+        }
+    }
+    (queued, claimed)
+}
+
 static HEARTBEAT_PROJECT_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 static HEARTBEAT_PLUGIN_MODULE_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 static HEARTBEAT_LAST_PLUGIN_POLL_TS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static HEARTBEAT_LAST_RUNNER_POLL_TS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static HEARTBEAT_DAEMON_BOOT_TS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static GM_PROCESSOR_CAPACITY: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
+static SHARED_STORE_RECYCLE_LIMIT_MB: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn gm_processor_capacity_reason() -> &'static Mutex<String> {
+    static SLOT: OnceLock<Mutex<String>> = OnceLock::new();
+    SLOT.get_or_init(|| Mutex::new("daemon configuration not loaded".to_string()))
+}
 
 fn last_plugin_poll_error() -> &'static Mutex<Option<String>> {
     static SLOT: OnceLock<Mutex<Option<String>>> = OnceLock::new();
@@ -1702,6 +1779,14 @@ static IN_FLIGHT: OnceLock<Mutex<HashMap<InFlightKey, InFlightHandle>>> = OnceLo
 
 pub(crate) fn in_flight_map() -> &'static Mutex<HashMap<InFlightKey, InFlightHandle>> {
     IN_FLIGHT.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn project_has_in_flight_step(root: &Path) -> bool {
+    in_flight_map()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .keys()
+        .any(|(active_root, _, _)| active_root == root)
 }
 
 fn handle_background_convert(root: &Path, body: &str) -> String {
@@ -2216,7 +2301,6 @@ pub(crate) fn last_measured_dispatch_queue_wait_ms() -> u64 {
 
 pub(crate) fn run_gm_dispatch_to_file(root: &Path, handle: &DispatchHandle, verb: &str, task: &str, body: &str, out_dir: &Path, queue_wait_ms: u64) {
     LAST_MEASURED_DISPATCH_QUEUE_WAIT_MS.store(queue_wait_ms, std::sync::atomic::Ordering::Relaxed);
-    let _fairness_guard = GmFairnessGuard::acquire(root);
     let plugin_name = if RAW_PLUGIN_SPOOL_VERBS.contains(&verb) { verb } else { "gm" };
     let inner_verb_owned: String = if plugin_name == "gm" {
         String::new()
@@ -2226,6 +2310,9 @@ pub(crate) fn run_gm_dispatch_to_file(root: &Path, handle: &DispatchHandle, verb
             .and_then(|v| v.get("verb").and_then(|s| s.as_str()).map(|s| s.to_string()))
             .unwrap_or_else(|| "capabilities".to_string())
     };
+    let _fairness_guard = GmFairnessGuard::acquire(root);
+    let tool_verb = if plugin_name == "gm" { verb } else { inner_verb_owned.as_str() };
+    let _tool_guard = ToolDispatchGuard::acquire(plugin_name, tool_verb);
     let dispatch_result = if plugin_name == "gm" {
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handle.dispatch("gm", verb, body)))
     } else {
@@ -2302,6 +2389,9 @@ fn dir_has_any_verb_subdir_with_claimable_txt(base: &Path) -> bool {
 // cold-sweep window indefinitely if worker capacity was contended at each
 // tick, since nothing marked it as having real waiting work.
 fn project_has_pending_dispatch_work(root: &Path) -> bool {
+    if project_has_in_flight_step(root) {
+        return true;
+    }
     let pd_in = root.join(".agentplug").join("plugin-dispatch").join("in");
     if let Ok(plugin_dirs) = fs::read_dir(&pd_in) {
         for plugin_entry in plugin_dirs.flatten() {
@@ -2323,6 +2413,10 @@ fn dispatch_project(root: &Path, project: &mut ProjectPlugins, plugin_modules: &
     let spool_dir = root.join(".gm").join("exec-spool");
     let in_dir = spool_dir.join("in");
     let out_dir = spool_dir.join("out");
+
+    if project_has_in_flight_step(root) {
+        return false;
+    }
 
     // Fast path for the overwhelmingly common case (an idle project with
     // nothing claimed this tick): try the scan-and-claim pass FIRST, against
@@ -2350,7 +2444,7 @@ fn dispatch_project(root: &Path, project: &mut ProjectPlugins, plugin_modules: &
     let in_dir_scan = fs::read_dir(&in_dir);
     let in_dir_existed = in_dir_scan.is_ok();
     if let Ok(entries) = in_dir_scan {
-        for verb_entry in entries.flatten() {
+        'claim_one: for verb_entry in entries.flatten() {
             if !verb_entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
                 continue;
             }
@@ -2384,6 +2478,7 @@ fn dispatch_project(root: &Path, project: &mut ProjectPlugins, plugin_modules: &
                 }
                 did_work = true;
                 claimed.push(ClaimedRequest { verb: verb.clone(), task, body, claimed_at });
+                break 'claim_one;
             }
         }
     }
@@ -2590,7 +2685,7 @@ fn dispatch_project(root: &Path, project: &mut ProjectPlugins, plugin_modules: &
             // call now returns within a bounded window regardless of how much
             // new work keeps arriving, and the next outer tick picks the
             // project back up to continue draining it.
-            const PROJECT_BATCH_ABSORB_WINDOW_MS: u64 = 3_000;
+            const PROJECT_BATCH_ABSORB_WINDOW_MS: u64 = 0;
             let batch_deadline = Instant::now() + Duration::from_millis(PROJECT_BATCH_ABSORB_WINDOW_MS);
             let mut last_status_refresh = Instant::now();
             let bg_convert_dir = in_dir.join("background-convert");
@@ -2700,6 +2795,10 @@ fn dispatch_project(root: &Path, project: &mut ProjectPlugins, plugin_modules: &
         }
     }
 
+    if did_work {
+        return true;
+    }
+
     let pd_dir = root.join(".agentplug").join("plugin-dispatch");
     let pd_in = pd_dir.join("in");
     let pd_out = pd_dir.join("out");
@@ -2750,13 +2849,13 @@ fn dispatch_project(root: &Path, project: &mut ProjectPlugins, plugin_modules: &
                             let out_name = format!("{plugin_name}-{verb}-{task}.json");
                             let out_body = serde_json::json!({"ok": false, "error": format!("plugin {plugin_name} not compiled yet for this daemon -- retry shortly")}).to_string();
                             write_pd_out(&out_name, &out_body);
-                            continue;
+                            return true;
                         };
                         if let Err(e) = project.load_plugin(&plugin_modules.engine, &plugin_name, module, content_hash) {
                             let out_name = format!("{plugin_name}-{verb}-{task}.json");
                             let out_body = serde_json::json!({"ok": false, "error": format!("plugin instantiate failed: {e:#}")}).to_string();
                             write_pd_out(&out_name, &out_body);
-                            continue;
+                            return true;
                         }
                     }
                 }
@@ -2776,6 +2875,7 @@ fn dispatch_project(root: &Path, project: &mut ProjectPlugins, plugin_modules: &
                     }
                 }
 
+                let _tool_guard = ToolDispatchGuard::acquire(&plugin_name, &verb);
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| project.dispatch(&plugin_name, &verb, &body)));
                 let out_name = format!("{plugin_name}-{verb}-{task}.json");
                 let out_body = match result {
@@ -2794,6 +2894,7 @@ fn dispatch_project(root: &Path, project: &mut ProjectPlugins, plugin_modules: &
                 };
                 let out_body = patch_update_available_from_escalation(&plugin_name, &verb, out_body);
                 write_pd_out(&out_name, &out_body);
+                return true;
             }
         }
     }
@@ -2913,6 +3014,9 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
     let daemon_cfg = DaemonConfig::load();
     let registry_poll_interval = daemon_cfg.registry_poll_interval();
     let heartbeat_interval = daemon_cfg.heartbeat_interval();
+    GM_PROCESSOR_CAPACITY.store(daemon_cfg.gm_pool_size(), std::sync::atomic::Ordering::Relaxed);
+    SHARED_STORE_RECYCLE_LIMIT_MB.store(daemon_cfg.shared_store_recycle_private_bytes() / (1024 * 1024), std::sync::atomic::Ordering::Relaxed);
+    *gm_processor_capacity_reason().lock().unwrap_or_else(|e| e.into_inner()) = daemon_cfg.gm_pool_capacity_reason();
     eprintln!(
         "[agentplug daemon] concurrency: max_concurrent_projects={} gm_concurrency={} gm_pool_size={} side_plugin_concurrency={} (host_available_parallelism={}, unset config keys derive from it)",
         daemon_cfg.max_concurrent_projects(),
@@ -2940,6 +3044,7 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
     let mut known_roots: Vec<PathBuf> = Vec::new();
     let mut roots_new_this_registry_poll: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
     let mut last_cold_project_sweep = Instant::now().checked_sub(COLD_PROJECT_SWEEP_INTERVAL).unwrap_or_else(Instant::now);
+    let mut project_round_robin_cursor = 0usize;
 
     const SELF_RECYCLE_IDLE_MS: u64 = 60 * 60 * 1000;
     let mut last_any_dispatch = Instant::now();
@@ -3209,7 +3314,22 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
                 }
             }
         }
-        let queue = std::sync::Mutex::new(all_projects);
+        let mut background_projects = Vec::with_capacity(all_projects.len());
+        let mut active_projects = Vec::with_capacity(all_projects.len());
+        for (project, active) in all_projects.into_iter().zip(is_genuinely_active) {
+            if active {
+                active_projects.push(project);
+            } else {
+                background_projects.push(project);
+            }
+        }
+        if !active_projects.is_empty() {
+            let len = active_projects.len();
+            active_projects.rotate_left(project_round_robin_cursor % len);
+            project_round_robin_cursor = (project_round_robin_cursor + worker_count) % len;
+        }
+        background_projects.extend(active_projects);
+        let queue = std::sync::Mutex::new(background_projects);
         let done = std::sync::Mutex::new(Vec::<(PathBuf, ProjectPlugins, bool)>::new());
         {
             let plugin_modules_ref: &PluginModules = &plugin_modules;

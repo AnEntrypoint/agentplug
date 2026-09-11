@@ -1,0 +1,1 @@
+{"callee_symbol":"is_headless_root_chrome_process","caller_path":"crates/agentplug-host/src/browser.rs","caller_symbol":"reap_globally_orphaned_headless_chromes","line":797}

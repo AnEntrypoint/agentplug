@@ -1,0 +1,1 @@
+{"callee_symbol":"Ok","caller_path":"crates/agentplug-runner/src/download.rs","caller_symbol":"record_plugin_load_failure_and_rollback","line":694}

@@ -1,0 +1,1 @@
+{"callee_symbol":"session_cdp_endpoint_responds","caller_path":"crates/agentplug-host/src/browser.rs","caller_symbol":"try_adopt_orphaned_session","line":428}

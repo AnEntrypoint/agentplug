@@ -1,0 +1,1 @@
+{"callee_symbol":"m","caller_path":"crates/agentplug-runner/src/daemon.rs","caller_symbol":"write_project_heartbeat_with_queue_info","line":1317}

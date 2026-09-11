@@ -1,0 +1,1 @@
+{"callee_symbol":"lock_path","caller_path":"crates/agentplug-runner/src/daemon.rs","caller_symbol":"ensure_daemon_running","line":710}

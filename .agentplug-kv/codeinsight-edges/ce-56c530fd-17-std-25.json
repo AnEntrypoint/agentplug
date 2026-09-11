@@ -1,0 +1,1 @@
+{"callee_symbol":"std","caller_path":"crates/agentplug-host/src/http_agent.rs","caller_symbol":"load_extra_trust_anchors","line":17}

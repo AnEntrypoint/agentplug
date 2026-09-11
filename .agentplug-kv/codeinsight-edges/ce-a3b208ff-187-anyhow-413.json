@@ -1,0 +1,1 @@
+{"callee_symbol":"anyhow","caller_path":"crates/agentplug-runner/src/download.rs","caller_symbol":"describe_github_api_error","line":187}

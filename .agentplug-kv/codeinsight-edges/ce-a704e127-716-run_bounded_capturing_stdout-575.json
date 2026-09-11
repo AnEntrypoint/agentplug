@@ -1,0 +1,1 @@
+{"callee_symbol":"run_bounded_capturing_stdout","caller_path":"crates/agentplug-host/src/browser.rs","caller_symbol":"list_chrome_processes","line":716}

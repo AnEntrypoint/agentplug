@@ -1,0 +1,1 @@
+{"callee_symbol":"ensure_plugin_installed","caller_path":"crates/agentplug-runner/src/daemon.rs","caller_symbol":"get_or_compile","line":1701}
