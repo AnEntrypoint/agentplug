@@ -1,0 +1,1 @@
+{"callee_symbol":"ensure_plugin_installed_via_github","caller_path":"crates/agentplug-runner/src/download.rs","caller_symbol":"ensure_plugin_installed","line":851}

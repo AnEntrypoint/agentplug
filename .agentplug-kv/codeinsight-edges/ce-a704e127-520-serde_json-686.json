@@ -1,0 +1,1 @@
+{"callee_symbol":"serde_json","caller_path":"crates/agentplug-host/src/browser.rs","caller_symbol":"this_process_is_the_registered_daemon","line":520}

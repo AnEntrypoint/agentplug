@@ -1,0 +1,1 @@
+{"callee_symbol":"sync_instruction_source_if_configured","caller_path":"crates/agentplug-runner/src/daemon.rs","caller_symbol":"run_daemon_body","line":3200}

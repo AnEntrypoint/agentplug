@@ -1,0 +1,1 @@
+{"callee_symbol":"HEARTBEAT_AUTHORITY_LOST","caller_path":"crates/agentplug-runner/src/daemon.rs","caller_symbol":"heartbeat_authority_lost","line":1634}

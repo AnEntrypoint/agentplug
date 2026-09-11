@@ -1,0 +1,1 @@
+{"callee_symbol":"std","caller_path":"crates/agentplug-runner/src/daemon.rs","caller_symbol":"reexec_from_canonical_and_exit","line":1049}

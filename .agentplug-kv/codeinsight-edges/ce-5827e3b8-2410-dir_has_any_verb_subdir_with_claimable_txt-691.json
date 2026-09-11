@@ -1,0 +1,1 @@
+{"callee_symbol":"dir_has_any_verb_subdir_with_claimable_txt","caller_path":"crates/agentplug-runner/src/daemon.rs","caller_symbol":"project_has_pending_dispatch_work","line":2410}

@@ -1,0 +1,1 @@
+{"callee_symbol":"log_path","caller_path":"crates/agentplug-host/src/registry.rs","caller_symbol":"log_poisoned_store_eviction_event","line":148}

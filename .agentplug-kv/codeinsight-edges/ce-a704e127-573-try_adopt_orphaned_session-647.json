@@ -1,0 +1,1 @@
+{"callee_symbol":"try_adopt_orphaned_session","caller_path":"crates/agentplug-host/src/browser.rs","caller_symbol":"reap_os_orphans","line":573}

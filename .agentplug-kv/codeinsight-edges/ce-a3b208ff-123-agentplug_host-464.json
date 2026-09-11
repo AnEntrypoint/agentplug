@@ -1,0 +1,1 @@
+{"callee_symbol":"agentplug_host","caller_path":"crates/agentplug-runner/src/download.rs","caller_symbol":"resolve_latest_tag_via_release_page","line":123}

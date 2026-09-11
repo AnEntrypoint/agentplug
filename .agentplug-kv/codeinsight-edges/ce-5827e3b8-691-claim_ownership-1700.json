@@ -1,0 +1,1 @@
+{"callee_symbol":"claim_ownership","caller_path":"crates/agentplug-runner/src/daemon.rs","caller_symbol":"holds_heartbeat_authority","line":691}

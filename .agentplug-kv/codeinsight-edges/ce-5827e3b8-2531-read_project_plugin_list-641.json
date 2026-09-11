@@ -1,0 +1,1 @@
+{"callee_symbol":"read_project_plugin_list","caller_path":"crates/agentplug-runner/src/daemon.rs","caller_symbol":"dispatch_project","line":2531}

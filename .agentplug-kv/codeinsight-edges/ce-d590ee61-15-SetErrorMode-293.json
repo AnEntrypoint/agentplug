@@ -1,0 +1,1 @@
+{"callee_symbol":"SetErrorMode","caller_path":"crates/agentplug-runner/src/main.rs","caller_symbol":"suppress_crash_dialogs","line":15}

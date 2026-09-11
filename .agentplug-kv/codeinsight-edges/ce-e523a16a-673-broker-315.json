@@ -1,0 +1,1 @@
+{"callee_symbol":"broker","caller_path":"crates/agentplug-host/src/registry.rs","caller_symbol":"resolve_routed_plugin_name","line":673}

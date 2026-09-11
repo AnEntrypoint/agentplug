@@ -1,0 +1,1 @@
+{"callee_symbol":"s","caller_path":"crates/agentplug-host/src/browser.rs","caller_symbol":"chrome_stderr_log_indicates_suid_sandbox_init_denial","line":1069}

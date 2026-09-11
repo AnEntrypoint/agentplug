@@ -1,0 +1,1 @@
+{"callee_symbol":"known_project_roots","caller_path":"crates/agentplug-runner/src/daemon.rs","caller_symbol":"set_known_project_roots","line":1330}

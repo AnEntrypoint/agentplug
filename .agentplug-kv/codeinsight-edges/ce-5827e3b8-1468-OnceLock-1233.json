@@ -1,0 +1,1 @@
+{"callee_symbol":"OnceLock","caller_path":"crates/agentplug-runner/src/daemon.rs","caller_symbol":"consecutive_handoff_failures","line":1468}
