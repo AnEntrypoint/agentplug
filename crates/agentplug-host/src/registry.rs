@@ -229,8 +229,13 @@ pub fn cost_class_for_dispatch(verb: &str, body: &str) -> DispatchCostClass {
     }
     let mode = serde_json::from_str::<serde_json::Value>(body)
         .ok()
-        .and_then(|value| value.get("mode").and_then(serde_json::Value::as_str));
-    match mode {
+        .and_then(|value| {
+            value
+                .get("mode")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        });
+    match mode.as_deref() {
         None | Some("dual") => DispatchCostClass::Heavy,
         Some(_) => DispatchCostClass::Cheap,
     }
