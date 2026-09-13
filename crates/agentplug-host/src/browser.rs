@@ -1313,7 +1313,15 @@ pub fn run(body: &str, opts: &str, cwd_raw: &Path, session_id: &str) -> Value {
     }
     let dom_selector = mode_name.clone();
     let timeout_ms = timeout_override.unwrap_or(timeout_ms);
-    let script = if rest.trim().is_empty() { url_default_script } else { rest.to_string() };
+    let script = if rest.trim().is_empty() {
+        if url_default_script.trim().is_empty() && start_url.is_some() {
+            "void 0".to_string()
+        } else {
+            url_default_script
+        }
+    } else {
+        rest.to_string()
+    };
 
     if mode != BrowserMode::Dom && script.trim().is_empty() {
         return json!({"ok": false, "stdout": "", "exit_code": 1,
