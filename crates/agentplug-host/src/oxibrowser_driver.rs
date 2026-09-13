@@ -104,7 +104,10 @@ const UNSUPPORTED_MODES: &[&str] = &["screenshot", "capture", "profile", "trace"
 fn rejects_unsupported_mode(body: &str) -> Option<Value> {
     let trimmed = body.trim_start();
     for mode in UNSUPPORTED_MODES {
-        if trimmed.starts_with(&format!("{mode}\n")) || trimmed == *mode {
+        if trimmed == *mode
+            || trimmed.starts_with(&format!("{mode}\n"))
+            || (*mode == "screenshot" && trimmed.starts_with("screenshot="))
+        {
             return Some(json!({
                 "ok": false,
                 "error": format!("browser (oxibrowser) does not support the '{mode}' mode yet"),
@@ -216,15 +219,14 @@ pub fn run(
         SessionCommand::None => {}
     }
 
-    if let Some(rejection) = rejects_unsupported_mode(after_sid) {
-        return rejection;
-    }
-
     let mut rest = after_sid;
     let mut dom_selector = None;
     let mut url = None;
     let mut extract_markdown = false;
     loop {
+        if let Some(rejection) = rejects_unsupported_mode(rest) {
+            return rejection;
+        }
         let (timeout_override, after_timeout) = strip_timeout_prefix(rest);
         if timeout_override.is_some() {
             rest = after_timeout;
