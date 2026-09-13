@@ -46,6 +46,17 @@ fn strip_dom_prefix(body: &str) -> (Option<String>, &str) {
     (Some(selector), remainder)
 }
 
+fn strip_extract_markdown_prefix(body: &str) -> (bool, &str) {
+    let trimmed = body.trim_start();
+    if trimmed == "extract-markdown" {
+        return (true, "");
+    }
+    if let Some(remainder) = trimmed.strip_prefix("extract-markdown\n") {
+        return (true, remainder);
+    }
+    (false, body)
+}
+
 fn strip_url_prefix(body: &str) -> (Option<String>, &str) {
     let trimmed = body.trim_start();
     if let Some(rest) = trimmed.strip_prefix("url=") {
@@ -73,7 +84,7 @@ enum SessionCommand {
 
 fn parse_session_command(body: &str) -> SessionCommand {
     let trimmed = body.trim();
-    if trimmed == "session new" || trimmed.starts_with("session new\n") {
+    if trimmed == "session new" || trimmed.starts_with("session new ") || trimmed.starts_with("session new\n") {
         return SessionCommand::New;
     }
     if trimmed == "session list" || trimmed.starts_with("session list\n") {
@@ -209,9 +220,36 @@ pub fn run(
         return rejection;
     }
 
-    let (_timeout_override, after_timeout) = strip_timeout_prefix(after_sid);
-    let (dom_selector, after_dom) = strip_dom_prefix(after_timeout);
-    let (url, after_url) = strip_url_prefix(after_dom);
+    let mut rest = after_sid;
+    let mut dom_selector = None;
+    let mut url = None;
+    let mut extract_markdown = false;
+    loop {
+        let (timeout_override, after_timeout) = strip_timeout_prefix(rest);
+        if timeout_override.is_some() {
+            rest = after_timeout;
+            continue;
+        }
+        let (selector, after_dom) = strip_dom_prefix(rest);
+        if let Some(selector) = selector {
+            dom_selector = Some(selector);
+            rest = after_dom;
+            continue;
+        }
+        let (is_extract_markdown, after_extract_markdown) = strip_extract_markdown_prefix(rest);
+        if is_extract_markdown {
+            extract_markdown = true;
+            rest = after_extract_markdown;
+            continue;
+        }
+        let (parsed_url, after_url) = strip_url_prefix(rest);
+        if let Some(parsed_url) = parsed_url {
+            url = Some(parsed_url);
+            rest = after_url;
+            continue;
+        }
+        break;
+    }
 
     if let Some(url) = url {
         let result = call_oxibrowser(cwd, siblings.clone(), "navigate", &json!({"url": url}));
@@ -235,10 +273,16 @@ pub fn run(
                 Err(e) => json!({"ok": false, "error": e.to_string()}),
             };
         }
-        if after_url.trim().is_empty() {
+        if extract_markdown {
+            return match call_oxibrowser(cwd, siblings, "extract-markdown", &json!({})) {
+                Ok(v) => v,
+                Err(e) => json!({"ok": false, "error": e.to_string()}),
+            };
+        }
+        if rest.trim().is_empty() {
             return json!({"ok": true, "navigated": true, "url": nav});
         }
-        return match call_oxibrowser(cwd, siblings, "evaluate", &json!({"expression": after_url})) {
+        return match call_oxibrowser(cwd, siblings, "evaluate", &json!({"expression": rest})) {
             Ok(v) => v,
             Err(e) => json!({"ok": false, "error": e.to_string()}),
         };
@@ -251,14 +295,21 @@ pub fn run(
         };
     }
 
-    if after_dom.trim().is_empty() {
+    if extract_markdown {
+        return match call_oxibrowser(cwd, siblings, "extract-markdown", &json!({})) {
+            Ok(v) => v,
+            Err(e) => json!({"ok": false, "error": e.to_string()}),
+        };
+    }
+
+    if rest.trim().is_empty() {
         return json!({
             "ok": false,
             "error": "browser body resolved to an empty script after prefix parsing -- nothing would be evaluated",
         });
     }
 
-    match call_oxibrowser(cwd, siblings, "evaluate", &json!({"expression": after_dom})) {
+    match call_oxibrowser(cwd, siblings, "evaluate", &json!({"expression": rest})) {
         Ok(v) => v,
         Err(e) => json!({"ok": false, "error": e.to_string()}),
     }
