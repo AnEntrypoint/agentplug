@@ -9,6 +9,7 @@ use wait_timeout::ChildExt;
 const RESULT_SENTINEL: &str = "__GM_RESULT__";
 const META_SENTINEL: &str = "__GM_META__";
 const PROFILE_SENTINEL: &str = "__GM_PROFILE__";
+const DEFAULT_TIMEOUT_MS: u64 = 120_000;
 
 pub fn run(code: &str, opts: &Value, cwd: &Path) -> Value {
     let lang = opts.get("lang").and_then(|v| v.as_str()).unwrap_or("nodejs");
@@ -19,12 +20,7 @@ pub fn run(code: &str, opts: &Value, cwd: &Path) -> Value {
                 "ok": false, "error": "timeoutMs below floor", "min": 100, "received": ms,
             });
         }
-        None => {
-            return json!({
-                "ok": false, "error": "missing timeoutMs",
-                "required": "positive integer milliseconds",
-            });
-        }
+        None => DEFAULT_TIMEOUT_MS,
     };
 
     let is_js_lang = lang == "nodejs" || lang == "js";
