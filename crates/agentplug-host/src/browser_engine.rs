@@ -117,7 +117,7 @@ pub fn select_engine(cwd: &Path, requested: Option<&str>) -> Engine {
 /// `lightpanda_path`/`GM_LIGHTPANDA_PATH` override naming a WSL2/Docker
 /// wrapper.
 fn lightpanda_reachable(cwd: &Path) -> bool {
-    lightpanda_native_binary_available() || lightpanda_path_override(cwd).is_some()
+    find_lightpanda(cwd).is_some()
 }
 
 fn lightpanda_native_binary_available() -> bool {
