@@ -2,8 +2,9 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::{Mutex, OnceLock};
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use wait_timeout::ChildExt;
 use wasmtime::{AsContextMut, Caller, Linker, Memory};
@@ -65,6 +66,53 @@ pub fn git_subprocess_timeout_ms() -> u64 {
         .and_then(|v| v.trim().parse::<u64>().ok())
         .filter(|ms| *ms > 0)
         .unwrap_or(GIT_SUBPROCESS_TIMEOUT_MS_DEFAULT_AMPLE_FOR_SLOW_PUSH_FETCH_OR_FIRST_CLONE)
+}
+
+// A git child on a large working tree writes far more than the ~64 KB OS pipe buffer holds.
+// If the host waits for the child before it reads the pipe, the child blocks on the full pipe,
+// never exits, and the wait runs to its whole timeout -- the git_diff hang. These caps let a
+// reader thread drain each pipe as the child writes, so the child always makes progress, while
+// the stored bytes stay bounded. The stdout cap sits well above the git_diff verb's own
+// 60000-char truncation, so a normal status/log/diff is returned in full and only a pathological
+// diff is cut short (reported through stdout_truncated).
+const HOST_GIT_STDOUT_CAP_BYTES: usize = 1_048_576;
+const HOST_GIT_STDERR_CAP_BYTES: usize = 262_144;
+
+// Read a child pipe on its own thread, stopping at `cap` bytes. On reaching the cap it sets
+// `cap_hit` so the caller can kill the child at once instead of draining a huge stream in full.
+// Returns the collected bytes and whether the cap fired.
+fn drain_reader_capped<R: std::io::Read + Send + 'static>(
+    mut reader: R,
+    cap: usize,
+    cap_hit: Arc<AtomicBool>,
+) -> std::thread::JoinHandle<(Vec<u8>, bool)> {
+    std::thread::spawn(move || {
+        let mut buf: Vec<u8> = Vec::new();
+        let mut chunk = [0u8; 16 * 1024];
+        let mut truncated = false;
+        loop {
+            match reader.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => {
+                    let room = cap.saturating_sub(buf.len());
+                    if room == 0 {
+                        truncated = true;
+                        cap_hit.store(true, Ordering::SeqCst);
+                        break;
+                    }
+                    let take = room.min(n);
+                    buf.extend_from_slice(&chunk[..take]);
+                    if take < n {
+                        truncated = true;
+                        cap_hit.store(true, Ordering::SeqCst);
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        (buf, truncated)
+    })
 }
 
 fn normalize_lexically(path: &std::path::Path) -> Option<PathBuf> {
@@ -935,31 +983,54 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
                 git_cmd.creation_flags(CREATE_NO_WINDOW);
             }
             let v = match git_cmd.spawn() {
-                Ok(mut child) => match child.wait_timeout(Duration::from_millis(git_subprocess_timeout_ms())) {
-                    Ok(Some(status)) => {
-                        let mut stdout = Vec::new();
-                        let mut stderr = Vec::new();
-                        if let Some(mut o) = child.stdout.take() { let _ = std::io::Read::read_to_end(&mut o, &mut stdout); }
-                        if let Some(mut e) = child.stderr.take() { let _ = std::io::Read::read_to_end(&mut e, &mut stderr); }
+                Ok(mut child) => {
+                    let cap_hit = Arc::new(AtomicBool::new(false));
+                    let out_handle = child.stdout.take().map(|o| drain_reader_capped(o, HOST_GIT_STDOUT_CAP_BYTES, cap_hit.clone()));
+                    let err_handle = child.stderr.take().map(|e| drain_reader_capped(e, HOST_GIT_STDERR_CAP_BYTES, cap_hit.clone()));
+                    let timeout_ms = git_subprocess_timeout_ms();
+                    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+                    let mut exit_code: i32 = -1;
+                    let mut timed_out = false;
+                    let mut cap_stopped = false;
+                    loop {
+                        if cap_hit.load(Ordering::SeqCst) {
+                            let _ = child.kill();
+                            let _ = child.wait();
+                            cap_stopped = true;
+                            break;
+                        }
+                        match child.wait_timeout(Duration::from_millis(20)) {
+                            Ok(Some(status)) => { exit_code = status.code().unwrap_or(-1); break; }
+                            Ok(None) => {}
+                            Err(_) => break,
+                        }
+                        if Instant::now() >= deadline {
+                            let _ = child.kill();
+                            let _ = child.wait();
+                            timed_out = true;
+                            break;
+                        }
+                    }
+                    let (stdout, out_trunc_read) = out_handle.and_then(|h| h.join().ok()).unwrap_or_default();
+                    let (stderr, _err_trunc) = err_handle.and_then(|h| h.join().ok()).unwrap_or_default();
+                    if timed_out {
+                        serde_json::json!({
+                            "stdout": String::from_utf8_lossy(&stdout),
+                            "stderr": format!("git {argv:?} timed out after {timeout_ms}ms, killed"),
+                            "exit_code": -1,
+                        })
+                    } else {
+                        // A cap-stopped read is a deliberate, successful truncation, not a failure:
+                        // report exit 0 so a verb that errors on a nonzero code (git_diff) still gets
+                        // its (truncated) output rather than an error.
                         serde_json::json!({
                             "stdout": String::from_utf8_lossy(&stdout),
                             "stderr": String::from_utf8_lossy(&stderr),
-                            "exit_code": status.code().unwrap_or(-1),
+                            "exit_code": if cap_stopped { 0 } else { exit_code },
+                            "stdout_truncated": out_trunc_read || cap_stopped,
                         })
                     }
-                    Ok(None) => {
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        serde_json::json!({
-                            "stdout": "", "stderr": format!("git {argv:?} timed out after {}ms, killed", git_subprocess_timeout_ms()),
-                            "exit_code": -1,
-                        })
-                    }
-                    Err(e) => {
-                        let _ = child.kill();
-                        serde_json::json!({"stdout": "", "stderr": format!("wait_timeout failed: {e}"), "exit_code": -1})
-                    }
-                },
+                }
                 Err(e) => serde_json::json!({"stdout": "", "stderr": e.to_string(), "exit_code": 1}),
             };
             write_guest_json(&mut caller, v)
