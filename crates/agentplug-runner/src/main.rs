@@ -183,9 +183,16 @@ fn main() -> anyhow::Result<()> {
             let body = args.get(4).cloned().unwrap_or_else(|| "{}".to_string());
             let cwd = std::env::current_dir()?;
 
-            if let Some(out) = daemon::try_dispatch_via_daemon(&cwd, &plugin, &verb, &body) {
-                println!("{out}");
-                return Ok(());
+            match daemon::try_dispatch_via_daemon(&cwd, &plugin, &verb, &body) {
+                daemon::DaemonDispatchOutcome::Answered(out) => {
+                    println!("{out}");
+                    return Ok(());
+                }
+                daemon::DaemonDispatchOutcome::ClaimedUnanswered(report) => {
+                    println!("{report}");
+                    std::process::exit(3);
+                }
+                daemon::DaemonDispatchOutcome::NeverClaimedRunLocally => {}
             }
             let wasm = download::ensure_plugin_installed(&plugin, None)?;
             let content_hash = download::sha256_hex(&std::fs::read(&wasm)?);
