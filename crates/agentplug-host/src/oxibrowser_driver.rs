@@ -1,20 +1,9 @@
-//! Translates the `serp` verb's plain-text-body dispatch shape into calls
-//! against the sideloaded `oxibrowser` plugin (its own `plugkit_alloc`/
-//! `plugin_call` instance, driven via the same sibling-pool machinery
-//! `host_plugin_call` uses). oxibrowser's verb surface (navigate/evaluate/
-//! dom-query/extract-markdown/capabilities) is a genuine subset of what the
-//! `cdp`/`browser` verbs (real Chrome, lightpanda, steel) support --
-//! anything outside that subset (screenshot/capture/profile/trace/viewport,
-//! multi-tab session pooling) returns a clear "not supported here, use
-//! cdp/browser" error rather than silently mishandling it. When
-//! steel-browser is configured (`.gm/browser-config.json`'s
-//! `steel_endpoint` or `GM_STEEL_BROWSER_URL`), `run` redirects the whole
-//! dispatch to `browser::run` instead, since Steel takes over `serp` too
-//! (explicit user decision: steel-browser overrides every one of
-//! serp/browser/cdp uniformly, not just the CDP-capable pair).
-
 use serde_json::{json, Value};
 use std::path::Path;
+
+type SiblingPools = std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<crate::registry::SharedPluginPool>>>>;
+
+const PAGE_FIELD: &str = "page";
 
 fn strip_session_id_prefix(body: &str) -> (Option<String>, &str) {
     let trimmed = body.trim_start();
@@ -74,18 +63,15 @@ fn strip_url_prefix(body: &str) -> (Option<String>, &str) {
     (None, body)
 }
 
-enum SessionCommand {
+enum SessionCommand<'a> {
     New,
     List,
-    Close,
-    Reset,
+    Close(&'a str),
+    Reset(&'a str),
     None,
 }
 
-/// Splits a leading `session ...` command line off the body, mirroring
-/// `browser::parse_session_command` so `session new` stacks with the
-/// prefixes and script that follow it instead of consuming the whole body.
-fn parse_session_command(body: &str) -> (SessionCommand, &str) {
+fn parse_session_command(body: &str) -> (SessionCommand<'_>, &str) {
     let trimmed = body.trim_start();
     let (first_line, remainder) = match trimmed.find('\n') {
         Some(nl) => (&trimmed[..nl], &trimmed[nl + 1..]),
@@ -98,11 +84,11 @@ fn parse_session_command(body: &str) -> (SessionCommand, &str) {
     if first_line == "session list" {
         return (SessionCommand::List, remainder);
     }
-    if first_line.starts_with("session close ") {
-        return (SessionCommand::Close, remainder);
+    if let Some(id) = first_line.strip_prefix("session close ") {
+        return (SessionCommand::Close(id.trim()), remainder);
     }
-    if first_line.starts_with("session reset ") {
-        return (SessionCommand::Reset, remainder);
+    if let Some(id) = first_line.strip_prefix("session reset ") {
+        return (SessionCommand::Reset(id.trim()), remainder);
     }
     (SessionCommand::None, body)
 }
@@ -133,9 +119,72 @@ fn rejects_unsupported_mode(body: &str) -> Option<Value> {
     None
 }
 
+struct PageTarget<'a> {
+    cwd: &'a Path,
+    siblings: SiblingPools,
+    page: String,
+    gm_session: Option<String>,
+}
+
+impl PageTarget<'_> {
+    fn call(&self, verb: &str, mut body: Value) -> Value {
+        if let Some(obj) = body.as_object_mut() {
+            obj.insert(PAGE_FIELD.to_string(), json!(self.page));
+        }
+        let reply = call_oxibrowser(self.cwd, self.siblings.clone(), verb, &body)
+            .unwrap_or_else(|e| json!({"ok": false, "error": e.to_string()}));
+        self.attribute(reply)
+    }
+
+    fn attribute(&self, mut reply: Value) -> Value {
+        let Some(obj) = reply.as_object_mut() else { return reply };
+        if !obj.contains_key(PAGE_FIELD) {
+            obj.insert("page_partition_unsupported".to_string(), json!(true));
+            obj.insert(
+                "page_partition_note".to_string(),
+                json!("this oxibrowser plugin predates per-page partitioning, so every gm session shares one page -- update the oxibrowser plugin"),
+            );
+        }
+        obj.insert("session_id".to_string(), json!(self.page));
+        obj.insert("gm_session".to_string(), json!(self.gm_session));
+        reply
+    }
+
+    fn list(&self, caller_implicit_session: &str) -> Value {
+        let mut reply = self.call("list-pages", json!({}));
+        let pages = reply
+            .pointer_mut("/data/pages")
+            .and_then(Value::as_array_mut)
+            .map(std::mem::take)
+            .unwrap_or_default();
+        let sessions: Vec<Value> = pages
+            .into_iter()
+            .map(|mut entry| {
+                let page = entry.get(PAGE_FIELD).and_then(Value::as_str).unwrap_or_default().to_string();
+                if let Some(obj) = entry.as_object_mut() {
+                    obj.insert("session_id".to_string(), json!(page));
+                    obj.insert("alive".to_string(), json!(true));
+                    obj.insert("is_caller_implicit_session".to_string(), json!(page == caller_implicit_session));
+                }
+                entry
+            })
+            .collect();
+        if let Some(obj) = reply.as_object_mut() {
+            obj.insert("sessions".to_string(), json!(sessions));
+            obj.insert("caller_gm_session".to_string(), json!(self.gm_session));
+            obj.insert("caller_implicit_session".to_string(), json!(caller_implicit_session));
+        }
+        reply
+    }
+
+    fn close(&self) -> Value {
+        self.call("close-page", json!({}))
+    }
+}
+
 fn call_oxibrowser(
     caller_root: &Path,
-    caller_siblings: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<crate::registry::SharedPluginPool>>>>,
+    caller_siblings: SiblingPools,
     verb: &str,
     body: &Value,
 ) -> anyhow::Result<Value> {
@@ -173,79 +222,61 @@ fn call_oxibrowser(
     }
 }
 
-/// Entry point mirroring `browser::run`'s `(body, opts, cwd, session_id)`
-/// shape, called from `host_oxi_exec`. `body` is the caller's raw
-/// plain-text verbatim, never JSON-wrapped; `opts` is the small separate
-/// metadata payload (`{"timeoutMs": <n>}`) rs-plugkit's `serp` verb sends
-/// via host_oxi_exec's own opts_ptr/opts_len param.
-pub fn run(
-    body: &str,
-    opts: &str,
-    cwd: &Path,
-    session_id: &str,
-    siblings: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<crate::registry::SharedPluginPool>>>>,
-) -> Value {
-    // A configured steel-browser endpoint takes over serp too (explicit
-    // user decision: steel overrides serp/browser/cdp uniformly, not just
-    // the two CDP-capable verbs). oxibrowser's own verb surface has no wire
-    // compatibility with a CDP session, so this redirects the whole
-    // dispatch to browser::run (the same CDP-over-port driver cdp/browser
-    // use) with `engine: "steel"` forced into a fresh opts payload, rather
-    // than trying to translate oxibrowser's narrower body grammar onto a
-    // CDP session.
+fn redirect_to_steel(body: &str, opts: &str, cwd: &Path, session_id: &str) -> Value {
+    let mut opts_v: Value = serde_json::from_str(opts).unwrap_or_else(|_| json!({}));
+    if let Some(obj) = opts_v.as_object_mut() {
+        obj.insert("engine".to_string(), json!("steel"));
+    } else {
+        opts_v = json!({"engine": "steel"});
+    }
+    crate::browser::run(body, &opts_v.to_string(), cwd, session_id)
+}
+
+pub fn run(body: &str, opts: &str, cwd: &Path, session_id: &str, siblings: SiblingPools) -> Value {
     if crate::browser_engine::steel_endpoint_override(cwd).is_some() {
-        let mut opts_v: Value = serde_json::from_str(opts).unwrap_or_else(|_| json!({}));
-        if let Some(obj) = opts_v.as_object_mut() {
-            obj.insert("engine".to_string(), json!("steel"));
-        } else {
-            opts_v = json!({"engine": "steel"});
-        }
-        return crate::browser::run(body, &opts_v.to_string(), cwd, session_id);
+        return redirect_to_steel(body, opts, cwd, session_id);
     }
 
-    let inner_body = body.to_string();
+    let (explicit_sid, after_sid) = strip_session_id_prefix(body);
+    let origin = crate::dispatch_origin::current_dispatch_origin();
+    let caller_implicit_session = origin.implicit_page_session(session_id);
+    let named_page = |page: String| PageTarget {
+        cwd,
+        siblings: siblings.clone(),
+        page,
+        gm_session: origin.gm_session.clone(),
+    };
+    let own_page = named_page(origin.page_session(explicit_sid, session_id));
 
-    let (explicit_sid, after_sid) = strip_session_id_prefix(&inner_body);
-    let session_id = explicit_sid.as_deref().filter(|s| !s.is_empty()).unwrap_or(session_id);
-    let session_id = if session_id.is_empty() { "default" } else { session_id };
-
-    // oxibrowser keeps one implicit session per wasm instance (thread_local
-    // SESSION in wasm_dispatch.rs) rather than a multi-session pool like real
-    // Chrome -- new/close/reset are no-ops that report success so
-    // session-lifecycle scripts written against the cdp verb's contract need
-    // no special case. Like the cdp verb, `session new`/`session reset`
-    // stack: a body after the command line is evaluated instead of dropped.
     let (session_command, after_session_command) = parse_session_command(after_sid);
     let trailing_body_present = !after_session_command.trim().is_empty();
-    let after_sid: &str = match session_command {
-        SessionCommand::New => {
+    let terminal_refusal = |command: &str| {
+        json!({"ok": false, "error": format!("'{command}' is a terminal session command and the lines after it were not evaluated -- send them as their own dispatch, or stack them under 'session new'/'session reset <id>'")})
+    };
+    let (target, script) = match session_command {
+        SessionCommand::New if !trailing_body_present => {
+            return own_page.attribute(json!({"ok": true, "page": own_page.page, "note": "oxibrowser opens a page on its first navigate/evaluate; session new reports the page this gm session owns"}));
+        }
+        SessionCommand::New => (own_page, after_session_command),
+        SessionCommand::List if trailing_body_present => return terminal_refusal("session list"),
+        SessionCommand::List => return own_page.list(&caller_implicit_session),
+        SessionCommand::Close(id) | SessionCommand::Reset(id) if id.is_empty() => {
+            return json!({"ok": false, "error": format!("session close/reset requires an explicit id, e.g. 'session close {caller_implicit_session}' for this gm session's own page")});
+        }
+        SessionCommand::Close(_) if trailing_body_present => return terminal_refusal("session close <id>"),
+        SessionCommand::Close(id) => return named_page(id.to_string()).close(),
+        SessionCommand::Reset(id) => {
+            let target = named_page(id.to_string());
+            let closed = target.close();
             if !trailing_body_present {
-                return json!({"ok": true, "session_id": session_id, "note": "oxibrowser keeps one implicit session per plugin instance; session new/close/reset are accepted but no-ops"});
+                return closed;
             }
-            after_session_command
+            (target, after_session_command)
         }
-        SessionCommand::List => {
-            if trailing_body_present {
-                return json!({"ok": false, "error": "'session list' is a terminal session command and the lines after it were not evaluated -- send them as their own dispatch, or stack them under 'session new'"});
-            }
-            return json!({"ok": true, "sessions": [{"session_id": session_id, "alive": true}]});
-        }
-        SessionCommand::Close => {
-            if trailing_body_present {
-                return json!({"ok": false, "error": "'session close <id>' is a terminal session command and the lines after it were not evaluated -- send them as their own dispatch, or stack them under 'session new'/'session reset <id>'"});
-            }
-            return json!({"ok": true, "closed": true, "session_id": session_id});
-        }
-        SessionCommand::Reset => {
-            if !trailing_body_present {
-                return json!({"ok": true, "closed": true, "session_id": session_id});
-            }
-            after_session_command
-        }
-        SessionCommand::None => after_sid,
+        SessionCommand::None => (own_page, after_sid),
     };
 
-    let mut rest = after_sid;
+    let mut rest = script;
     let mut dom_selector = None;
     let mut url = None;
     let mut extract_markdown = false;
@@ -280,65 +311,25 @@ pub fn run(
     }
 
     if let Some(url) = url {
-        let result = call_oxibrowser(cwd, siblings.clone(), "navigate", &json!({"url": url}));
-        let nav = match result {
-            Ok(v) => v,
-            Err(e) => return json!({"ok": false, "error": e.to_string()}),
-        };
-        if nav.get("ok").and_then(|b| b.as_bool()) != Some(true) {
+        let nav = target.call("navigate", json!({"url": url}));
+        if nav.get("ok").and_then(Value::as_bool) != Some(true) {
             return nav;
         }
-        // The prefixes are documented as stacking, so `dom=` alongside `url=`
-        // has to run the dom-query AFTER navigating. Previously this branch
-        // returned before the dom_selector branch below could ever be reached,
-        // so a body carrying both silently dropped the dom-query -- and worse,
-        // a `dom=` written after the `url=` line fell through to `after_url`
-        // and got evaluated as JavaScript, surfacing as a baffling
-        // "reference: h1 is not defined" rather than a selector query.
-        if let Some(selector) = dom_selector {
-            return match call_oxibrowser(cwd, siblings, "dom-query", &json!({"selector": selector})) {
-                Ok(v) => v,
-                Err(e) => json!({"ok": false, "error": e.to_string()}),
-            };
+        if dom_selector.is_none() && !extract_markdown && rest.trim().is_empty() {
+            return target.attribute(json!({"ok": true, "navigated": true, "page": target.page, "url": nav}));
         }
-        if extract_markdown {
-            return match call_oxibrowser(cwd, siblings, "extract-markdown", &json!({})) {
-                Ok(v) => v,
-                Err(e) => json!({"ok": false, "error": e.to_string()}),
-            };
-        }
-        if rest.trim().is_empty() {
-            return json!({"ok": true, "navigated": true, "url": nav});
-        }
-        return match call_oxibrowser(cwd, siblings, "evaluate", &json!({"expression": rest})) {
-            Ok(v) => v,
-            Err(e) => json!({"ok": false, "error": e.to_string()}),
-        };
     }
-
     if let Some(selector) = dom_selector {
-        return match call_oxibrowser(cwd, siblings, "dom-query", &json!({"selector": selector})) {
-            Ok(v) => v,
-            Err(e) => json!({"ok": false, "error": e.to_string()}),
-        };
+        return target.call("dom-query", json!({"selector": selector}));
     }
-
     if extract_markdown {
-        return match call_oxibrowser(cwd, siblings, "extract-markdown", &json!({})) {
-            Ok(v) => v,
-            Err(e) => json!({"ok": false, "error": e.to_string()}),
-        };
+        return target.call("extract-markdown", json!({}));
     }
-
     if rest.trim().is_empty() {
         return json!({
             "ok": false,
             "error": "browser body resolved to an empty script after prefix parsing -- nothing would be evaluated",
         });
     }
-
-    match call_oxibrowser(cwd, siblings, "evaluate", &json!({"expression": rest})) {
-        Ok(v) => v,
-        Err(e) => json!({"ok": false, "error": e.to_string()}),
-    }
+    target.call("evaluate", json!({"expression": rest}))
 }
