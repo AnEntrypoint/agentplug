@@ -1,0 +1,11 @@
+# AGENTS.md
+
+agentplug is the native wasm host (`agentplug-runner`, `agentplug-host`) that loads the gm plugin and its sibling plugins. Work on `main` only and commit as `lanmower`. Pushing `main` runs `.github/workflows/release.yml`, which bumps the patch version, builds every runner target, and publishes the release that running daemons self-update to.
+
+Code carries no comments. Keep `// SAFETY:` justifications and attributes. Put rationale that structure cannot express in this file, the commit message, or the gm recall store.
+
+## Browser verbs
+
+- `serp`, `browser` and `cdp` resolve their page the same way: a `sessionId=` body line, then a JSON envelope `sessionId`, then the dispatching gm session (`dispatch_origin.rs`, from a JSON `session_id` or the spool task id), then the guest-resolved id, then `default` only when no gm session is derivable. `DispatchOrigin::page_session` is the single implementation.
+- `serp` drives the sideloaded `oxibrowser` plugin (`oxibrowser_driver.rs`). The plugin keys pages by the `page` field of each call and keeps at most 16, evicting the least recently used. `session list`, `session close <id>` and `session reset <id>` map to its `list-pages` and `close-page` verbs. A reply without a `page` field comes from a plugin older than the partition, and the driver flags it with `page_partition_unsupported`.
+- A configured steel endpoint (`.gm/browser-config.json` `steel_endpoint` or `GM_STEEL_BROWSER_URL`) takes over `serp` as well as `browser` and `cdp`. This is a user decision: steel overrides all three verbs uniformly. `serp` then runs through `browser::run` with `engine: "steel"`, because oxibrowser's body grammar does not map onto a CDP session.

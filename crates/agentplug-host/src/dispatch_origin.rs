@@ -8,6 +8,23 @@ pub(crate) struct DispatchOrigin {
     pub named_page_session: Option<String>,
 }
 
+pub(crate) const UNATTRIBUTED_DISPATCH_SESSION: &str = "default";
+
+impl DispatchOrigin {
+    pub(crate) fn implicit_page_session(&self, guest_resolved_session: &str) -> String {
+        self.gm_session
+            .clone()
+            .or_else(|| Some(guest_resolved_session.trim().to_string()).filter(|s| !s.is_empty()))
+            .unwrap_or_else(|| UNATTRIBUTED_DISPATCH_SESSION.to_string())
+    }
+
+    pub(crate) fn page_session(&self, explicit_session_line: Option<String>, guest_resolved_session: &str) -> String {
+        explicit_session_line
+            .or_else(|| self.named_page_session.clone())
+            .unwrap_or_else(|| self.implicit_page_session(guest_resolved_session))
+    }
+}
+
 thread_local! {
     static CURRENT_DISPATCH_ORIGIN: RefCell<Option<DispatchOrigin>> = const { RefCell::new(None) };
 }
