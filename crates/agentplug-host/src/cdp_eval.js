@@ -77,7 +77,7 @@ async function createTargetViaFlattenedSession(port, startUrl) {
   }
 }
 
-async function pickPageTarget(port, startUrl, targetId, timeoutMs) {
+async function pickPageTarget(port, startUrl, targetId, timeoutMs, claimFreshTarget) {
   const deadline = Date.now() + timeoutMs;
   let sawWorkingJsonList = false;
   while (Date.now() < deadline) {
@@ -88,16 +88,15 @@ async function pickPageTarget(port, startUrl, targetId, timeoutMs) {
         const remembered = list.find((t) => t.id === targetId && t.webSocketDebuggerUrl);
         if (remembered) return remembered;
       }
-      const pages = list.filter((t) => t.type === 'page' && t.webSocketDebuggerUrl);
-      // No remembered target (or it's gone): never silently adopt Chrome's own
-      // new-tab-page as the working tab -- prefer any real, non-internal page
-      // first, and only fall back to an internal page if nothing else exists.
-      const realPage = pages.find((t) => !isInternalChromeUrl(t.url));
-      if (realPage) return realPage;
-      if (pages.length) return pages[0];
+      if (!claimFreshTarget) {
+        const pages = list.filter((t) => t.type === 'page' && t.webSocketDebuggerUrl);
+        const realPage = pages.find((t) => !isInternalChromeUrl(t.url));
+        if (realPage) return realPage;
+        if (pages.length) return pages[0];
+      }
     }
-    if (startUrl) {
-      const created = await httpPutJson(`http://127.0.0.1:${port}/json/new?${encodeURIComponent(startUrl)}`, 3000);
+    if (startUrl || claimFreshTarget) {
+      const created = await httpPutJson(`http://127.0.0.1:${port}/json/new?${encodeURIComponent(startUrl || 'about:blank')}`, 3000);
       if (created && created.webSocketDebuggerUrl) return created;
       // /json/list answered valid JSON (a real CDP server, not "not up yet")
       // but /json/new did not -- this is the lightpanda shape, not a
@@ -461,9 +460,9 @@ function aggregateCpuProfile(profile, topN) {
 
 async function main() {
   const cfg = JSON.parse(process.argv[2]);
-  const { port, startUrl, targetId, scriptFile, resultFile, timeoutMs, mode, artifactFile, viewport } = cfg;
+  const { port, startUrl, targetId, scriptFile, resultFile, timeoutMs, mode, artifactFile, viewport, claimFreshTarget } = cfg;
   const script = fs.readFileSync(scriptFile, 'utf-8');
-  const target = await pickPageTarget(port, startUrl, targetId, Math.min(timeoutMs, 30000));
+  const target = await pickPageTarget(port, startUrl, targetId, Math.min(timeoutMs, 30000), claimFreshTarget === true);
   if (!target) {
     fs.writeFileSync(resultFile, JSON.stringify({ __cdpError: 'no page target on CDP endpoint' }));
     process.stderr.write('cdp-eval: no page target\n');
