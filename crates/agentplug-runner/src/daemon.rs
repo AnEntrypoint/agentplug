@@ -2548,6 +2548,8 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
     }
 
     let mut last_instruction_source_sync: HashMap<PathBuf, Instant> = HashMap::new();
+    let mut instruction_source_syncing: HashSet<PathBuf> = HashSet::new();
+    let (instruction_source_sync_done_tx, instruction_source_sync_done_rx) = std::sync::mpsc::channel::<PathBuf>();
 
     let mut last_browser_orphan_sweep = Instant::now()
         .checked_sub(Duration::from_millis(5 * 60 * 1000))
@@ -2584,6 +2586,10 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
             }
         }
 
+        while let Ok(root) = instruction_source_sync_done_rx.try_recv() {
+            instruction_source_syncing.remove(&root);
+        }
+
         const BROWSER_ORPHAN_SWEEP_INTERVAL_LONGER_THAN_REGISTRY_POLL_MS: u64 = 5 * 60 * 1000;
         if last_browser_orphan_sweep.elapsed() >= Duration::from_millis(BROWSER_ORPHAN_SWEEP_INTERVAL_LONGER_THAN_REGISTRY_POLL_MS) {
             last_browser_orphan_sweep = Instant::now();
@@ -2609,13 +2615,15 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
                 .get(root)
                 .map(|t| t.elapsed() >= instruction_source_poll_interval)
                 .unwrap_or(true);
-            if due {
+            if due && instruction_source_syncing.insert(root.clone()) {
                 last_instruction_source_sync.insert(root.clone(), Instant::now());
                 let thread_root = root.clone();
+                let done = instruction_source_sync_done_tx.clone();
                 std::thread::spawn(move || {
                     if let Err(e) = sync_instruction_source_if_configured(&thread_root) {
                         eprintln!("[agentplug daemon] instruction source-repo sync failed for {}: {e:#}", thread_root.display());
                     }
+                    let _ = done.send(thread_root);
                 });
             }
         }
