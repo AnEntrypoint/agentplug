@@ -1,6 +1,7 @@
 mod broker;
 mod browser;
 mod browser_engine;
+mod dispatch_origin;
 mod exec_js;
 mod host_state;
 mod http_agent;
@@ -16,6 +17,7 @@ pub use broker::{
     unregister_provider, BrokerStatus, LoadBalancePolicy, ProviderStatus, RouteLease,
 };
 pub use browser::{canonical_project_root, close_all_sessions, reap_idle_sessions_and_os_orphans_across_every_known_project_root, run as browser_run};
+pub use dispatch_origin::{enter_dispatch_origin_scope, DispatchOriginScope};
 pub use host_state::HostState;
 pub use http_agent::{build_agent, shared_agent};
 pub use imports::{git_subprocess_timeout_ms, register_env_imports, register_wasi};
