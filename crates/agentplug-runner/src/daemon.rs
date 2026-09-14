@@ -1043,6 +1043,8 @@ fn write_project_heartbeat_with_queue_info(spool_dir: &Path, busy_until: Option<
     payload["gm_processor_capacity_reason"] = serde_json::json!(gm_processor_capacity_reason().lock().unwrap_or_else(|e| e.into_inner()).clone());
     payload["shared_store_recycle_limit_mb"] = serde_json::json!(SHARED_STORE_RECYCLE_LIMIT_MB.load(std::sync::atomic::Ordering::Relaxed));
     payload["tool_serialization"] = serde_json::json!("fifo per plugin and verb");
+    payload["runner_version"] = serde_json::json!(env!("CARGO_PKG_VERSION"));
+    payload["loaded_plugin_versions"] = serde_json::json!(loaded_plugin_versions().lock().unwrap_or_else(|e| e.into_inner()).clone());
     payload["queue_wait_ms"] = serde_json::json!(last_measured_dispatch_queue_wait_ms());
     if let Some((staged_at_ms, _len)) = cached_staged_runner() {
         payload["runner_update_in_progress"] = serde_json::json!(true);
@@ -1291,6 +1293,11 @@ fn loaded_plugin_content_hashes() -> &'static Mutex<HashMap<String, String>> {
     LOADED_PLUGIN_CONTENT_HASHES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+fn loaded_plugin_versions() -> &'static Mutex<HashMap<String, String>> {
+    static LOADED_PLUGIN_VERSIONS: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+    LOADED_PLUGIN_VERSIONS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 static LAST_PLUGIN_COMPILE_FAILURE: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
 
 fn last_plugin_compile_failure() -> &'static Mutex<HashMap<String, String>> {
@@ -1423,6 +1430,10 @@ impl PluginModules {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .insert(plugin_name.to_string(), on_disk_hash.clone());
+            loaded_plugin_versions()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(plugin_name.to_string(), installed_plugin_version(plugin_name).unwrap_or_else(|| "unversioned".to_string()));
             agentplug_host::note_shared_plugin_bytes_current(plugin_name, &on_disk_hash);
         }
         Ok(())
