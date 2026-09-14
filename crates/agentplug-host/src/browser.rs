@@ -290,6 +290,7 @@ fn browser_chrome_profile_dir(cwd: &Path, session_id: &str) -> PathBuf {
 struct BrowserSession {
     cwd: PathBuf,
     session_id: String,
+    owner_gm_session: Option<String>,
     /// None for a session ADOPTED from an OS-orphaned chrome after a daemon
     /// restart -- the pid is known (sidecar) but this process holds no Child
     /// handle for it. Liveness then goes through pid_is_alive instead of
@@ -326,6 +327,16 @@ fn sessions_map() -> &'static Mutex<HashMap<String, BrowserSession>> {
 
 fn session_key(cwd: &Path, session_id: &str) -> String {
     format!("{}\u{0}{}", cwd.display(), session_id)
+}
+
+const UNATTRIBUTED_DISPATCH_SESSION: &str = "default";
+
+fn implicit_page_session(origin: &crate::dispatch_origin::DispatchOrigin, guest_resolved_session: &str) -> String {
+    origin
+        .gm_session
+        .clone()
+        .or_else(|| Some(guest_resolved_session.trim().to_string()).filter(|s| !s.is_empty()))
+        .unwrap_or_else(|| UNATTRIBUTED_DISPATCH_SESSION.to_string())
 }
 
 static SESSION_LIFECYCLE_LOCKS: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
@@ -370,6 +381,7 @@ fn kill_session(mut session: BrowserSession) {
     let _ = std::fs::remove_file(pid_sidecar_path(&profile_dir));
     let _ = std::fs::remove_file(port_sidecar_path(&profile_dir));
     let _ = std::fs::remove_file(session_id_sidecar_path(&profile_dir));
+    let _ = std::fs::remove_file(owner_gm_session_sidecar_path(&profile_dir));
 }
 
 fn pid_sidecar_path(profile_dir: &Path) -> PathBuf {
@@ -382,6 +394,23 @@ fn port_sidecar_path(profile_dir: &Path) -> PathBuf {
 
 fn session_id_sidecar_path(profile_dir: &Path) -> PathBuf {
     profile_dir.join("chrome.session-id")
+}
+
+fn owner_gm_session_sidecar_path(profile_dir: &Path) -> PathBuf {
+    profile_dir.join("chrome.owner-gm-session")
+}
+
+fn record_owner_gm_session(cwd: &Path, session_id: &str, owner_gm_session: Option<&str>) {
+    let profile_dir = browser_chrome_profile_dir(cwd, session_id);
+    let sidecar = owner_gm_session_sidecar_path(&profile_dir);
+    match owner_gm_session {
+        Some(owner) if profile_dir.is_dir() => {
+            let _ = std::fs::write(sidecar, owner);
+        }
+        _ => {
+            let _ = std::fs::remove_file(sidecar);
+        }
+    }
 }
 
 fn target_id_sidecar_path(profile_dir: &Path) -> PathBuf {
@@ -432,6 +461,10 @@ fn try_adopt_orphaned_session(cwd: &Path, session_id_hint: Option<&str>, profile
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
+    let owner_gm_session = std::fs::read_to_string(owner_gm_session_sidecar_path(profile_dir))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
     let key = session_key(cwd, &session_id);
     {
         let mut map = sessions_map().lock().unwrap_or_else(|e| e.into_inner());
@@ -446,6 +479,7 @@ fn try_adopt_orphaned_session(cwd: &Path, session_id_hint: Option<&str>, profile
             BrowserSession {
                 cwd: cwd.to_path_buf(),
                 session_id: session_id.clone(),
+                owner_gm_session,
                 child: None,
                 pid,
                 port,
@@ -935,7 +969,7 @@ fn evict_session_lifecycle_locks_with_no_active_holder() {
     locks.retain(|_, arc| Arc::strong_count(arc) > 1);
 }
 
-fn session_new(cwd: &Path, session_id: &str, cfg: &BrowserConfig, engine: crate::browser_engine::Engine) -> Value {
+fn session_new(cwd: &Path, session_id: &str, owner_gm_session: Option<&str>, cfg: &BrowserConfig, engine: crate::browser_engine::Engine) -> Value {
     let key = session_key(cwd, session_id);
     let lifecycle_lock = session_lifecycle_lock_for_key(&key);
     let _lifecycle_guard = lifecycle_lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -955,6 +989,7 @@ fn session_new(cwd: &Path, session_id: &str, cfg: &BrowserConfig, engine: crate:
                 BrowserSession {
                     cwd: cwd.to_path_buf(),
                     session_id: session_id.to_string(),
+                    owner_gm_session: owner_gm_session.map(str::to_string),
                     child: acquired.child,
                     pid,
                     port,
@@ -964,13 +999,15 @@ fn session_new(cwd: &Path, session_id: &str, cfg: &BrowserConfig, engine: crate:
                     engine,
                 },
             );
-            json!({"ok": true, "stdout": "", "exit_code": 0, "stderr": "", "session_id": session_id, "port": port})
+            drop(map);
+            record_owner_gm_session(cwd, session_id, owner_gm_session);
+            json!({"ok": true, "stdout": "", "exit_code": 0, "stderr": "", "session_id": session_id, "owner_gm_session": owner_gm_session, "port": port})
         }
         Err(e) => json!({"ok": false, "stdout": "", "exit_code": 1, "stderr": e}),
     }
 }
 
-fn session_list(cwd: &Path) -> Value {
+fn session_list(cwd: &Path, caller_gm_session: Option<&str>, caller_implicit_session: &str) -> Value {
     let mut map = sessions_map().lock().unwrap_or_else(|e| e.into_inner());
     let keys_for_cwd: Vec<String> = map
         .iter()
@@ -987,6 +1024,9 @@ fn session_list(cwd: &Path) -> Value {
         if let Some(s) = map.get(&k) {
             out.push(json!({
                 "session_id": s.session_id,
+                "owner_gm_session": s.owner_gm_session,
+                "owned_by_caller": caller_gm_session.is_some() && s.owner_gm_session.as_deref() == caller_gm_session,
+                "is_caller_implicit_session": s.session_id == caller_implicit_session,
                 "port": s.port,
                 "alive": true,
                 "idle_ms": s.last_used.elapsed().as_millis() as u64,
@@ -997,7 +1037,12 @@ fn session_list(cwd: &Path) -> Value {
             }));
         }
     }
-    json!({"ok": true, "stdout": "", "exit_code": 0, "stderr": "", "sessions": out})
+    json!({
+        "ok": true, "stdout": "", "exit_code": 0, "stderr": "",
+        "caller_gm_session": caller_gm_session,
+        "caller_implicit_session": caller_implicit_session,
+        "sessions": out,
+    })
 }
 
 fn session_close(cwd: &Path, target_session_id: &str, require_found: bool) -> Value {
@@ -1223,51 +1268,14 @@ pub fn run(body: &str, opts: &str, cwd_raw: &Path, session_id: &str) -> Value {
     let engine = crate::browser_engine::select_engine(cwd, requested_engine.as_deref());
 
     let (explicit_session_id, after_session_prefix) = strip_session_id_prefix(&inner_body);
-    let session_id_owned;
-    let session_id = match &explicit_session_id {
-        Some(explicit) => {
-            session_id_owned = explicit.clone();
-            session_id_owned.as_str()
-        }
-        None => session_id,
-    };
     let inner_body = after_session_prefix;
-
-    // The wasm-side caller (rs-plugkit's `browser` verb handler) resolves a
-    // session id from an explicit `sessionId`, the current gm dispatch's own
-    // SESSION_ID, or `.gm/exec-spool/.session-current` -- and falls back to
-    // an empty string when none of those are set (e.g. a bare eval dispatch
-    // with no `session ...` prefix and no prior browser session recorded for
-    // this repo). Threading that empty string straight into
-    // session_new/session_key used to key the new Chrome session under the
-    // literal empty string: session_new and session_list both echoed
-    // session_id: "" back, so the caller had no real id to pass to a later
-    // `session close <id>`/`session reset <id>` (which require a non-empty
-    // explicit id).
-    //
-    // A prior fix generated a fresh `auto-{pid}-{unix_ms}` id per empty-sid
-    // call to make every session addressable. That traded one bug for a
-    // worse one: EVERY bare-eval dispatch (the common case -- no explicit
-    // `session ...` prefix) minted a brand-new id, so it always missed the
-    // session-cache lookup below and always launched a brand-new Chrome
-    // process + profile dir, even for back-to-back dispatches against the
-    // same repo seconds apart. Observed live: 21 leaked chrome.exe processes
-    // from a handful of plain-eval `browser` dispatches in one session.
-    //
-    // Fix: default to a STABLE, deterministic per-cwd+pid id ("default")
-    // instead of a time-varying one. This keeps every property the addressability
-    // fix wanted (a real non-empty id, usable with `session close`/`session
-    // reset`) while making repeat bare-eval calls resolve to the SAME
-    // session_key -> the SAME cached, already-launched Chrome -- process reuse
-    // for the overwhelmingly common no-explicit-session case, with the well-worn
-    // idle-timeout/reap machinery below still cleaning it up eventually.
-    let session_id_owned2;
-    let session_id = if session_id.is_empty() {
-        session_id_owned2 = "default".to_string();
-        session_id_owned2.as_str()
-    } else {
-        session_id
-    };
+    let origin = crate::dispatch_origin::current_dispatch_origin();
+    let owner_gm_session = origin.gm_session.clone();
+    let caller_implicit_session = implicit_page_session(&origin, session_id);
+    let resolved_session_id = explicit_session_id
+        .or_else(|| origin.named_page_session.clone())
+        .unwrap_or_else(|| caller_implicit_session.clone());
+    let session_id = resolved_session_id.as_str();
 
     // `session new` and `session reset <id>` stack: the session action runs
     // first and the rest of the body is evaluated on the fresh session.
@@ -1282,7 +1290,7 @@ pub fn run(body: &str, opts: &str, cwd_raw: &Path, session_id: &str) -> Value {
     let mut session_created_by_this_dispatch = false;
     let inner_body: &str = match session_command {
         SessionCommand::New => {
-            let created = session_new(cwd, session_id, &browser_cfg, engine);
+            let created = session_new(cwd, session_id, owner_gm_session.as_deref(), &browser_cfg, engine);
             if !trailing_body_present || created.get("ok") != Some(&Value::Bool(true)) {
                 return created;
             }
@@ -1293,7 +1301,7 @@ pub fn run(body: &str, opts: &str, cwd_raw: &Path, session_id: &str) -> Value {
             if trailing_body_present {
                 return refuse_trailing_body_after_terminal_session_command("session list", after_session_command);
             }
-            return session_list(cwd);
+            return session_list(cwd, owner_gm_session.as_deref(), &caller_implicit_session);
         }
         SessionCommand::Close(id) if !id.is_empty() => {
             if trailing_body_present {
@@ -1310,7 +1318,7 @@ pub fn run(body: &str, opts: &str, cwd_raw: &Path, session_id: &str) -> Value {
         }
         SessionCommand::Close(_) | SessionCommand::Reset(_) => {
             return json!({"ok": false, "stdout": "", "exit_code": 1,
-                "stderr": "session close/reset requires an explicit id, e.g. 'session close default'"});
+                "stderr": format!("session close/reset requires an explicit id, e.g. 'session close {caller_implicit_session}' for this gm session's own page")});
         }
         SessionCommand::None => inner_body,
     };
@@ -1506,6 +1514,7 @@ pub fn run(body: &str, opts: &str, cwd_raw: &Path, session_id: &str) -> Value {
                         BrowserSession {
                             cwd: cwd.to_path_buf(),
                             session_id: session_id.to_string(),
+                            owner_gm_session: owner_gm_session.clone(),
                             child: acquired.child,
                             pid,
                             port: new_port,
@@ -1515,6 +1524,8 @@ pub fn run(body: &str, opts: &str, cwd_raw: &Path, session_id: &str) -> Value {
                             engine,
                         },
                     );
+                    drop(map);
+                    record_owner_gm_session(cwd, session_id, owner_gm_session.as_deref());
                     new_port
                 }
             }
@@ -1525,6 +1536,7 @@ pub fn run(body: &str, opts: &str, cwd_raw: &Path, session_id: &str) -> Value {
         "port": port,
         "startUrl": start_url,
         "targetId": known_target_id,
+        "claimFreshTarget": engine == crate::browser_engine::Engine::Steel,
         "scriptFile": script_path.to_string_lossy(),
         "resultFile": result_path.to_string_lossy(),
         "timeoutMs": timeout_ms,
@@ -1625,6 +1637,7 @@ pub fn run(body: &str, opts: &str, cwd_raw: &Path, session_id: &str) -> Value {
         "timed_out": timed_out,
         "duration_ms": t0.elapsed().as_millis() as u64,
         "session_id": session_id,
+        "gm_session": owner_gm_session,
         "port": port,
     });
     if session_created_by_this_dispatch {

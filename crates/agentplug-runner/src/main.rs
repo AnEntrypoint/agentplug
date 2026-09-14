@@ -471,6 +471,7 @@ fn run_spool_watcher_single_process(project: &mut ProjectPlugins, spool_dir: &st
                         continue;
                     }
                     let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+                    let _dispatch_origin_scope = agentplug_host::enter_dispatch_origin_scope(&stem, &body);
                     let result = project
                         .dispatch("gm", &verb, &body)
                         .unwrap_or_else(|e| serde_json::json!({"ok": false, "verb": verb, "error": e.to_string()}).to_string());

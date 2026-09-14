@@ -1890,6 +1890,7 @@ pub(crate) fn run_gm_dispatch_to_file(root: &Path, handle: &DispatchHandle, verb
     let _fairness_guard = GmFairnessGuard::acquire(root);
     let tool_verb = if plugin_name == "gm" { verb } else { inner_verb_owned.as_str() };
     let _tool_guard = ToolDispatchGuard::acquire(plugin_name, tool_verb);
+    let _dispatch_origin_scope = agentplug_host::enter_dispatch_origin_scope(task, body);
     let dispatch_result = if plugin_name == "gm" {
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handle.dispatch("gm", verb, body)))
     } else {
