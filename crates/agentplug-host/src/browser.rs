@@ -1027,23 +1027,39 @@ enum SessionCommand<'a> {
     None,
 }
 
-fn parse_session_command(body: &str) -> SessionCommand<'_> {
-    let trimmed = body.trim();
-    if trimmed == "session new" || trimmed.starts_with("session new\n") {
-        return SessionCommand::New;
+/// Splits a leading `session ...` command line off the body. The second
+/// element is everything after that line, so `session new` stacks with the
+/// other prefixes (`timeout=`, `url=`, `screenshot=`, the script) instead of
+/// being the whole dispatch. A body with no session command comes back as
+/// `(None, body)`.
+fn parse_session_command(body: &str) -> (SessionCommand<'_>, &str) {
+    let trimmed = body.trim_start();
+    let (first_line, remainder) = match trimmed.find('\n') {
+        Some(nl) => (&trimmed[..nl], &trimmed[nl + 1..]),
+        None => (trimmed, ""),
+    };
+    let first_line = first_line.trim_end();
+    if first_line == "session new" {
+        return (SessionCommand::New, remainder);
     }
-    if trimmed == "session list" || trimmed.starts_with("session list\n") {
-        return SessionCommand::List;
+    if first_line == "session list" {
+        return (SessionCommand::List, remainder);
     }
-    if let Some(rest) = trimmed.strip_prefix("session close ") {
-        let id = rest.lines().next().unwrap_or("").trim();
-        return SessionCommand::Close(id);
+    if let Some(id) = first_line.strip_prefix("session close ") {
+        return (SessionCommand::Close(id.trim()), remainder);
     }
-    if let Some(rest) = trimmed.strip_prefix("session reset ") {
-        let id = rest.lines().next().unwrap_or("").trim();
-        return SessionCommand::Reset(id);
+    if let Some(id) = first_line.strip_prefix("session reset ") {
+        return (SessionCommand::Reset(id.trim()), remainder);
     }
-    SessionCommand::None
+    (SessionCommand::None, body)
+}
+
+fn refuse_trailing_body_after_terminal_session_command(command: &str, remainder: &str) -> Value {
+    let dropped_lines = remainder.lines().filter(|l| !l.trim().is_empty()).count();
+    json!({"ok": false, "stdout": "", "exit_code": 1,
+        "stderr": format!(
+            "'{command}' is a terminal session command and the {dropped_lines} non-empty line(s) after it were not evaluated -- send them as their own dispatch, or stack them under 'session new'/'session reset <id>' which do continue into the script"
+        )})
 }
 
 fn chrome_launch_log_path(profile_dir: &Path) -> PathBuf {
@@ -1261,17 +1277,51 @@ pub fn run(body: &str, opts: &str, cwd_raw: &Path, session_id: &str) -> Value {
         session_id
     };
 
-    match parse_session_command(inner_body) {
-        SessionCommand::New => return session_new(cwd, session_id, &browser_cfg, engine),
-        SessionCommand::List => return session_list(cwd),
-        SessionCommand::Close(id) if !id.is_empty() => return session_close(cwd, id, true),
-        SessionCommand::Reset(id) if !id.is_empty() => return session_close(cwd, id, false),
+    // `session new` and `session reset <id>` stack: the session action runs
+    // first and the rest of the body is evaluated on the fresh session.
+    // Before this, a body of `session new\n<prefixes>\n<script>` answered
+    // with session_new's `{ok, session_id, port}` envelope alone and every
+    // line after the first was dropped without a word (witnessed live: a
+    // screenshot dispatch that returned no value and no screenshot path).
+    // `session list` and `session close <id>` stay terminal, and refuse a
+    // trailing body loudly instead of dropping it.
+    let (session_command, after_session_command) = parse_session_command(inner_body);
+    let trailing_body_present = !after_session_command.trim().is_empty();
+    let mut session_created_by_this_dispatch = false;
+    let inner_body: &str = match session_command {
+        SessionCommand::New => {
+            let created = session_new(cwd, session_id, &browser_cfg, engine);
+            if !trailing_body_present || created.get("ok") != Some(&Value::Bool(true)) {
+                return created;
+            }
+            session_created_by_this_dispatch = true;
+            after_session_command
+        }
+        SessionCommand::List => {
+            if trailing_body_present {
+                return refuse_trailing_body_after_terminal_session_command("session list", after_session_command);
+            }
+            return session_list(cwd);
+        }
+        SessionCommand::Close(id) if !id.is_empty() => {
+            if trailing_body_present {
+                return refuse_trailing_body_after_terminal_session_command("session close <id>", after_session_command);
+            }
+            return session_close(cwd, id, true);
+        }
+        SessionCommand::Reset(id) if !id.is_empty() => {
+            let closed = session_close(cwd, id, false);
+            if !trailing_body_present {
+                return closed;
+            }
+            after_session_command
+        }
         SessionCommand::Close(_) | SessionCommand::Reset(_) => {
             return json!({"ok": false, "stdout": "", "exit_code": 1,
                 "stderr": "session close/reset requires an explicit id, e.g. 'session close default'"});
         }
-        SessionCommand::None => {}
-    }
+        SessionCommand::None => inner_body,
+    };
 
     let mut timeout_override: Option<u64> = None;
     let mut mode = BrowserMode::Default;
@@ -1582,7 +1632,12 @@ pub fn run(body: &str, opts: &str, cwd_raw: &Path, session_id: &str) -> Value {
         "exit_code": exit_code,
         "timed_out": timed_out,
         "duration_ms": t0.elapsed().as_millis() as u64,
+        "session_id": session_id,
+        "port": port,
     });
+    if session_created_by_this_dispatch {
+        out["session_created"] = Value::Bool(true);
+    }
     if cdp_error.is_some() {
         out["result"] = Value::Null;
         out["debug"] = result_value.get("debug").cloned().unwrap_or_else(default_debug);
@@ -1617,16 +1672,19 @@ pub fn run(body: &str, opts: &str, cwd_raw: &Path, session_id: &str) -> Value {
         BrowserMode::Screenshot => {
             out["result"] = result_value.get("result").cloned().unwrap_or(Value::Null);
             out["debug"] = result_value.get("debug").cloned().unwrap_or_else(default_debug);
-            let screenshot_error = result_value.get("screenshot_error").cloned();
-            if let Some(p) = &artifact_path {
-                if screenshot_error.is_none() {
+            // cdp_eval.js always writes the key, as JSON null on success, so
+            // a bare `.get()` is Some(Null) and used to hide screenshot_path
+            // on every successful capture (witnessed: PNG on disk, no path in
+            // the envelope).
+            let screenshot_error = result_value.get("screenshot_error").cloned().filter(|e| !e.is_null());
+            match (&artifact_path, screenshot_error) {
+                (Some(p), None) => {
                     out["screenshot_path"] = json!(p.to_string_lossy());
                 }
-            }
-            if let Some(e) = screenshot_error {
-                if !e.is_null() {
+                (_, Some(e)) => {
                     out["screenshot_error"] = e;
                 }
+                (None, None) => {}
             }
         }
         BrowserMode::Dom => {

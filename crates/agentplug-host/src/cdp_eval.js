@@ -304,6 +304,25 @@ async function attachDebugCapture(sess) {
   };
   await sess.send('Network.enable', {});
   await sess.send('Page.addScriptToEvaluateOnNewDocument', { source: GL_ERROR_TRACKING_INIT_SCRIPT });
+  // A real app page emits thousands of network events per navigation (1743
+  // witnessed on one dispatch, a 305K-character envelope no MCP client can
+  // return), so the capture is bounded: failed responses first, then the most
+  // recent, with the dropped count reported instead of silently truncating.
+  const NETWORK_CAP = 30;
+  const CONSOLE_CAP = 50;
+  const boundedNetwork = () => {
+    if (networkEvents.length <= NETWORK_CAP) return { network: networkEvents, network_dropped: 0 };
+    const failed = networkEvents.filter((e) => e.phase === 'response' && !(e.status >= 200 && e.status < 400));
+    const kept = failed.slice(0, NETWORK_CAP);
+    for (let i = networkEvents.length - 1; i >= 0 && kept.length < NETWORK_CAP; i--) {
+      if (!kept.includes(networkEvents[i])) kept.push(networkEvents[i]);
+    }
+    return { network: kept, network_dropped: networkEvents.length - kept.length };
+  };
+  const boundedConsole = () => ({
+    console: consoleLines.slice(-CONSOLE_CAP),
+    console_dropped: Math.max(0, consoleLines.length - CONSOLE_CAP),
+  });
   return async () => {
     const perf = await sess.send('Runtime.evaluate', { expression: 'JSON.stringify(performance.timing || {})', returnByValue: true }).catch(() => null);
     let performanceSnapshot = null;
@@ -314,7 +333,7 @@ async function attachDebugCapture(sess) {
     }).catch(() => null);
     let gl = { errors: [], drawCalls: {}, errorTotalCount: 0 };
     try { if (glRes && glRes.result && glRes.result.value) gl = JSON.parse(glRes.result.value); } catch (_) {}
-    return { console: consoleLines, pageErrors, network: networkEvents, performance: performanceSnapshot, gl };
+    return { ...boundedConsole(), pageErrors, ...boundedNetwork(), performance: performanceSnapshot, gl };
   };
 }
 
