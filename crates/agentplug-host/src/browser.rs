@@ -329,16 +329,6 @@ fn session_key(cwd: &Path, session_id: &str) -> String {
     format!("{}\u{0}{}", cwd.display(), session_id)
 }
 
-const UNATTRIBUTED_DISPATCH_SESSION: &str = "default";
-
-fn implicit_page_session(origin: &crate::dispatch_origin::DispatchOrigin, guest_resolved_session: &str) -> String {
-    origin
-        .gm_session
-        .clone()
-        .or_else(|| Some(guest_resolved_session.trim().to_string()).filter(|s| !s.is_empty()))
-        .unwrap_or_else(|| UNATTRIBUTED_DISPATCH_SESSION.to_string())
-}
-
 static SESSION_LIFECYCLE_LOCKS: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
 
 fn session_lifecycle_lock_for_key(key: &str) -> Arc<Mutex<()>> {
@@ -1271,10 +1261,8 @@ pub fn run(body: &str, opts: &str, cwd_raw: &Path, session_id: &str) -> Value {
     let inner_body = after_session_prefix;
     let origin = crate::dispatch_origin::current_dispatch_origin();
     let owner_gm_session = origin.gm_session.clone();
-    let caller_implicit_session = implicit_page_session(&origin, session_id);
-    let resolved_session_id = explicit_session_id
-        .or_else(|| origin.named_page_session.clone())
-        .unwrap_or_else(|| caller_implicit_session.clone());
+    let caller_implicit_session = origin.implicit_page_session(session_id);
+    let resolved_session_id = origin.page_session(explicit_session_id, session_id);
     let session_id = resolved_session_id.as_str();
 
     // `session new` and `session reset <id>` stack: the session action runs
