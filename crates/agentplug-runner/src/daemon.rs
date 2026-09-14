@@ -61,24 +61,31 @@ pub fn register_project(cwd: &Path) -> anyhow::Result<()> {
         fs::create_dir_all(parent)?;
     }
     let existing = fs::read_to_string(&path).unwrap_or_default();
-    let cwd_str = cwd.to_string_lossy().to_string();
+    let cwd_str = agentplug_host::canonical_project_root(cwd).to_string_lossy().to_string();
 
     let mut live: Vec<String> = Vec::new();
     let mut dropped = 0usize;
+    let mut respelled = false;
     for line in existing.lines() {
         let entry = line.trim();
-        if entry.is_empty() || live.iter().any(|e| e == entry) {
+        if entry.is_empty() {
             continue;
         }
-        if entry == cwd_str || Path::new(entry).exists() {
-            live.push(entry.to_string());
-        } else {
+        if !Path::new(entry).exists() {
             dropped += 1;
+            continue;
         }
+        let canonical = agentplug_host::canonical_project_root(Path::new(entry)).to_string_lossy().to_string();
+        respelled |= canonical != entry;
+        if live.iter().any(|e| e == &canonical) {
+            respelled = true;
+            continue;
+        }
+        live.push(canonical);
     }
 
     let already_present = live.iter().any(|e| e == &cwd_str);
-    if already_present && dropped == 0 {
+    if already_present && dropped == 0 && !respelled {
         return Ok(());
     }
     if !already_present {
@@ -101,14 +108,17 @@ fn describe_dispatch_error_naming_wasm_trap_kind_distinctly_from_a_guest_logic_e
 }
 
 pub(crate) fn read_registry() -> Vec<PathBuf> {
-    fs::read_to_string(registry_path())
-        .unwrap_or_default()
-        .lines()
-        .map(|l| l.trim())
-        .filter(|l| !l.is_empty())
-        .map(PathBuf::from)
-        .filter(|p| p.exists())
-        .collect()
+    let mut roots: Vec<PathBuf> = Vec::new();
+    for entry in fs::read_to_string(registry_path()).unwrap_or_default().lines().map(str::trim) {
+        if entry.is_empty() || !Path::new(entry).exists() {
+            continue;
+        }
+        let canonical = agentplug_host::canonical_project_root(Path::new(entry));
+        if !roots.contains(&canonical) {
+            roots.push(canonical);
+        }
+    }
+    roots
 }
 
 fn host_available_parallelism() -> usize {

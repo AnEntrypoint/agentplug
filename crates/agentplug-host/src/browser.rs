@@ -761,7 +761,7 @@ fn strip_windows_verbatim_prefix(path: &str) -> String {
     path.strip_prefix(r"\\?\").unwrap_or(path).to_string()
 }
 
-fn canonical_project_root(path: &Path) -> PathBuf {
+pub fn canonical_project_root(path: &Path) -> PathBuf {
     let resolved = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
     PathBuf::from(strip_windows_verbatim_prefix(&resolved.to_string_lossy()))
 }
