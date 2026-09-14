@@ -82,21 +82,29 @@ enum SessionCommand {
     None,
 }
 
-fn parse_session_command(body: &str) -> SessionCommand {
-    let trimmed = body.trim();
-    if trimmed == "session new" || trimmed.starts_with("session new ") || trimmed.starts_with("session new\n") {
-        return SessionCommand::New;
+/// Splits a leading `session ...` command line off the body, mirroring
+/// `browser::parse_session_command` so `session new` stacks with the
+/// prefixes and script that follow it instead of consuming the whole body.
+fn parse_session_command(body: &str) -> (SessionCommand, &str) {
+    let trimmed = body.trim_start();
+    let (first_line, remainder) = match trimmed.find('\n') {
+        Some(nl) => (&trimmed[..nl], &trimmed[nl + 1..]),
+        None => (trimmed, ""),
+    };
+    let first_line = first_line.trim_end();
+    if first_line == "session new" || first_line.starts_with("session new ") {
+        return (SessionCommand::New, remainder);
     }
-    if trimmed == "session list" || trimmed.starts_with("session list\n") {
-        return SessionCommand::List;
+    if first_line == "session list" {
+        return (SessionCommand::List, remainder);
     }
-    if trimmed.starts_with("session close ") {
-        return SessionCommand::Close;
+    if first_line.starts_with("session close ") {
+        return (SessionCommand::Close, remainder);
     }
-    if trimmed.starts_with("session reset ") {
-        return SessionCommand::Reset;
+    if first_line.starts_with("session reset ") {
+        return (SessionCommand::Reset, remainder);
     }
-    SessionCommand::None
+    (SessionCommand::None, body)
 }
 
 const UNSUPPORTED_MODES: &[&str] = &["screenshot", "capture", "profile", "trace"];
@@ -201,23 +209,41 @@ pub fn run(
     let session_id = explicit_sid.as_deref().filter(|s| !s.is_empty()).unwrap_or(session_id);
     let session_id = if session_id.is_empty() { "default" } else { session_id };
 
-    match parse_session_command(after_sid) {
+    // oxibrowser keeps one implicit session per wasm instance (thread_local
+    // SESSION in wasm_dispatch.rs) rather than a multi-session pool like real
+    // Chrome -- new/close/reset are no-ops that report success so
+    // session-lifecycle scripts written against the cdp verb's contract need
+    // no special case. Like the cdp verb, `session new`/`session reset`
+    // stack: a body after the command line is evaluated instead of dropped.
+    let (session_command, after_session_command) = parse_session_command(after_sid);
+    let trailing_body_present = !after_session_command.trim().is_empty();
+    let after_sid: &str = match session_command {
         SessionCommand::New => {
-            // oxibrowser keeps one implicit session per wasm instance
-            // (thread_local SESSION in wasm_dispatch.rs) rather than a
-            // multi-session pool like real Chrome -- "new" is a no-op that
-            // reports success so session-lifecycle scripts written against
-            // the cdp verb's contract do not need a special case.
-            return json!({"ok": true, "session_id": session_id, "note": "oxibrowser keeps one implicit session per plugin instance; session new/close/reset are accepted but no-ops"});
+            if !trailing_body_present {
+                return json!({"ok": true, "session_id": session_id, "note": "oxibrowser keeps one implicit session per plugin instance; session new/close/reset are accepted but no-ops"});
+            }
+            after_session_command
         }
         SessionCommand::List => {
+            if trailing_body_present {
+                return json!({"ok": false, "error": "'session list' is a terminal session command and the lines after it were not evaluated -- send them as their own dispatch, or stack them under 'session new'"});
+            }
             return json!({"ok": true, "sessions": [{"session_id": session_id, "alive": true}]});
         }
-        SessionCommand::Close | SessionCommand::Reset => {
+        SessionCommand::Close => {
+            if trailing_body_present {
+                return json!({"ok": false, "error": "'session close <id>' is a terminal session command and the lines after it were not evaluated -- send them as their own dispatch, or stack them under 'session new'/'session reset <id>'"});
+            }
             return json!({"ok": true, "closed": true, "session_id": session_id});
         }
-        SessionCommand::None => {}
-    }
+        SessionCommand::Reset => {
+            if !trailing_body_present {
+                return json!({"ok": true, "closed": true, "session_id": session_id});
+            }
+            after_session_command
+        }
+        SessionCommand::None => after_sid,
+    };
 
     let mut rest = after_sid;
     let mut dom_selector = None;
