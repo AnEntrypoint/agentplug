@@ -543,6 +543,7 @@ fn reap_os_orphans(cwd: &Path) {
             .map(|s| browser_chrome_profile_dir(&s.cwd, &s.session_id))
             .collect()
     };
+    let mut chrome_processes_this_pass: Option<Vec<(u32, String)>> = None;
     for entry in entries.flatten() {
         let path = entry.path();
         if !path.is_dir() {
@@ -573,24 +574,13 @@ fn reap_os_orphans(cwd: &Path) {
         if try_adopt_orphaned_session(cwd, None, &path).is_some() {
             continue;
         }
-        let sidecar_pids: Vec<u32> = std::fs::read_to_string(&sidecar)
-            .ok()
-            .and_then(|raw| raw.trim().parse::<u32>().ok())
-            .into_iter()
-            .collect();
-        let pids_to_check = if sidecar_pids.is_empty() {
-            find_pids_of_chrome_processes_using_profile_dir(&path)
-        } else {
-            sidecar_pids
-        };
-        let used_sidecar_missing_fallback = !sidecar.exists();
-        for pid in pids_to_check {
-            if pid_is_alive(pid) {
+        if chrome_singleton_lock_present(&path) {
+            let processes = chrome_processes_this_pass.get_or_insert_with(list_chrome_processes);
+            for pid in pids_of_chrome_processes_using_profile_dir(processes, &path) {
                 eprintln!(
-                    "[agentplug browser] reaping OS-orphaned chrome pid={} (profile {}, no owning session in this process -- crash/hard-exit orphan, sidecar-missing fallback used: {})",
+                    "[agentplug browser] reaping OS-orphaned chrome pid={} (profile {}, no owning session in this process -- crash/hard-exit orphan, not adoptable)",
                     pid,
-                    path.display(),
-                    used_sidecar_missing_fallback
+                    path.display()
                 );
                 kill_pid(pid);
             }
@@ -750,25 +740,57 @@ fn list_chrome_processes() -> Vec<(u32, String)> {
         .collect()
 }
 
-fn find_pids_of_chrome_processes_using_profile_dir(profile_dir: &Path) -> Vec<u32> {
-    let needle = profile_dir.to_string_lossy().replace('\\', "/").to_lowercase();
-    list_chrome_processes()
-        .into_iter()
-        .filter_map(|(pid, cmdline)| {
-            let cmdline_normalized = cmdline.replace('\\', "/").to_lowercase();
-            if cmdline_normalized.contains(&needle) { Some(pid) } else { None }
-        })
+fn chrome_singleton_lock_present(profile_dir: &Path) -> bool {
+    let lock_name = if cfg!(windows) { "lockfile" } else { "SingletonLock" };
+    std::fs::symlink_metadata(profile_dir.join(lock_name)).is_ok()
+}
+
+fn pids_of_chrome_processes_using_profile_dir(processes: &[(u32, String)], profile_dir: &Path) -> Vec<u32> {
+    let wanted = profile_dir_key(&profile_dir.to_string_lossy());
+    processes
+        .iter()
+        .filter(|(_, cmdline)| cmdline_flag_value(cmdline, "--user-data-dir=").is_some_and(|dir| profile_dir_key(&dir) == wanted))
+        .map(|(pid, _)| *pid)
         .collect()
 }
 
-fn cmdline_flag_value(cmdline: &str, flag: &str) -> Option<String> {
-    for token in cmdline.split_whitespace() {
-        let token = token.trim_matches('"');
-        if let Some(rest) = token.strip_prefix(flag) {
-            return Some(rest.trim_matches('"').to_string());
-        }
+fn strip_windows_verbatim_prefix(path: &str) -> String {
+    if let Some(unc) = path.strip_prefix(r"\\?\UNC\") {
+        return format!(r"\\{unc}");
     }
-    None
+    path.strip_prefix(r"\\?\").unwrap_or(path).to_string()
+}
+
+fn canonical_project_root(path: &Path) -> PathBuf {
+    let resolved = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    PathBuf::from(strip_windows_verbatim_prefix(&resolved.to_string_lossy()))
+}
+
+fn profile_dir_key(path: &str) -> String {
+    let unified = strip_windows_verbatim_prefix(path).replace('\\', "/");
+    let trimmed = unified.trim_end_matches('/');
+    if cfg!(windows) { trimmed.to_lowercase() } else { trimmed.to_string() }
+}
+
+fn is_gm_owned_chrome_profile_dir(profile_key: &str) -> bool {
+    let mut segments = profile_key.rsplit('/');
+    let leaf = segments.next().unwrap_or("");
+    let parent = segments.next().unwrap_or("");
+    parent == ".gm" && leaf.len() > "browser-chrome-profile-".len() && leaf.starts_with("browser-chrome-profile-")
+}
+
+fn cmdline_flag_value(cmdline: &str, flag: &str) -> Option<String> {
+    let start = cmdline.find(flag)?;
+    let whole_argument_quoted = cmdline[..start].ends_with('"');
+    let rest = &cmdline[start + flag.len()..];
+    let value = if whole_argument_quoted {
+        rest.split('"').next()
+    } else if let Some(quoted) = rest.strip_prefix('"') {
+        quoted.split('"').next()
+    } else {
+        rest.split_whitespace().next()
+    }?;
+    Some(value.to_string()).filter(|v| !v.is_empty())
 }
 
 fn is_headless_root_chrome_process(cmdline: &str) -> bool {
@@ -786,11 +808,10 @@ fn reap_globally_orphaned_headless_chromes() {
         );
         return;
     }
-    let real_user_profile = dirs_local_appdata_chrome_user_data();
     let claimed_profile_dirs: std::collections::HashSet<String> = {
         let map = sessions_map().lock().unwrap_or_else(|e| e.into_inner());
         map.values()
-            .map(|s| browser_chrome_profile_dir(&s.cwd, &s.session_id).to_string_lossy().replace('\\', "/").to_lowercase())
+            .map(|s| profile_dir_key(&browser_chrome_profile_dir(&s.cwd, &s.session_id).to_string_lossy()))
             .collect()
     };
     for (pid, cmdline) in list_chrome_processes() {
@@ -798,13 +819,11 @@ fn reap_globally_orphaned_headless_chromes() {
             continue;
         }
         let Some(profile_dir) = cmdline_flag_value(&cmdline, "--user-data-dir=") else { continue };
-        let profile_dir_normalized = profile_dir.replace('\\', "/").to_lowercase();
-        if let Some(real) = &real_user_profile {
-            if profile_dir_normalized == *real {
-                continue;
-            }
+        let profile_key = profile_dir_key(&profile_dir);
+        if !is_gm_owned_chrome_profile_dir(&profile_key) {
+            continue;
         }
-        if claimed_profile_dirs.contains(&profile_dir_normalized) {
+        if claimed_profile_dirs.contains(&profile_key) {
             continue;
         }
         if !pid_is_alive(pid) {
@@ -816,25 +835,6 @@ fn reap_globally_orphaned_headless_chromes() {
         );
         kill_pid(pid);
     }
-}
-
-#[cfg(windows)]
-fn dirs_local_appdata_chrome_user_data() -> Option<String> {
-    let local_appdata = std::env::var_os("LOCALAPPDATA")?;
-    Some(
-        PathBuf::from(local_appdata)
-            .join("Google")
-            .join("Chrome")
-            .join("User Data")
-            .to_string_lossy()
-            .replace('\\', "/")
-            .to_lowercase(),
-    )
-}
-
-#[cfg(not(windows))]
-fn dirs_local_appdata_chrome_user_data() -> Option<String> {
-    None
 }
 
 /// Called on every daemon shutdown/handoff path (self-update handoff,
@@ -865,12 +865,15 @@ pub fn close_all_sessions() {
 }
 
 pub fn reap_idle_sessions_and_os_orphans_across_every_known_project_root(roots: &[std::path::PathBuf]) {
-    for root in roots {
+    let mut canonical_roots: Vec<PathBuf> = roots.iter().map(|r| canonical_project_root(r)).collect();
+    canonical_roots.sort();
+    canonical_roots.dedup();
+    for root in &canonical_roots {
         let cfg = BrowserConfig::load(root);
         reap_idle_sessions(root, &cfg);
         reap_os_orphans(root);
     }
-    reap_sessions_for_deregistered_roots(roots);
+    reap_sessions_for_deregistered_roots(&canonical_roots);
     reap_globally_orphaned_headless_chromes();
 }
 
@@ -1199,18 +1202,7 @@ pub fn run(body: &str, opts: &str, cwd_raw: &Path, session_id: &str) -> Value {
             "stderr": "node not found on PATH; required to drive Chrome over CDP"});
     };
 
-    // session_key/session_list compare cwd by raw Path::display() string equality (no filesystem
-    // normalization) -- two dispatches naming the SAME real directory via a different literal spelling
-    // (a trailing separator, mixed \ vs /, or Windows drive-letter case) silently miss each other's
-    // session, causing session_list to report [] for a session that is genuinely alive and tracked
-    // under a different key, and every subsequent dispatch to relaunch Chrome from scratch instead of
-    // reusing it (live-witnessed: a project whose caller passed cwd inconsistently across dispatches
-    // within one debugging session). canonicalize() resolves symlinks/`.`/`..` and normalizes
-    // separators/case on the underlying filesystem, giving every dispatch for the same real directory
-    // the identical key regardless of how its caller happened to spell the path this time. Falls back
-    // to the raw path if canonicalization fails (e.g. the directory doesn't exist yet) rather than
-    // erroring the whole dispatch over a cosmetic normalization step.
-    let cwd_owned = cwd_raw.canonicalize().unwrap_or_else(|_| cwd_raw.to_path_buf());
+    let cwd_owned = canonical_project_root(cwd_raw);
     let cwd: &Path = &cwd_owned;
 
     let t0 = Instant::now();
