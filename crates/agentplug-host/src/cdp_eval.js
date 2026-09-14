@@ -94,7 +94,7 @@ async function pickPageTarget(port, startUrl, targetId, timeoutMs) {
       // first, and only fall back to an internal page if nothing else exists.
       const realPage = pages.find((t) => !isInternalChromeUrl(t.url));
       if (realPage) return realPage;
-      if (!startUrl && pages.length) return pages[0];
+      if (pages.length) return pages[0];
     }
     if (startUrl) {
       const created = await httpPutJson(`http://127.0.0.1:${port}/json/new?${encodeURIComponent(startUrl)}`, 3000);
@@ -150,7 +150,7 @@ function cdpSession(wsUrl, timeoutMs) {
       close() { clearTimeout(timer); try { ws.close(); } catch (_) {} },
       onIdLessNotification: null,
     };
-    ws.addEventListener('open', () => { opened = true; resolve(sessObj); });
+    ws.addEventListener('open', () => { opened = true; clearTimeout(timer); resolve(sessObj); });
     ws.addEventListener('message', (ev) => {
       let msg;
       try { msg = JSON.parse(ev.data); } catch (_) { return; }
@@ -174,6 +174,87 @@ function cdpSession(wsUrl, timeoutMs) {
       rejectAllPendingSendsOnSocketDrop('cdp websocket closed (connection dropped mid-session)');
     });
   });
+}
+
+const CONNECTION_DROP_MARKER = 'connection dropped mid-session';
+const RECONNECT_CONSECUTIVE_FAILURE_LIMIT = 4;
+
+function isConnectionDrop(error) {
+  return String(error && error.message || error).includes(CONNECTION_DROP_MARKER);
+}
+
+async function openTargetConnection(port, target) {
+  if (target.sessionId) {
+    const version = await httpJson(`http://127.0.0.1:${port}/json/version`, 2000);
+    if (!version || !version.webSocketDebuggerUrl) return { failure: `CDP endpoint on port ${port} stopped answering /json/version -- the browser process exited or was killed` };
+    const root = await cdpSession(version.webSocketDebuggerUrl, 5000);
+    const attached = await root.send('Target.attachToTarget', { targetId: target.id, flatten: true });
+    root.bindSession(attached.sessionId);
+    return { connection: root };
+  }
+  const list = await httpJson(`http://127.0.0.1:${port}/json/list`, 2000);
+  if (!Array.isArray(list)) return { failure: `CDP endpoint on port ${port} stopped answering /json/list -- the browser process exited or was killed` };
+  const same = list.find((t) => t.id === target.id && t.webSocketDebuggerUrl);
+  if (!same) return { failure: `target ${target.id} is no longer listed by the browser -- the tab was closed or crashed` };
+  return { connection: await cdpSession(same.webSocketDebuggerUrl, 5000) };
+}
+
+async function reopenTargetConnection(port, target, deadline) {
+  let failure = 'the deadline passed before any reconnect attempt';
+  for (let consecutiveFailures = 0; Date.now() < deadline && consecutiveFailures < RECONNECT_CONSECUTIVE_FAILURE_LIMIT; consecutiveFailures++) {
+    try {
+      const opened = await openTargetConnection(port, target);
+      if (opened.connection) return opened.connection;
+      failure = opened.failure;
+    } catch (e) {
+      failure = `reconnect to target ${target.id} failed: ${e && e.message || e}`;
+    }
+    await new Promise((r) => setTimeout(r, 500));
+  }
+  throw new Error(`cdp websocket dropped mid-session and the same target could not be re-attached: ${failure}`);
+}
+
+function resumableSession(port, target, first) {
+  let live = first;
+  const replayedSetup = new Map();
+  const wrapper = {
+    onIdLessNotification: null,
+    send(method, params) {
+      if (method.endsWith('.enable') || method.startsWith('Emulation.set')) replayedSetup.set(method, params);
+      return live.send(method, params);
+    },
+    async reattach(deadline) {
+      try { live.close(); } catch (_) {}
+      live = await reopenTargetConnection(port, target, deadline);
+      live.onIdLessNotification = forwardNotification;
+      for (const [method, params] of replayedSetup) await live.send(method, params).catch(() => {});
+    },
+    close() { live.close(); },
+  };
+  const forwardNotification = (msg) => { if (wrapper.onIdLessNotification) wrapper.onIdLessNotification(msg); };
+  first.onIdLessNotification = forwardNotification;
+  return wrapper;
+}
+
+async function evaluateParkedSurvivingReconnect(sess, wrapped, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  const token = JSON.stringify(`${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+  const slot = `globalThis.__gmEvalRuns[${token}]`;
+  const park = `((globalThis.__gmEvalRuns ||= {}), ${slot} = ${wrapped})`;
+  const resume = `(globalThis.__gmEvalRuns && ${token} in globalThis.__gmEvalRuns) ? ${slot} : Promise.reject(new Error('the parked evaluation is gone from the page after the cdp reconnect -- the page navigated or reloaded while the connection was down'))`;
+  let expression = park;
+  for (;;) {
+    try {
+      const result = await sess.send('Runtime.evaluate', { expression, awaitPromise: true, returnByValue: true, userGesture: true, timeout: timeoutMs });
+      await sess.send('Runtime.evaluate', { expression: `globalThis.__gmEvalRuns && delete ${slot}` }).catch(() => {});
+      return result;
+    } catch (e) {
+      if (!isConnectionDrop(e) || Date.now() >= deadline) throw e;
+      process.stderr.write(`cdp-eval: ${e.message} -- re-attaching to target and resuming the parked evaluation\n`);
+      await sess.reattach(deadline);
+      expression = resume;
+    }
+  }
 }
 
 async function navigateIfNeededThenEvaluateOverCdp(sess, script, startUrl, timeoutMs) {
@@ -220,9 +301,7 @@ async function navigateIfNeededThenEvaluateOverCdp(sess, script, startUrl, timeo
       wrapped = exprAttempt;
     } catch (_) { /* not a single valid expression -- use the statement-body form */ }
   }
-  const result = await sess.send('Runtime.evaluate', {
-    expression: wrapped, awaitPromise: true, returnByValue: true, userGesture: true, timeout: timeoutMs,
-  });
+  const result = await evaluateParkedSurvivingReconnect(sess, wrapped, timeoutMs);
   if (navigationFailure && !result.exceptionDetails) {
     result.exceptionDetails = { text: `page navigation failed: ${navigationFailure} (url=${startUrl})` };
   }
@@ -390,6 +469,7 @@ async function main() {
     process.stderr.write('cdp-eval: no page target\n');
     process.exit(1);
   }
+  fs.writeFileSync(resultFile, JSON.stringify({ __cdpError: 'cdp helper exited before the evaluation settled', __targetId: target.id }));
   let resultWritten = false;
   const writeResult = (envelope) => {
     resultWritten = true;
@@ -420,7 +500,7 @@ async function main() {
   // attached connection -- opening a second one to the same URL would get a
   // fresh, unattached socket that cannot use the sessionId that only the
   // original connection holds (see createTargetViaFlattenedSession).
-  const sess = target.__liveSession || await cdpSession(target.webSocketDebuggerUrl, timeoutMs);
+  const sess = resumableSession(port, target, target.__liveSession || await cdpSession(target.webSocketDebuggerUrl, timeoutMs));
   try {
     await sess.send('Runtime.enable', {});
     await sess.send('Page.enable', {});
