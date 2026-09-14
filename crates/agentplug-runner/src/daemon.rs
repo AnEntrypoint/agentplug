@@ -2279,14 +2279,12 @@ fn dispatch_project(root: &Path, project: &mut ProjectPlugins, plugin_modules: &
                 if file_path.extension().and_then(|e| e.to_str()) != Some("txt") {
                     continue;
                 }
-                let claim_path = file_path.with_extension(format!("txt.claim.{}", std::process::id()));
+                let claim_path = plugin_dispatch_claim_path(&file_path);
                 if fs::rename(&file_path, &claim_path).is_err() {
                     continue;
                 }
-                did_work = true;
                 let task = file_path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
                 let body = fs::read_to_string(&claim_path).unwrap_or_default();
-                let _ = fs::remove_file(&claim_path);
 
                 let write_pd_out = |out_name: &str, out_body: &str| {
                     let tmp = pd_out.join(format!("{out_name}.tmp.{}", std::process::id()));
@@ -2294,6 +2292,7 @@ fn dispatch_project(root: &Path, project: &mut ProjectPlugins, plugin_modules: &
                         let _ = fs::rename(&tmp, pd_out.join(out_name));
                         let _ = fs::write(pd_out.join(format!("{out_name}.ready")), b"");
                     }
+                    let _ = fs::remove_file(&claim_path);
                 };
 
                 {
@@ -2358,45 +2357,155 @@ fn dispatch_project(root: &Path, project: &mut ProjectPlugins, plugin_modules: &
     did_work
 }
 
-pub fn try_dispatch_via_daemon(cwd: &Path, plugin: &str, verb: &str, body: &str) -> Option<String> {
+pub enum DaemonDispatchOutcome {
+    Answered(String),
+    NeverClaimedRunLocally,
+    ClaimedUnanswered(String),
+}
+
+const PLUGIN_DISPATCH_CLAIM_WAIT_MS_DEFAULT: u64 = 30_000;
+const PLUGIN_DISPATCH_CLAIMED_TIMEOUT_MS_DEFAULT: u64 = 20 * 60 * 1000;
+const PLUGIN_DISPATCH_POLL_MS: u64 = 100;
+const PLUGIN_DISPATCH_OWNER_LIVENESS_CHECK_MS: u64 = 5_000;
+
+fn env_ms_or(name: &str, default_ms: u64) -> u64 {
+    std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(default_ms)
+}
+
+fn plugin_dispatch_claim_path(req_path: &Path) -> PathBuf {
+    req_path.with_extension(format!("txt.claim.{}", std::process::id()))
+}
+
+fn find_plugin_dispatch_claim(in_dir: &Path, task: &str) -> Option<(PathBuf, Option<u64>)> {
+    let prefix = format!("{task}.txt.claim.");
+    fs::read_dir(in_dir).ok()?.flatten().find_map(|entry| {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let claimer_pid = name.strip_prefix(&prefix)?.parse::<u64>().ok();
+        Some((entry.path(), claimer_pid))
+    })
+}
+
+fn take_plugin_dispatch_answer(out_path: &Path) -> Option<String> {
+    let content = fs::read_to_string(out_path).ok()?;
+    let _ = fs::remove_file(out_path);
+    let _ = fs::remove_file(out_path.with_extension("json.ready"));
+    Some(content)
+}
+
+fn reclaim_unclaimed_plugin_dispatch(req_path: &Path) -> bool {
+    let reclaimed = req_path.with_extension(format!("txt.reclaimed.{}", std::process::id()));
+    if fs::rename(req_path, &reclaimed).is_err() {
+        return false;
+    }
+    let _ = fs::remove_file(&reclaimed);
+    true
+}
+
+fn unanswered_dispatch_report(error_code: &str, error: String, plugin: &str, verb: &str, task: &str, claimer_pid: Option<u64>, waited_ms: u64, out_path: &Path) -> String {
+    serde_json::json!({
+        "ok": false,
+        "error_code": error_code,
+        "error": error,
+        "plugin": plugin,
+        "verb": verb,
+        "task": task,
+        "claimer_pid": claimer_pid,
+        "waited_ms": waited_ms,
+        "out_path": out_path.to_string_lossy(),
+        "re_executed_locally": false,
+    })
+    .to_string()
+}
+
+pub fn try_dispatch_via_daemon(cwd: &Path, plugin: &str, verb: &str, body: &str) -> DaemonDispatchOutcome {
+    use DaemonDispatchOutcome::{Answered, ClaimedUnanswered, NeverClaimedRunLocally};
     if std::env::var("AGENTPLUG_NO_DAEMON").is_ok() {
-        return None;
+        return NeverClaimedRunLocally;
     }
     if let Err(e) = register_project(cwd) {
         eprintln!("[agentplug] {e}");
-        return None;
+        return NeverClaimedRunLocally;
     }
     if !ensure_daemon_running().unwrap_or(false) {
-        return None;
+        return NeverClaimedRunLocally;
     }
 
     let pd_dir = cwd.join(".agentplug").join("plugin-dispatch");
     let in_dir = pd_dir.join("in").join(plugin).join(verb);
     let out_dir = pd_dir.join("out");
     if fs::create_dir_all(&in_dir).is_err() || fs::create_dir_all(&out_dir).is_err() {
-        return None;
+        return NeverClaimedRunLocally;
     }
 
     let task = format!("{}{}", std::process::id(), now_ms());
     let req_path = in_dir.join(format!("{task}.txt"));
-    if fs::write(&req_path, body).is_err() {
-        return None;
+    let staging_path = in_dir.join(format!("{task}.txt.staging"));
+    if fs::write(&staging_path, body).is_err() || fs::rename(&staging_path, &req_path).is_err() {
+        let _ = fs::remove_file(&staging_path);
+        return NeverClaimedRunLocally;
     }
     let out_path = out_dir.join(format!("{plugin}-{verb}-{task}.json"));
 
-    const POLL_INTERVAL_MS: u64 = 100;
-    const MAX_WAIT_MS: u64 = 30_000;
-    let mut waited = 0u64;
-    while waited < MAX_WAIT_MS {
-        if let Ok(content) = fs::read_to_string(&out_path) {
-            let _ = fs::remove_file(&out_path);
-            return Some(content);
+    let claim_wait_ms = env_ms_or("AGENTPLUG_DISPATCH_CLAIM_WAIT_MS", PLUGIN_DISPATCH_CLAIM_WAIT_MS_DEFAULT);
+    let claimed_timeout_ms = env_ms_or("AGENTPLUG_DISPATCH_CLAIMED_TIMEOUT_MS", PLUGIN_DISPATCH_CLAIMED_TIMEOUT_MS_DEFAULT);
+    let started = Instant::now();
+    let mut claimed_at: Option<Instant> = None;
+    let mut last_owner_liveness_check = Instant::now();
+    loop {
+        if let Some(answer) = take_plugin_dispatch_answer(&out_path) {
+            return Answered(answer);
         }
-        std::thread::sleep(Duration::from_millis(POLL_INTERVAL_MS));
-        waited += POLL_INTERVAL_MS;
+        let waited_ms = started.elapsed().as_millis() as u64;
+        match claimed_at {
+            None if !req_path.exists() => {
+                claimed_at = Some(Instant::now());
+                continue;
+            }
+            None => {
+                if waited_ms >= claim_wait_ms
+                    && find_plugin_dispatch_claim(&in_dir, &task).is_none()
+                    && reclaim_unclaimed_plugin_dispatch(&req_path)
+                {
+                    eprintln!("[agentplug] daemon never claimed {plugin}/{verb} task {task} within {claim_wait_ms}ms -- reclaimed the request atomically, running it locally exactly once");
+                    return NeverClaimedRunLocally;
+                }
+                if waited_ms >= claim_wait_ms.saturating_add(claimed_timeout_ms) {
+                    return ClaimedUnanswered(unanswered_dispatch_report(
+                        "fallback_reclaim_failed",
+                        format!("{plugin}/{verb} task {task} was never claimed by the daemon, but the request file {} could not be atomically reclaimed for the local fallback within {waited_ms}ms -- not run locally, because the daemon could still claim it and the verb would then run twice", req_path.display()),
+                        plugin, verb, task.as_str(), None, waited_ms, &out_path,
+                    ));
+                }
+            }
+            Some(at) => {
+                if last_owner_liveness_check.elapsed() >= Duration::from_millis(PLUGIN_DISPATCH_OWNER_LIVENESS_CHECK_MS) {
+                    last_owner_liveness_check = Instant::now();
+                    if let Some((claim_path, Some(claimer_pid))) = find_plugin_dispatch_claim(&in_dir, &task) {
+                        if !pid_is_alive(claimer_pid) {
+                            if let Some(answer) = take_plugin_dispatch_answer(&out_path) {
+                                return Answered(answer);
+                            }
+                            let _ = fs::remove_file(&claim_path);
+                            return ClaimedUnanswered(unanswered_dispatch_report(
+                                "claim_owner_dead",
+                                format!("daemon pid {claimer_pid} claimed {plugin}/{verb} task {task} and exited without answering -- the outcome is UNVERIFIED (a side-effecting verb may have applied some or all of its work), so it was NOT re-executed locally; read the real state (git log, the file, the store) before re-dispatching"),
+                                plugin, verb, task.as_str(), Some(claimer_pid), waited_ms, &out_path,
+                            ));
+                        }
+                    }
+                }
+                if at.elapsed() >= Duration::from_millis(claimed_timeout_ms) {
+                    let claimer_pid = find_plugin_dispatch_claim(&in_dir, &task).and_then(|(_, pid)| pid);
+                    return ClaimedUnanswered(unanswered_dispatch_report(
+                        "claimed_still_in_flight",
+                        format!("the daemon claimed {plugin}/{verb} task {task} and has not answered within {claimed_timeout_ms}ms (AGENTPLUG_DISPATCH_CLAIMED_TIMEOUT_MS) -- it was NOT re-executed locally because the daemon may still be performing it; its answer will land at {}; read the real state before re-dispatching a side-effecting verb", out_path.display()),
+                        plugin, verb, task.as_str(), claimer_pid, waited_ms, &out_path,
+                    ));
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(PLUGIN_DISPATCH_POLL_MS));
     }
-    let _ = fs::remove_file(&req_path);
-    None
 }
 
 fn seed_github_token_from_gh_cli_if_unset() {
