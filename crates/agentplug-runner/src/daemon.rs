@@ -611,12 +611,23 @@ fn run_git_bounded(args: &[&str]) -> anyhow::Result<std::process::Output> {
     }
     let mut child = cmd.spawn()?;
     let timeout_ms = agentplug_host::git_subprocess_timeout_ms();
+    // Drain both pipes on their own threads before waiting, so a child whose output exceeds the
+    // ~64 KB OS pipe buffer cannot deadlock (it keeps writing while we read); wait_timeout still
+    // bounds a genuinely stuck network op.
+    let out_reader = child.stdout.take().map(|mut o| std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = std::io::Read::read_to_end(&mut o, &mut buf);
+        buf
+    }));
+    let err_reader = child.stderr.take().map(|mut e| std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = std::io::Read::read_to_end(&mut e, &mut buf);
+        buf
+    }));
     match child.wait_timeout(Duration::from_millis(timeout_ms))? {
         Some(status) => {
-            let mut stdout = Vec::new();
-            let mut stderr = Vec::new();
-            if let Some(mut o) = child.stdout.take() { let _ = std::io::Read::read_to_end(&mut o, &mut stdout); }
-            if let Some(mut e) = child.stderr.take() { let _ = std::io::Read::read_to_end(&mut e, &mut stderr); }
+            let stdout = out_reader.and_then(|h| h.join().ok()).unwrap_or_default();
+            let stderr = err_reader.and_then(|h| h.join().ok()).unwrap_or_default();
             Ok(std::process::Output { status, stdout, stderr })
         }
         None => {
