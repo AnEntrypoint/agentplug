@@ -52,9 +52,6 @@ jobs:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             asset: agentplug-runner-linux-x64
-          - os: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
-            asset: agentplug-runner-linux-arm64
           # macos-13 (Intel-hosted) GitHub runners are capacity-constrained
           # to the point of queuing indefinitely (confirmed live: 26+ minutes
           # queued, never started). Cross-compiling x86_64 from the arm64
@@ -107,8 +104,38 @@ jobs:
           path: release-assets/*
           retention-days: 1
 
+  publish-host-linux-arm64:
+    needs: bump
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: main
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-gnu
+      - name: Build host runner
+        run: cargo build -p agentplug-runner --bin agentplug-runner --release --target aarch64-unknown-linux-gnu
+      - name: Publish host release asset
+        env:
+          GH_TOKEN: ${{ secrets.PUBLISHER_TOKEN }}
+          VER: ${{ needs.bump.outputs.version }}
+          REPO: AnEntrypoint/agentplug-bin
+          SHA: ${{ github.sha }}
+        run: |
+          set -e
+          mkdir -p release-assets
+          cp target/aarch64-unknown-linux-gnu/release/agentplug-runner release-assets/agentplug-runner-linux-arm64
+          cd release-assets
+          sha256sum agentplug-runner-linux-arm64 | sed 's/ \*/  /' > agentplug-runner-linux-arm64.sha256
+          if ! gh release view "v$VER" --repo "$REPO" >/dev/null 2>&1; then
+            gh release create "v$VER" --repo "$REPO" --title "agentplug-runner v$VER" --notes "Auto-published from agentplug CI at $SHA"
+          fi
+          gh release upload "v$VER" --repo "$REPO" --clobber *
+          for f in *; do test "$(curl -sL -o /dev/null -w '%{http_code}' "https://github.com/$REPO/releases/download/v$VER/$f")" = 200; done
+
   publish:
-    needs: [bump, build]
+    needs: [bump, build, publish-host-linux-arm64]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
