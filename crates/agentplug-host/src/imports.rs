@@ -543,20 +543,6 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
         "host_env_get",
         |mut caller: Caller<'_, HostState>, key_ptr: u32, key_len: u32| -> u64 {
             let key = read_guest_string(&mut caller, key_ptr, key_len);
-            if key == "GM_PIPELINE_HMAC_KEY" && matches!(caller.data().plugin_name.as_str(), "gm" | "plugkit" | "plugkit-slim") {
-                let path = crate::install_dir().join("gm-pipeline-hmac-key");
-                let value = match fs::read(&path) {
-                    Ok(value) if !value.is_empty() => value,
-                    _ => {
-                        let mut value = vec![0u8; 32];
-                        let _ = getrandom::getrandom(&mut value);
-                        if let Some(parent) = path.parent() { let _ = fs::create_dir_all(parent); }
-                        let _ = fs::write(&path, &value);
-                        value
-                    }
-                };
-                return write_guest_bytes(&mut caller, &value);
-            }
             match std::env::var(&key) {
                 Ok(val) => write_guest_bytes(&mut caller, val.as_bytes()),
                 Err(_) => 0,
