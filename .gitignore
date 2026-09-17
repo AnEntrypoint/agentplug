@@ -1,3 +1,5 @@
 /target
 Cargo.lock
 .gm/
+config.bat
+node_modules
