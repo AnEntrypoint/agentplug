@@ -1846,12 +1846,13 @@ pub fn sweep_unconsumable_spool_files(root: &Path) {
 const RAW_PLUGIN_SPOOL_VERBS: &[&str] = &["libsql", "bert"];
 
 fn extract_session_id(body: &str) -> Option<String> {
-    serde_json::from_str::<serde_json::Value>(body)
-        .ok()?
-        .get("session_id")?
-        .as_str()
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
+    let value = serde_json::from_str::<serde_json::Value>(body).ok()?;
+    ["session_id", "sessionId", "SESSION_ID"]
+        .into_iter()
+        .filter_map(|name| value.get(name).and_then(|entry| entry.as_str()))
+        .map(str::trim)
+        .find(|session_id| !session_id.is_empty())
+        .map(str::to_string)
 }
 
 fn session_id_task_mismatch_rejection(verb: &str, task: &str, body: &str) -> Option<String> {
