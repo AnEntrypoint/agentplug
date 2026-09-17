@@ -543,7 +543,7 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
         "host_env_get",
         |mut caller: Caller<'_, HostState>, key_ptr: u32, key_len: u32| -> u64 {
             let key = read_guest_string(&mut caller, key_ptr, key_len);
-            if key == "GM_PIPELINE_HMAC_KEY" && caller.data().plugin_name == "gm" {
+            if key == "GM_PIPELINE_HMAC_KEY" && matches!(caller.data().plugin_name.as_str(), "gm" | "plugkit" | "plugkit-slim") {
                 let path = crate::install_dir().join("gm-pipeline-hmac-key");
                 let value = match fs::read(&path) {
                     Ok(value) if !value.is_empty() => value,
