@@ -1590,19 +1590,9 @@ pub fn live_foreign_spool_sweeper(spool_dir: &Path) -> Option<u64> {
     Some(pid)
 }
 
-const SPOOL_WRITE_SETTLE_MS: u64 = 200;
-
 fn spool_in_file_write_has_settled(txt_path: &Path) -> bool {
     let Ok(metadata) = fs::metadata(txt_path) else { return false };
-    if metadata.len() == 0 {
-        return false;
-    }
-    metadata
-        .modified()
-        .ok()
-        .and_then(|m| m.elapsed().ok())
-        .map(|age| age.as_millis() as u64 >= SPOOL_WRITE_SETTLE_MS)
-        .unwrap_or(true)
+    metadata.len() > 0
 }
 
 pub fn claim_spool_request_in_place(txt_path: &Path) -> Option<PathBuf> {
@@ -2377,7 +2367,7 @@ pub enum DaemonDispatchOutcome {
 
 const PLUGIN_DISPATCH_CLAIM_WAIT_MS_DEFAULT: u64 = 30_000;
 const PLUGIN_DISPATCH_CLAIMED_TIMEOUT_MS_DEFAULT: u64 = 20 * 60 * 1000;
-const PLUGIN_DISPATCH_POLL_MS: u64 = 100;
+const PLUGIN_DISPATCH_POLL_MS: u64 = 25;
 const PLUGIN_DISPATCH_OWNER_LIVENESS_CHECK_MS: u64 = 5_000;
 
 fn env_ms_or(name: &str, default_ms: u64) -> u64 {
@@ -3038,7 +3028,7 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
         }
 
         if !any_work {
-            std::thread::sleep(Duration::from_millis(200));
+            std::thread::sleep(Duration::from_millis(25));
         }
     }
 }
