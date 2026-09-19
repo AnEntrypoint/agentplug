@@ -371,7 +371,6 @@ fn selfcheck_inflight_cleanup() -> anyhow::Result<()> {
 
 fn selfcheck_spool_claim() -> anyhow::Result<()> {
     use std::fs;
-    use std::time::{Duration, SystemTime};
 
     let in_dir = std::env::temp_dir()
         .join(format!("agentplug-selfcheck-claim-{}-{}", std::process::id(), agentplug_host::now_ms()))
@@ -385,14 +384,9 @@ fn selfcheck_spool_claim() -> anyhow::Result<()> {
     fs::write(&txt, br#"{"session_id":"s","query":"x"}"#)?;
     let fresh_claimed = daemon::claim_spool_request_in_place(&txt).is_some();
 
-    let settled = SystemTime::now() - Duration::from_millis(2_000);
-    fs::File::options().write(true).open(&txt)?.set_modified(settled)?;
-    let settled_claimed = daemon::claim_spool_request_in_place(&txt).is_some();
-
-    println!("[selfcheck-spool-claim] empty_claimed={empty_claimed} fresh_claimed={fresh_claimed} settled_claimed={settled_claimed}");
+    println!("[selfcheck-spool-claim] empty_claimed={empty_claimed} fresh_claimed={fresh_claimed}");
     assert!(!empty_claimed, "an empty in-file is the first half of a shell redirect, never a request: claiming it dispatches a torn body");
-    assert!(!fresh_claimed, "an in-file written this instant may still be growing: claiming it dispatches a torn body");
-    assert!(settled_claimed, "a non-empty in-file that has sat unmodified past the settle interval MUST still be claimable, or no dispatch ever runs");
+    assert!(fresh_claimed, "a non-empty in-file is claimable immediately: publishers rename a complete sibling into place");
 
     let _ = fs::remove_dir_all(in_dir.parent().unwrap_or(&in_dir));
     println!("[selfcheck-spool-claim] witnessed live against the real claim predicate: PASS");
