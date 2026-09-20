@@ -160,7 +160,7 @@ const DAEMON_CONFIG_EXAMPLE: &str = r#"{
   "heartbeat_interval_secs": 10,
   "plugin_update_poll_interval_secs": 600,
   "plugin_update_poll_interval_secs_by_name": {},
-  "runner_update_poll_interval_secs": 3600,
+  "runner_update_poll_interval_secs": 60,
   "instruction_source_poll_interval_secs": 600
 }
 "#;
@@ -218,7 +218,7 @@ impl DaemonConfig {
             None => self.plugin_update_poll_interval(),
         }
     }
-    fn runner_update_poll_interval(&self) -> Duration { Duration::from_secs(self.runner_update_poll_interval_secs.unwrap_or(3600)) }
+    fn runner_update_poll_interval(&self) -> Duration { Duration::from_secs(self.runner_update_poll_interval_secs.unwrap_or(60)) }
     fn instruction_source_poll_interval(&self) -> Duration { Duration::from_secs(self.instruction_source_poll_interval_secs.unwrap_or(600)) }
     fn max_concurrent_projects(&self) -> usize { 4 }
     fn gm_concurrency(&self) -> usize { self.gm_concurrency.unwrap_or_else(|| self.max_concurrent_projects()).max(1) }
@@ -1059,6 +1059,9 @@ fn write_project_heartbeat_with_queue_info(spool_dir: &Path, busy_until: Option<
     if let Some((staged_at_ms, _len)) = cached_staged_runner() {
         payload["runner_update_in_progress"] = serde_json::json!(true);
         payload["runner_update_waiting_ms"] = serde_json::json!(now_ms().saturating_sub(staged_at_ms));
+    } else if let Some(map) = payload.as_object_mut() {
+        map.remove("runner_update_in_progress");
+        map.remove("runner_update_waiting_ms");
     }
     let failures = last_plugin_compile_failure().lock().unwrap_or_else(|e| e.into_inner()).clone();
     if failures.is_empty() {
@@ -1926,6 +1929,85 @@ fn dir_has_any_verb_subdir_with_claimable_txt(base: &Path) -> bool {
     false
 }
 
+#[cfg(windows)]
+struct IdleInDirWatch {
+    entries: Vec<(PathBuf, windows_sys::Win32::Foundation::HANDLE)>,
+}
+
+#[cfg(windows)]
+impl IdleInDirWatch {
+    fn new() -> Self {
+        Self { entries: Vec::new() }
+    }
+
+    fn close_all(&mut self) {
+        use windows_sys::Win32::Storage::FileSystem::FindCloseChangeNotification;
+        for (_, handle) in self.entries.drain(..) {
+            unsafe { FindCloseChangeNotification(handle); }
+        }
+    }
+
+    fn sync(&mut self, roots: &[PathBuf]) {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FindFirstChangeNotificationW, FILE_NOTIFY_CHANGE_DIR_NAME, FILE_NOTIFY_CHANGE_FILE_NAME,
+            FILE_NOTIFY_CHANGE_SIZE,
+        };
+        let wanted: Vec<PathBuf> = roots
+            .iter()
+            .map(|root| root.join(".gm").join("exec-spool").join("in"))
+            .filter(|dir| dir.is_dir())
+            .take(64)
+            .collect();
+        if self.entries.iter().map(|(p, _)| p).eq(wanted.iter()) {
+            return;
+        }
+        self.close_all();
+        for dir in wanted {
+            let mut wide: Vec<u16> = dir.as_os_str().encode_wide().collect();
+            wide.push(0);
+            let handle = unsafe {
+                FindFirstChangeNotificationW(
+                    wide.as_ptr(),
+                    1,
+                    FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_DIR_NAME | FILE_NOTIFY_CHANGE_SIZE,
+                )
+            };
+            if handle != INVALID_HANDLE_VALUE {
+                self.entries.push((dir, handle));
+            }
+        }
+    }
+
+    fn wait(&self, cap: Duration) {
+        use windows_sys::Win32::Storage::FileSystem::FindNextChangeNotification;
+        use windows_sys::Win32::System::Threading::WaitForMultipleObjects;
+        if self.entries.is_empty() {
+            std::thread::sleep(cap);
+            return;
+        }
+        let handles: Vec<_> = self.entries.iter().map(|(_, h)| *h).collect();
+        let rc = unsafe {
+            WaitForMultipleObjects(handles.len() as u32, handles.as_ptr(), 0, cap.as_millis() as u32)
+        };
+        const WAIT_OBJECT_0: u32 = 0;
+        if (WAIT_OBJECT_0..WAIT_OBJECT_0 + handles.len() as u32).contains(&rc) {
+            let idx = (rc - WAIT_OBJECT_0) as usize;
+            if let Some((_, handle)) = self.entries.get(idx) {
+                unsafe { FindNextChangeNotification(*handle); }
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for IdleInDirWatch {
+    fn drop(&mut self) {
+        self.close_all();
+    }
+}
+
 fn project_has_pending_dispatch_work(root: &Path) -> bool {
     if project_has_in_flight_step(root) {
         return true;
@@ -2632,10 +2714,13 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
 
     let runner_update_poll_interval = daemon_cfg.runner_update_poll_interval();
     let mut last_runner_update_poll = seed_poll_timer_from_persisted_ts(&persisted_runner_poll_ts_path());
+    let mut first_runner_poll_pending = true;
     let persisted_runner_poll_ts_at_boot = read_persisted_poll_ts(&persisted_runner_poll_ts_path());
     if persisted_runner_poll_ts_at_boot > 0 {
         HEARTBEAT_LAST_RUNNER_POLL_TS.store(persisted_runner_poll_ts_at_boot, std::sync::atomic::Ordering::Relaxed);
     }
+    #[cfg(windows)]
+    let mut idle_in_dir_watch = IdleInDirWatch::new();
     let mut pending_self_update: Option<(PathBuf, String)> = None;
     let mut pending_self_update_staged_at: Option<Instant> = None;
     const SELF_UPDATE_MAX_STARVED_MS: u64 = 10 * 60 * 1000;
@@ -2917,7 +3002,8 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
             record_plugin_poll_error(if cycle_errors.is_empty() { None } else { Some(cycle_errors.join("; ")) });
         }
 
-        if last_runner_update_poll.elapsed() >= runner_update_poll_interval || take_forced_runner_refresh_request() {
+        if first_runner_poll_pending || last_runner_update_poll.elapsed() >= runner_update_poll_interval || take_forced_runner_refresh_request() {
+            first_runner_poll_pending = false;
             last_runner_update_poll = Instant::now();
             let poll_ts = now_ms();
             HEARTBEAT_LAST_RUNNER_POLL_TS.store(poll_ts, std::sync::atomic::Ordering::Relaxed);
@@ -3028,7 +3114,21 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
         }
 
         if !any_work {
-            std::thread::sleep(Duration::from_millis(25));
+            if known_roots.iter().any(|root| project_has_pending_dispatch_work(root)) {
+                // in-file already visible: skip the idle quantum
+            } else {
+                #[cfg(windows)]
+                {
+                    idle_in_dir_watch.sync(&known_roots);
+                    if known_roots.iter().any(|root| project_has_pending_dispatch_work(root)) {
+                        // lost-wakeup: file landed while arming the watch
+                    } else {
+                        idle_in_dir_watch.wait(Duration::from_millis(25));
+                    }
+                }
+                #[cfg(not(windows))]
+                std::thread::sleep(Duration::from_millis(25));
+            }
         }
     }
 }
