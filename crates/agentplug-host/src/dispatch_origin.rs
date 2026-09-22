@@ -1,4 +1,7 @@
 use std::cell::RefCell;
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
@@ -42,8 +45,37 @@ impl Drop for DispatchOriginScope {
 
 pub fn enter_dispatch_origin_scope(spool_task: &str, body: &str) -> DispatchOriginScope {
     let origin = dispatch_origin_of(spool_task, body);
+    if let Some(gm_session) = origin.gm_session.as_deref() {
+        note_session_activity(gm_session);
+    }
     let previous = CURRENT_DISPATCH_ORIGIN.with(|cell| cell.replace(Some(origin)));
     DispatchOriginScope { previous }
+}
+
+const SESSION_ACTIVITY_MAX_ENTRIES: usize = 4096;
+
+static SESSION_LAST_SEEN: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
+
+fn session_last_seen_map() -> &'static Mutex<HashMap<String, Instant>> {
+    SESSION_LAST_SEEN.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub(crate) fn note_session_activity(session_id: &str) {
+    let mut map = session_last_seen_map().lock().unwrap_or_else(|e| e.into_inner());
+    map.insert(session_id.to_string(), Instant::now());
+    if map.len() > SESSION_ACTIVITY_MAX_ENTRIES {
+        let mut entries: Vec<(String, Instant)> = map.iter().map(|(k, v)| (k.clone(), *v)).collect();
+        entries.sort_by_key(|(_, t)| *t);
+        let evict_count = entries.len() - SESSION_ACTIVITY_MAX_ENTRIES / 2;
+        for (k, _) in entries.into_iter().take(evict_count) {
+            map.remove(&k);
+        }
+    }
+}
+
+pub(crate) fn session_activity_elapsed(session_id: &str) -> Option<Duration> {
+    let map = session_last_seen_map().lock().unwrap_or_else(|e| e.into_inner());
+    map.get(session_id).map(|t| t.elapsed())
 }
 
 pub(crate) fn current_dispatch_origin() -> DispatchOrigin {
