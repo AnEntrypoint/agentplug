@@ -24,6 +24,8 @@ pub(crate) struct BrowserRuntimeConfig {
     headless: Option<bool>,
     #[serde(default)]
     session_idle_timeout_ms: Option<u64>,
+    #[serde(default)]
+    session_owner_gone_idle_timeout_ms: Option<u64>,
 }
 
 type BrowserConfig = BrowserRuntimeConfig;
@@ -41,6 +43,7 @@ impl BrowserRuntimeConfig {
                 eval_timeout_grace_ms: None,
                 headless: None,
                 session_idle_timeout_ms: None,
+                session_owner_gone_idle_timeout_ms: None,
             })
     }
     fn cdp_poll_timeout(&self) -> Duration { Duration::from_millis(self.cdp_poll_timeout_ms.unwrap_or(1000)) }
@@ -50,6 +53,9 @@ impl BrowserRuntimeConfig {
     fn headless(&self) -> bool { self.headless.unwrap_or(false) }
     fn session_idle_timeout(&self) -> Duration {
         Duration::from_millis(self.session_idle_timeout_ms.unwrap_or(30 * 60 * 1000))
+    }
+    fn session_owner_gone_idle_timeout(&self) -> Duration {
+        Duration::from_millis(self.session_owner_gone_idle_timeout_ms.unwrap_or(5 * 60 * 1000))
     }
 }
 
@@ -931,21 +937,41 @@ fn reap_sessions_for_deregistered_roots(roots: &[std::path::PathBuf]) {
     evict_session_lifecycle_locks_with_no_active_holder();
 }
 
+fn owner_gm_session_is_stale(owner_gm_session: Option<&str>, threshold: Duration) -> bool {
+    owner_gm_session
+        .and_then(crate::dispatch_origin::session_activity_elapsed)
+        .map(|elapsed| elapsed >= threshold)
+        .unwrap_or(false)
+}
+
+fn effective_idle_timeout(owner_gm_session: Option<&str>, cfg: &BrowserConfig) -> Duration {
+    let long_ceiling = cfg.session_idle_timeout();
+    let short_ceiling = cfg.session_owner_gone_idle_timeout();
+    if owner_gm_session_is_stale(owner_gm_session, short_ceiling) {
+        short_ceiling.min(long_ceiling)
+    } else {
+        long_ceiling
+    }
+}
+
 fn reap_idle_sessions(cwd: &Path, cfg: &BrowserConfig) {
-    let timeout = cfg.session_idle_timeout();
     let mut map = sessions_map().lock().unwrap_or_else(|e| e.into_inner());
     let dead_keys: Vec<String> = map
         .iter()
-        .filter(|(_, s)| s.cwd == cwd && s.last_used.elapsed() > timeout)
+        .filter(|(_, s)| s.cwd == cwd && s.last_used.elapsed() > effective_idle_timeout(s.owner_gm_session.as_deref(), cfg))
         .map(|(k, _)| k.clone())
         .collect();
     for k in dead_keys {
         if let Some(session) = map.remove(&k) {
+            let timeout = effective_idle_timeout(session.owner_gm_session.as_deref(), cfg);
+            let owner_gone = owner_gm_session_is_stale(session.owner_gm_session.as_deref(), cfg.session_owner_gone_idle_timeout());
             eprintln!(
-                "[agentplug browser] reaping idle session {} (idle {}ms > {}ms)",
+                "[agentplug browser] reaping idle session {} (idle {}ms > {}ms, owner_gm_session={:?}, owner_gone={})",
                 session.session_id,
                 session.last_used.elapsed().as_millis(),
-                timeout.as_millis()
+                timeout.as_millis(),
+                session.owner_gm_session,
+                owner_gone
             );
             kill_session(session);
         }
@@ -1012,6 +1038,11 @@ fn session_list(cwd: &Path, caller_gm_session: Option<&str>, caller_implicit_ses
             continue;
         }
         if let Some(s) = map.get(&k) {
+            let owner_last_seen_ms = s
+                .owner_gm_session
+                .as_deref()
+                .and_then(crate::dispatch_origin::session_activity_elapsed)
+                .map(|d| d.as_millis() as u64);
             out.push(json!({
                 "session_id": s.session_id,
                 "owner_gm_session": s.owner_gm_session,
@@ -1020,9 +1051,8 @@ fn session_list(cwd: &Path, caller_gm_session: Option<&str>, caller_implicit_ses
                 "port": s.port,
                 "alive": true,
                 "idle_ms": s.last_used.elapsed().as_millis() as u64,
+                "owner_last_dispatch_ms": owner_last_seen_ms,
                 "target_id": s.target_id,
-                // Which engine actually backs it -- without this a caller
-                // cannot tell a chrome session from a lightpanda one.
                 "engine": format!("{:?}", s.engine),
             }));
         }
