@@ -1,4 +1,4 @@
-mod daemon;
+﻿mod daemon;
 mod download;
 
 use std::path::PathBuf;
@@ -393,7 +393,7 @@ fn selfcheck_spool_claim() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn write_standalone_status(status_path: &std::path::Path) {
+fn write_standalone_status(status_path: &std::path::Path, busy_until: Option<u64>) {
     use std::fs;
     let mut payload = match fs::read_to_string(status_path).ok().and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok()) {
         Some(serde_json::Value::Object(map)) => serde_json::Value::Object(map),
@@ -404,7 +404,27 @@ fn write_standalone_status(status_path: &std::path::Path) {
     payload["runtime"] = serde_json::json!("agentplug-runner-standalone");
     payload["daemon"] = serde_json::json!(false);
     payload["shared_process"] = serde_json::json!(false);
+    if let Some(busy_until) = busy_until {
+        payload["busy_until"] = serde_json::json!(busy_until);
+    } else {
+        payload.as_object_mut().map(|m| m.remove("busy_until"));
+    }
     let _ = fs::write(status_path, payload.to_string());
+}
+
+const STANDALONE_BUSY_HEARTBEAT_MS: u64 = 5_000;
+const STANDALONE_BUSY_EXTEND_MS: u64 = 20_000;
+
+fn spawn_standalone_busy_ticker(
+    status_path: std::path::PathBuf,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+            write_standalone_status(&status_path, Some(agentplug_host::now_ms() + STANDALONE_BUSY_EXTEND_MS));
+            std::thread::sleep(std::time::Duration::from_millis(STANDALONE_BUSY_HEARTBEAT_MS));
+        }
+    })
 }
 
 fn clear_standalone_status(status_path: &std::path::Path) {
@@ -439,7 +459,7 @@ fn run_spool_watcher_single_process(project: &mut ProjectPlugins, spool_dir: &st
             return Ok(());
         }
 
-        write_standalone_status(&status_path);
+        write_standalone_status(&status_path, None);
 
         let mut work_done = false;
         if let Ok(verb_dirs) = fs::read_dir(&in_dir) {
@@ -457,7 +477,7 @@ fn run_spool_watcher_single_process(project: &mut ProjectPlugins, spool_dir: &st
                     }
                     let Some(claim_path) = daemon::claim_spool_request_in_place(&path) else { continue };
                     let Ok(body) = fs::read_to_string(&claim_path) else {
-                        let _ = fs::remove_file(&claim_path);
+                        let _ = fs::rename(&claim_path, &path);
                         continue;
                     };
                     if body.trim().is_empty() {
@@ -466,11 +486,23 @@ fn run_spool_watcher_single_process(project: &mut ProjectPlugins, spool_dir: &st
                     }
                     let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
                     let _dispatch_origin_scope = agentplug_host::enter_dispatch_origin_scope(&stem, &body);
+
+                    let busy_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                    let ticker = spawn_standalone_busy_ticker(status_path.clone(), busy_stop.clone());
                     let result = project
                         .dispatch("gm", &verb, &body)
                         .unwrap_or_else(|e| serde_json::json!({"ok": false, "verb": verb, "error": e.to_string()}).to_string());
-                    daemon::write_spool_out(&out_dir, &format!("{verb}-{stem}.json"), &result);
-                    let _ = fs::remove_file(&claim_path);
+                    busy_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                    let _ = ticker.join();
+
+                    let out_confirmed = daemon::write_spool_out_confirmed(&out_dir, &format!("{verb}-{stem}.json"), &result);
+                    if out_confirmed {
+                        let _ = fs::remove_file(&claim_path);
+                    } else {
+                        eprintln!(
+                            "[agentplug] standalone: out-file write for {verb}/{stem} did not confirm -- leaving the claim in place for the orphan sweep to retry rather than deleting an unanswered request"
+                        );
+                    }
                     work_done = true;
                 }
             }

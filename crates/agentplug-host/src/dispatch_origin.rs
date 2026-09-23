@@ -94,7 +94,7 @@ fn dispatch_origin_of(spool_task: &str, body: &str) -> DispatchOrigin {
             .map(str::to_string)
     };
     DispatchOrigin {
-        gm_session: envelope_field("session_id").or_else(|| gm_session_from_spool_task(spool_task)),
+        gm_session: envelope_field("session_id").or_else(|| envelope_field("SESSION_ID")).or_else(|| gm_session_from_spool_task(spool_task)),
         named_page_session: envelope_field("sessionId"),
     }
 }
