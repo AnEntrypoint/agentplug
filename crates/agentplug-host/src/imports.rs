@@ -920,7 +920,7 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
                     break;
                 }
                 if attempt + 1 < EMBED_RETRY_ATTEMPTS {
-                    std::thread::sleep(std::time::Duration::from_millis(EMBED_RETRY_BACKOFF_MS));
+                    sibling_pool.any_instantiated_within(EMBED_RETRY_BACKOFF_MS);
                 }
             }
 

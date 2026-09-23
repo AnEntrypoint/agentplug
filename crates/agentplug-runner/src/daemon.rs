@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+﻿use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -753,8 +753,21 @@ fn release_ownership_for_handoff() {
     }
 }
 
+fn path_is_cargo_build_output(path: &Path) -> bool {
+    path.ancestors().any(|dir| {
+        dir.file_name().and_then(|n| n.to_str()) == Some("target") && dir.parent().map(|p| p.join("Cargo.toml").exists()).unwrap_or(false)
+    })
+}
+
 fn promote_staged_exe_to_canonical(version: &str) -> bool {
     let Some(canonical) = canonical_runner_exe_path() else { return false };
+    if path_is_cargo_build_output(&canonical) {
+        eprintln!(
+            "[agentplug daemon] takeover: refusing to promote {version} onto {} -- that path is a cargo build output (a target/ dir beside a Cargo.toml), not an installed runner; this process keeps running from the staged copy instead of overwriting the build artifact",
+            canonical.display()
+        );
+        return false;
+    }
     let Ok(staged) = std::env::current_exe() else { return false };
     if staged == canonical {
         return false;
@@ -1606,11 +1619,22 @@ pub fn claim_spool_request_in_place(txt_path: &Path) -> Option<PathBuf> {
     fs::rename(txt_path, &claim_path).ok().map(|_| claim_path)
 }
 
-pub fn write_spool_out(out_dir: &Path, out_name: &str, out_body: &str) {
+pub fn write_spool_out_confirmed(out_dir: &Path, out_name: &str, out_body: &str) -> bool {
+    let dest = out_dir.join(out_name);
     let tmp = out_dir.join(format!("{out_name}.tmp.{}", std::process::id()));
-    if fs::write(&tmp, out_body).is_ok() {
-        let _ = fs::rename(&tmp, out_dir.join(out_name));
+    if fs::write(&tmp, out_body).is_ok() && fs::rename(&tmp, &dest).is_ok() {
         let _ = fs::write(out_dir.join(format!("{out_name}.ready")), b"");
+        return dest.exists();
+    }
+    let _ = fs::remove_file(&tmp);
+    dest.exists()
+}
+
+fn write_spool_out_and_release_claim(out_dir: &Path, in_dir: &Path, verb: &str, task: &str, out_body: &str) {
+    if write_spool_out_confirmed(out_dir, &format!("{verb}-{task}.json"), out_body) {
+        let _ = fs::remove_file(inflight_claim_path(in_dir, verb, task));
+    } else {
+        eprintln!("[agentplug daemon] out-file write for {verb}/{task} did not confirm -- leaving the claim for the orphan sweep instead of deleting an unanswered request");
     }
 }
 
@@ -1783,7 +1807,9 @@ fn sweep_orphaned_claims_distinguishing_handoff_from_crash(root: &Path, inherite
                 continue;
             }
             let out_name = format!("{verb}-{task}.json");
-            if !out_dir.join(&out_name).exists() {
+            let out_confirmed = if out_dir.join(&out_name).exists() {
+                true
+            } else {
                 let out_body = serde_json::json!({
                     "ok": false,
                     "error_code": "dispatch_orphaned",
@@ -1792,10 +1818,15 @@ fn sweep_orphaned_claims_distinguishing_handoff_from_crash(root: &Path, inherite
                     "task": task,
                     "sweeping_pid": std::process::id(),
                 }).to_string();
-                write_spool_out(&out_dir, &out_name, &out_body);
+                let confirmed = write_spool_out_confirmed(&out_dir, &out_name, &out_body);
                 eprintln!("[agentplug daemon] swept orphaned claim {verb}/{task} for {} -- wrote error out-file", root.display());
+                confirmed
+            };
+            if out_confirmed {
+                let _ = fs::remove_file(&path);
+            } else {
+                eprintln!("[agentplug daemon] could not confirm the dispatch_orphaned out-file for {verb}/{task} -- leaving the claim for the next sweep rather than deleting it unanswered");
             }
-            let _ = fs::remove_file(&path);
         }
     }
 }
@@ -1906,9 +1937,13 @@ pub(crate) fn run_gm_dispatch_to_file(root: &Path, handle: &DispatchHandle, verb
     };
     let out_body = patch_update_available_from_escalation(plugin_name, verb, out_body);
     let out_name = format!("{verb}-{task}.json");
-    write_spool_out(out_dir, &out_name, &out_body);
+    let out_confirmed = write_spool_out_confirmed(out_dir, &out_name, &out_body);
     let in_dir = root.join(".gm").join("exec-spool").join("in");
-    let _ = fs::remove_file(inflight_claim_path(&in_dir, verb, task));
+    if out_confirmed {
+        let _ = fs::remove_file(inflight_claim_path(&in_dir, verb, task));
+    } else {
+        eprintln!("[agentplug daemon] out-file write for {verb}/{task} did not confirm for {} -- leaving the claim for the orphan sweep instead of deleting an unanswered request", root.display());
+    }
     let key: InFlightKey = (root.to_path_buf(), verb.to_string(), task.to_string());
     in_flight_map().lock().unwrap_or_else(|e| e.into_inner()).remove(&key);
 }
@@ -2112,9 +2147,7 @@ fn dispatch_project(root: &Path, project: &mut ProjectPlugins, plugin_modules: &
     let mut plugin_refresh_requests: Vec<ClaimedRequest> = Vec::new();
     for req in claimed {
         if let Some(out_body) = session_id_task_mismatch_rejection(&req.verb, &req.task, &req.body) {
-            let out_name = format!("{}-{}.json", req.verb, req.task);
-            write_spool_out(&out_dir, &out_name, &out_body);
-            let _ = fs::remove_file(inflight_claim_path(&in_dir, &req.verb, &req.task));
+            write_spool_out_and_release_claim(&out_dir, &in_dir, &req.verb, &req.task, &out_body);
             continue;
         }
         if req.verb == "background-convert" {
@@ -2129,16 +2162,12 @@ fn dispatch_project(root: &Path, project: &mut ProjectPlugins, plugin_modules: &
     let answer_bg_converts = |reqs: Vec<ClaimedRequest>| {
         for req in reqs {
             let out_body = handle_background_convert(root, &req.body);
-            let out_name = format!("{}-{}.json", req.verb, req.task);
-            write_spool_out(&out_dir, &out_name, &out_body);
-            let _ = fs::remove_file(inflight_claim_path(&in_dir, &req.verb, &req.task));
+            write_spool_out_and_release_claim(&out_dir, &in_dir, &req.verb, &req.task, &out_body);
         }
     };
     for req in plugin_refresh_requests {
         let out_body = handle_plugin_refresh_request(root, &req.body);
-        let out_name = format!("{}-{}.json", req.verb, req.task);
-        write_spool_out(&out_dir, &out_name, &out_body);
-        let _ = fs::remove_file(inflight_claim_path(&in_dir, &req.verb, &req.task));
+        write_spool_out_and_release_claim(&out_dir, &in_dir, &req.verb, &req.task, &out_body);
         did_work = true;
     }
 
@@ -2189,10 +2218,8 @@ fn dispatch_project(root: &Path, project: &mut ProjectPlugins, plugin_modules: &
                 None => "gm plugin failed to load for this project (see daemon stderr for the compile/install/instantiate failure)".to_string(),
             };
             for req in &gm_requests {
-                let out_name = format!("{}-{}.json", req.verb, req.task);
                 let out_body = serde_json::json!({"ok": false, "error": error_message, "verb": req.verb}).to_string();
-                write_spool_out(&out_dir, &out_name, &out_body);
-                let _ = fs::remove_file(inflight_claim_path(&in_dir, &req.verb, &req.task));
+                write_spool_out_and_release_claim(&out_dir, &in_dir, &req.verb, &req.task, &out_body);
             }
             answer_bg_converts(bg_convert_requests);
         } else {
@@ -2274,8 +2301,9 @@ fn dispatch_project(root: &Path, project: &mut ProjectPlugins, plugin_modules: &
                                 let bc_body = fs::read_to_string(&claim_path).unwrap_or_default();
                                 let out_body = handle_background_convert(root, &bc_body);
                                 let out_name = format!("background-convert-{bc_task}.json");
-                                write_spool_out(&out_dir, &out_name, &out_body);
-                                let _ = fs::remove_file(&claim_path);
+                                if write_spool_out_confirmed(&out_dir, &out_name, &out_body) {
+                                    let _ = fs::remove_file(&claim_path);
+                                }
                             }
                         }
 
@@ -2304,8 +2332,9 @@ fn dispatch_project(root: &Path, project: &mut ProjectPlugins, plugin_modules: &
 
                                     if let Some(out_body) = session_id_task_mismatch_rejection(&verb, &task, &body) {
                                         let out_name = format!("{verb}-{task}.json");
-                                        write_spool_out(&out_dir, &out_name, &out_body);
-                                        let _ = fs::remove_file(&claim_path);
+                                        if write_spool_out_confirmed(&out_dir, &out_name, &out_body) {
+                                            let _ = fs::remove_file(&claim_path);
+                                        }
                                         continue;
                                     }
 
