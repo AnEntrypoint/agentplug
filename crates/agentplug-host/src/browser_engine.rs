@@ -85,20 +85,6 @@ fn find_lightpanda(cwd: &Path) -> Option<PathBuf> {
     which("lightpanda")
 }
 
-/// Picks the CDP-capable engine for THIS dispatch, given the caller-supplied
-/// hint (rs-plugkit's `browser` verb sends `"engine":"lightpanda"`, its `cdp`
-/// verb sends `"engine":"chrome"`, both in the same JSON envelope
-/// host_browser_exec already carries -- no wasm ABI signature change, see
-/// host_abi.rs's #[link(wasm_import_module="env")] extern block). A field
-/// that is missing or unrecognized (an older cached wasm build, or any
-/// caller that predates this field) defaults to Chrome -- the pre-existing
-/// cdp verb's own behavior -- never to a newly-introduced engine, so cdp's
-/// "must work identically to before this change" holds even against a stale
-/// caller. A configured steel endpoint always wins regardless of the
-/// caller's hint: once an operator opts a project into steel-browser, it
-/// becomes the CDP target for every CDP-capable dispatch uniformly
-/// (serp/oxibrowser's in-process path is untouched -- it never reaches this
-/// function).
 pub fn select_engine(cwd: &Path, requested: Option<&str>) -> Engine {
     if steel_endpoint_override(cwd).is_some() {
         return Engine::Steel;
@@ -110,12 +96,6 @@ pub fn select_engine(cwd: &Path, requested: Option<&str>) -> Engine {
     }
 }
 
-/// `browser` is lightpanda's real home once a native plugin exists for every
-/// platform this runs on; until then it is a transparent alias for `cdp`
-/// (real Chrome) wherever lightpanda cannot actually run -- no native
-/// Windows binary (confirmed in lightpanda-io/browser's own README) and no
-/// `lightpanda_path`/`GM_LIGHTPANDA_PATH` override naming a WSL2/Docker
-/// wrapper.
 fn lightpanda_reachable(cwd: &Path) -> bool {
     find_lightpanda(cwd).is_some()
 }
@@ -220,12 +200,6 @@ fn dial_steel(cwd: &Path, browser_cfg: &BrowserRuntimeConfig) -> Result<u16, Str
     Ok(port)
 }
 
-/// Acquires a CDP-reachable port for the requested engine, spawning a
-/// process only for Chrome/lightpanda -- steel is always dial-only, never
-/// spawned, matching BrowserSession's existing `child: Option<Child>`
-/// adopted-session shape (used today for OS-orphan adoption; steel reuses
-/// the identical "no owned process" case for an always-on external CDP
-/// service).
 pub fn acquire(engine: Engine, cwd: &Path, session_id: &str, browser_cfg: &BrowserRuntimeConfig) -> Result<AcquiredEngine, String> {
     match engine {
         Engine::Chrome => {

@@ -31,19 +31,6 @@ function isInternalChromeUrl(url) {
   return url.startsWith('chrome://') || url.startsWith('chrome-untrusted://') || url.startsWith('devtools://');
 }
 
-// lightpanda's CDP HTTP server answers /json/version (with a browser-level
-// webSocketDebuggerUrl) and /json/list (always `[]`, verified live) but has
-// no /json/new at all -- PUT or GET both return a plain-text 404 "Not
-// found", which httpPutJson's JSON.parse failure already collapses to null
-// indistinguishably from a network error. Confirmed live (2026-09-05) that
-// lightpanda's CDP protocol itself is fully working via the STANDARD
-// Target.createTarget + Target.attachToTarget commands sent over that
-// browser-level websocket -- it just doesn't implement Chrome's proprietary
-// HTTP shortcut for the same operation. This creates and attaches a target
-// the protocol-native way and returns a descriptor shaped like a Chrome
-// /json/new response (webSocketDebuggerUrl + sessionId) so the rest of this
-// file's single call site (cdpSession(target.webSocketDebuggerUrl, ...))
-// needs no other change beyond threading sessionId through once it exists.
 async function createTargetViaFlattenedSession(port, startUrl) {
   const version = await httpJson(`http://127.0.0.1:${port}/json/version`, 2000);
   const rootWsUrl = version && version.webSocketDebuggerUrl;
@@ -61,14 +48,6 @@ async function createTargetViaFlattenedSession(port, startUrl) {
     const attached = await sess.send('Target.attachToTarget', { targetId, flatten: true });
     const sessionId = attached && attached.sessionId;
     if (!sessionId) { sess.close(); return null; }
-    // Verified live (2026-09-05): a flattened sessionId is scoped to the
-    // WEBSOCKET CONNECTION that issued Target.attachToTarget -- closing that
-    // connection and reopening a fresh one to the same URL then reusing the
-    // old sessionId answers "Unknown sessionId" (-32001). This connection
-    // must therefore stay open and be reused, not just its URL - bind the
-    // session so every future sess.send() on it carries sessionId
-    // automatically, and hand the live object back via __liveSession so the
-    // caller skips opening a second, useless connection.
     sess.bindSession(sessionId);
     return { id: targetId, webSocketDebuggerUrl: rootWsUrl, sessionId, url: startUrl || 'about:blank', __liveSession: sess };
   } catch (_) {
@@ -98,11 +77,6 @@ async function pickPageTarget(port, startUrl, targetId, timeoutMs, claimFreshTar
     if (startUrl || claimFreshTarget) {
       const created = await httpPutJson(`http://127.0.0.1:${port}/json/new?${encodeURIComponent(startUrl || 'about:blank')}`, 3000);
       if (created && created.webSocketDebuggerUrl) return created;
-      // /json/list answered valid JSON (a real CDP server, not "not up yet")
-      // but /json/new did not -- this is the lightpanda shape, not a
-      // transient Chrome startup race. Try the protocol-native path once
-      // immediately instead of burning the rest of the deadline retrying an
-      // HTTP endpoint that will never exist on this engine.
       if (sawWorkingJsonList) {
         const flattened = await createTargetViaFlattenedSession(port, startUrl);
         if (flattened) return flattened;
@@ -131,20 +105,10 @@ function cdpSession(wsUrl, timeoutMs) {
         return new Promise((res, rej) => {
           pending.set(id, { res, rej });
           const body = { id, method, params: params || {} };
-          // Set only for a flattened (lightpanda-style) session created via
-          // createTargetViaFlattenedSession -- a plain per-target Chrome
-          // connection never binds one, and every message on it stays
-          // exactly as before this field existed.
           if (boundSessionId) body.sessionId = boundSessionId;
           ws.send(JSON.stringify(body));
         });
       },
-      // Scopes every future send() on this connection to a CDP target
-      // session obtained via Target.attachToTarget on this SAME
-      // connection -- a flattened sessionId is invalid on any other
-      // websocket (verified live: reusing one after a reconnect answers
-      // "Unknown sessionId", -32001), so this only ever makes sense called
-      // on the connection that produced the sessionId in the first place.
       bindSession(sessionId) { boundSessionId = sessionId; },
       close() { clearTimeout(timer); try { ws.close(); } catch (_) {} },
       onIdLessNotification: null,
@@ -279,17 +243,6 @@ async function navigateIfNeededThenEvaluateOverCdp(sess, script, startUrl, timeo
     await new Promise((r) => setTimeout(r, 1200));
     sess.onIdLessNotification = prevOnIdLessNotification;
   }
-  // The documented contract ("bare JS", same REPL semantics as the
-  // javascript_tool: "the result of the last expression is returned
-  // automatically") never required an explicit `return` -- but wrapping the
-  // raw script in a plain async-IIFE body executes it as ordinary statements
-  // with no implicit return, so `1+1` or `({a:1})` silently evaluated to
-  // `undefined` (serialized as `result: null`) with no error, indistinguishable
-  // from a real null result or evaluation failure. Try the single-expression
-  // form first (`return (<script>)`), which is what a bare expression body
-  // needs to actually produce a value; a script that fails to parse that way
-  // (multi-statement code, an already-explicit `return`, a `;`-terminated
-  // statement list) falls back to the raw statement-body form unchanged.
   const trimmedScript = script.trim();
   const exprAttempt = `(async () => { return (\n${trimmedScript}\n); })()`;
   const stmtAttempt = `(async () => { ${script} })()`;
@@ -382,10 +335,6 @@ async function attachDebugCapture(sess) {
   };
   await sess.send('Network.enable', {});
   await sess.send('Page.addScriptToEvaluateOnNewDocument', { source: GL_ERROR_TRACKING_INIT_SCRIPT });
-  // A real app page emits thousands of network events per navigation (1743
-  // witnessed on one dispatch, a 305K-character envelope no MCP client can
-  // return), so the capture is bounded: failed responses first, then the most
-  // recent, with the dropped count reported instead of silently truncating.
   const NETWORK_CAP = 30;
   const CONSOLE_CAP = 50;
   const boundedNetwork = () => {
@@ -474,16 +423,6 @@ async function main() {
     resultWritten = true;
     fs.writeFileSync(resultFile, JSON.stringify({ ...envelope, __targetId: target.id }));
   };
-  // The Rust host kills this process outright (SIGKILL-equivalent on Windows,
-  // no chance to flush a result file) once its own outer wait_timeout expires,
-  // which races an in-flight Runtime.evaluate awaitPromise directly: a script
-  // whose awaited promise resolves even a moment after that outer deadline
-  // never gets to call writeResult, so the host reads a missing result file
-  // as Value::Null and reports it identically to a real marshaling failure.
-  // This watchdog fires a fixed margin before the host's own deadline and
-  // force-writes whatever partial signal is available (pending-eval marker,
-  // no console/network capture) so a real still-running async page always
-  // yields a distinguishable, honest __cdpError instead of a silent null.
   const HOST_KILL_MARGIN_MS = 1500;
   const watchdogDeadline = Math.max(500, timeoutMs - HOST_KILL_MARGIN_MS);
   const watchdogTimer = setTimeout(() => {
@@ -495,23 +434,10 @@ async function main() {
     process.exit(1);
   }, watchdogDeadline);
   watchdogTimer.unref();
-  // A flattened (lightpanda-style) target already carries its own live,
-  // attached connection -- opening a second one to the same URL would get a
-  // fresh, unattached socket that cannot use the sessionId that only the
-  // original connection holds (see createTargetViaFlattenedSession).
   const sess = resumableSession(port, target, target.__liveSession || await cdpSession(target.webSocketDebuggerUrl, timeoutMs));
   try {
     await sess.send('Runtime.enable', {});
     await sess.send('Page.enable', {});
-    // Chrome throttles rAF/setInterval/setTimeout to ~1/sec on a backgrounded tab (real OS-level
-    // window focus, not just "is this the active browser tab") -- automation-driven tabs are near-
-    // permanently backgrounded from Chrome's perspective even when they're the only/active MCP tab,
-    // which silently invalidates any live fps/frame-time measurement taken through this verb (JS-side
-    // document.hidden overrides do nothing; the throttle lives below that layer). Emulation.set-
-    // FocusEmulationEnabled is CDP's own sanctioned override for exactly this automation scenario --
-    // makes the page's document.hasFocus()/visibilityState report focused and lifts the background
-    // timer/rAF throttle, regardless of the real OS window state. Best-effort: older/non-Chromium
-    // targets may not support this domain, hence the swallow.
     await sess.send('Emulation.setFocusEmulationEnabled', { enabled: true }).catch(() => {});
     const collectDebug = await attachDebugCapture(sess);
 

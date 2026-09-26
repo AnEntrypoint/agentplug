@@ -171,15 +171,6 @@ pub(crate) fn cdp_ready_probe(port: u16, deadline: Instant, cfg: &BrowserRuntime
     cdp_ready(port, deadline, cfg)
 }
 
-// Split out from parse_body so url=/bare-http(s) can be stripped inside the
-// same stacking loop as timeout=/mode/viewport (see the loop in the caller)
-// instead of only ever being resolved LAST against whatever remained after
-// every other prefix -- the previous parse_body-only-at-the-end shape meant
-// `url=... \n dom=...` (url first) failed with a SyntaxError from the mode
-// parser choking on a literal "dom=..." line, while `dom=... \n url=...`
-// (url last) silently worked. "Prefixes stack" implies order-independence;
-// this makes url= a first-class member of the same loop as every other
-// prefix so it composes in either order.
 fn strip_url_prefix(body: &str) -> (Option<String>, String, &str) {
     let trimmed = body.trim_start();
     if let Some(rest) = trimmed.strip_prefix("url=") {
@@ -253,13 +244,6 @@ fn strip_session_id_prefix(body: &str) -> (Option<String>, &str) {
     let Some(nl) = rest.find('\n') else { return (None, body) };
     let (id, remainder) = (&rest[..nl], &rest[nl + 1..]);
     let id = id.trim();
-    // An explicit-but-empty `sessionId=` line (caller intends "no override",
-    // just wrote the prefix with nothing after it) must still be stripped --
-    // returning the original `body` here left the literal "sessionId=\n"
-    // text in front of whatever followed, which the downstream session-command/
-    // JS parser then choked on as malformed input instead of treating it as
-    // "no explicit id". Only the id-with-content branch is genuinely
-    // meaningful to keep, so both branches now consume the prefix line.
     if id.is_empty() { (None, remainder) } else { (Some(id.to_string()), remainder) }
 }
 
@@ -297,31 +281,12 @@ struct BrowserSession {
     cwd: PathBuf,
     session_id: String,
     owner_gm_session: Option<String>,
-    /// None for a session ADOPTED from an OS-orphaned chrome after a daemon
-    /// restart -- the pid is known (sidecar) but this process holds no Child
-    /// handle for it. Liveness then goes through pid_is_alive instead of
-    /// try_wait. Also None for a dialed steel-browser session (owns_process
-    /// false) -- there the port is real but no local pid/process exists at
-    /// all, adopted or otherwise.
     child: Option<Child>,
     pid: u32,
     port: u16,
     last_used: Instant,
     target_id: Option<String>,
-    /// False for a steel-browser session: an always-on external service we
-    /// only dial, never spawn and never own the lifecycle of. `pid` is 0 in
-    /// that case and liveness/teardown route through the CDP endpoint check
-    /// instead of pid_is_alive/kill_pid, which would otherwise operate on a
-    /// meaningless local pid.
     owns_process: bool,
-    /// Which engine actually backs this session. The session key is
-    /// (cwd, session_id) with NO engine component, so without this field a
-    /// `cdp` dispatch (engine=chrome) silently reused whatever `browser`
-    /// (engine=lightpanda) had already created under the same session id --
-    /// answering ok:true from the wrong engine, with lightpanda's UA and a
-    /// getComputedStyle that returns transparent for everything. That defect
-    /// only became reachable once lightpanda started working at all; before
-    /// that a `browser` dispatch never established a reusable session.
     engine: crate::browser_engine::Engine,
 }
 
@@ -362,10 +327,6 @@ fn session_cdp_endpoint_responds(port: u16) -> bool {
 
 fn kill_session(mut session: BrowserSession) {
     if !session.owns_process {
-        // A steel-browser session dials an operator-owned always-on
-        // external service -- there is no local process or sidecar for
-        // this repo's session to tear down, only the map entry (already
-        // removed by the caller before this runs) to forget.
         return;
     }
     kill_pid(session.pid);
@@ -417,23 +378,12 @@ fn write_target_id_sidecar(profile_dir: &Path, target_id: &str) {
     let _ = std::fs::write(target_id_sidecar_path(profile_dir), target_id);
 }
 
-/// Written next to the pid sidecar at every successful chrome spawn so a
-/// LATER daemon process (self-update handoff, idle self-recycle, panic
-/// restart) can re-attach to this chrome instead of reaping it -- pid + CDP
-/// port + the raw (unsanitized) session id are everything adoption needs.
 fn write_session_sidecars(profile_dir: &Path, pid: u32, port: u16, session_id: &str) {
     let _ = std::fs::write(pid_sidecar_path(profile_dir), pid.to_string());
     let _ = std::fs::write(port_sidecar_path(profile_dir), port.to_string());
     let _ = std::fs::write(session_id_sidecar_path(profile_dir), session_id);
 }
 
-/// Re-attach to a chrome that outlived the daemon process that launched it.
-/// Returns the adopted session id when the profile dir has intact sidecars,
-/// the recorded pid is alive, and the recorded CDP port still answers --
-/// in which case the session is inserted into the live sessions map (as an
-/// adopted, Child-less session) and the caller must NOT reap or relaunch it.
-/// Any gap in that chain returns None and the caller keeps its old behavior
-/// (reap as orphan / launch fresh).
 fn try_adopt_orphaned_session(cwd: &Path, session_id_hint: Option<&str>, profile_dir: &Path) -> Option<String> {
     let session_id = std::fs::read_to_string(session_id_sidecar_path(profile_dir))
         .ok()
@@ -482,9 +432,6 @@ fn try_adopt_orphaned_session(cwd: &Path, session_id_hint: Option<&str>, profile
                 last_used: Instant::now(),
                 target_id,
                 owns_process: true,
-                // Adoption only ever scans `browser-chrome-profile-*` dirs
-                // (see the strip_prefix above), so an adopted orphan is a
-                // Chrome session by construction.
                 engine: crate::browser_engine::Engine::Chrome,
             },
         );
@@ -595,12 +542,6 @@ fn reap_os_orphans(cwd: &Path) {
                 }
             }
         }
-        // Adoption before reaping: a chrome whose launcher daemon died
-        // (self-update handoff, idle self-recycle, panic) is only orphaned
-        // from THIS process's perspective -- with intact sidecars and a live
-        // CDP endpoint it is re-attached as a session, not killed. Reaping is
-        // now the fallback for genuinely-unadoptable orphans (missing/stale
-        // sidecars, dead CDP endpoint).
         if try_adopt_orphaned_session(cwd, None, &path).is_some() {
             continue;
         }
@@ -867,19 +808,6 @@ fn reap_globally_orphaned_headless_chromes() {
     }
 }
 
-/// Called on every daemon shutdown/handoff path (self-update handoff,
-/// heartbeat authority loss, panic hook). This used to KILL every session's
-/// chrome, which meant an infrastructure event the browser session had nothing
-/// to do with (a runner version swap, a contested ownership file, a daemon
-/// panic) destroyed that session's entire page state -- observed live as
-/// "[agentplug browser] reaping OS-orphaned chrome" followed by lost work.
-///
-/// It now DETACHES instead: the session is forgotten by this process but its
-/// chrome keeps running with the pid/port/session-id sidecars in place, so
-/// the next daemon (or the next dispatch in this one) re-attaches via
-/// `try_adopt_orphaned_session`. Child::drop does not kill the process, and
-/// sessions that are genuinely done are still reaped later by the
-/// idle-timeout and deregistered-root sweepers after re-adoption.
 pub fn close_all_sessions() {
     let mut map = sessions_map().lock().unwrap_or_else(|e| e.into_inner());
     let keys: Vec<String> = map.keys().cloned().collect();
@@ -907,15 +835,6 @@ pub fn reap_idle_sessions_and_os_orphans_across_every_known_project_root(roots: 
     reap_globally_orphaned_headless_chromes();
 }
 
-/// `reap_idle_sessions` only ever matches a session whose `cwd` is IN `roots`
-/// -- a session belonging to a project root that has since been deleted or
-/// deregistered from the daemon registry never appears in any `roots` pass
-/// again, so its idle timer is never even evaluated and its Chrome subprocess
-/// keeps running until the whole daemon restarts. This closes that gap: any
-/// live session whose `cwd` is no longer present in the current known-roots
-/// list is reaped unconditionally, independent of its idle timer, because
-/// there is no longer any registry-tracked project that could still be using
-/// it.
 fn reap_sessions_for_deregistered_roots(roots: &[std::path::PathBuf]) {
     let mut map = sessions_map().lock().unwrap_or_else(|e| e.into_inner());
     let dead_keys: Vec<String> = map
@@ -1095,11 +1014,6 @@ enum SessionCommand<'a> {
     None,
 }
 
-/// Splits a leading `session ...` command line off the body. The second
-/// element is everything after that line, so `session new` stacks with the
-/// other prefixes (`timeout=`, `url=`, `screenshot=`, the script) instead of
-/// being the whole dispatch. A body with no session command comes back as
-/// `(None, body)`.
 fn parse_session_command(body: &str) -> (SessionCommand<'_>, &str) {
     let trimmed = body.trim_start();
     let (first_line, remainder) = match trimmed.find('\n') {
@@ -1275,12 +1189,6 @@ pub fn run(body: &str, opts: &str, cwd_raw: &Path, session_id: &str) -> Value {
     reap_idle_sessions(cwd, &browser_cfg);
     reap_os_orphans(cwd);
 
-    // `body` is the caller's raw code/plain-text verbatim -- never JSON-wrapped
-    // and never re-parsed here. `opts` is the small, separate metadata
-    // payload (rs-plugkit's verbs.rs sends it via host_browser_exec's own
-    // opts_ptr/opts_len param, matching host_exec_js's two-buffer shape) so
-    // a caller's raw JS/plain-text body is never JSON-escaped just to carry
-    // timeoutMs/engine alongside it.
     let inner_body = body.to_string();
     let opts_v: Value = serde_json::from_str(opts).unwrap_or_else(|_| json!({}));
     let timeout_ms = opts_v.get("timeoutMs").and_then(|v| v.as_u64()).unwrap_or(120_000);
@@ -1295,14 +1203,6 @@ pub fn run(body: &str, opts: &str, cwd_raw: &Path, session_id: &str) -> Value {
     let resolved_session_id = origin.page_session(explicit_session_id, session_id);
     let session_id = resolved_session_id.as_str();
 
-    // `session new` and `session reset <id>` stack: the session action runs
-    // first and the rest of the body is evaluated on the fresh session.
-    // Before this, a body of `session new\n<prefixes>\n<script>` answered
-    // with session_new's `{ok, session_id, port}` envelope alone and every
-    // line after the first was dropped without a word (witnessed live: a
-    // screenshot dispatch that returned no value and no screenshot path).
-    // `session list` and `session close <id>` stay terminal, and refuse a
-    // trailing body loudly instead of dropping it.
     let (session_command, after_session_command) = parse_session_command(inner_body);
     let trailing_body_present = !after_session_command.trim().is_empty();
     let mut session_created_by_this_dispatch = false;
@@ -1431,12 +1331,6 @@ pub fn run(body: &str, opts: &str, cwd_raw: &Path, session_id: &str) -> Value {
     let key = session_key(cwd, session_id);
     let lifecycle_lock = session_lifecycle_lock_for_key(&key);
     let _lifecycle_guard_serializes_reuse_check_launch_and_insert = lifecycle_lock.lock().unwrap_or_else(|e| e.into_inner());
-    // A session tracked under this key that was created by a DIFFERENT engine
-    // must never serve this dispatch: `cdp` promises real Chrome (full CSS and
-    // layout fidelity, real screenshots) and `browser` promises lightpanda/steel.
-    // Reusing across that boundary answered ok:true from the wrong engine with
-    // no disclosure at all. Evict and relaunch under the engine actually asked
-    // for -- correctness over keeping a warm process.
     let engine_mismatch = {
         let map = sessions_map().lock().unwrap_or_else(|e| e.into_inner());
         map.get(&key).map(|s| s.engine).filter(|&e| e != engine)
@@ -1490,15 +1384,6 @@ pub fn run(body: &str, opts: &str, cwd_raw: &Path, session_id: &str) -> Value {
     let port = match port {
         Some(p) => p,
         None => {
-            // A daemon recycle (self-update handoff, idle self-recycle, panic)
-            // may have left this session's chrome/lightpanda running as an OS
-            // orphan with intact sidecars. Re-attach to it instead of
-            // spawning a second process onto the same (locked) profile dir --
-            // which both fails the launch AND destroys the page state the
-            // caller still wants. A steel session owns no local process or
-            // sidecar (always dialed fresh against the operator's own
-            // always-on endpoint), so adoption is meaningless for it and
-            // skipped outright.
             let adopted_port = if engine == crate::browser_engine::Engine::Steel {
                 None
             } else {
@@ -1633,13 +1518,6 @@ pub fn run(body: &str, opts: &str, cwd_raw: &Path, session_id: &str) -> Value {
         if let Some(s) = map.get_mut(&key) {
             s.target_id = Some(resolved_target_id.to_string());
         }
-        // Mirrors pid/port/session-id: without this, a daemon recycle
-        // (self-update handoff, idle self-recycle, panic restart) between
-        // dispatches re-attaches via try_adopt_orphaned_session with
-        // target_id forced to None, so pickPageTarget in cdp_eval.js falls
-        // back to "first real page" or chrome://new-tab-page/ instead of the
-        // page the caller was actually driving -- silently losing navigation
-        // state the adoption path's own log line claims is preserved.
         write_target_id_sidecar(&browser_chrome_profile_dir(cwd, session_id), resolved_target_id);
     }
 
@@ -1695,10 +1573,6 @@ pub fn run(body: &str, opts: &str, cwd_raw: &Path, session_id: &str) -> Value {
         BrowserMode::Screenshot => {
             out["result"] = result_value.get("result").cloned().unwrap_or(Value::Null);
             out["debug"] = result_value.get("debug").cloned().unwrap_or_else(default_debug);
-            // cdp_eval.js always writes the key, as JSON null on success, so
-            // a bare `.get()` is Some(Null) and used to hide screenshot_path
-            // on every successful capture (witnessed: PNG on disk, no path in
-            // the envelope).
             let screenshot_error = result_value.get("screenshot_error").cloned().filter(|e| !e.is_null());
             match (&artifact_path, screenshot_error) {
                 (Some(p), None) => {

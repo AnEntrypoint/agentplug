@@ -53,16 +53,6 @@ fn is_stateless_shared_plugin(plugin_name: &str) -> bool {
     STATELESS_SHARED_PLUGIN_NAMES.contains(&plugin_name)
 }
 
-/// A sibling wasm plugin's lifecycle state (paper Section 4.3, Definition
-/// 49), the same three-state reduction `discipline_note.rs::FiberLifecycle`
-/// uses for disciplines (gm has no async load step for either -- a plugin
-/// load is one synchronous `Module::from_file` + `load_plugin` call, so
-/// there is no `Reloading` window to model). Generalizes the fiber
-/// lifecycle abstraction beyond disciplines to gm's OTHER real component
-/// family: `Inactive` (never loaded, or evicted), `Active` (a pool slot
-/// currently holds this plugin's content), `Unloading` (a load attempt
-/// failed or the plugin was evicted, one dispatch before the state
-/// collapses back to `Inactive`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PluginFiberLifecycle {
@@ -98,14 +88,6 @@ fn write_plugin_fiber_state(plugin_name: &str, state: PluginFiberLifecycle, cont
     }
 }
 
-/// Advances one plugin's persisted lifecycle by exactly one transition,
-/// given whether `load_plugin` just succeeded. Mirrors the discipline
-/// fiber's `advance_fiber`: `Inactive -> Active` on success,
-/// `Active -> Unloading` on failure (a load attempt that fails leaves the
-/// prior content in place structurally via `load_plugin`'s own LIFO
-/// revert, but the LIFECYCLE marks the attempt as a withdrawal-in-
-/// progress), `Unloading -> Inactive` on the following call regardless of
-/// outcome.
 pub fn advance_plugin_fiber(plugin_name: &str, load_succeeded: bool, content_hash: Option<&str>) {
     let current = read_plugin_fiber_state(plugin_name).state;
     let next = match (current, load_succeeded) {
@@ -180,20 +162,6 @@ fn side_plugin_pool_size() -> usize {
     *SIDE_PLUGIN_POOL_SIZE.get_or_init(|| 1)
 }
 
-/// Whether a verb's dispatch is expected to hold its pool slot for a short,
-/// bounded time or for tens of seconds to minutes. Measured on this machine
-/// against the real daemon, which is why the heavy set is a literal list and
-/// not a guess: `recall` cold start 166607ms vs 195-216ms warm, `health`
-/// 90842-193039ms reproducibly on a quiet host, a `code_index` embed batch
-/// 7124ms per batch over 500 files. A `codesearch`/`instruction`/`git_*`/
-/// `prd-*` dispatch is sub-second to a few seconds on the same host.
-///
-/// The distinction is load-bearing, not descriptive: `Heavy` dispatches are
-/// admitted at most `slots - 1` at a time, so at least one slot always stays
-/// reachable by a `Cheap` one. Without it, four concurrent heavy dispatches
-/// filled a four-slot `gm` pool and every cheap verb behind them waited on
-/// the heavy work -- live-observed as six waiters (tickets #4-#9) held
-/// 195000-460000ms against a pool whose four served tickets were all heavy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DispatchCostClass {
     Cheap,
@@ -241,15 +209,6 @@ pub fn cost_class_for_dispatch(verb: &str, body: &str) -> DispatchCostClass {
     }
 }
 
-/// A panic that unwinds through a held slot guard leaves that `Mutex`
-/// poisoned, and `try_lock` on a poisoned mutex returns `Err` FOREVER, not
-/// just while it is held. Treating that `Err` as "busy" (the previous
-/// behavior) permanently removed the slot from the pool, and once every slot
-/// had been poisoned once the FIFO head could never be served again -- an
-/// unrecoverable pool wedge produced by a single guest panic, indistinguishable
-/// from legitimate saturation. Recovering the guard restores the slot; a
-/// genuinely broken Store then fails its next dispatch and is evicted by
-/// `dispatch_and_evict_on_error` as usual.
 fn try_lock_slot_recovering_from_poison(slot: &Mutex<Option<SiblingHandle>>) -> Option<std::sync::MutexGuard<'_, Option<SiblingHandle>>> {
     match slot.try_lock() {
         Ok(guard) => Some(guard),
@@ -258,11 +217,6 @@ fn try_lock_slot_recovering_from_poison(slot: &Mutex<Option<SiblingHandle>>) -> 
     }
 }
 
-/// What one pool slot holds, as observed WITHOUT waiting for a dispatch to
-/// release it. `BusyWithDispatchInFlight` is a real third answer, not a
-/// stand-in for unknown: it says a dispatch is executing in that slot right
-/// now, which is exactly what a diagnostic reader wants to know and what a
-/// blocking read can only report by stalling until it is no longer true.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SlotContentSnapshot {
     Empty,
@@ -304,10 +258,6 @@ impl TicketQueue {
     }
 }
 
-/// Decrements the pool's heavy-dispatch admission count when the dispatch it
-/// was taken for finishes. Held alongside the slot guard for the whole
-/// dispatch, so the cap counts dispatches actually executing rather than
-/// tickets merely drawn.
 pub struct HeavyDispatchAdmission {
     pool: Option<Arc<SharedPluginPool>>,
 }
@@ -338,16 +288,8 @@ impl SharedPluginPool {
         }
     }
 
-    /// Diagnostic-only ceiling: how long a FIFO-fair wait may run before it is reported as
-    /// abnormally long. Crossing it never denies the request -- the wait keeps going. The real
-    /// backstop against a truly wedged pool is each dispatch's own outer call deadline
-    /// (`DISPATCH_CALL_DEADLINE_SECS`), which aborts the holder and frees its slot.
     pub const ACQUIRE_TIMEOUT_MS: u64 = 60_000;
 
-    /// How many slots heavy dispatches may occupy at once. One slot is always
-    /// withheld from them so a cheap verb's wait is bounded by other cheap
-    /// verbs alone. A single-slot pool (every side plugin, by default) cannot
-    /// reserve anything and is left unrestricted.
     fn heavy_admission_limit(&self) -> usize {
         self.slots.len().saturating_sub(1).max(1)
     }
@@ -390,14 +332,6 @@ impl SharedPluginPool {
         self.acquire_within_for_class(timeout_ms, DispatchCostClass::Cheap)
     }
 
-    /// FIFO-fair, non-denying slot acquisition, fair WITHIN a cost class rather than across
-    /// all callers. Every caller draws a ticket from its own class's queue and is served in
-    /// arrival order against that class alone -- so a cheap verb never queues behind a heavy
-    /// one, which combined with `admit`'s reservation of one slot is what bounds a cheap
-    /// wait by cheap work only. `timeout_ms` is retained as the elapsed-time figure reported
-    /// to the caller for observability; it no longer terminates the wait early. A genuinely
-    /// stuck holder (wasm trap, deadlock) is bounded by its own dispatch-call deadline
-    /// elsewhere, not by this wait giving up.
     pub fn acquire_within_for_class(
         &self,
         timeout_ms: u64,
@@ -468,14 +402,6 @@ impl SharedPluginPool {
         &self.slots
     }
 
-    /// Never blocks on a slot a dispatch currently holds, so a caller polling
-    /// it on a timer keeps its own cadence. `slot_content_hashes` takes each
-    /// slot's mutex, which makes the caller wait out whatever dispatch holds
-    /// it -- live-observed as the daemon's own heartbeat (a 10s ticker that
-    /// publishes these hashes) going 76 SECONDS stale while a single-slot `gm`
-    /// pool served one long verb. Every client then read `daemon-status.json`
-    /// as stale, concluded the daemon was dead, and spawned a competing one,
-    /// which is the daemon start/exit churn that follows a slow dispatch.
     pub fn slot_snapshot_without_blocking(&self) -> Vec<SlotContentSnapshot> {
         self.slots
             .iter()
@@ -630,20 +556,6 @@ pub fn shared_plugin_slot_snapshot_without_blocking(plugin_name: &str) -> Vec<Sl
         .unwrap_or_default()
 }
 
-/// The content hash currently answering dispatches for `plugin_name`,
-/// mirroring the paper's `provider_k(gamma)` (Definition 46): each shared
-/// plugin is a singleton service (bert/libsql/treesitter each have exactly
-/// one logical identity, unlike the paper's multi-provider services), so
-/// its `SharedPluginPool` -- every dispatch resolving through the pool's
-/// slots regardless of which slot happens to be free -- already IS the
-/// stable entrypoint a Cordis service broker (Section 6.2) provides: a
-/// caller never names a concrete slot, only the plugin name, and the pool
-/// decouples that name from which of its N pooled instances actually
-/// answers. Returns `None` when no slot has been filled yet (the service
-/// has no active provider). A pool with mixed content hashes across slots
-/// (a swap in progress) returns the hash the FIRST filled slot carries --
-/// callers wanting the full in-flight picture use
-/// `shared_plugin_slot_content_hashes` instead.
 pub fn get_active_provider(plugin_name: &str) -> Option<String> {
     shared_plugin_slot_content_hashes(plugin_name)
         .into_iter()
@@ -651,29 +563,6 @@ pub fn get_active_provider(plugin_name: &str) -> Option<String> {
         .next()
 }
 
-/// The real integration point for Cordis paper Section 6.2 service
-/// multiplexing: every dispatch call site (`ProjectPlugins::dispatch`,
-/// `DispatchHandle::dispatch`) routes the caller-named `plugin_name` through
-/// here before doing the `siblings` map lookup. `plugin_name` doubles as the
-/// broker's `service_key` -- a caller wanting broker semantics for a
-/// capability registers >=2 provider instances under that same key via
-/// `broker::register_provider`, each provider's `provider_id` naming a
-/// DISTINCT key already present in `self.siblings` (a separately-loaded
-/// plugin instance). `broker::route` selects one such `provider_id` per its
-/// configured policy and the returned `RouteLease` names the sibling-map key
-/// to dispatch on. Zero or one registered provider (the default, unchanged
-/// from before this function existed) returns `(plugin_name, None)` --
-/// exclusive binding (`SharedPluginPool`/`get_active_provider`, Definition
-/// 45/46) stays the default single-provider path with no behavior change.
-///
-/// The caller MUST hold the returned `RouteLease` alive for the full
-/// duration of the actual dispatch call and drop it only once that call
-/// returns. Dropping it early (e.g. right after reading `provider_id` out
-/// of it) decrements `in_flight` before the real wasm call even starts,
-/// which defeats `LeastLoaded` selection (every provider would read as
-/// idle regardless of genuine concurrent load) and lets
-/// `unregister_provider`'s in-flight safety check race a still-running
-/// dispatch into believing the provider is safe to drop mid-call.
 fn resolve_routed_plugin_name(plugin_name: &str) -> (String, Option<crate::broker::RouteLease>) {
     match crate::broker::route(plugin_name) {
         Some(lease) => {
@@ -813,12 +702,6 @@ impl ProjectPlugins {
         }).unwrap_or(false)
     }
 
-    /// Like `is_loaded`, but for non-shared (stateful, per-session) plugins a
-    /// loaded instance whose content hash no longer matches `content_hash` is
-    /// treated as not-loaded, so a rebuilt `.wasm` is picked up on the next
-    /// dispatch instead of being served stale forever. Shared plugins already
-    /// self-refresh their hash inside `load_plugin`'s pool-fill check, so this
-    /// only changes behavior for the non-shared path.
     pub fn is_loaded_current(&self, plugin_name: &str, content_hash: &str) -> bool {
         if is_stateless_shared_plugin(plugin_name) {
             return self.is_loaded(plugin_name);

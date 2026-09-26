@@ -68,19 +68,9 @@ pub fn git_subprocess_timeout_ms() -> u64 {
         .unwrap_or(GIT_SUBPROCESS_TIMEOUT_MS_DEFAULT_AMPLE_FOR_SLOW_PUSH_FETCH_OR_FIRST_CLONE)
 }
 
-// A git child on a large working tree writes far more than the ~64 KB OS pipe buffer holds.
-// If the host waits for the child before it reads the pipe, the child blocks on the full pipe,
-// never exits, and the wait runs to its whole timeout -- the git_diff hang. These caps let a
-// reader thread drain each pipe as the child writes, so the child always makes progress, while
-// the stored bytes stay bounded. The stdout cap sits well above the git_diff verb's own
-// 60000-char truncation, so a normal status/log/diff is returned in full and only a pathological
-// diff is cut short (reported through stdout_truncated).
 const HOST_GIT_STDOUT_CAP_BYTES: usize = 1_048_576;
 const HOST_GIT_STDERR_CAP_BYTES: usize = 262_144;
 
-// Read a child pipe on its own thread, stopping at `cap` bytes. On reaching the cap it sets
-// `cap_hit` so the caller can kill the child at once instead of draining a huge stream in full.
-// Returns the collected bytes and whether the cap fired.
 fn drain_reader_capped<R: std::io::Read + Send + 'static>(
     mut reader: R,
     cap: usize,
@@ -141,18 +131,6 @@ fn user_gm_root() -> Option<PathBuf> {
     normalize_lexically(&std::path::Path::new(home).join(".gm"))
 }
 
-/// Process-wide per-path locks for host_fs_write. The shared plugin pool
-/// dispatches guest writes from multiple wasmtime Store instances on
-/// separate OS threads with no serialization of their own (see
-/// registry.rs's SHARED_PLUGINS pool, keyed by plugin name across every
-/// project the daemon serves, not by file path) -- a plain fs::write here
-/// raced two concurrent guest writers to the same path (e.g. two
-/// back-to-back prd-add dispatches performing a read-modify-write cycle
-/// against .gm/prd.yml) into a lost update, even though the guest side
-/// (orchestrator/cas.rs's cas_retry_write) already does an optimistic
-/// recheck/confirm around its own read-modify-write. This lock closes the
-/// gap the guest-side optimistic check cannot see: true interleaving of
-/// two independent fs::write calls at the host layer.
 static FS_WRITE_LOCKS: OnceLock<Mutex<HashMap<PathBuf, std::sync::Arc<Mutex<()>>>>> = OnceLock::new();
 
 fn fs_write_lock_for(path: &Path) -> std::sync::Arc<Mutex<()>> {
@@ -162,12 +140,6 @@ fn fs_write_lock_for(path: &Path) -> std::sync::Arc<Mutex<()>> {
     guard.entry(key).or_insert_with(|| std::sync::Arc::new(Mutex::new(()))).clone()
 }
 
-/// Serializes writers to the same path, then writes via temp-file + rename
-/// so a reader can never observe a torn/partial write either (matching the
-/// atomic_write pattern already used for .gm/memories/*.md in
-/// crates/plugkit-core/src/memory_md.rs's rename_batch, ported to the host
-/// side where the real fs::write call lives for the guest's host_fs_write
-/// import).
 fn atomic_write_locked(full: &Path, data: &str) -> std::io::Result<()> {
     let lock = fs_write_lock_for(full);
     let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -190,21 +162,6 @@ fn atomic_write_under_held_lock(full: &Path, data: &str) -> std::io::Result<()> 
     }
 }
 
-/// Compare-and-swap write: read-compare-write as ONE critical section under
-/// the same per-path lock atomic_write_locked uses. atomic_write_locked
-/// alone only serializes the write half of a read-modify-write cycle --
-/// two guest callers can each read the same "before" content (via a
-/// separate, unlocked host_fs_read call), independently compute a new
-/// document, and then both call host_fs_write: the lock stops their writes
-/// from interleaving/tearing, but NOT from one silently clobbering the
-/// other's already-landed change, since neither write re-validates the
-/// content it was based on is still current. The guest's own optimistic
-/// recheck/confirm (orchestrator/cas.rs) can't close this gap either,
-/// because its recheck read and its write are two independent host calls
-/// with no shared lock scope. This function closes it by doing the
-/// "is `expected` still current" check and the write inside one lock hold.
-/// Returns Ok(true) on a successful swap, Ok(false) on a CAS mismatch (the
-/// guest should re-read and retry), Err on a real I/O failure.
 fn atomic_cas_write_locked(full: &Path, expected: &str, data: &str) -> std::io::Result<bool> {
     let lock = fs_write_lock_for(full);
     let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -216,13 +173,6 @@ fn atomic_cas_write_locked(full: &Path, expected: &str, data: &str) -> std::io::
     Ok(true)
 }
 
-/// A directory is only grantable via `host_fs_allow_root` when it carries a
-/// recognizable project marker -- a bare existence check would let a guest
-/// name any real directory on the machine (a home folder, `.ssh`, anything),
-/// which is a materially larger capability grant than "reach another real
-/// project" actually requires. `.git`/`.gm` cover the two markers every gm
-/// project and every plain git repo already has; a manifest file covers a
-/// project this host has never run gm against but is still a real codebase.
 fn has_project_marker(dir: &std::path::Path) -> bool {
     const MARKERS: &[&str] = &[
         ".git", ".gm", "package.json", "Cargo.toml", "go.mod", "pyproject.toml",
@@ -230,11 +180,6 @@ fn has_project_marker(dir: &std::path::Path) -> bool {
     MARKERS.iter().any(|m| dir.join(m).exists())
 }
 
-/// Resolves a guest-supplied path to a real host path if it falls under
-/// `cwd`, `~/.gm`, or a caller-supplied set of additional roots the guest
-/// has explicitly named this session (see `HostState::allow_extra_root`) --
-/// a project only becomes reachable when a real dispatch names it as a
-/// target, never a standing blanket grant.
 fn sandboxed_guest_path_with_extra_roots(cwd: &std::path::Path, path: &str, extra_roots: &[PathBuf]) -> Option<PathBuf> {
     let requested = std::path::Path::new(path);
     let joined = if requested.is_absolute() || requested.has_root() {
@@ -321,19 +266,6 @@ fn write_guest_bytes(caller: &mut Caller<'_, HostState>, bytes: &[u8]) -> u64 {
         .get_typed_func::<u32, u32>(&mut *caller, "plugkit_alloc")
         .expect("plugkit_alloc export missing on wasm module");
     const RESPONSE_HANDOFF_GRACE_SECS: u64 = 5;
-    // The dispatch's own real deadline (default or caller-supplied override,
-    // set once in dispatch_on) -- captured before narrowing to the short
-    // handoff grace window below, so it can be restored afterward rather than
-    // left at 5s for the remainder of the guest's execution. A dispatch that
-    // makes several sequential host calls (memorize-fire's embed, then its
-    // dedup-check read, then its md/vector writes) crosses this handoff many
-    // times per call; leaving the deadline at RESPONSE_HANDOFF_GRACE_SECS
-    // after the first one silently shrank every caller-supplied deadline
-    // override (deadline_secs:180, :700, whatever) down to a de facto 5s
-    // budget for everything after the first host response -- the actual
-    // cause of memorize-fire's persistent plugin_call_deadline_exceeded
-    // failures under real embed latency, previously misread as bert-pool
-    // contention or a stuck holder.
     let real_deadline_secs = caller.data().call_deadline_secs();
     caller.as_context_mut().set_epoch_deadline(crate::registry::epoch_ticks_for_seconds(RESPONSE_HANDOFF_GRACE_SECS));
     match alloc.call(&mut *caller, bytes.len() as u32) {
@@ -846,7 +778,6 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
                 None => Err(anyhow::anyhow!("plugin_not_loaded_yet")),
                 Some(handle) => crate::registry::dispatch_on(&mut handle.store, handle.instance, &verb, &body, &caller_root, caller_siblings.clone()),
             };
-            // Complete any version swap that deferred behind this call.
             sibling_pool.evict_if_swap_pending(&mut guard);
             drop(guard);
 
@@ -881,14 +812,6 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
             let sibling_pool = { caller_siblings.lock().unwrap_or_else(|e| e.into_inner()).get("bert").cloned() };
             let caller_root = caller.data().cwd();
             let Some(sibling_pool) = sibling_pool else {
-                // Previously a bare `return -1` with nothing logged anywhere, which
-                // made it the one failure mode of this import that left no trace at
-                // all: the guest only sees rc != EMBED_DIM and a slim gm build then
-                // reports "host_vec_embed must be implemented by the host", blaming
-                // the host's candle path rather than a missing sibling registration.
-                // The live case is a standalone spool watcher that loaded only `gm`
-                // into its project: every embedding-dependent verb hard-fails for as
-                // long as it serves that project.
                 let registered: Vec<String> = caller_siblings.lock().unwrap_or_else(|e| e.into_inner()).keys().cloned().collect();
                 eprintln!(
                     "[agentplug:host_vec_embed] no `bert` sibling registered for {} (caller plugin {caller_plugin}); this process has {registered:?} loaded -- the embedder is unreachable, so every embedding-dependent verb will fail until bert is loaded into the SAME siblings map as the caller",
@@ -912,7 +835,6 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
                 if result.is_err() {
                     *guard = None;
                 } else {
-                    // Complete any version swap that deferred behind this call.
                     sibling_pool.evict_if_swap_pending(&mut guard);
                 }
                 drop(guard);
@@ -1020,9 +942,6 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
                             "exit_code": -1,
                         })
                     } else {
-                        // A cap-stopped read is a deliberate, successful truncation, not a failure:
-                        // report exit 0 so a verb that errors on a nonzero code (git_diff) still gets
-                        // its (truncated) output rather than an error.
                         serde_json::json!({
                             "stdout": String::from_utf8_lossy(&stdout),
                             "stderr": String::from_utf8_lossy(&stderr),
