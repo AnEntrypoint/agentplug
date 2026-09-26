@@ -152,9 +152,9 @@ fn free_port() -> u16 {
 
 pub(crate) fn free_port_probe() -> u16 { free_port() }
 
-fn cdp_ready(port: u16, deadline: Instant, cfg: &BrowserConfig) -> bool {
+fn cdp_endpoint_ready(endpoint: &str, deadline: Instant, cfg: &BrowserConfig) -> bool {
     while Instant::now() < deadline {
-        let url = format!("http://127.0.0.1:{port}/json/version");
+        let url = format!("{}/json/version", endpoint.trim_end_matches('/'));
         if let Ok(resp) = ureq::get(&url).timeout(cfg.cdp_poll_timeout()).call() {
             if let Ok(body) = resp.into_string() {
                 if body.contains("webSocketDebuggerUrl") {
@@ -167,8 +167,16 @@ fn cdp_ready(port: u16, deadline: Instant, cfg: &BrowserConfig) -> bool {
     false
 }
 
+fn cdp_ready(port: u16, deadline: Instant, cfg: &BrowserConfig) -> bool {
+    cdp_endpoint_ready(&format!("http://127.0.0.1:{port}"), deadline, cfg)
+}
+
 pub(crate) fn cdp_ready_probe(port: u16, deadline: Instant, cfg: &BrowserRuntimeConfig) -> bool {
     cdp_ready(port, deadline, cfg)
+}
+
+pub(crate) fn cdp_endpoint_ready_probe(endpoint: &str, deadline: Instant, cfg: &BrowserRuntimeConfig) -> bool {
+    cdp_endpoint_ready(endpoint, deadline, cfg)
 }
 
 fn strip_url_prefix(body: &str) -> (Option<String>, String, &str) {
@@ -284,6 +292,7 @@ struct BrowserSession {
     child: Option<Child>,
     pid: u32,
     port: u16,
+    cdp_endpoint: String,
     last_used: Instant,
     target_id: Option<String>,
     owns_process: bool,
@@ -309,7 +318,7 @@ fn session_lifecycle_lock_for_key(key: &str) -> Arc<Mutex<()>> {
 
 fn session_is_alive(session: &mut BrowserSession) -> bool {
     if !session.owns_process {
-        return session_cdp_endpoint_responds(session.port);
+        return session_cdp_endpoint_responds(&session.cdp_endpoint);
     }
     match session.child.as_mut() {
         Some(child) => matches!(child.try_wait(), Ok(None)),
@@ -317,8 +326,8 @@ fn session_is_alive(session: &mut BrowserSession) -> bool {
     }
 }
 
-fn session_cdp_endpoint_responds(port: u16) -> bool {
-    let url = format!("http://127.0.0.1:{port}/json/version");
+fn session_cdp_endpoint_responds(endpoint: &str) -> bool {
+    let url = format!("{}/json/version", endpoint.trim_end_matches('/'));
     match ureq::get(&url).timeout(std::time::Duration::from_millis(1500)).call() {
         Ok(resp) => resp.into_string().map(|b| b.contains("webSocketDebuggerUrl")).unwrap_or(false),
         Err(_) => false,
@@ -400,7 +409,7 @@ fn try_adopt_orphaned_session(cwd: &Path, session_id_hint: Option<&str>, profile
         })?;
     let pid: u32 = std::fs::read_to_string(pid_sidecar_path(profile_dir)).ok()?.trim().parse().ok()?;
     let port: u16 = std::fs::read_to_string(port_sidecar_path(profile_dir)).ok()?.trim().parse().ok()?;
-    if !pid_is_alive(pid) || !session_cdp_endpoint_responds(port) {
+    if !pid_is_alive(pid) || !session_cdp_endpoint_responds(&format!("http://127.0.0.1:{port}")) {
         return None;
     }
     let target_id = std::fs::read_to_string(target_id_sidecar_path(profile_dir))
@@ -429,6 +438,7 @@ fn try_adopt_orphaned_session(cwd: &Path, session_id_hint: Option<&str>, profile
                 child: None,
                 pid,
                 port,
+                cdp_endpoint: format!("http://127.0.0.1:{port}"),
                 last_used: Instant::now(),
                 target_id,
                 owns_process: true,
@@ -564,7 +574,7 @@ fn browser_profiles_root_for_orphan_scan(cwd: &Path) -> PathBuf {
     cwd.join(".gm")
 }
 
-fn session_liveness_recheck(port: u16, browser_cfg: &BrowserConfig) -> bool {
+fn session_liveness_recheck(port: u16, cdp_endpoint: &str, browser_cfg: &BrowserConfig) -> bool {
     let Some(node) = which("node") else { return false };
     let tmp = std::env::temp_dir();
     let stamp = format!("{}-livecheck-{}", std::process::id(), unix_ms());
@@ -581,6 +591,7 @@ fn session_liveness_recheck(port: u16, browser_cfg: &BrowserConfig) -> bool {
     let recheck_timeout_ms: u64 = 15000;
     let cfg = json!({
         "port": port,
+        "cdpEndpoint": cdp_endpoint,
         "startUrl": Value::Null,
         "scriptFile": script_path.to_string_lossy(),
         "resultFile": result_path.to_string_lossy(),
@@ -925,9 +936,10 @@ fn session_new(cwd: &Path, session_id: &str, owner_gm_session: Option<&str>, cfg
                     cwd: cwd.to_path_buf(),
                     session_id: session_id.to_string(),
                     owner_gm_session: owner_gm_session.map(str::to_string),
-                    child: acquired.child,
-                    pid,
-                    port,
+                child: acquired.child,
+                pid,
+                port,
+                cdp_endpoint: acquired.cdp_endpoint,
                     last_used: Instant::now(),
                     target_id: None,
                     owns_process: acquired.owns_process,
@@ -1194,6 +1206,7 @@ pub fn run(body: &str, opts: &str, cwd_raw: &Path, session_id: &str) -> Value {
     let timeout_ms = opts_v.get("timeoutMs").and_then(|v| v.as_u64()).unwrap_or(120_000);
     let requested_engine = crate::browser_engine::requested_engine_from_envelope(&opts_v);
     let engine = crate::browser_engine::select_engine(cwd, requested_engine.as_deref());
+    let requested_cdp_endpoint = crate::browser_engine::chrome_cdp_endpoint_override(cwd);
 
     let (explicit_session_id, after_session_prefix) = strip_session_id_prefix(&inner_body);
     let inner_body = after_session_prefix;
@@ -1333,9 +1346,11 @@ pub fn run(body: &str, opts: &str, cwd_raw: &Path, session_id: &str) -> Value {
     let _lifecycle_guard_serializes_reuse_check_launch_and_insert = lifecycle_lock.lock().unwrap_or_else(|e| e.into_inner());
     let engine_mismatch = {
         let map = sessions_map().lock().unwrap_or_else(|e| e.into_inner());
-        map.get(&key).map(|s| s.engine).filter(|&e| e != engine)
+        map.get(&key).map(|s| (s.engine, s.cdp_endpoint.clone())).filter(|(prior_engine, prior_endpoint)| {
+            *prior_engine != engine || requested_cdp_endpoint.as_deref().is_some_and(|endpoint| endpoint != prior_endpoint)
+        })
     };
-    if let Some(prior_engine) = engine_mismatch {
+    if let Some((prior_engine, _)) = engine_mismatch {
         let stale = sessions_map().lock().unwrap_or_else(|e| e.into_inner()).remove(&key);
         if let Some(session) = stale {
             eprintln!(
@@ -1359,7 +1374,10 @@ pub fn run(body: &str, opts: &str, cwd_raw: &Path, session_id: &str) -> Value {
         reuse_port
     };
     let mut known_target_id: Option<String> = None;
-    let port = match candidate_port.filter(|&p| session_cdp_endpoint_responds(p)) {
+    let port = match candidate_port.filter(|_| {
+        let map = sessions_map().lock().unwrap_or_else(|e| e.into_inner());
+        map.get(&key).is_some_and(|session| session_cdp_endpoint_responds(&session.cdp_endpoint))
+    }) {
         Some(p) => {
             let mut map = sessions_map().lock().unwrap_or_else(|e| e.into_inner());
             if let Some(s) = map.get_mut(&key) {
@@ -1421,6 +1439,7 @@ pub fn run(body: &str, opts: &str, cwd_raw: &Path, session_id: &str) -> Value {
                             child: acquired.child,
                             pid,
                             port: new_port,
+                            cdp_endpoint: acquired.cdp_endpoint,
                             last_used: Instant::now(),
                             target_id: None,
                             owns_process: acquired.owns_process,
@@ -1437,6 +1456,7 @@ pub fn run(body: &str, opts: &str, cwd_raw: &Path, session_id: &str) -> Value {
 
     let cfg = json!({
         "port": port,
+        "cdpEndpoint": sessions_map().lock().unwrap_or_else(|e| e.into_inner()).get(&key).map(|session| session.cdp_endpoint.clone()).unwrap_or_else(|| format!("http://127.0.0.1:{port}")),
         "startUrl": start_url,
         "targetId": known_target_id,
         "claimFreshTarget": engine == crate::browser_engine::Engine::Steel,
@@ -1488,7 +1508,11 @@ pub fn run(body: &str, opts: &str, cwd_raw: &Path, session_id: &str) -> Value {
         Err(_) => false,
     };
 
-    if timed_out && !session_liveness_recheck(port, &browser_cfg) {
+    let cdp_endpoint = sessions_map().lock().unwrap_or_else(|e| e.into_inner())
+        .get(&key)
+        .map(|session| session.cdp_endpoint.clone())
+        .unwrap_or_else(|| format!("http://127.0.0.1:{port}"));
+    if timed_out && !session_liveness_recheck(port, &cdp_endpoint, &browser_cfg) {
         eprintln!(
             "[agentplug browser] eval timeout AND page unresponsive to a follow-up probe -- session '{}' (port {}) is wedged, killing and evicting so the next dispatch gets a fresh Chrome",
             session_id, port

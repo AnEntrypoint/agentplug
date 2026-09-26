@@ -9,6 +9,7 @@ use crate::browser::{cdp_ready_probe, free_port_probe, BrowserRuntimeConfig};
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Engine {
     Chrome,
+    RemoteChrome,
     Lightpanda,
     Steel,
 }
@@ -17,6 +18,7 @@ pub struct AcquiredEngine {
     pub child: Option<Child>,
     pub port: u16,
     pub owns_process: bool,
+    pub cdp_endpoint: String,
 }
 
 #[derive(serde::Deserialize, Default)]
@@ -27,6 +29,8 @@ struct BrowserEngineFileConfig {
     lightpanda_path: Option<String>,
     #[serde(default)]
     steel_endpoint: Option<String>,
+    #[serde(default)]
+    chrome_cdp_endpoint: Option<String>,
 }
 
 fn load_engine_file_config(cwd: &Path) -> BrowserEngineFileConfig {
@@ -42,6 +46,14 @@ pub(crate) fn steel_endpoint_override(cwd: &Path) -> Option<String> {
         return Some(v);
     }
     load_engine_file_config(cwd).steel_endpoint.filter(|s| !s.trim().is_empty())
+}
+
+pub(crate) fn chrome_cdp_endpoint_override(cwd: &Path) -> Option<String> {
+    std::env::var("GM_CHROME_CDP_ENDPOINT")
+        .ok()
+        .or_else(|| load_engine_file_config(cwd).chrome_cdp_endpoint)
+        .map(|endpoint| endpoint.trim().trim_end_matches('/').to_string())
+        .filter(|endpoint| !endpoint.is_empty())
 }
 
 fn lightpanda_path_override(cwd: &Path) -> Option<PathBuf> {
@@ -86,6 +98,9 @@ fn find_lightpanda(cwd: &Path) -> Option<PathBuf> {
 }
 
 pub fn select_engine(cwd: &Path, requested: Option<&str>) -> Engine {
+    if chrome_cdp_endpoint_override(cwd).is_some() {
+        return Engine::RemoteChrome;
+    }
     if steel_endpoint_override(cwd).is_some() {
         return Engine::Steel;
     }
@@ -171,7 +186,7 @@ fn launch_lightpanda(cwd: &Path, session_id: &str, browser_cfg: &BrowserRuntimeC
     Ok((child, port))
 }
 
-fn parse_steel_port(endpoint: &str) -> Result<u16, String> {
+fn parse_cdp_endpoint_port(endpoint: &str, name: &str) -> Result<u16, String> {
     let trimmed = endpoint.trim();
     let without_scheme = trimmed
         .strip_prefix("http://")
@@ -180,15 +195,15 @@ fn parse_steel_port(endpoint: &str) -> Result<u16, String> {
         .or_else(|| trimmed.strip_prefix("wss://"))
         .unwrap_or(trimmed);
     let host_port = without_scheme.split('/').next().unwrap_or(without_scheme);
-    let port_str = host_port.rsplit(':').next().ok_or_else(|| format!("steel_endpoint '{endpoint}' has no port"))?;
+    let port_str = host_port.rsplit(':').next().ok_or_else(|| format!("{name} '{endpoint}' has no port"))?;
     port_str
         .parse::<u16>()
-        .map_err(|_| format!("steel_endpoint '{endpoint}' does not end in a valid port number (expected host:port, e.g. 127.0.0.1:9223)"))
+        .map_err(|_| format!("{name} '{endpoint}' does not end in a valid port number (expected host:port, e.g. 127.0.0.1:9223)"))
 }
 
 fn dial_steel(cwd: &Path, browser_cfg: &BrowserRuntimeConfig) -> Result<u16, String> {
     let endpoint = steel_endpoint_override(cwd).ok_or_else(|| "steel-browser not configured".to_string())?;
-    let port = parse_steel_port(&endpoint)?;
+    let port = parse_cdp_endpoint_port(&endpoint, "steel_endpoint")?;
     if !cdp_ready_probe(port, Instant::now() + browser_cfg.chrome_ready_deadline(), browser_cfg) {
         return Err(format!(
             "configured steel-browser endpoint '{endpoint}' (CDP port {port}) did not respond within {}ms -- \
@@ -200,19 +215,36 @@ fn dial_steel(cwd: &Path, browser_cfg: &BrowserRuntimeConfig) -> Result<u16, Str
     Ok(port)
 }
 
+fn dial_remote_chrome(cwd: &Path, browser_cfg: &BrowserRuntimeConfig) -> Result<(String, u16), String> {
+    let endpoint = chrome_cdp_endpoint_override(cwd).ok_or_else(|| "Chrome CDP endpoint not configured".to_string())?;
+    let port = parse_cdp_endpoint_port(&endpoint, "GM_CHROME_CDP_ENDPOINT/chrome_cdp_endpoint")?;
+    if !crate::browser::cdp_endpoint_ready_probe(&endpoint, Instant::now() + browser_cfg.chrome_ready_deadline(), browser_cfg) {
+        return Err(format!(
+            "configured Chrome CDP endpoint '{endpoint}' did not respond within {}ms -- start Chrome with --remote-debugging-port={port}, or set GM_CHROME_CDP_ENDPOINT / .gm/browser-config.json's chrome_cdp_endpoint to a live endpoint",
+            browser_cfg.chrome_ready_deadline().as_millis()
+        ));
+    }
+    Ok((endpoint, port))
+}
+
 pub fn acquire(engine: Engine, cwd: &Path, session_id: &str, browser_cfg: &BrowserRuntimeConfig) -> Result<AcquiredEngine, String> {
     match engine {
         Engine::Chrome => {
             let (child, port) = crate::browser::launch_chrome_pub(cwd, session_id, browser_cfg)?;
-            Ok(AcquiredEngine { child: Some(child), port, owns_process: true })
+            Ok(AcquiredEngine { child: Some(child), port, owns_process: true, cdp_endpoint: format!("http://127.0.0.1:{port}") })
+        }
+        Engine::RemoteChrome => {
+            let (cdp_endpoint, port) = dial_remote_chrome(cwd, browser_cfg)?;
+            Ok(AcquiredEngine { child: None, port, owns_process: false, cdp_endpoint })
         }
         Engine::Lightpanda => {
             let (child, port) = launch_lightpanda(cwd, session_id, browser_cfg)?;
-            Ok(AcquiredEngine { child: Some(child), port, owns_process: true })
+            Ok(AcquiredEngine { child: Some(child), port, owns_process: true, cdp_endpoint: format!("http://127.0.0.1:{port}") })
         }
         Engine::Steel => {
             let port = dial_steel(cwd, browser_cfg)?;
-            Ok(AcquiredEngine { child: None, port, owns_process: false })
+            let cdp_endpoint = steel_endpoint_override(cwd).unwrap_or_else(|| format!("http://127.0.0.1:{port}"));
+            Ok(AcquiredEngine { child: None, port, owns_process: false, cdp_endpoint })
         }
     }
 }
