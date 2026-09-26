@@ -82,7 +82,7 @@ pub fn run(code: &str, opts: &Value, cwd: &Path) -> Value {
             "in_progress": true,
             "task_id": task_id,
             "elapsed_ms": t0.elapsed().as_millis() as u64,
-            "decision_required": "this call hit its timeoutMs still running -- it was NOT killed, it is alive in the background task registry as task_id. Decide: `task-output {id}` to keep it running and poll progress/result later (the queue is already free, this worker returned immediately), or `task-stop {id}` to kill it now. It does not run forever unattended -- dispatch one of those two, do not leave it un-decided.",
+            "decision_required": "this call hit its timeoutMs still running -- it was NOT killed, it is alive in the background task registry as task_id. Dispatch the GM `task-output` verb with JSON body `{\"id\":\"<task_id>\"}` to poll its progress or final result, or dispatch the GM `task-stop` verb with the same JSON body to kill it now. These are GM verbs, not shell commands. Do not leave the task unattended.",
         });
     }
 
