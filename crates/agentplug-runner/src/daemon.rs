@@ -29,7 +29,7 @@ const GM_SPOOL_VERBS: &[&str] = &[
     "tencentdb-compat-probe", "tencentdb-memory-import", "python", "bash", "powershell",
     "ssh", "go", "rust", "c", "cpp", "java", "deno", "status", "wait", "close",
     "filter", "git_status", "branch_status", "git_push", "git_add", "git_commit",
-    "git_finalize", "git_log", "git_diff", "git_show", "git_fetch", "git_pull",
+    "git_finalize", "git_log", "git_diff", "git_show", "git_fetch", "git_clone", "git_pull",
     "ci-status", "git_branch", "git_checkout", "git_merge", "git_merge_abort",
     "git_branch_delete", "git_rm", "git_revert", "git_reset", "git_poll", "forget",
     "discipline",
@@ -610,6 +610,14 @@ fn instruction_source_cache_dir(root: &Path) -> PathBuf {
     root.join(".gm").join("instructions-source-cache")
 }
 
+fn spawn_pipe_drain_thread<R: std::io::Read + Send + 'static>(mut pipe: R) -> std::thread::JoinHandle<Vec<u8>> {
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = pipe.read_to_end(&mut bytes);
+        bytes
+    })
+}
+
 fn run_git_bounded(args: &[&str]) -> anyhow::Result<std::process::Output> {
     use wait_timeout::ChildExt;
     let mut cmd = std::process::Command::new("git");
@@ -621,23 +629,12 @@ fn run_git_bounded(args: &[&str]) -> anyhow::Result<std::process::Output> {
     }
     let mut child = cmd.spawn()?;
     let timeout_ms = agentplug_host::git_subprocess_timeout_ms();
-    // Drain both pipes on their own threads before waiting, so a child whose output exceeds the
-    // ~64 KB OS pipe buffer cannot deadlock (it keeps writing while we read); wait_timeout still
-    // bounds a genuinely stuck network op.
-    let out_reader = child.stdout.take().map(|mut o| std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = std::io::Read::read_to_end(&mut o, &mut buf);
-        buf
-    }));
-    let err_reader = child.stderr.take().map(|mut e| std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = std::io::Read::read_to_end(&mut e, &mut buf);
-        buf
-    }));
+    let stdout_drain_thread = child.stdout.take().map(spawn_pipe_drain_thread);
+    let stderr_drain_thread = child.stderr.take().map(spawn_pipe_drain_thread);
     match child.wait_timeout(Duration::from_millis(timeout_ms))? {
         Some(status) => {
-            let stdout = out_reader.and_then(|h| h.join().ok()).unwrap_or_default();
-            let stderr = err_reader.and_then(|h| h.join().ok()).unwrap_or_default();
+            let stdout = stdout_drain_thread.and_then(|h| h.join().ok()).unwrap_or_default();
+            let stderr = stderr_drain_thread.and_then(|h| h.join().ok()).unwrap_or_default();
             Ok(std::process::Output { status, stdout, stderr })
         }
         None => {
