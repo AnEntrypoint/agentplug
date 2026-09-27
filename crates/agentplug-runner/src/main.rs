@@ -117,9 +117,6 @@ fn main() -> anyhow::Result<()> {
                 return Ok(());
             }
 
-            eprintln!("[agentplug] shared daemon not yet visible, attempting to become it before falling back");
-            daemon::run_daemon()?;
-
             if daemon::ensure_daemon_running()? {
                 eprintln!(
                     "[agentplug] registered {} with the shared system-wide daemon (converged after retry) -- no dedicated per-project process spawned",
@@ -128,32 +125,11 @@ fn main() -> anyhow::Result<()> {
                 return Ok(());
             }
 
-            if let Some(owner_pid) = daemon::live_foreign_daemon_owner_pid() {
-                eprintln!(
-                    "[agentplug] daemon pid {owner_pid} is alive and owns the shared lock -- {} stays registered with it, no standalone watcher started (a second sweeper on one spool double-claims its requests)",
-                    cwd.display()
-                );
-                return Ok(());
-            }
-
-            if let Some(sweeper_pid) = daemon::live_foreign_spool_sweeper(&spool_dir) {
-                eprintln!(
-                    "[agentplug] pid {sweeper_pid} is already sweeping {} with a live heartbeat -- {} stays registered with it, no second standalone watcher started (two sweepers on one spool orphan each other's in-flight claims)",
-                    spool_dir.display(),
-                    cwd.display()
-                );
-                return Ok(());
-            }
-
-            eprintln!("[agentplug] shared daemon still unavailable after retry -- falling back to a standalone watcher for this project");
-            let wasm = download::ensure_plugin_installed("gm", None)?;
-            let content_hash = download::sha256_hex(&std::fs::read(&wasm)?);
-            let engine = build_engine()?;
-            let module = Module::from_file(&engine, &wasm)?;
-            let mut project = ProjectPlugins::new(cwd);
-            project.load_plugin(&engine, "gm", &module, &content_hash)?;
-            let _ = reconcile_plugin_manifest(&mut project, &engine, &[("libsql", None), ("bert", None), ("treesitter", None)]);
-            run_spool_watcher_single_process(&mut project, &spool_dir)
+            eprintln!(
+                "[agentplug] registered {} but the shared daemon has not published a fresh heartbeat yet; it will be retried by the next spool or dispatch command",
+                cwd.display()
+            );
+            Ok(())
         }
         "daemon" => daemon::run_daemon(),
         "sweep-spool" => {
