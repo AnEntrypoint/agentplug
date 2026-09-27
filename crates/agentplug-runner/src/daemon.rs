@@ -528,8 +528,13 @@ fn pid_is_alive(pid: u64) -> bool {
 
 #[cfg(not(windows))]
 fn pid_is_alive(pid: u64) -> bool {
-    std::process::Command::new("kill")
+    let mut command = std::process::Command::new("kill");
+    command
         .args(["-0", &pid.to_string()])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    command
         .status()
         .map(|s| s.success())
         .unwrap_or(true)
@@ -1135,11 +1140,12 @@ fn spool_has_queued_work(spool_dir: &Path) -> bool {
         if !verb_entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
             continue;
         }
+        let verb = verb_entry.file_name().to_string_lossy().into_owned();
         let Ok(files) = fs::read_dir(verb_entry.path()) else { continue };
         for file_entry in files.flatten() {
             let name = file_entry.file_name();
             let name = name.to_string_lossy();
-            if name.ends_with(".inflight") || name.ends_with(".txt") {
+            if name.ends_with(".inflight") || is_spool_request_path(&verb, &file_entry.path()) {
                 return true;
             }
         }
@@ -1156,11 +1162,12 @@ fn spool_step_counts(spool_dir: &Path) -> (usize, usize) {
         if !verb_entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
             continue;
         }
+        let verb = verb_entry.file_name().to_string_lossy().into_owned();
         let Ok(files) = fs::read_dir(verb_entry.path()) else { continue };
         for file_entry in files.flatten() {
             let name = file_entry.file_name();
             let name = name.to_string_lossy();
-            if name.ends_with(".txt") {
+            if is_spool_request_path(&verb, &file_entry.path()) {
                 queued += 1;
             } else if name.ends_with(".inflight") {
                 claimed += 1;
@@ -1603,17 +1610,46 @@ pub fn live_foreign_spool_sweeper(spool_dir: &Path) -> Option<u64> {
     Some(pid)
 }
 
-fn spool_in_file_write_has_settled(txt_path: &Path) -> bool {
-    let Ok(metadata) = fs::metadata(txt_path) else { return false };
+fn spool_in_file_write_has_settled(request_path: &Path) -> bool {
+    let Ok(metadata) = fs::metadata(request_path) else { return false };
     metadata.len() > 0
 }
 
-pub fn claim_spool_request_in_place(txt_path: &Path) -> Option<PathBuf> {
-    if !spool_in_file_write_has_settled(txt_path) {
+fn language_spool_extension(verb: &str) -> Option<&'static str> {
+    match verb {
+        "nodejs" => Some("js"),
+        "python" => Some("py"),
+        "bash" => Some("sh"),
+        "powershell" => Some("ps1"),
+        "typescript" | "deno" => Some("ts"),
+        "go" => Some("go"),
+        "rust" => Some("rs"),
+        "c" => Some("c"),
+        "cpp" => Some("cpp"),
+        "java" => Some("java"),
+        _ => None,
+    }
+}
+
+fn spool_request_extension(verb: &str) -> &'static str {
+    language_spool_extension(verb).unwrap_or("txt")
+}
+
+fn is_spool_request_path(verb: &str, request_path: &Path) -> bool {
+    request_path.extension().and_then(|extension| extension.to_str()) == Some(spool_request_extension(verb))
+}
+
+fn spool_claim_path(request_path: &Path) -> Option<PathBuf> {
+    let extension = request_path.extension()?.to_str()?;
+    Some(request_path.with_extension(format!("{extension}.{ORPHAN_CLAIM_EXT}")))
+}
+
+pub fn claim_spool_request_in_place(request_path: &Path) -> Option<PathBuf> {
+    if !spool_in_file_write_has_settled(request_path) {
         return None;
     }
-    let claim_path = txt_path.with_extension(format!("txt.{ORPHAN_CLAIM_EXT}"));
-    fs::rename(txt_path, &claim_path).ok().map(|_| claim_path)
+    let claim_path = spool_claim_path(request_path)?;
+    fs::rename(request_path, &claim_path).ok().map(|_| claim_path)
 }
 
 pub fn write_spool_out_confirmed(out_dir: &Path, out_name: &str, out_body: &str) -> bool {
@@ -1638,11 +1674,11 @@ fn write_spool_out_and_release_claim(out_dir: &Path, in_dir: &Path, verb: &str, 
 const ORPHAN_CLAIM_EXT: &str = "inflight";
 
 fn inflight_claim_path(in_dir: &Path, verb: &str, task: &str) -> PathBuf {
-    in_dir.join(verb).join(format!("{task}.txt.{ORPHAN_CLAIM_EXT}"))
+    in_dir.join(verb).join(format!("{task}.{}.{ORPHAN_CLAIM_EXT}", spool_request_extension(verb)))
 }
 
 fn queued_request_path(in_dir: &Path, verb: &str, task: &str) -> PathBuf {
-    in_dir.join(verb).join(format!("{task}.txt"))
+    in_dir.join(verb).join(format!("{task}.{}", spool_request_extension(verb)))
 }
 
 fn project_in_dir(root: &Path) -> PathBuf {
@@ -1845,7 +1881,7 @@ pub fn sweep_unconsumable_spool_files(root: &Path) {
                 continue;
             }
             let ext = path.extension().and_then(|e| e.to_str());
-            if ext == Some("txt") || ext == Some(ORPHAN_CLAIM_EXT) {
+            if is_spool_request_path(&verb, &path) || ext == Some(ORPHAN_CLAIM_EXT) {
                 continue;
             }
             let file_name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
@@ -1856,7 +1892,7 @@ pub fn sweep_unconsumable_spool_files(root: &Path) {
             let dest = quarantine_dir.join(format!("{verb}__{file_name}"));
             if fs::rename(&path, &dest).is_ok() {
                 eprintln!(
-                    "[agentplug daemon] quarantined unconsumable spool file in/{verb}/{file_name} to {} -- the spool ABI is in/<verb>/<numeric-id>.txt, so a non-conforming name is never claimed by the dispatch loop and would otherwise sit invisibly forever",
+                    "[agentplug daemon] quarantined unconsumable spool file in/{verb}/{file_name} to {} -- the spool ABI is in/<verb>/<session-id>-<local-counter>.<ext>, so a non-conforming name is never claimed by the dispatch loop and would otherwise sit invisibly forever",
                     dest.display()
                 );
             }
@@ -1945,15 +1981,21 @@ pub(crate) fn run_gm_dispatch_to_file(root: &Path, handle: &DispatchHandle, verb
     in_flight_map().lock().unwrap_or_else(|e| e.into_inner()).remove(&key);
 }
 
-fn dir_has_any_verb_subdir_with_claimable_txt(base: &Path) -> bool {
+fn dir_has_any_verb_subdir_with_claimable_request(base: &Path, language_stems: bool) -> bool {
     let Ok(verb_dirs) = fs::read_dir(base) else { return false };
     for verb_entry in verb_dirs.flatten() {
         if !verb_entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
             continue;
         }
+        let verb = verb_entry.file_name().to_string_lossy().into_owned();
         let Ok(files) = fs::read_dir(verb_entry.path()) else { continue };
         for file_entry in files.flatten() {
-            if file_entry.path().extension().and_then(|e| e.to_str()) == Some("txt") {
+            let path = file_entry.path();
+            if if language_stems {
+                is_spool_request_path(&verb, &path)
+            } else {
+                path.extension().and_then(|extension| extension.to_str()) == Some("txt")
+            } {
                 return true;
             }
         }
@@ -2050,13 +2092,13 @@ fn project_has_pending_dispatch_work(root: &Path) -> bool {
             if !plugin_entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
                 continue;
             }
-            if dir_has_any_verb_subdir_with_claimable_txt(&plugin_entry.path()) {
+            if dir_has_any_verb_subdir_with_claimable_request(&plugin_entry.path(), false) {
                 return true;
             }
         }
     }
     let gm_in = root.join(".gm").join("exec-spool").join("in");
-    dir_has_any_verb_subdir_with_claimable_txt(&gm_in)
+    dir_has_any_verb_subdir_with_claimable_request(&gm_in, true)
 }
 
 fn dispatch_project(root: &Path, project: &mut ProjectPlugins, plugin_modules: &PluginModules) -> bool {
@@ -2089,13 +2131,13 @@ fn dispatch_project(root: &Path, project: &mut ProjectPlugins, plugin_modules: &
             let Ok(files) = fs::read_dir(&verb_dir) else { continue };
             for file_entry in files.flatten() {
                 let file_path = file_entry.path();
-                if file_path.extension().and_then(|e| e.to_str()) != Some("txt") {
+                if !is_spool_request_path(&verb, &file_path) {
                     continue;
                 }
                 if !spool_in_file_write_has_settled(&file_path) {
                     continue;
                 }
-                let claim_path = file_path.with_extension(format!("txt.{ORPHAN_CLAIM_EXT}"));
+                let Some(claim_path) = spool_claim_path(&file_path) else { continue };
                 if fs::rename(&file_path, &claim_path).is_err() {
                     continue;
                 }
@@ -2316,10 +2358,10 @@ fn dispatch_project(root: &Path, project: &mut ProjectPlugins, plugin_modules: &
                                 let Ok(files) = fs::read_dir(verb_entry.path()) else { continue };
                                 for file_entry in files.flatten() {
                                     let file_path = file_entry.path();
-                                    if file_path.extension().and_then(|e| e.to_str()) != Some("txt") {
+                                    if !is_spool_request_path(&verb, &file_path) {
                                         continue;
                                     }
-                                    let claim_path = file_path.with_extension(format!("txt.{ORPHAN_CLAIM_EXT}"));
+                                    let Some(claim_path) = spool_claim_path(&file_path) else { continue };
                                     if fs::rename(&file_path, &claim_path).is_err() {
                                         continue;
                                     }
@@ -3139,22 +3181,22 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
             return Ok(());
         }
 
-        if !any_work {
-            if known_roots.iter().any(|root| project_has_pending_dispatch_work(root)) {
-                // in-file already visible: skip the idle quantum
-            } else {
-                #[cfg(windows)]
-                {
-                    idle_in_dir_watch.sync(&known_roots);
-                    if known_roots.iter().any(|root| project_has_pending_dispatch_work(root)) {
-                        // lost-wakeup: file landed while arming the watch
-                    } else {
-                        idle_in_dir_watch.wait(Duration::from_millis(25));
-                    }
+        let pending_work_exists_before_idle_wait = known_roots
+            .iter()
+            .any(|root| project_has_pending_dispatch_work(root));
+        if !any_work && !pending_work_exists_before_idle_wait {
+            #[cfg(windows)]
+            {
+                idle_in_dir_watch.sync(&known_roots);
+                let pending_work_appeared_while_arming_idle_watcher = known_roots
+                    .iter()
+                    .any(|root| project_has_pending_dispatch_work(root));
+                if !pending_work_appeared_while_arming_idle_watcher {
+                    idle_in_dir_watch.wait(Duration::from_millis(25));
                 }
-                #[cfg(not(windows))]
-                std::thread::sleep(Duration::from_millis(25));
             }
+        #[cfg(not(windows))]
+            std::thread::sleep(Duration::from_millis(25));
         }
     }
 }
