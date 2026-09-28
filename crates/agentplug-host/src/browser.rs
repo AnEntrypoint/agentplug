@@ -11,7 +11,7 @@ use wait_timeout::ChildExt;
 const CDP_EVAL_JS: &str = include_str!("cdp_eval.js");
 const EXTENSION_LOAD_JS: &str = include_str!("extension_load.js");
 
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, Default)]
 pub(crate) struct BrowserRuntimeConfig {
     #[serde(default)]
     cdp_poll_timeout_ms: Option<u64>,
@@ -29,6 +29,10 @@ pub(crate) struct BrowserRuntimeConfig {
     session_owner_gone_idle_timeout_ms: Option<u64>,
     #[serde(default)]
     load_extension: Option<String>,
+    #[serde(default)]
+    chrome_extra_args: Option<Vec<Value>>,
+    #[serde(default)]
+    enable_webgpu: Option<bool>,
 }
 
 type BrowserConfig = BrowserRuntimeConfig;
@@ -39,16 +43,7 @@ impl BrowserRuntimeConfig {
         std::fs::read_to_string(&path)
             .ok()
             .and_then(|s| serde_json::from_str::<BrowserRuntimeConfig>(&s).ok())
-            .unwrap_or(BrowserRuntimeConfig {
-                cdp_poll_timeout_ms: None,
-                cdp_poll_interval_ms: None,
-                chrome_ready_deadline_ms: None,
-                eval_timeout_grace_ms: None,
-                headless: None,
-                session_idle_timeout_ms: None,
-                session_owner_gone_idle_timeout_ms: None,
-                load_extension: None,
-            })
+            .unwrap_or_default()
     }
     fn cdp_poll_timeout(&self) -> Duration { Duration::from_millis(self.cdp_poll_timeout_ms.unwrap_or(1000)) }
     fn cdp_poll_interval(&self) -> Duration { Duration::from_millis(self.cdp_poll_interval_ms.unwrap_or(250)) }
@@ -64,6 +59,8 @@ impl BrowserRuntimeConfig {
     pub(crate) fn load_extension(&self) -> Option<&str> {
         self.load_extension.as_deref()
     }
+    fn chrome_extra_args(&self) -> &[Value] { self.chrome_extra_args.as_deref().unwrap_or(&[]) }
+    fn enable_webgpu(&self) -> bool { self.enable_webgpu.unwrap_or(false) }
 }
 
 fn which(cmd: &str) -> Option<PathBuf> {
@@ -1090,32 +1087,62 @@ fn chrome_stderr_log_indicates_suid_sandbox_init_denial(log_path: &Path) -> bool
         .unwrap_or(false)
 }
 
+fn is_valid_chrome_extra_arg(arg: &str) -> bool {
+    arg.starts_with("--") && !arg.contains(['\0', '\n', '\r'])
+}
+
+fn partition_chrome_extra_args(cfg: &BrowserRuntimeConfig) -> (Vec<String>, Vec<String>) {
+    let mut accepted = Vec::new();
+    let mut dropped = Vec::new();
+    for entry in cfg.chrome_extra_args() {
+        match entry.as_str().filter(|s| is_valid_chrome_extra_arg(s)) {
+            Some(arg) => accepted.push(arg.to_string()),
+            None => dropped.push(entry.to_string()),
+        }
+    }
+    (accepted, dropped)
+}
+
+fn chrome_launch_args(profile_dir: &Path, port: u16, headless: bool, no_sandbox: bool, cfg: &BrowserRuntimeConfig) -> Vec<String> {
+    let mut args = vec![
+        format!("--user-data-dir={}", profile_dir.display()),
+        format!("--remote-debugging-port={port}"),
+        "--remote-debugging-address=127.0.0.1".to_string(),
+        "--no-first-run".to_string(),
+        "--no-default-browser-check".to_string(),
+        "--disable-default-apps".to_string(),
+        "--disable-gpu-process-crash-limit".to_string(),
+    ];
+    if headless {
+        if !cfg.enable_webgpu() {
+            args.push("--disable-gpu".to_string());
+        }
+        args.push("--headless=new".to_string());
+    }
+    if cfg.enable_webgpu() {
+        args.push("--enable-unsafe-webgpu".to_string());
+    }
+    if no_sandbox {
+        args.extend(["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"].map(String::from));
+    }
+    if let Some(ext) = cfg.load_extension() {
+        args.push(format!("--load-extension={ext}"));
+        args.push(format!("--disable-extensions-except={ext}"));
+    }
+    args.extend(partition_chrome_extra_args(cfg).0);
+    args
+}
+
 fn spawn_chrome_once(
     chrome: &Path,
     profile_dir: &Path,
     port: u16,
     headless: bool,
     no_sandbox: bool,
-    load_extension: Option<&str>,
+    cfg: &BrowserRuntimeConfig,
 ) -> Result<Child, String> {
     let mut cmd = Command::new(chrome);
-    cmd.arg(format!("--user-data-dir={}", profile_dir.display()))
-        .arg(format!("--remote-debugging-port={port}"))
-        .arg("--remote-debugging-address=127.0.0.1")
-        .arg("--no-first-run")
-        .arg("--no-default-browser-check")
-        .arg("--disable-default-apps")
-        .arg("--disable-gpu-process-crash-limit");
-    if headless {
-        cmd.arg("--disable-gpu").arg("--headless=new");
-    }
-    if no_sandbox {
-        cmd.arg("--no-sandbox").arg("--disable-setuid-sandbox").arg("--disable-dev-shm-usage");
-    }
-    if let Some(ext) = load_extension {
-        cmd.arg(format!("--load-extension={ext}"));
-        cmd.arg(format!("--disable-extensions-except={ext}"));
-    }
+    cmd.args(chrome_launch_args(profile_dir, port, headless, no_sandbox, cfg));
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -1128,6 +1155,9 @@ fn spawn_chrome_once(
         .append(true)
         .open(&log_path)
         .map_err(|e| format!("failed to open chrome launch log {}: {e}", log_path.display()))?;
+    for rejected in partition_chrome_extra_args(cfg).1 {
+        let _ = writeln!(&log_file, "[chrome_extra_args] dropped invalid entry {rejected} (must be a string starting with -- and free of NUL/newline)");
+    }
     let log_file_err = log_file
         .try_clone()
         .map_err(|e| format!("failed to clone chrome launch log handle: {e}"))?;
@@ -1198,8 +1228,7 @@ fn launch_chrome(cwd: &Path, session_id: &str, browser_cfg: &BrowserConfig) -> R
         || (running_as_root && no_sandbox_env.as_deref() != Some("0"));
     let headless = browser_cfg.headless();
     let port = free_port();
-    let load_extension = browser_cfg.load_extension();
-    let mut chrome_child = spawn_chrome_once(&chrome, &profile_dir, port, headless, no_sandbox, load_extension)?;
+    let mut chrome_child = spawn_chrome_once(&chrome, &profile_dir, port, headless, no_sandbox, browser_cfg)?;
 
     write_session_sidecars(&profile_dir, chrome_child.id(), port, session_id);
 
@@ -1211,7 +1240,7 @@ fn launch_chrome(cwd: &Path, session_id: &str, browser_cfg: &BrowserConfig) -> R
         if !no_sandbox && no_sandbox_env.as_deref() != Some("0") && chrome_stderr_log_indicates_suid_sandbox_init_denial(&log_path) {
             no_sandbox = true;
             let port2 = free_port();
-            let mut retry_child = spawn_chrome_once(&chrome, &profile_dir, port2, headless, no_sandbox, load_extension)?;
+            let mut retry_child = spawn_chrome_once(&chrome, &profile_dir, port2, headless, no_sandbox, browser_cfg)?;
             write_session_sidecars(&profile_dir, retry_child.id(), port2, session_id);
             if cdp_ready(port2, Instant::now() + browser_cfg.chrome_ready_deadline(), browser_cfg) {
                 return Ok((retry_child, port2));
@@ -1365,6 +1394,22 @@ pub fn run(body: &str, opts: &str, cwd_raw: &Path, session_id: &str) -> Value {
             "start_url": start_url});
     }
 
+    let key = session_key(cwd, session_id);
+    let lifecycle_lock = session_lifecycle_lock_for_key(&key);
+    let (_lifecycle_guard_serializes_temp_files_reuse_check_launch_and_insert, queued_behind_same_page_ms) = match lifecycle_lock.try_lock() {
+        Ok(guard) => (guard, None),
+        Err(std::sync::TryLockError::Poisoned(poisoned)) => (poisoned.into_inner(), None),
+        Err(std::sync::TryLockError::WouldBlock) => {
+            let queued_at = Instant::now();
+            let guard = lifecycle_lock.lock().unwrap_or_else(|e| e.into_inner());
+            let waited_ms = queued_at.elapsed().as_millis() as u64;
+            eprintln!(
+                "[agentplug browser] queued {waited_ms}ms behind another dispatch on the same page (session '{session_id}'); use `sessionId=<other>` for an independent page"
+            );
+            (guard, Some(waited_ms))
+        }
+    };
+
     let tmp = std::env::temp_dir();
     let stamp = format!("{}-{}", std::process::id(), sanitize(session_id));
     let helper_path = tmp.join(format!("agentplug-cdp-eval-{stamp}.mjs"));
@@ -1396,9 +1441,6 @@ pub fn run(body: &str, opts: &str, cwd_raw: &Path, session_id: &str) -> Value {
         let _ = f.write_all(script.as_bytes());
     }
 
-    let key = session_key(cwd, session_id);
-    let lifecycle_lock = session_lifecycle_lock_for_key(&key);
-    let _lifecycle_guard_serializes_reuse_check_launch_and_insert = lifecycle_lock.lock().unwrap_or_else(|e| e.into_inner());
     let engine_mismatch = {
         let map = sessions_map().lock().unwrap_or_else(|e| e.into_inner());
         map.get(&key).map(|s| (s.engine, s.cdp_endpoint.clone())).filter(|(prior_engine, prior_endpoint)| {
@@ -1479,7 +1521,7 @@ pub fn run(body: &str, opts: &str, cwd_raw: &Path, session_id: &str) -> Value {
                         Ok(v) => v,
                         Err(e) => {
                             cleanup(&[&helper_path, &script_path, &result_path]);
-                            return json!({"ok": false, "stdout": "", "exit_code": 1, "stderr": e});
+                            return annotate_queue_wait(json!({"ok": false, "stdout": "", "exit_code": 1, "stderr": e}), queued_behind_same_page_ms, session_id);
                         }
                     };
                     let pid = acquired.child.as_ref().map(|c| c.id()).unwrap_or(0);
@@ -1548,8 +1590,11 @@ pub fn run(body: &str, opts: &str, cwd_raw: &Path, session_id: &str) -> Value {
         Ok(c) => c,
         Err(e) => {
             cleanup(&[&helper_path, &script_path, &result_path]);
-            return json!({"ok": false, "stdout": "", "exit_code": 1,
-                "stderr": format!("node cdp helper spawn failed: {e}")});
+            return annotate_queue_wait(
+                json!({"ok": false, "stdout": "", "exit_code": 1, "stderr": format!("node cdp helper spawn failed: {e}")}),
+                queued_behind_same_page_ms,
+                session_id,
+            );
         }
     };
 
@@ -1618,6 +1663,7 @@ pub fn run(body: &str, opts: &str, cwd_raw: &Path, session_id: &str) -> Value {
     if session_created_by_this_dispatch {
         out["session_created"] = Value::Bool(true);
     }
+    let mut out = annotate_queue_wait(out, queued_behind_same_page_ms, session_id);
     if cdp_error.is_some() {
         out["result"] = Value::Null;
         out["debug"] = result_value.get("debug").cloned().unwrap_or_else(default_debug);
@@ -1680,6 +1726,16 @@ pub fn run(body: &str, opts: &str, cwd_raw: &Path, session_id: &str) -> Value {
         out["stderr"] = json!(format!(
             "browser dispatch returned success with no evidence a page was ever reached (empty result envelope, mode={}) -- treating as a false success rather than a silent no-op",
             mode_label(mode)
+        ));
+    }
+    out
+}
+
+fn annotate_queue_wait(mut out: Value, queued_behind_same_page_ms: Option<u64>, session_id: &str) -> Value {
+    if let Some(waited_ms) = queued_behind_same_page_ms {
+        out["queued_behind_same_page_dispatch_ms"] = json!(waited_ms);
+        out["queue_note"] = json!(format!(
+            "queued {waited_ms}ms behind another dispatch on the same page (session '{session_id}'); dispatches of one session run one at a time, use `sessionId=<other>` for an independent page"
         ));
     }
     out
