@@ -168,6 +168,8 @@ pub enum DispatchCostClass {
     Heavy,
 }
 
+const MAX_CONCURRENT_HEAVY_DISPATCHES: usize = 3;
+
 const HEAVY_DISPATCH_VERBS: &[&str] = &[
     "code_index",
     "embed",
@@ -291,7 +293,7 @@ impl SharedPluginPool {
     pub const ACQUIRE_TIMEOUT_MS: u64 = 60_000;
 
     fn heavy_admission_limit(&self) -> usize {
-        self.slots.len().saturating_sub(1).max(1)
+        self.slots.len().saturating_sub(1).min(MAX_CONCURRENT_HEAVY_DISPATCHES).max(1)
     }
 
     pub fn admit(pool: &Arc<SharedPluginPool>, class: DispatchCostClass) -> HeavyDispatchAdmission {
@@ -905,7 +907,7 @@ fn dispatch_and_evict_on_error(
     result
 }
 
-static GM_INFLIGHT_BY_PROJECT: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
+static GM_INFLIGHT_BY_PROJECT: OnceLock<Mutex<HashMap<(PathBuf, &'static str), usize>>> = OnceLock::new();
 
 static GM_PROJECT_STEP_RELEASED: OnceLock<Condvar> = OnceLock::new();
 
@@ -919,7 +921,7 @@ static TOOL_INFLIGHT: OnceLock<Mutex<HashMap<String, ToolQueue>>> = OnceLock::ne
 
 static TOOL_STEP_RELEASED: OnceLock<Condvar> = OnceLock::new();
 
-fn gm_inflight_map() -> &'static Mutex<HashMap<PathBuf, usize>> {
+fn gm_inflight_map() -> &'static Mutex<HashMap<(PathBuf, &'static str), usize>> {
     GM_INFLIGHT_BY_PROJECT.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -935,20 +937,62 @@ fn tool_step_released() -> &'static Condvar {
     TOOL_STEP_RELEASED.get_or_init(Condvar::new)
 }
 
+const PARALLEL_SAFE_VERBS: &[&str] = &[
+    "exec_js", "lang", "nodejs", "javascript", "node", "js", "typescript", "python", "py", "bash", "sh", "shell", "zsh",
+    "powershell", "ps1", "ssh", "go", "rust", "c", "cpp", "java", "deno",
+    "serp", "browser", "cdp", "fetch", "codesearch", "callers", "callees", "impact",
+    "fs_read", "fs_readdir", "fs_stat", "env_get", "kv_get", "config_resolve",
+    "git_status", "branch_status", "git_log", "git_diff", "git_show", "ci-status", "git_poll",
+    "status", "wait", "close", "phase-status", "prd-list", "prd-status", "mutable-list", "filter",
+];
+
+const GIT_LANE_VERBS: &[&str] = &[
+    "git_add", "git_commit", "git_finalize", "git_push", "git_pull", "git_fetch", "git_checkout", "git_merge",
+    "git_merge_abort", "git_branch", "git_branch_delete", "git_rm", "git_revert", "git_reset", "git_stash",
+    "git_stash_pop", "git_stash_drop", "git_stash_list",
+];
+
+const STORE_LANE_VERBS: &[&str] = &[
+    "scan_deps", "health", "memorize", "memorize-fire", "memorize-prune", "memorize-vacuum", "memorize-retention",
+    "recall", "forget", "codeinsight_index", "code_index", "embed", "index", "libsql", "bert",
+    "tencentdb-compat-probe", "tencentdb-memory-import", "config-sync-now", "dataflow_resolve",
+    "sql_open", "sql_close", "sql_list_dbs", "sql_exec", "sql_query", "sql_smoke", "sql_serialize", "sql_deserialize",
+    "cache_get", "cache_put", "cache_invalidate", "cache_stats", "kv_put", "kv_query",
+];
+
+pub fn is_parallel_safe_verb(verb: &str) -> bool {
+    PARALLEL_SAFE_VERBS.contains(&verb)
+}
+
+fn serial_lane_for_verb(verb: &str) -> Option<&'static str> {
+    if is_parallel_safe_verb(verb) {
+        None
+    } else if GIT_LANE_VERBS.contains(&verb) {
+        Some("git")
+    } else if STORE_LANE_VERBS.contains(&verb) {
+        Some("store")
+    } else {
+        Some("state")
+    }
+}
+
 pub struct GmFairnessGuard {
     root: PathBuf,
-    limited: bool,
+    lane: Option<&'static str>,
 }
 
 impl GmFairnessGuard {
-    pub fn acquire(root: &Path) -> Self {
+    pub fn acquire(root: &Path, verb: &str) -> Self {
         let root = root.to_path_buf();
+        let Some(lane) = serial_lane_for_verb(verb) else {
+            return Self { root, lane: None };
+        };
         let mut map = gm_inflight_map().lock().unwrap_or_else(|e| e.into_inner());
         loop {
-            let count = map.entry(root.clone()).or_insert(0);
+            let count = map.entry((root.clone(), lane)).or_insert(0);
             if *count == 0 {
                 *count = 1;
-                return Self { root, limited: true };
+                return Self { root, lane: Some(lane) };
             }
             map = gm_project_step_released().wait(map).unwrap_or_else(|e| e.into_inner());
         }
@@ -957,14 +1001,15 @@ impl GmFairnessGuard {
 
 impl Drop for GmFairnessGuard {
     fn drop(&mut self) {
-        if !self.limited {
+        let Some(lane) = self.lane else {
             return;
-        }
+        };
         let mut map = gm_inflight_map().lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(count) = map.get_mut(&self.root) {
+        let key = (self.root.clone(), lane);
+        if let Some(count) = map.get_mut(&key) {
             *count = count.saturating_sub(1);
             if *count == 0 {
-                map.remove(&self.root);
+                map.remove(&key);
             }
         }
         drop(map);
@@ -973,11 +1018,14 @@ impl Drop for GmFairnessGuard {
 }
 
 pub struct ToolDispatchGuard {
-    key: String,
+    key: Option<String>,
 }
 
 impl ToolDispatchGuard {
     pub fn acquire(plugin: &str, verb: &str) -> Self {
+        if is_parallel_safe_verb(verb) {
+            return Self { key: None };
+        }
         let key = format!("{plugin}\u{0}{verb}");
         let mut active = tool_inflight().lock().unwrap_or_else(|e| e.into_inner());
         let ticket = {
@@ -995,7 +1043,7 @@ impl ToolDispatchGuard {
             if queue.now_serving == ticket && !queue.active {
                 queue.now_serving += 1;
                 queue.active = true;
-                return Self { key };
+                return Self { key: Some(key) };
             }
             active = tool_step_released().wait(active).unwrap_or_else(|e| e.into_inner());
         }
@@ -1004,11 +1052,14 @@ impl ToolDispatchGuard {
 
 impl Drop for ToolDispatchGuard {
     fn drop(&mut self) {
+        let Some(key) = self.key.as_ref() else {
+            return;
+        };
         let mut active = tool_inflight().lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(queue) = active.get_mut(&self.key) {
+        if let Some(queue) = active.get_mut(key) {
             queue.active = false;
             if queue.next_ticket == queue.now_serving {
-                active.remove(&self.key);
+                active.remove(key);
             }
         }
         drop(active);
