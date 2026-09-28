@@ -29,7 +29,7 @@ const GM_SPOOL_VERBS: &[&str] = &[
     "tencentdb-compat-probe", "tencentdb-memory-import", "python", "bash", "powershell",
     "ssh", "go", "rust", "c", "cpp", "java", "deno", "status", "wait", "close",
     "filter", "git_status", "branch_status", "git_push", "git_add", "git_commit",
-    "git_finalize", "git_log", "git_diff", "git_show", "git_fetch", "git_clone", "git_pull",
+    "git_finalize", "git_log", "git_diff", "git_show", "git_fetch", "git_pull",
     "ci-status", "git_branch", "git_checkout", "git_merge", "git_merge_abort",
     "git_branch_delete", "git_rm", "git_revert", "git_reset", "git_poll", "forget",
     "discipline",
@@ -124,6 +124,9 @@ pub(crate) fn read_registry() -> Vec<PathBuf> {
 fn host_available_parallelism() -> usize {
     std::thread::available_parallelism().map(std::num::NonZeroUsize::get).unwrap_or(4)
 }
+
+const DEFAULT_GM_POOL_SIZE: usize = 8;
+const MAX_GM_POOL_SIZE: usize = 16;
 
 #[derive(serde::Deserialize, Clone)]
 struct DaemonConfig {
@@ -224,19 +227,15 @@ impl DaemonConfig {
     fn gm_concurrency(&self) -> usize { self.gm_concurrency.unwrap_or_else(|| self.max_concurrent_projects()).max(1) }
     fn gm_pool_size(&self) -> usize {
         self.gm_pool_size
-            .unwrap_or(4)
+            .unwrap_or(DEFAULT_GM_POOL_SIZE)
             .min(host_available_parallelism())
-            .min(4)
+            .min(MAX_GM_POOL_SIZE)
             .max(1)
     }
 
     fn gm_pool_capacity_reason(&self) -> String {
         let capacity = self.gm_pool_size();
-        if capacity == 4 {
-            "four processors admitted by host capacity".to_string()
-        } else {
-            format!("limited to {capacity} processor(s) by configured or host capacity")
-        }
+        format!("{capacity} processor(s): default {DEFAULT_GM_POOL_SIZE}, capped by host parallelism and {MAX_GM_POOL_SIZE}, gm_pool_size in daemon-config.json overrides")
     }
     fn side_plugin_concurrency(&self) -> usize {
         self.side_plugin_concurrency.unwrap_or(1).max(1)
@@ -1067,7 +1066,7 @@ fn write_project_heartbeat_with_queue_info(spool_dir: &Path, busy_until: Option<
     payload["gm_processor_capacity"] = serde_json::json!(GM_PROCESSOR_CAPACITY.load(std::sync::atomic::Ordering::Relaxed));
     payload["gm_processor_capacity_reason"] = serde_json::json!(gm_processor_capacity_reason().lock().unwrap_or_else(|e| e.into_inner()).clone());
     payload["shared_store_recycle_limit_mb"] = serde_json::json!(SHARED_STORE_RECYCLE_LIMIT_MB.load(std::sync::atomic::Ordering::Relaxed));
-    payload["tool_serialization"] = serde_json::json!("fifo per plugin and verb");
+    payload["tool_serialization"] = serde_json::json!("fifo per plugin and verb for state-changing verbs, one dispatch per project lane (git, store, state); exec-family, codesearch, fetch, browser and read-only verbs run unserialised");
     payload["runner_version"] = serde_json::json!(env!("CARGO_PKG_VERSION"));
     payload["loaded_plugin_versions"] = serde_json::json!(loaded_plugin_versions().lock().unwrap_or_else(|e| e.into_inner()).clone());
     payload["queue_wait_ms"] = serde_json::json!(last_measured_dispatch_queue_wait_ms());
@@ -1498,12 +1497,25 @@ pub(crate) fn in_flight_map() -> &'static Mutex<HashMap<InFlightKey, InFlightHan
     IN_FLIGHT.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn project_has_in_flight_step(root: &Path) -> bool {
+const MAX_CLAIMED_DISPATCHES_PER_PROJECT: usize = 32;
+
+fn project_in_flight_count(root: &Path) -> usize {
     in_flight_map()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .keys()
-        .any(|(active_root, _, _)| active_root == root)
+        .filter(|(active_root, _, _)| active_root == root)
+        .count()
+}
+
+struct InFlightEntryRelease {
+    key: InFlightKey,
+}
+
+impl Drop for InFlightEntryRelease {
+    fn drop(&mut self) {
+        in_flight_map().lock().unwrap_or_else(|e| e.into_inner()).remove(&self.key);
+    }
 }
 
 fn handle_background_convert(root: &Path, body: &str) -> String {
@@ -1945,7 +1957,7 @@ pub(crate) fn run_gm_dispatch_to_file(root: &Path, handle: &DispatchHandle, verb
             .and_then(|v| v.get("verb").and_then(|s| s.as_str()).map(|s| s.to_string()))
             .unwrap_or_else(|| "capabilities".to_string())
     };
-    let _fairness_guard = GmFairnessGuard::acquire(root);
+    let _fairness_guard = GmFairnessGuard::acquire(root, if plugin_name == "gm" { verb } else { inner_verb_owned.as_str() });
     let tool_verb = if plugin_name == "gm" { verb } else { inner_verb_owned.as_str() };
     let _tool_guard = ToolDispatchGuard::acquire(plugin_name, tool_verb);
     let _dispatch_origin_scope = agentplug_host::enter_dispatch_origin_scope(task, body);
@@ -2083,9 +2095,6 @@ impl Drop for IdleInDirWatch {
 }
 
 fn project_has_pending_dispatch_work(root: &Path) -> bool {
-    if project_has_in_flight_step(root) {
-        return true;
-    }
     let pd_in = root.join(".agentplug").join("plugin-dispatch").join("in");
     if let Ok(plugin_dirs) = fs::read_dir(&pd_in) {
         for plugin_entry in plugin_dirs.flatten() {
@@ -2108,10 +2117,6 @@ fn dispatch_project(root: &Path, project: &mut ProjectPlugins, plugin_modules: &
     let in_dir = spool_dir.join("in");
     let out_dir = spool_dir.join("out");
 
-    if project_has_in_flight_step(root) {
-        return false;
-    }
-
     struct ClaimedRequest {
         verb: String,
         task: String,
@@ -2121,14 +2126,14 @@ fn dispatch_project(root: &Path, project: &mut ProjectPlugins, plugin_modules: &
     let mut claimed: Vec<ClaimedRequest> = Vec::new();
     let in_dir_scan = fs::read_dir(&in_dir);
     let in_dir_existed = in_dir_scan.is_ok();
+    let mut claimable: Vec<(std::time::SystemTime, String, PathBuf)> = Vec::new();
     if let Ok(entries) = in_dir_scan {
-        'claim_one: for verb_entry in entries.flatten() {
+        for verb_entry in entries.flatten() {
             if !verb_entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
                 continue;
             }
             let verb = verb_entry.file_name().to_string_lossy().into_owned();
-            let verb_dir = verb_entry.path();
-            let Ok(files) = fs::read_dir(&verb_dir) else { continue };
+            let Ok(files) = fs::read_dir(verb_entry.path()) else { continue };
             for file_entry in files.flatten() {
                 let file_path = file_entry.path();
                 if !is_spool_request_path(&verb, &file_path) {
@@ -2137,22 +2142,27 @@ fn dispatch_project(root: &Path, project: &mut ProjectPlugins, plugin_modules: &
                 if !spool_in_file_write_has_settled(&file_path) {
                     continue;
                 }
-                let Some(claim_path) = spool_claim_path(&file_path) else { continue };
-                if fs::rename(&file_path, &claim_path).is_err() {
-                    continue;
-                }
-                let claimed_at = Instant::now();
-                let task = file_path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-                let body = fs::read_to_string(&claim_path).unwrap_or_default();
-                if body.trim().is_empty() {
-                    let _ = fs::rename(&claim_path, &file_path);
-                    continue;
-                }
-                did_work = true;
-                claimed.push(ClaimedRequest { verb: verb.clone(), task, body, claimed_at });
-                break 'claim_one;
+                let queued_since = file_entry.metadata().and_then(|m| m.modified()).unwrap_or(std::time::UNIX_EPOCH);
+                claimable.push((queued_since, verb.clone(), file_path));
             }
         }
+    }
+    claimable.sort_by_key(|(queued_since, _, _)| *queued_since);
+    let claim_budget = MAX_CLAIMED_DISPATCHES_PER_PROJECT.saturating_sub(project_in_flight_count(root));
+    for (_, verb, file_path) in claimable.into_iter().take(claim_budget) {
+        let Some(claim_path) = spool_claim_path(&file_path) else { continue };
+        if fs::rename(&file_path, &claim_path).is_err() {
+            continue;
+        }
+        let claimed_at = Instant::now();
+        let task = file_path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+        let body = fs::read_to_string(&claim_path).unwrap_or_default();
+        if body.trim().is_empty() {
+            let _ = fs::rename(&claim_path, &file_path);
+            continue;
+        }
+        did_work = true;
+        claimed.push(ClaimedRequest { verb, task, body, claimed_at });
     }
 
     if claimed.is_empty() && in_dir_existed && !project_has_pending_dispatch_work(root) {
@@ -2262,144 +2272,28 @@ fn dispatch_project(root: &Path, project: &mut ProjectPlugins, plugin_modules: &
             }
             answer_bg_converts(bg_convert_requests);
         } else {
-            struct Spawned {
-                key: InFlightKey,
-                join_handle: Option<std::thread::JoinHandle<()>>,
-                detach_flag: Arc<std::sync::atomic::AtomicBool>,
-                spawned_at: Instant,
-            }
-            let mut spawned: Vec<Spawned> = Vec::with_capacity(gm_requests.len());
             for req in gm_requests {
                 let self_healing_dispatch_handle = project.dispatch_handle_with_reload(Some((plugin_modules.engine.clone(), plugin_modules.modules_with_hashes())));
                 let detach_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
                 let key: InFlightKey = (root.to_path_buf(), req.verb.clone(), req.task.clone());
-                in_flight_map().lock().unwrap_or_else(|e| e.into_inner()).insert(key.clone(), InFlightHandle { detach: detach_flag.clone() });
+                let failed_spawn_key = key.clone();
+                in_flight_map().lock().unwrap_or_else(|e| e.into_inner()).insert(key.clone(), InFlightHandle { detach: detach_flag });
 
                 let thread_root = root.to_path_buf();
-                let thread_verb = req.verb.clone();
-                let thread_task = req.task.clone();
-                let thread_body = req.body.clone();
                 let thread_out_dir = out_dir.clone();
                 let queue_wait_ms = req.claimed_at.elapsed().as_millis() as u64;
-                let join_handle = std::thread::spawn(move || {
-                    run_gm_dispatch_to_file(&thread_root, &self_healing_dispatch_handle, &thread_verb, &thread_task, &thread_body, &thread_out_dir, queue_wait_ms);
+                let spawn_result = std::thread::Builder::new().name(format!("gm-dispatch-{}", req.task)).spawn(move || {
+                    let _release_in_flight_entry = InFlightEntryRelease { key };
+                    run_gm_dispatch_to_file(&thread_root, &self_healing_dispatch_handle, &req.verb, &req.task, &req.body, &thread_out_dir, queue_wait_ms);
                 });
-                spawned.push(Spawned { key, join_handle: Some(join_handle), detach_flag, spawned_at: Instant::now() });
+                if let Err(e) = spawn_result {
+                    eprintln!("[agentplug daemon] could not spawn a dispatch thread for {}: {e} -- the claim stays for the orphan sweep", root.display());
+                    in_flight_map().lock().unwrap_or_else(|e| e.into_inner()).remove(&failed_spawn_key);
+                }
             }
 
             answer_bg_converts(bg_convert_requests);
-
-            const WORKER_AUTO_DETACH_AFTER_MS: u64 = 45_000;
-            const STATUS_REFRESH_INTERVAL_MS: u64 = 5_000;
-            const PROJECT_BATCH_ABSORB_WINDOW_MS: u64 = 0;
-            let batch_deadline = Instant::now() + Duration::from_millis(PROJECT_BATCH_ABSORB_WINDOW_MS);
-            let mut last_status_refresh = Instant::now();
-            let bg_convert_dir = in_dir.join("background-convert");
-            while spawned.iter().any(|s| s.join_handle.is_some()) {
-                if last_status_refresh.elapsed() >= Duration::from_millis(STATUS_REFRESH_INTERVAL_MS) {
-                    last_status_refresh = Instant::now();
-                    write_project_heartbeat(&spool_dir, Some(now_ms() + STATUS_REFRESH_INTERVAL_MS));
-                }
-                for s in spawned.iter_mut() {
-                    if s.join_handle.is_some()
-                        && !s.detach_flag.load(std::sync::atomic::Ordering::SeqCst)
-                        && s.spawned_at.elapsed() >= Duration::from_millis(WORKER_AUTO_DETACH_AFTER_MS)
-                    {
-                        eprintln!(
-                            "[agentplug daemon] gm dispatch for {} exceeded {WORKER_AUTO_DETACH_AFTER_MS}ms with no completion -- auto-detaching so this worker and the daemon's other projects are not blocked; it keeps running and will write its out/ file whenever it finishes",
-                            root.display()
-                        );
-                        s.detach_flag.store(true, std::sync::atomic::Ordering::SeqCst);
-                        s.join_handle = None;
-                        write_project_heartbeat(&spool_dir, Some(now_ms() + TICKER_BUSY_UNTIL_EXTEND_MS));
-                    }
-                }
-                for s in spawned.iter_mut() {
-                    let Some(jh) = s.join_handle.as_ref() else { continue };
-                    if jh.is_finished() {
-                        let jh = s.join_handle.take().unwrap();
-                        let _ = jh.join();
-                        in_flight_map().lock().unwrap_or_else(|e| e.into_inner()).remove(&s.key);
-                    } else if s.detach_flag.load(std::sync::atomic::Ordering::SeqCst) {
-                        s.join_handle = None;
-                    }
-                }
-                if spawned.iter().any(|s| s.join_handle.is_some()) {
-                    if Instant::now() < batch_deadline {
-                        if let Ok(files) = fs::read_dir(&bg_convert_dir) {
-                            for file_entry in files.flatten() {
-                                let file_path = file_entry.path();
-                                if file_path.extension().and_then(|e| e.to_str()) != Some("txt") {
-                                    continue;
-                                }
-                                let claim_path = file_path.with_extension(format!("txt.{ORPHAN_CLAIM_EXT}"));
-                                if fs::rename(&file_path, &claim_path).is_err() {
-                                    continue;
-                                }
-                                let bc_task = file_path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-                                let bc_body = fs::read_to_string(&claim_path).unwrap_or_default();
-                                let out_body = handle_background_convert(root, &bc_body);
-                                let out_name = format!("background-convert-{bc_task}.json");
-                                if write_spool_out_confirmed(&out_dir, &out_name, &out_body) {
-                                    let _ = fs::remove_file(&claim_path);
-                                }
-                            }
-                        }
-
-                        if let Ok(verb_dirs) = fs::read_dir(&in_dir) {
-                            for verb_entry in verb_dirs.flatten() {
-                                if !verb_entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                                    continue;
-                                }
-                                let verb = verb_entry.file_name().to_string_lossy().into_owned();
-                                if verb == "background-convert" {
-                                    continue;
-                                }
-                                let Ok(files) = fs::read_dir(verb_entry.path()) else { continue };
-                                for file_entry in files.flatten() {
-                                    let file_path = file_entry.path();
-                                    if !is_spool_request_path(&verb, &file_path) {
-                                        continue;
-                                    }
-                                    let Some(claim_path) = spool_claim_path(&file_path) else { continue };
-                                    if fs::rename(&file_path, &claim_path).is_err() {
-                                        continue;
-                                    }
-                                    let claimed_at = Instant::now();
-                                    let task = file_path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-                                    let body = fs::read_to_string(&claim_path).unwrap_or_default();
-
-                                    if let Some(out_body) = session_id_task_mismatch_rejection(&verb, &task, &body) {
-                                        let out_name = format!("{verb}-{task}.json");
-                                        if write_spool_out_confirmed(&out_dir, &out_name, &out_body) {
-                                            let _ = fs::remove_file(&claim_path);
-                                        }
-                                        continue;
-                                    }
-
-                                    let self_healing_dispatch_handle = project.dispatch_handle_with_reload(Some((plugin_modules.engine.clone(), plugin_modules.modules_with_hashes())));
-                                    let detach_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
-                                    let key: InFlightKey = (root.to_path_buf(), verb.clone(), task.clone());
-                                    in_flight_map().lock().unwrap_or_else(|e| e.into_inner()).insert(key.clone(), InFlightHandle { detach: detach_flag.clone() });
-
-                                    let thread_root = root.to_path_buf();
-                                    let thread_verb = verb.clone();
-                                    let thread_task = task.clone();
-                                    let thread_body = body;
-                                    let thread_out_dir = out_dir.clone();
-                                    let queue_wait_ms = claimed_at.elapsed().as_millis() as u64;
-                                    let join_handle = std::thread::spawn(move || {
-                                        run_gm_dispatch_to_file(&thread_root, &self_healing_dispatch_handle, &thread_verb, &thread_task, &thread_body, &thread_out_dir, queue_wait_ms);
-                                    });
-                                    spawned.push(Spawned { key, join_handle: Some(join_handle), detach_flag, spawned_at: Instant::now() });
-                                }
-                            }
-                        }
-                    }
-
-                    std::thread::sleep(Duration::from_millis(50));
-                }
-            }
+            write_project_heartbeat(&spool_dir, Some(now_ms() + TICKER_BUSY_UNTIL_EXTEND_MS));
         }
     }
 
