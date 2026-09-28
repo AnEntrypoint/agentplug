@@ -1643,12 +1643,19 @@ fn language_spool_extension(verb: &str) -> Option<&'static str> {
     }
 }
 
+const UNIVERSAL_SPOOL_REQUEST_EXTENSION: &str = "txt";
+
 fn spool_request_extension(verb: &str) -> &'static str {
-    language_spool_extension(verb).unwrap_or("txt")
+    language_spool_extension(verb).unwrap_or(UNIVERSAL_SPOOL_REQUEST_EXTENSION)
+}
+
+fn accepted_spool_request_extensions(verb: &str) -> [&'static str; 2] {
+    [spool_request_extension(verb), UNIVERSAL_SPOOL_REQUEST_EXTENSION]
 }
 
 fn is_spool_request_path(verb: &str, request_path: &Path) -> bool {
-    request_path.extension().and_then(|extension| extension.to_str()) == Some(spool_request_extension(verb))
+    let Some(extension) = request_path.extension().and_then(|extension| extension.to_str()) else { return false };
+    accepted_spool_request_extensions(verb).contains(&extension)
 }
 
 fn spool_claim_path(request_path: &Path) -> Option<PathBuf> {
@@ -1685,12 +1692,31 @@ fn write_spool_out_and_release_claim(out_dir: &Path, in_dir: &Path, verb: &str, 
 
 const ORPHAN_CLAIM_EXT: &str = "inflight";
 
-fn inflight_claim_path(in_dir: &Path, verb: &str, task: &str) -> PathBuf {
-    in_dir.join(verb).join(format!("{task}.{}.{ORPHAN_CLAIM_EXT}", spool_request_extension(verb)))
+fn inflight_claim_path_with_extension(in_dir: &Path, verb: &str, task: &str, extension: &str) -> PathBuf {
+    in_dir.join(verb).join(format!("{task}.{extension}.{ORPHAN_CLAIM_EXT}"))
 }
 
-fn queued_request_path(in_dir: &Path, verb: &str, task: &str) -> PathBuf {
-    in_dir.join(verb).join(format!("{task}.{}", spool_request_extension(verb)))
+fn existing_inflight_claim(in_dir: &Path, verb: &str, task: &str) -> Option<(PathBuf, &'static str)> {
+    accepted_spool_request_extensions(verb)
+        .into_iter()
+        .map(|extension| (inflight_claim_path_with_extension(in_dir, verb, task, extension), extension))
+        .find(|(claim, _)| claim.exists())
+}
+
+fn inflight_claim_path(in_dir: &Path, verb: &str, task: &str) -> PathBuf {
+    existing_inflight_claim(in_dir, verb, task)
+        .map(|(claim, _)| claim)
+        .unwrap_or_else(|| inflight_claim_path_with_extension(in_dir, verb, task, spool_request_extension(verb)))
+}
+
+fn queued_request_path_with_extension(in_dir: &Path, verb: &str, task: &str, extension: &str) -> PathBuf {
+    in_dir.join(verb).join(format!("{task}.{extension}"))
+}
+
+fn any_queued_request_exists(in_dir: &Path, verb: &str, task: &str) -> bool {
+    accepted_spool_request_extensions(verb)
+        .into_iter()
+        .any(|extension| queued_request_path_with_extension(in_dir, verb, task, extension).exists())
 }
 
 fn project_in_dir(root: &Path) -> PathBuf {
@@ -1700,13 +1726,12 @@ fn project_in_dir(root: &Path) -> PathBuf {
 type AbandonedClaim = (PathBuf, String, String);
 
 fn requeue_claim(in_dir: &Path, verb: &str, task: &str) -> bool {
-    let claim = inflight_claim_path(in_dir, verb, task);
-    let queued = queued_request_path(in_dir, verb, task);
-    if queued.exists() {
+    let Some((claim, extension)) = existing_inflight_claim(in_dir, verb, task) else { return false };
+    if any_queued_request_exists(in_dir, verb, task) {
         let _ = fs::remove_file(&claim);
         return true;
     }
-    fs::rename(&claim, &queued).is_ok()
+    fs::rename(&claim, queued_request_path_with_extension(in_dir, verb, task, extension)).is_ok()
 }
 
 fn snapshot_in_flight_claims() -> Vec<AbandonedClaim> {
