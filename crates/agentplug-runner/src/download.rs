@@ -97,7 +97,7 @@ fn github_api_request(url: &str) -> ureq::Request {
 }
 
 fn github_token() -> Option<String> {
-    std::env::var("GITHUB_TOKEN").or_else(|_| std::env::var("GH_TOKEN")).ok().filter(|t| !t.is_empty())
+    agentplug_host::resolve_github_token()
 }
 
 fn github_api_call(url: &str) -> Result<ureq::Response, ureq::Error> {
