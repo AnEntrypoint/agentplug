@@ -1,5 +1,6 @@
 ﻿mod daemon;
 mod download;
+mod update_trust;
 
 use std::path::PathBuf;
 
@@ -187,6 +188,17 @@ fn main() -> anyhow::Result<()> {
             println!("{out}");
             Ok(())
         }
+        "trust-status" => {
+            println!("{}", serde_json::to_string_pretty(&update_trust::status())?);
+            Ok(())
+        }
+        "update-runner" => {
+            match download::stage_runner_self_update()? {
+                Some((staged, version)) => println!("staged verified runner {version} at {}", staged.display()),
+                None => println!("no runner update to stage"),
+            }
+            Ok(())
+        }
         "--version" | "version" => {
             println!("agentplug-runner {}", env!("CARGO_PKG_VERSION"));
             Ok(())
@@ -197,7 +209,7 @@ fn main() -> anyhow::Result<()> {
         "selfcheck-spool-claim" => selfcheck_spool_claim(),
         other => {
             eprintln!(
-                "agentplug-runner: unknown command '{other}'. Usage: agentplug-runner <plugin <name> [version]|spool|daemon|takeover <version>|dispatch [plugin] <verb> [body]|reap-orphans|sweep-spool [root]|selfcheck-registry|selfcheck-inflight|version>"
+                "agentplug-runner: unknown command '{other}'. Usage: agentplug-runner <plugin <name> [version]|spool|daemon|takeover <version>|dispatch [plugin] <verb> [body]|reap-orphans|sweep-spool [root]|trust-status|update-runner|selfcheck-registry|selfcheck-inflight|version>"
             );
             std::process::exit(1);
         }
