@@ -1142,14 +1142,6 @@ pub(crate) fn launch_chrome_pub(cwd: &Path, session_id: &str, browser_cfg: &Brow
     launch_chrome(cwd, session_id, browser_cfg)
 }
 
-/// `--load-extension` is silently ignored by current stable Chrome unless the
-/// profile already has developer mode on (a chicken-and-egg problem for a
-/// freshly-profiled session), so the reliable path is the CDP `Extensions`
-/// domain's `loadUnpacked` method against the browser-level websocket,
-/// called once right after Chrome answers ready. Best-effort: a failure here
-/// (no node, no `load_extension` configured, CDP call error) never fails
-/// session creation, it just means the extension did not load -- logged to
-/// the same per-session chrome-launch.log for visibility.
 pub(crate) fn load_extension_after_launch(cwd: &Path, session_id: &str, port: u16, browser_cfg: &BrowserRuntimeConfig) {
     let Some(ext_path) = browser_cfg.load_extension() else { return };
     let profile_dir = browser_chrome_profile_dir(cwd, session_id);
