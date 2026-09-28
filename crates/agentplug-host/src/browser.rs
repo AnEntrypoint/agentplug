@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -10,6 +11,10 @@ use wait_timeout::ChildExt;
 
 const CDP_EVAL_JS: &str = include_str!("cdp_eval.js");
 const EXTENSION_LOAD_JS: &str = include_str!("extension_load.js");
+const DEFAULT_CHROME_IDLE_TTL_SECONDS: u64 = 300;
+const DEFAULT_CHROME_MAX_CONCURRENT: u64 = 3;
+const IDLE_REAPER_TICK: Duration = Duration::from_secs(30);
+const LRU_EVICTION_IDLE_FLOOR: Duration = Duration::from_secs(60);
 
 #[derive(serde::Deserialize, Default)]
 pub(crate) struct BrowserRuntimeConfig {
@@ -33,6 +38,10 @@ pub(crate) struct BrowserRuntimeConfig {
     chrome_extra_args: Option<Vec<Value>>,
     #[serde(default)]
     enable_webgpu: Option<bool>,
+    #[serde(default)]
+    chrome_idle_ttl_seconds: Option<u64>,
+    #[serde(default)]
+    chrome_max_concurrent: Option<u64>,
 }
 
 type BrowserConfig = BrowserRuntimeConfig;
@@ -61,6 +70,12 @@ impl BrowserRuntimeConfig {
     }
     fn chrome_extra_args(&self) -> &[Value] { self.chrome_extra_args.as_deref().unwrap_or(&[]) }
     fn enable_webgpu(&self) -> bool { self.enable_webgpu.unwrap_or(false) }
+    fn chrome_idle_ttl(&self) -> Duration {
+        Duration::from_secs(self.chrome_idle_ttl_seconds.filter(|s| *s > 0).unwrap_or(DEFAULT_CHROME_IDLE_TTL_SECONDS))
+    }
+    fn chrome_max_concurrent(&self) -> usize {
+        self.chrome_max_concurrent.filter(|n| *n > 0).unwrap_or(DEFAULT_CHROME_MAX_CONCURRENT) as usize
+    }
 }
 
 fn which(cmd: &str) -> Option<PathBuf> {
@@ -352,6 +367,7 @@ fn kill_session(mut session: BrowserSession) {
     let _ = std::fs::remove_file(port_sidecar_path(&profile_dir));
     let _ = std::fs::remove_file(session_id_sidecar_path(&profile_dir));
     let _ = std::fs::remove_file(owner_gm_session_sidecar_path(&profile_dir));
+    let _ = std::fs::remove_file(last_used_sidecar_path(&profile_dir));
 }
 
 fn pid_sidecar_path(profile_dir: &Path) -> PathBuf {
@@ -389,6 +405,29 @@ fn target_id_sidecar_path(profile_dir: &Path) -> PathBuf {
 
 fn write_target_id_sidecar(profile_dir: &Path, target_id: &str) {
     let _ = std::fs::write(target_id_sidecar_path(profile_dir), target_id);
+}
+
+fn last_used_sidecar_path(profile_dir: &Path) -> PathBuf {
+    profile_dir.join("chrome.last-used")
+}
+
+fn touch_last_used(cwd: &Path, session_id: &str, key: &str) {
+    if let Some(session) = sessions_map().lock().unwrap_or_else(|e| e.into_inner()).get_mut(key) {
+        session.last_used = Instant::now();
+    }
+    let profile_dir = browser_chrome_profile_dir(cwd, session_id);
+    if profile_dir.is_dir() {
+        let _ = std::fs::write(last_used_sidecar_path(&profile_dir), unix_ms().to_string());
+    }
+}
+
+fn last_used_recorded_in_sidecars(profile_dir: &Path) -> Instant {
+    [last_used_sidecar_path(profile_dir), target_id_sidecar_path(profile_dir), pid_sidecar_path(profile_dir)]
+        .iter()
+        .filter_map(|p| std::fs::metadata(p).ok()?.modified().ok()?.elapsed().ok())
+        .min()
+        .and_then(|idle| Instant::now().checked_sub(idle))
+        .unwrap_or_else(Instant::now)
 }
 
 fn write_session_sidecars(profile_dir: &Path, pid: u32, port: u16, session_id: &str) {
@@ -443,7 +482,7 @@ fn try_adopt_orphaned_session(cwd: &Path, session_id_hint: Option<&str>, profile
                 pid,
                 port,
                 cdp_endpoint: format!("http://127.0.0.1:{port}"),
-                last_used: Instant::now(),
+                last_used: last_used_recorded_in_sidecars(profile_dir),
                 target_id,
                 owns_process: true,
                 engine: crate::browser_engine::Engine::Chrome,
@@ -652,6 +691,7 @@ fn kill_pid(pid: u32) {
 
 #[cfg(not(windows))]
 fn kill_pid(pid: u32) {
+    let _ = Command::new("kill").args(["-9", "--", &format!("-{pid}")]).output();
     let _ = Command::new("kill").args(["-9", &pid.to_string()]).output();
 }
 
@@ -878,26 +918,41 @@ fn owner_gm_session_is_stale(owner_gm_session: Option<&str>, threshold: Duration
         .unwrap_or(false)
 }
 
-fn effective_idle_timeout(owner_gm_session: Option<&str>, cfg: &BrowserConfig) -> Duration {
+fn effective_idle_timeout(owner_gm_session: Option<&str>, owns_process: bool, cfg: &BrowserConfig) -> Duration {
     let long_ceiling = cfg.session_idle_timeout();
     let short_ceiling = cfg.session_owner_gone_idle_timeout();
-    if owner_gm_session_is_stale(owner_gm_session, short_ceiling) {
+    let session_ceiling = if owner_gm_session_is_stale(owner_gm_session, short_ceiling) {
         short_ceiling.min(long_ceiling)
     } else {
         long_ceiling
+    };
+    if owns_process {
+        session_ceiling.min(cfg.chrome_idle_ttl())
+    } else {
+        session_ceiling
     }
+}
+
+fn dispatch_in_flight(key: &str) -> bool {
+    let lock = session_lifecycle_lock_for_key(key);
+    let blocked = matches!(lock.try_lock(), Err(std::sync::TryLockError::WouldBlock));
+    blocked
 }
 
 fn reap_idle_sessions(cwd: &Path, cfg: &BrowserConfig) {
     let mut map = sessions_map().lock().unwrap_or_else(|e| e.into_inner());
     let dead_keys: Vec<String> = map
         .iter()
-        .filter(|(_, s)| s.cwd == cwd && s.last_used.elapsed() > effective_idle_timeout(s.owner_gm_session.as_deref(), cfg))
+        .filter(|(k, s)| {
+            s.cwd == cwd
+                && s.last_used.elapsed() > effective_idle_timeout(s.owner_gm_session.as_deref(), s.owns_process, cfg)
+                && !dispatch_in_flight(k)
+        })
         .map(|(k, _)| k.clone())
         .collect();
     for k in dead_keys {
         if let Some(session) = map.remove(&k) {
-            let timeout = effective_idle_timeout(session.owner_gm_session.as_deref(), cfg);
+            let timeout = effective_idle_timeout(session.owner_gm_session.as_deref(), session.owns_process, cfg);
             let owner_gone = owner_gm_session_is_stale(session.owner_gm_session.as_deref(), cfg.session_owner_gone_idle_timeout());
             eprintln!(
                 "[agentplug browser] reaping idle session {} (idle {}ms > {}ms, owner_gm_session={:?}, owner_gone={})",
@@ -912,6 +967,124 @@ fn reap_idle_sessions(cwd: &Path, cfg: &BrowserConfig) {
     }
     drop(map);
     evict_session_lifecycle_locks_with_no_active_holder();
+}
+
+static IDLE_REAPER_STARTED: OnceLock<()> = OnceLock::new();
+
+fn ensure_idle_reaper_running() {
+    if IDLE_REAPER_STARTED.set(()).is_err() {
+        return;
+    }
+    let _ = std::thread::Builder::new().name("agentplug-browser-idle-reaper".to_string()).spawn(|| loop {
+        std::thread::sleep(IDLE_REAPER_TICK);
+        reap_idle_sessions_of_every_tracked_project();
+    });
+}
+
+fn reap_idle_sessions_of_every_tracked_project() {
+    let mut project_roots: Vec<PathBuf> = sessions_map().lock().unwrap_or_else(|e| e.into_inner()).values().map(|s| s.cwd.clone()).collect();
+    project_roots.sort();
+    project_roots.dedup();
+    for root in project_roots {
+        reap_idle_sessions(&root, &BrowserConfig::load(&root));
+    }
+}
+
+struct OwnedChrome {
+    key: String,
+    pid: u32,
+    project: PathBuf,
+    session_id: String,
+    idle: Duration,
+}
+
+fn owned_chrome_sessions() -> Vec<OwnedChrome> {
+    let mut map = sessions_map().lock().unwrap_or_else(|e| e.into_inner());
+    let is_owned_chrome = |s: &BrowserSession| s.owns_process && s.engine == crate::browser_engine::Engine::Chrome;
+    let exited: Vec<String> = map
+        .iter_mut()
+        .filter_map(|(k, s)| (is_owned_chrome(s) && s.child.as_mut().is_some_and(|c| matches!(c.try_wait(), Ok(Some(_))))).then(|| k.clone()))
+        .collect();
+    for k in exited {
+        map.remove(&k);
+    }
+    map.iter()
+        .filter(|(_, s)| is_owned_chrome(s))
+        .map(|(k, s)| OwnedChrome {
+            key: k.clone(),
+            pid: s.pid,
+            project: s.cwd.clone(),
+            session_id: s.session_id.clone(),
+            idle: s.last_used.elapsed(),
+        })
+        .collect()
+}
+
+static CHROME_CAP_HIGH_WATER: AtomicUsize = AtomicUsize::new(0);
+static PENDING_CHROME_LAUNCHES: AtomicUsize = AtomicUsize::new(0);
+static CHROME_ADMISSION: Mutex<()> = Mutex::new(());
+
+fn effective_chrome_cap(cfg: &BrowserConfig) -> usize {
+    let this_project = cfg.chrome_max_concurrent();
+    CHROME_CAP_HIGH_WATER.fetch_max(this_project, Ordering::Relaxed).max(this_project)
+}
+
+struct ChromeLaunchReservation;
+
+impl Drop for ChromeLaunchReservation {
+    fn drop(&mut self) {
+        PENDING_CHROME_LAUNCHES.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+fn chrome_cap_exceeded_message(cap: usize, live: &[OwnedChrome]) -> String {
+    let listing = live
+        .iter()
+        .map(|s| format!("pid {} project {} session '{}' idle {}s", s.pid, s.project.display(), s.session_id, s.idle.as_secs()))
+        .collect::<Vec<_>>()
+        .join("; ");
+    format!(
+        "chrome_max_concurrent={cap} gm-launched Chrome processes are already live across every project this daemon serves (launches in flight: {}) and none has been idle for {}s, so no new Chrome was started. Live: [{listing}]. Free one with `sessionId=<id>` plus `session close <id>`, wait for chrome_idle_ttl_seconds to reap an idle one, or raise chrome_max_concurrent in .gm/browser-config.json",
+        PENDING_CHROME_LAUNCHES.load(Ordering::Relaxed),
+        LRU_EVICTION_IDLE_FLOOR.as_secs()
+    )
+}
+
+fn reserve_chrome_launch_slot(cfg: &BrowserConfig, engine: crate::browser_engine::Engine, launching_key: &str) -> Result<Option<ChromeLaunchReservation>, String> {
+    if engine != crate::browser_engine::Engine::Chrome {
+        return Ok(None);
+    }
+    let cap = effective_chrome_cap(cfg);
+    let _admission = CHROME_ADMISSION.lock().unwrap_or_else(|e| e.into_inner());
+    let occupied = |live: &[OwnedChrome]| live.len() + PENDING_CHROME_LAUNCHES.load(Ordering::Relaxed);
+    let mut live = owned_chrome_sessions();
+    if occupied(&live) >= cap {
+        reap_idle_sessions_of_every_tracked_project();
+        live = owned_chrome_sessions();
+    }
+    while occupied(&live) >= cap {
+        let victim = live
+            .iter()
+            .filter(|s| s.key != launching_key && s.idle >= LRU_EVICTION_IDLE_FLOOR && !dispatch_in_flight(&s.key))
+            .max_by_key(|s| s.idle)
+            .map(|s| (s.key.clone(), s.pid, s.idle));
+        let Some((victim_key, victim_pid, victim_idle)) = victim else {
+            return Err(chrome_cap_exceeded_message(cap, &live));
+        };
+        let evicted = sessions_map().lock().unwrap_or_else(|e| e.into_inner()).remove(&victim_key);
+        if let Some(session) = evicted {
+            eprintln!(
+                "[agentplug browser] evicting least-recently-used idle session '{}' (pid {victim_pid}, project {}, idle {}s) to stay within chrome_max_concurrent={cap}",
+                session.session_id,
+                session.cwd.display(),
+                victim_idle.as_secs()
+            );
+            kill_session(session);
+        }
+        live = owned_chrome_sessions();
+    }
+    PENDING_CHROME_LAUNCHES.fetch_add(1, Ordering::Relaxed);
+    Ok(Some(ChromeLaunchReservation))
 }
 
 fn evict_session_lifecycle_locks_with_no_active_holder() {
@@ -929,6 +1102,10 @@ fn session_new(cwd: &Path, session_id: &str, owner_gm_session: Option<&str>, cfg
             kill_session(existing);
         }
     }
+    let _launch_slot = match reserve_chrome_launch_slot(cfg, engine, &key) {
+        Ok(slot) => slot,
+        Err(e) => return json!({"ok": false, "stdout": "", "exit_code": 1, "stderr": e}),
+    };
     match crate::browser_engine::acquire(engine, cwd, session_id, cfg) {
         Ok(acquired) => {
             let pid = acquired.child.as_ref().map(|c| c.id()).unwrap_or(0);
@@ -984,18 +1161,49 @@ fn session_list(cwd: &Path, caller_gm_session: Option<&str>, caller_implicit_ses
                 "owned_by_caller": caller_gm_session.is_some() && s.owner_gm_session.as_deref() == caller_gm_session,
                 "is_caller_implicit_session": s.session_id == caller_implicit_session,
                 "port": s.port,
+                "pid": s.pid,
+                "project": s.cwd.display().to_string(),
+                "owns_process": s.owns_process,
                 "alive": true,
                 "idle_ms": s.last_used.elapsed().as_millis() as u64,
+                "idle_seconds": s.last_used.elapsed().as_secs(),
                 "owner_last_dispatch_ms": owner_last_seen_ms,
                 "target_id": s.target_id,
                 "engine": format!("{:?}", s.engine),
             }));
         }
     }
+    drop(map);
+    let all_chrome = owned_chrome_sessions();
+    let mut pids_to_measure: Vec<u32> = all_chrome.iter().map(|s| s.pid).collect();
+    pids_to_measure.extend(out.iter().filter(|v| v["owns_process"] == json!(true)).filter_map(|v| v["pid"].as_u64()).map(|p| p as u32));
+    pids_to_measure.sort_unstable();
+    pids_to_measure.dedup();
+    let working_sets = crate::process_tree::tree_working_set_bytes(&pids_to_measure);
+    let working_set_mb = |pid: u32| working_sets.get(&pid).map(|bytes| bytes / (1024 * 1024));
+    for entry in &mut out {
+        let pid = entry["pid"].as_u64().map(|p| p as u32);
+        entry["working_set_mb"] = json!(pid.and_then(working_set_mb));
+    }
+    let cfg = BrowserConfig::load(cwd);
+    let chrome_sessions_all_projects: Vec<Value> = all_chrome
+        .iter()
+        .map(|s| json!({
+            "session_id": s.session_id,
+            "project": s.project.display().to_string(),
+            "pid": s.pid,
+            "idle_seconds": s.idle.as_secs(),
+            "working_set_mb": working_set_mb(s.pid),
+        }))
+        .collect();
     json!({
         "ok": true, "stdout": "", "exit_code": 0, "stderr": "",
         "caller_gm_session": caller_gm_session,
         "caller_implicit_session": caller_implicit_session,
+        "chrome_process_count": all_chrome.len(),
+        "chrome_max_concurrent": effective_chrome_cap(&cfg),
+        "chrome_idle_ttl_seconds": cfg.chrome_idle_ttl().as_secs(),
+        "chrome_sessions_all_projects": chrome_sessions_all_projects,
         "sessions": out,
     })
 }
@@ -1004,10 +1212,12 @@ fn session_close(cwd: &Path, target_session_id: &str, require_found: bool) -> Va
     let key = session_key(cwd, target_session_id);
     let lifecycle_lock = session_lifecycle_lock_for_key(&key);
     let _lifecycle_guard_blocks_concurrent_launch_for_this_key = lifecycle_lock.lock().unwrap_or_else(|e| e.into_inner());
-    let removed = {
-        let mut map = sessions_map().lock().unwrap_or_else(|e| e.into_inner());
-        map.remove(&key)
-    };
+    let remove_tracked = || sessions_map().lock().unwrap_or_else(|e| e.into_inner()).remove(&key);
+    let removed = remove_tracked().or_else(|| {
+        try_adopt_orphaned_session(cwd, Some(target_session_id), &browser_chrome_profile_dir(cwd, target_session_id))
+            .filter(|adopted_id| adopted_id == target_session_id)
+            .and_then(|_| remove_tracked())
+    });
     match removed {
         Some(session) => {
             kill_session(session);
@@ -1143,6 +1353,11 @@ fn spawn_chrome_once(
 ) -> Result<Child, String> {
     let mut cmd = Command::new(chrome);
     cmd.args(chrome_launch_args(profile_dir, port, headless, no_sandbox, cfg));
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -1281,6 +1496,7 @@ pub fn run(body: &str, opts: &str, cwd_raw: &Path, session_id: &str) -> Value {
     let cwd: &Path = &cwd_owned;
 
     let t0 = Instant::now();
+    ensure_idle_reaper_running();
     let browser_cfg = BrowserConfig::load(cwd);
     reap_idle_sessions(cwd, &browser_cfg);
     reap_os_orphans(cwd);
@@ -1517,6 +1733,13 @@ pub fn run(body: &str, opts: &str, cwd_raw: &Path, session_id: &str) -> Value {
             match adopted_port {
                 Some(p) => p,
                 None => {
+                    let _launch_slot = match reserve_chrome_launch_slot(&browser_cfg, engine, &key) {
+                        Ok(slot) => slot,
+                        Err(e) => {
+                            cleanup(&[&helper_path, &script_path, &result_path]);
+                            return annotate_queue_wait(json!({"ok": false, "stdout": "", "exit_code": 1, "stderr": e}), queued_behind_same_page_ms, session_id);
+                        }
+                    };
                     let acquired = match crate::browser_engine::acquire(engine, cwd, session_id, &browser_cfg) {
                         Ok(v) => v,
                         Err(e) => {
@@ -1646,8 +1869,9 @@ pub fn run(body: &str, opts: &str, cwd_raw: &Path, session_id: &str) -> Value {
     }
 
     cleanup(&[&helper_path, &script_path, &result_path]);
+    touch_last_used(cwd, session_id, &key);
 
-    let cdp_error = result_value.get("__cdpError").and_then(|v| v.as_str());
+    let cdp_error =result_value.get("__cdpError").and_then(|v| v.as_str());
     let ok = exit_code == 0 && !timed_out && cdp_error.is_none();
     let default_debug = || json!({"console": [], "pageErrors": [], "network": [], "performance": null, "gl": {"errors": [], "drawCalls": {}, "errorTotalCount": 0}});
     let mut out = json!({

@@ -7,6 +7,7 @@ mod host_state;
 mod http_agent;
 mod memory_pressure;
 mod oxibrowser_driver;
+mod process_tree;
 mod task;
 mod imports;
 mod install;
