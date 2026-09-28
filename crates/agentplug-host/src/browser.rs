@@ -9,6 +9,7 @@ use serde_json::{json, Value};
 use wait_timeout::ChildExt;
 
 const CDP_EVAL_JS: &str = include_str!("cdp_eval.js");
+const EXTENSION_LOAD_JS: &str = include_str!("extension_load.js");
 
 #[derive(serde::Deserialize)]
 pub(crate) struct BrowserRuntimeConfig {
@@ -26,6 +27,8 @@ pub(crate) struct BrowserRuntimeConfig {
     session_idle_timeout_ms: Option<u64>,
     #[serde(default)]
     session_owner_gone_idle_timeout_ms: Option<u64>,
+    #[serde(default)]
+    load_extension: Option<String>,
 }
 
 type BrowserConfig = BrowserRuntimeConfig;
@@ -44,6 +47,7 @@ impl BrowserRuntimeConfig {
                 headless: None,
                 session_idle_timeout_ms: None,
                 session_owner_gone_idle_timeout_ms: None,
+                load_extension: None,
             })
     }
     fn cdp_poll_timeout(&self) -> Duration { Duration::from_millis(self.cdp_poll_timeout_ms.unwrap_or(1000)) }
@@ -56,6 +60,9 @@ impl BrowserRuntimeConfig {
     }
     fn session_owner_gone_idle_timeout(&self) -> Duration {
         Duration::from_millis(self.session_owner_gone_idle_timeout_ms.unwrap_or(5 * 60 * 1000))
+    }
+    pub(crate) fn load_extension(&self) -> Option<&str> {
+        self.load_extension.as_deref()
     }
 }
 
@@ -1089,6 +1096,7 @@ fn spawn_chrome_once(
     port: u16,
     headless: bool,
     no_sandbox: bool,
+    load_extension: Option<&str>,
 ) -> Result<Child, String> {
     let mut cmd = Command::new(chrome);
     cmd.arg(format!("--user-data-dir={}", profile_dir.display()))
@@ -1103,6 +1111,10 @@ fn spawn_chrome_once(
     }
     if no_sandbox {
         cmd.arg("--no-sandbox").arg("--disable-setuid-sandbox").arg("--disable-dev-shm-usage");
+    }
+    if let Some(ext) = load_extension {
+        cmd.arg(format!("--load-extension={ext}"));
+        cmd.arg(format!("--disable-extensions-except={ext}"));
     }
     #[cfg(windows)]
     {
@@ -1130,6 +1142,56 @@ pub(crate) fn launch_chrome_pub(cwd: &Path, session_id: &str, browser_cfg: &Brow
     launch_chrome(cwd, session_id, browser_cfg)
 }
 
+/// `--load-extension` is silently ignored by current stable Chrome unless the
+/// profile already has developer mode on (a chicken-and-egg problem for a
+/// freshly-profiled session), so the reliable path is the CDP `Extensions`
+/// domain's `loadUnpacked` method against the browser-level websocket,
+/// called once right after Chrome answers ready. Best-effort: a failure here
+/// (no node, no `load_extension` configured, CDP call error) never fails
+/// session creation, it just means the extension did not load -- logged to
+/// the same per-session chrome-launch.log for visibility.
+pub(crate) fn load_extension_after_launch(cwd: &Path, session_id: &str, port: u16, browser_cfg: &BrowserRuntimeConfig) {
+    let Some(ext_path) = browser_cfg.load_extension() else { return };
+    let profile_dir = browser_chrome_profile_dir(cwd, session_id);
+    let log_path = chrome_launch_log_path(&profile_dir);
+    let log_line = |msg: &str| {
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&log_path) {
+            let _ = writeln!(f, "[load_extension] {msg}");
+        }
+    };
+    let Some(node) = which("node") else {
+        log_line("node not found on PATH; skipping extension load");
+        return;
+    };
+    let script_path = std::env::temp_dir().join(format!("agentplug-load-extension-{}.mjs", std::process::id()));
+    if std::fs::write(&script_path, EXTENSION_LOAD_JS).is_err() {
+        log_line("failed to write extension_load.js helper to temp dir");
+        return;
+    }
+    let output = Command::new(&node).arg(&script_path).arg(port.to_string()).arg(ext_path).output();
+    let _ = std::fs::remove_file(&script_path);
+    match output {
+        Ok(out) => {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let line = stdout.lines().last().unwrap_or("").trim();
+            match serde_json::from_str::<Value>(line) {
+                Ok(v) => {
+                    if let Some(id) = v.get("id").and_then(|x| x.as_str()) {
+                        let _ = std::fs::write(profile_dir.join("chrome.extension-id"), id);
+                        log_line(&format!("loaded '{ext_path}' as extension id {id}"));
+                    } else if let Some(err) = v.get("error") {
+                        log_line(&format!("Extensions.loadUnpacked failed for '{ext_path}': {err}"));
+                    } else {
+                        log_line(&format!("Extensions.loadUnpacked: unrecognized response: {line}"));
+                    }
+                }
+                Err(_) => log_line(&format!("Extensions.loadUnpacked: non-JSON output: {line} (stderr: {})", String::from_utf8_lossy(&out.stderr))),
+            }
+        }
+        Err(e) => log_line(&format!("failed to spawn node to load extension: {e}")),
+    }
+}
+
 fn launch_chrome(cwd: &Path, session_id: &str, browser_cfg: &BrowserConfig) -> Result<(Child, u16), String> {
     let chrome = find_chrome().ok_or_else(|| "no Chrome found; install Google Chrome or Chromium".to_string())?;
     let profile_dir = browser_chrome_profile_dir(cwd, session_id);
@@ -1144,7 +1206,8 @@ fn launch_chrome(cwd: &Path, session_id: &str, browser_cfg: &BrowserConfig) -> R
         || (running_as_root && no_sandbox_env.as_deref() != Some("0"));
     let headless = browser_cfg.headless();
     let port = free_port();
-    let mut chrome_child = spawn_chrome_once(&chrome, &profile_dir, port, headless, no_sandbox)?;
+    let load_extension = browser_cfg.load_extension();
+    let mut chrome_child = spawn_chrome_once(&chrome, &profile_dir, port, headless, no_sandbox, load_extension)?;
 
     write_session_sidecars(&profile_dir, chrome_child.id(), port, session_id);
 
@@ -1156,7 +1219,7 @@ fn launch_chrome(cwd: &Path, session_id: &str, browser_cfg: &BrowserConfig) -> R
         if !no_sandbox && no_sandbox_env.as_deref() != Some("0") && chrome_stderr_log_indicates_suid_sandbox_init_denial(&log_path) {
             no_sandbox = true;
             let port2 = free_port();
-            let mut retry_child = spawn_chrome_once(&chrome, &profile_dir, port2, headless, no_sandbox)?;
+            let mut retry_child = spawn_chrome_once(&chrome, &profile_dir, port2, headless, no_sandbox, load_extension)?;
             write_session_sidecars(&profile_dir, retry_child.id(), port2, session_id);
             if cdp_ready(port2, Instant::now() + browser_cfg.chrome_ready_deadline(), browser_cfg) {
                 return Ok((retry_child, port2));
