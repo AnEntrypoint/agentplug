@@ -5,6 +5,29 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use agentplug_host::install_dir;
+use crate::update_trust::{self, AssetIdentity, UpdateRejected};
+
+const GITHUB_WEB_BASE_ENV: &str = "AGENTPLUG_GITHUB_WEB_BASE";
+const GITHUB_API_BASE_ENV: &str = "AGENTPLUG_GITHUB_API_BASE";
+
+fn base_from_env_or(var: &str, default: &str) -> String {
+    let Ok(over) = std::env::var(var) else { return default.to_string() };
+    let over = over.trim().trim_end_matches('/').to_string();
+    let loopback_http = ["http://127.0.0.1", "http://localhost", "http://[::1]"].iter().any(|p| over.starts_with(p));
+    if over.starts_with("https://") || loopback_http {
+        return over;
+    }
+    eprintln!("[agentplug] ignoring {var}={over:?}: only https:// or loopback http:// bases are accepted");
+    default.to_string()
+}
+
+fn github_web_base() -> String {
+    base_from_env_or(GITHUB_WEB_BASE_ENV, "https://github.com")
+}
+
+fn github_api_base() -> String {
+    base_from_env_or(GITHUB_API_BASE_ENV, "https://api.github.com")
+}
 
 pub fn sha256_hex(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
@@ -58,7 +81,7 @@ fn extract_version_from_release_url(url: &str) -> Option<String> {
 }
 
 fn resolve_latest_tag_via_release_page(repo: &str) -> Option<String> {
-    let page_url = format!("https://github.com/{repo}/releases/latest");
+    let page_url = format!("{}/{repo}/releases/latest", github_web_base());
     let resp = agentplug_host::shared_agent().get(&page_url).call().ok()?;
     let resolved_url = resp.get_url();
     let idx = resolved_url.find("/releases/tag/")?;
@@ -68,7 +91,7 @@ fn resolve_latest_tag_via_release_page(repo: &str) -> Option<String> {
 }
 
 fn try_ensure_plugin_installed_via_direct_release_latest(spec: &PluginAssetSpec, dest: &Path, version_file: &Path) -> anyhow::Result<PathBuf> {
-    let sha_url = format!("https://github.com/{}/releases/latest/download/{}.wasm.sha256", spec.repo, spec.asset_basename);
+    let sha_url = format!("{}/{}/releases/latest/download/{}.wasm.sha256", github_web_base(), spec.repo, spec.asset_basename);
     let sha_resp = agentplug_host::shared_agent().get(&sha_url).call()?;
     let resolved_url = sha_resp.get_url().to_string();
     let version = extract_version_from_release_url(&resolved_url)
@@ -81,9 +104,12 @@ fn try_ensure_plugin_installed_via_direct_release_latest(spec: &PluginAssetSpec,
         .ok_or_else(|| anyhow::anyhow!("empty sha256 sidecar for {} at {sha_url}", spec.asset_basename))?
         .to_string();
 
-    let wasm_url = format!("https://github.com/{}/releases/latest/download/{}.wasm", spec.repo, spec.asset_basename);
+    let wasm_url = format!("{}/{}/releases/latest/download/{}.wasm", github_web_base(), spec.repo, spec.asset_basename);
+    let artifact = format!("{}.wasm", spec.asset_basename);
+    let running = fs::read_to_string(version_file).ok().map(|s| s.trim().to_string());
+    let identity = AssetIdentity { artifact: &artifact, version: &version, running: running.as_deref() };
     snapshot_prev_wasm_and_version(dest, version_file);
-    download_and_verify(&wasm_url, dest, &expected_sha)?;
+    download_and_verify(&wasm_url, dest, &expected_sha, &identity)?;
     fs::write(version_file, &version)?;
     eprintln!(
         "[agentplug] {} installed via direct release-asset download {wasm_url} (api.github.com path failed or was blocked)",
@@ -127,7 +153,8 @@ fn describe_github_api_error(url: &str, err: ureq::Error) -> anyhow::Error {
     }
 }
 
-pub fn download_and_verify(url: &str, dest: &Path, expected_sha256_hex: &str) -> anyhow::Result<()> {
+pub fn download_and_verify(url: &str, dest: &Path, expected_sha256_hex: &str, identity: &AssetIdentity) -> anyhow::Result<bool> {
+    let preflight = update_trust::preflight(identity, &format!("{url}.sig"))?;
     let resp = agentplug_host::shared_agent().get(url).call()?;
     let mut reader = resp.into_reader();
     let mut bytes = Vec::new();
@@ -143,6 +170,7 @@ pub fn download_and_verify(url: &str, dest: &Path, expected_sha256_hex: &str) ->
     if !actual.eq_ignore_ascii_case(expected_sha256_hex) {
         anyhow::bail!("sha256 mismatch downloading {url}: expected {expected_sha256_hex}, got {actual}");
     }
+    let finalized = update_trust::finalize(identity, &preflight, &bytes)?;
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -162,7 +190,8 @@ pub fn download_and_verify(url: &str, dest: &Path, expected_sha256_hex: &str) ->
         return Err(e);
     }
     fs::rename(&tmp, dest)?;
-    Ok(())
+    update_trust::installed(identity, &finalized);
+    Ok(finalized.authorized.verified())
 }
 
 struct PluginAssetSpec {
@@ -267,7 +296,7 @@ pub fn installed_runner_version() -> Option<String> {
 }
 
 pub fn fetch_latest_runner_version() -> anyhow::Result<Option<String>> {
-    let url = format!("https://api.github.com/repos/{RUNNER_BIN_REPO}/releases/latest");
+    let url = format!("{}/repos/{RUNNER_BIN_REPO}/releases/latest", github_api_base());
     match github_api_call(&url) {
         Ok(resp) => {
             let body: serde_json::Value = serde_json::from_str(&resp.into_string()?)?;
@@ -275,7 +304,7 @@ pub fn fetch_latest_runner_version() -> anyhow::Result<Option<String>> {
         }
         Err(api_err) => {
             let Some(asset) = runner_asset_name() else { return Err(describe_github_api_error(&url, api_err)) };
-            let probe_url = format!("https://github.com/{RUNNER_BIN_REPO}/releases/latest/download/{asset}.sha256");
+            let probe_url = format!("{}/{RUNNER_BIN_REPO}/releases/latest/download/{asset}.sha256", github_web_base());
             match agentplug_host::shared_agent().get(&probe_url).call() {
                 Ok(resp) => {
                     let resolved_url = resp.get_url().to_string();
@@ -305,11 +334,15 @@ pub fn stage_runner_self_update() -> anyhow::Result<Option<(PathBuf, String)>> {
     let staged = current_exe.with_extension(
         current_exe.extension().map(|e| format!("{}.{staged_suffix}", e.to_string_lossy())).unwrap_or_else(|| staged_suffix.to_string())
     );
-    let base = format!("https://github.com/{RUNNER_BIN_REPO}/releases/download/v{latest}");
+    let base = format!("{}/{RUNNER_BIN_REPO}/releases/download/v{latest}", github_web_base());
     let sha_line = agentplug_host::shared_agent().get(&format!("{base}/{asset}.sha256")).call()?.into_string()?;
     let expected_sha = sha_line.split_whitespace().next()
         .ok_or_else(|| anyhow::anyhow!("empty sha256 sidecar for {asset} at {base}"))?.to_string();
-    download_and_verify(&format!("{base}/{asset}"), &staged, &expected_sha)?;
+    let identity = AssetIdentity { artifact: asset, version: &latest, running: Some(env!("CARGO_PKG_VERSION")) };
+    let verified = download_and_verify(&format!("{base}/{asset}"), &staged, &expected_sha, &identity)?;
+    if verified {
+        update_trust::mark_staged_verified(&staged, &identity);
+    }
     #[cfg(not(windows))]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -346,7 +379,7 @@ pub fn fetch_latest_plugin_version(plugin_name: &str) -> anyhow::Result<Option<S
     let Some(spec) = plugin_asset_spec(plugin_name) else {
         anyhow::bail!("unknown plugin {plugin_name} -- not registered in agentplug-runner's plugin_asset_spec map");
     };
-    let url = format!("https://api.github.com/repos/{}/releases?per_page=100", spec.repo);
+    let url = format!("{}/repos/{}/releases?per_page=100", github_api_base(), spec.repo);
     let resp = github_api_call(&url).map_err(|e| describe_github_api_error(&url, e))?;
     let body: serde_json::Value = serde_json::from_str(&resp.into_string()?)?;
     let Some(releases) = body.as_array() else {
@@ -456,7 +489,7 @@ fn fetch_remote_wasm_sha256(plugin_name: &str, version: &str) -> anyhow::Result<
     let Some(spec) = plugin_asset_spec(plugin_name) else {
         anyhow::bail!("unknown plugin {plugin_name} -- not registered in agentplug-runner's plugin_asset_spec map");
     };
-    let base = format!("https://github.com/{}/releases/download/v{version}", spec.repo);
+    let base = format!("{}/{}/releases/download/v{version}", github_web_base(), spec.repo);
     let sha_line = agentplug_host::shared_agent().get(&format!("{base}/{}.wasm.sha256", spec.asset_basename)).call()?.into_string()?;
     sha_line.split_whitespace().next().map(str::to_string)
         .ok_or_else(|| anyhow::anyhow!("empty sha256 sidecar for {} at {base}", spec.asset_basename))
@@ -497,8 +530,10 @@ pub fn refresh_plugin_if_stale(plugin_name: &str) -> anyhow::Result<Option<Strin
     }
     ensure_plugin_installed(plugin_name, Some(&latest))?;
     if plugin_name == "gm" {
-        if let Err(e) = refresh_installed_skill_md() {
-            eprintln!("[agentplug daemon] SKILL.md refresh after gm plugin update to {latest} failed: {e:#}");
+        if update_trust::skill_refresh_permitted() {
+            if let Err(e) = refresh_installed_skill_md() {
+                eprintln!("[agentplug daemon] SKILL.md refresh after gm plugin update to {latest} failed: {e:#}");
+            }
         }
     }
     Ok(Some(latest))
@@ -650,6 +685,7 @@ pub fn ensure_plugin_installed(plugin_name: &str, explicit_version: Option<&str>
 
     let result = match ensure_plugin_installed_via_github(plugin_name, explicit_version, &spec, &dest, &version_file) {
         Ok(path) => Ok(path),
+        Err(github_api_err) if github_api_err.downcast_ref::<UpdateRejected>().is_some() => Err(github_api_err),
         Err(github_api_err) => match try_ensure_plugin_installed_via_direct_release_latest(&spec, &dest, &version_file) {
             Ok(path) => Ok(path),
             Err(direct_err) => Err(anyhow::anyhow!(
@@ -687,7 +723,7 @@ fn ensure_plugin_installed_via_github(plugin_name: &str, explicit_version: Optio
         }
     }
 
-    let base = format!("https://github.com/{}/releases/download/v{version}", spec.repo);
+    let base = format!("{}/{}/releases/download/v{version}", github_web_base(), spec.repo);
 
     let sha_url = format!("{base}/{}.wasm.sha256", spec.asset_basename);
     let mut effective_basename = spec.asset_basename.as_str();
@@ -704,7 +740,10 @@ fn ensure_plugin_installed_via_github(plugin_name: &str, explicit_version: Optio
     let expected_sha = sha_line.split_whitespace().next().ok_or_else(|| anyhow::anyhow!("empty sha256 sidecar for {effective_basename} at {base}"))?.to_string();
 
     snapshot_prev_wasm_and_version(dest, version_file);
-    download_and_verify(&wasm_url, dest, &expected_sha)?;
+    let artifact = format!("{effective_basename}.wasm");
+    let running = fs::read_to_string(version_file).ok().map(|s| s.trim().to_string());
+    let identity = AssetIdentity { artifact: &artifact, version: &version, running: running.as_deref() };
+    download_and_verify(&wasm_url, dest, &expected_sha, &identity)?;
     fs::write(version_file, &version)?;
     Ok(dest.to_path_buf())
 }

@@ -717,6 +717,12 @@ fn staged_binary_self_check(staged_exe: &Path, expected_version: &str) -> bool {
 }
 
 fn attempt_self_update_handoff(staged_exe: &Path, version: &str) -> bool {
+    if let Err(problem) = crate::update_trust::staged_runner_permitted(staged_exe) {
+        let _ = fs::remove_file(staged_exe);
+        eprintln!("[agentplug UPDATE-TRUST REJECTED] {problem} -- staged exe removed, staying on the running version");
+        record_handoff_failure(version, format!("staged runner refused: {problem}"));
+        return false;
+    }
     if !staged_binary_self_check(staged_exe, version) {
         let _ = fs::remove_file(staged_exe);
         record_handoff_failure(version, format!("staged_binary_self_check failed for {version}, staged exe removed"));
@@ -1235,13 +1241,15 @@ pub(crate) fn patch_update_available_from_escalation(plugin: &str, verb: &str, r
     }
     let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&response) else { return response };
     let Some(obj) = value.as_object_mut() else { return response };
-    if !matches!(obj.get("update_available"), Some(serde_json::Value::Null) | None) {
-        return response;
+    let mut changed = crate::update_trust::annotate_instruction(obj);
+    if matches!(obj.get("update_available"), Some(serde_json::Value::Null) | None) {
+        if let Some(mut marker) = fs::read_to_string(runner_update_escalation_path()).ok().and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok()) {
+            crate::update_trust::harden_escalation(&mut marker);
+            obj.insert("update_available".to_string(), marker);
+            changed = true;
+        }
     }
-    let Ok(marker_raw) = fs::read_to_string(runner_update_escalation_path()) else { return response };
-    let Ok(marker) = serde_json::from_str::<serde_json::Value>(&marker_raw) else { return response };
-    obj.insert("update_available".to_string(), marker);
-    value.to_string()
+    if changed { value.to_string() } else { response }
 }
 
 fn record_handoff_failure(version: &str, reason: String) {
@@ -2725,36 +2733,41 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
             c.with_extension(c.extension().map(|e| format!("{}.new", e.to_string_lossy())).unwrap_or_else(|| "new".to_string()))
         }) {
             let staged_age = now_ms().saturating_sub(staged_at_ms);
-            let mut boot_check_cmd = std::process::Command::new(&staged_path);
-            boot_check_cmd.arg("--version");
-            #[cfg(windows)]
-            {
-                const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-                boot_check_cmd.creation_flags(CREATE_NO_WINDOW);
-            }
-            match boot_check_cmd.output() {
-                Ok(out) if out.status.success() => {
-                    let version = String::from_utf8_lossy(&out.stdout).trim().trim_start_matches('v').to_string();
-                    eprintln!(
-                        "[agentplug daemon] found pre-existing staged runner {} (version {version}) at boot, age {}ms -- adopting its on-disk mtime so a daemon restart does not reset the starve clock",
-                        staged_path.display(), staged_age
-                    );
-                    pending_self_update = Some((staged_path, version));
-                    pending_self_update_staged_at = Instant::now().checked_sub(Duration::from_millis(staged_age));
+            if let Err(problem) = crate::update_trust::staged_runner_permitted(&staged_path) {
+                eprintln!("[agentplug UPDATE-TRUST REJECTED] pre-existing staged runner at boot: {problem} -- removed without running it");
+                let _ = fs::remove_file(&staged_path);
+            } else {
+                let mut boot_check_cmd = std::process::Command::new(&staged_path);
+                boot_check_cmd.arg("--version");
+                #[cfg(windows)]
+                {
+                    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+                    boot_check_cmd.creation_flags(CREATE_NO_WINDOW);
                 }
-                Ok(out) => {
-                    eprintln!(
-                        "[agentplug daemon] pre-existing staged runner {} at boot failed --version check (exit {}) -- removing stale/corrupt staged binary",
-                        staged_path.display(), out.status
-                    );
-                    let _ = fs::remove_file(&staged_path);
-                }
-                Err(e) => {
-                    eprintln!(
-                        "[agentplug daemon] pre-existing staged runner {} at boot could not be spawned for --version ({e}) -- removing stale/corrupt staged binary",
-                        staged_path.display()
-                    );
-                    let _ = fs::remove_file(&staged_path);
+                match boot_check_cmd.output() {
+                    Ok(out) if out.status.success() => {
+                        let version = String::from_utf8_lossy(&out.stdout).trim().trim_start_matches('v').to_string();
+                        eprintln!(
+                            "[agentplug daemon] found pre-existing staged runner {} (version {version}) at boot, age {}ms -- adopting its on-disk mtime so a daemon restart does not reset the starve clock",
+                            staged_path.display(), staged_age
+                        );
+                        pending_self_update = Some((staged_path, version));
+                        pending_self_update_staged_at = Instant::now().checked_sub(Duration::from_millis(staged_age));
+                    }
+                    Ok(out) => {
+                        eprintln!(
+                            "[agentplug daemon] pre-existing staged runner {} at boot failed --version check (exit {}) -- removing stale/corrupt staged binary",
+                            staged_path.display(), out.status
+                        );
+                        let _ = fs::remove_file(&staged_path);
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "[agentplug daemon] pre-existing staged runner {} at boot could not be spawned for --version ({e}) -- removing stale/corrupt staged binary",
+                            staged_path.display()
+                        );
+                        let _ = fs::remove_file(&staged_path);
+                    }
                 }
             }
         }
