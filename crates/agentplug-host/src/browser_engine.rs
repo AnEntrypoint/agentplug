@@ -230,6 +230,7 @@ pub fn acquire(engine: Engine, cwd: &Path, session_id: &str, browser_cfg: &Brows
     match engine {
         Engine::Chrome => {
             let (child, port) = crate::browser::launch_chrome_pub(cwd, session_id, browser_cfg)?;
+            crate::browser::load_extension_after_launch(cwd, session_id, port, browser_cfg);
             Ok(AcquiredEngine { child: Some(child), port, owns_process: true })
         }
         Engine::Lightpanda => {
