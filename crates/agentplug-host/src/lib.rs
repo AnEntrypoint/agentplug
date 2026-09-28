@@ -1,4 +1,6 @@
 mod broker;
+mod credentials;
+mod git_exec;
 mod browser;
 mod browser_engine;
 mod dispatch_origin;
@@ -21,7 +23,9 @@ pub use browser::{canonical_project_root, close_all_sessions, reap_idle_sessions
 pub use dispatch_origin::{enter_dispatch_origin_scope, DispatchOriginScope};
 pub use host_state::HostState;
 pub use http_agent::{build_agent, shared_agent};
-pub use imports::{git_subprocess_timeout_ms, register_env_imports, register_wasi};
+pub use credentials::{resolve_github_token, GIT_CREDENTIAL_REJECTED_HINT};
+pub use git_exec::{git_subprocess_timeout_ms, run_git_with_credential_recovery};
+pub use imports::{register_env_imports, register_wasi};
 pub use install::{install_dir, plugins_dir, wasmtime_cache_dir};
 pub use memory_pressure::{process_private_bytes_tracking_retained_wasm_peak_unlike_working_set, reset_shared_dispatch_count, shared_dispatches_since_release};
 pub use registry::{
