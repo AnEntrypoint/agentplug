@@ -2627,36 +2627,11 @@ pub fn try_dispatch_via_daemon(cwd: &Path, plugin: &str, verb: &str, body: &str)
     }
 }
 
-fn seed_github_token_from_gh_cli_if_unset() {
-    if std::env::var_os("GITHUB_TOKEN").is_some() || std::env::var_os("GH_TOKEN").is_some() {
-        return;
-    }
-    let mut gh_cmd = std::process::Command::new("gh");
-    gh_cmd.args(["auth", "token"]);
-    #[cfg(windows)]
-    {
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        gh_cmd.creation_flags(CREATE_NO_WINDOW);
-    }
-    let Ok(output) = gh_cmd.output() else {
-        return;
-    };
-    if !output.status.success() {
-        return;
-    }
-    let token = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if token.is_empty() {
-        return;
-    }
-    std::env::set_var("GH_TOKEN", &token);
-    eprintln!("[agentplug daemon] seeded GH_TOKEN from `gh auth token` -- ci-status and other GitHub API verbs now run authenticated, avoiding the unauthenticated 60/hr rate limit");
-}
-
 pub fn run_daemon() -> anyhow::Result<()> {
     if let Some(owner_pid) = shared_daemon_owner_that_would_refuse_this_process() {
         record_wasted_daemon_start();
         eprintln!(
-            "[agentplug daemon] shared daemon pid {owner_pid} already owns the ownership lock and its heartbeat is fresh -- exiting before the registry announce and the `gh auth token` seed, nothing shared was touched"
+            "[agentplug daemon] shared daemon pid {owner_pid} already owns the ownership lock and its heartbeat is fresh -- exiting before the registry announce, nothing shared was touched"
         );
         return Ok(());
     }
@@ -2674,7 +2649,6 @@ pub fn run_daemon() -> anyhow::Result<()> {
     }
 
     clear_wasted_daemon_start_backoff();
-    seed_github_token_from_gh_cli_if_unset();
 
     let plugin_modules = PluginModules::new()?;
     let previously_recorded_version = installed_runner_version();
