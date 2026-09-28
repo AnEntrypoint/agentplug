@@ -3,5 +3,3 @@ Cargo.lock
 .gm/
 .agentplug/
 .agentplug-kv/
-config.bat
-node_modules
