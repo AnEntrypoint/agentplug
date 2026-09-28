@@ -3,3 +3,4 @@ Cargo.lock
 .gm/
 config.bat
 node_modules
+.agentplug-kv/git_commit_dedup/
