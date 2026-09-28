@@ -24,6 +24,19 @@ fn registry() -> &'static Registry {
     REG.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+fn ensure_reaper_running() {
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    STARTED.call_once(|| {
+        std::thread::spawn(|| loop {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            let mut reg = registry().lock().unwrap_or_else(|e| e.into_inner());
+            for entry in reg.values_mut() {
+                poll_entry(entry);
+            }
+        });
+    });
+}
+
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -52,6 +65,7 @@ fn poll_entry(entry: &mut TaskEntry) {
         }
         Ok(None) => {
             if now_ms().saturating_sub(entry.started_ms) > entry.timeout_ms {
+                crate::process_tree::kill_tree(entry.child.id());
                 let _ = entry.child.kill();
                 let _ = entry.child.wait();
                 if let Some(mut out) = entry.child.stdout.take() {
@@ -79,24 +93,6 @@ fn entry_summary(id: &str, entry: &TaskEntry) -> Value {
     })
 }
 
-pub fn adopt_running(child: std::process::Child, lang: &str, started: std::time::Instant, timeout_ms: u64) -> String {
-    let started_ms = now_ms().saturating_sub(started.elapsed().as_millis() as u64);
-    let id = next_id(started_ms ^ (child.id() as u64));
-    let entry = TaskEntry {
-        child,
-        lang: lang.to_string(),
-        started_ms,
-        timeout_ms,
-        stdout: Vec::new(),
-        stderr: Vec::new(),
-        exit_code: None,
-        finished_ms: None,
-    };
-    let mut reg = registry().lock().unwrap();
-    reg.insert(id.clone(), entry);
-    id
-}
-
 fn spawn(params: &Value, cwd: &Path) -> Value {
     let lang = params.get("lang").and_then(|v| v.as_str()).unwrap_or("");
     let code = params.get("code").and_then(|v| v.as_str()).unwrap_or("");
@@ -107,14 +103,14 @@ fn spawn(params: &Value, cwd: &Path) -> Value {
     if code.is_empty() {
         return json!({"ok": false, "error": "code required"});
     }
-    let Some((cmd, args, _script_file)) = crate::exec_js::build_command(lang, code) else {
+    let Some((cmd, args, stdin_payload)) = crate::exec_js::build_command(lang, code) else {
         return json!({"ok": false, "error": format!("unsupported lang: {lang}")});
     };
     let mut command = Command::new(&cmd);
     command
         .args(&args)
         .current_dir(cwd)
-        .stdin(Stdio::null())
+        .stdin(if stdin_payload.is_some() { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     #[cfg(windows)]
@@ -123,10 +119,15 @@ fn spawn(params: &Value, cwd: &Path) -> Value {
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         command.creation_flags(CREATE_NO_WINDOW);
     }
-    let child = match command.spawn() {
+    let mut child = match command.spawn() {
         Ok(c) => c,
         Err(e) => return json!({"ok": false, "error": format!("spawn failed: {e}")}),
     };
+    if let (Some(payload), Some(mut stdin)) = (stdin_payload, child.stdin.take()) {
+        std::thread::spawn(move || {
+            let _ = std::io::Write::write_all(&mut stdin, payload.as_bytes());
+        });
+    }
     let started = now_ms();
     let id = next_id(started ^ (child.id() as u64));
     let entry = TaskEntry {
@@ -141,6 +142,8 @@ fn spawn(params: &Value, cwd: &Path) -> Value {
     };
     let mut reg = registry().lock().unwrap();
     reg.insert(id.clone(), entry);
+    drop(reg);
+    ensure_reaper_running();
     json!({"ok": true, "id": id, "started_ms": started})
 }
 
@@ -191,6 +194,7 @@ fn stop(params: &Value) -> Value {
     let Some(mut entry) = reg.remove(id) else {
         return json!({"ok": false, "error": format!("no such task {id}")});
     };
+    crate::process_tree::kill_tree(entry.child.id());
     let _ = entry.child.kill();
     let _ = entry.child.wait();
     json!({"ok": true, "id": id, "stopped": true})

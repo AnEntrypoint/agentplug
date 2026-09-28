@@ -248,16 +248,18 @@ async function navigateIfNeededThenEvaluateOverCdp(sess, script, startUrl, timeo
     sess.onIdLessNotification = prevOnIdLessNotification;
   }
   const trimmedScript = script.trim();
+  const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
   const exprAttempt = `(async () => { return (\n${trimmedScript}\n); })()`;
   const stmtAttempt = `(async () => { ${script} })()`;
   let wrapped = stmtAttempt;
   if (trimmedScript && !/^\s*(return|const|let|var|if|for|while|switch|try|function|async|throw)\b/.test(trimmedScript)) {
     try {
-      new Function(`"use strict"; return (\n${trimmedScript}\n);`);
+      new AsyncFunction(`"use strict"; return (\n${trimmedScript}\n);`);
       wrapped = exprAttempt;
     } catch (_) { /* not a single valid expression -- use the statement-body form */ }
   }
   const result = await evaluateParkedSurvivingReconnect(sess, wrapped, timeoutMs);
+  result.statementBodyWithoutReturn = wrapped === stmtAttempt && !/\breturn\b/.test(trimmedScript);
   if (navigationFailure && !result.exceptionDetails) {
     result.exceptionDetails = { text: `page navigation failed: ${navigationFailure} (url=${startUrl})` };
   }
@@ -368,6 +370,12 @@ async function attachDebugCapture(sess) {
   };
 }
 
+const NO_RETURN_NOTE = 'the script ran as a statement body and returned no value: a single expression (top-level await included) returns its value automatically, a multi-statement script must end with an explicit `return <value>`';
+
+function resultNoteFor(res, value) {
+  return res.statementBodyWithoutReturn && (value === undefined || value === null) ? NO_RETURN_NOTE : undefined;
+}
+
 function aggregateCpuProfile(profile, topN) {
   if (!profile || !Array.isArray(profile.nodes) || !Array.isArray(profile.samples)) {
     return { timeframe: null, culprits: [] };
@@ -471,7 +479,7 @@ async function main() {
         process.exit(1);
       }
       const value = res.result && ('value' in res.result) ? res.result.value : null;
-      const envelope = { result: value === undefined ? null : value, debug };
+      const envelope = { result: value === undefined ? null : value, result_note: resultNoteFor(res, value), debug };
       writeResult(envelope);
       sess.close();
       process.exit(0);
@@ -627,7 +635,7 @@ async function main() {
       process.exit(1);
     }
     const value = res.result && ('value' in res.result) ? res.result.value : null;
-    writeResult({ result: value === undefined ? null : value, debug });
+    writeResult({ result: value === undefined ? null : value, result_note: resultNoteFor(res, value), debug });
     sess.close();
     process.exit(0);
   } catch (e) {

@@ -1,6 +1,8 @@
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
@@ -9,18 +11,86 @@ use wait_timeout::ChildExt;
 const RESULT_SENTINEL: &str = "__GM_RESULT__";
 const META_SENTINEL: &str = "__GM_META__";
 const PROFILE_SENTINEL: &str = "__GM_PROFILE__";
-const DEFAULT_TIMEOUT_MS: u64 = 120_000;
+const DEFAULT_LIMIT_MS: u64 = 300_000;
+const HARD_CEILING_MS: u64 = 900_000;
+const MIN_LIMIT_MS: i64 = 100;
+const PIPE_DRAIN_GRACE: Duration = Duration::from_millis(1500);
+
+struct BuiltCommand {
+    cmd: String,
+    args: Vec<String>,
+    stdin_payload: Option<String>,
+}
+
+struct DrainedPipe {
+    buffer: Arc<Mutex<Vec<u8>>>,
+    reader: JoinHandle<()>,
+}
+
+fn drain_in_background(mut pipe: impl Read + Send + 'static) -> DrainedPipe {
+    let buffer = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&buffer);
+    let reader = std::thread::spawn(move || {
+        let mut chunk = [0u8; 16384];
+        loop {
+            match pipe.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => sink.lock().unwrap_or_else(|e| e.into_inner()).extend_from_slice(&chunk[..n]),
+            }
+        }
+    });
+    DrainedPipe { buffer, reader }
+}
+
+impl DrainedPipe {
+    fn collect(self, deadline: Instant) -> Vec<u8> {
+        while !self.reader.is_finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let bytes = self.buffer.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        bytes
+    }
+}
+
+fn resolve_limit(opts: &Value) -> Result<(u64, Option<u64>), Value> {
+    match opts.get("timeoutMs").and_then(|v| v.as_i64()) {
+        Some(ms) if ms < MIN_LIMIT_MS => Err(json!({
+            "ok": false, "error": "timeoutMs below floor", "min": MIN_LIMIT_MS, "received": ms,
+        })),
+        Some(ms) if ms as u64 > HARD_CEILING_MS => Ok((HARD_CEILING_MS, Some(ms as u64))),
+        Some(ms) => Ok((ms as u64, None)),
+        None => Ok((DEFAULT_LIMIT_MS, None)),
+    }
+}
+
+fn timeout_failure(lang: &str, limit_ms: u64, clamped_from: Option<u64>, killed: usize, duration_ms: u64, stdout: String, stderr: String) -> Value {
+    let mut v = json!({
+        "ok": false,
+        "timed_out": true,
+        "killed": true,
+        "error_code": "exec_timeout",
+        "error": format!(
+            "{lang} body exceeded its {limit_ms} ms wall-clock limit and its process tree was killed ({killed} process(es)); the limit is timeoutMs from the body prefix, default {DEFAULT_LIMIT_MS} ms, hard ceiling {HARD_CEILING_MS} ms. For work that legitimately runs longer, use the task-spawn verb (its own cap is 30 minutes), or start it detached with stdio ignored and poll it in later calls"
+        ),
+        "limit_ms": limit_ms,
+        "default_limit_ms": DEFAULT_LIMIT_MS,
+        "ceiling_ms": HARD_CEILING_MS,
+        "stdout": stdout,
+        "stderr": stderr,
+        "exit_code": -1,
+        "duration_ms": duration_ms,
+    });
+    if let Some(requested) = clamped_from {
+        v["limit_clamped_from_ms"] = json!(requested);
+    }
+    v
+}
 
 pub fn run(code: &str, opts: &Value, cwd: &Path) -> Value {
     let lang = opts.get("lang").and_then(|v| v.as_str()).unwrap_or("nodejs");
-    let timeout_ms = match opts.get("timeoutMs").and_then(|v| v.as_i64()) {
-        Some(ms) if ms >= 100 => ms as u64,
-        Some(ms) => {
-            return json!({
-                "ok": false, "error": "timeoutMs below floor", "min": 100, "received": ms,
-            });
-        }
-        None => DEFAULT_TIMEOUT_MS,
+    let (limit_ms, clamped_from) = match resolve_limit(opts) {
+        Ok(v) => v,
+        Err(rejection) => return rejection,
     };
 
     let is_js_lang = lang == "nodejs" || lang == "js";
@@ -42,17 +112,17 @@ pub fn run(code: &str, opts: &Value, cwd: &Path) -> Value {
         ExecMode::Default
     };
 
-    let (cmd, args, script_file) = match build_command_mode(lang, code, mode, opts) {
+    let built = match build_command_mode(lang, code, mode, opts) {
         Some(v) => v,
         None => return json!({"ok": false, "error": format!("unsupported lang: {lang}")}),
     };
 
     let t0 = Instant::now();
-    let mut command = Command::new(&cmd);
+    let mut command = Command::new(&built.cmd);
     command
-        .args(&args)
+        .args(&built.args)
         .current_dir(cwd)
-        .stdin(Stdio::null())
+        .stdin(if built.stdin_payload.is_some() { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     #[cfg(windows)]
@@ -73,36 +143,33 @@ pub fn run(code: &str, opts: &Value, cwd: &Path) -> Value {
         }
     };
 
-    let still_running = matches!(child.wait_timeout(Duration::from_millis(timeout_ms)), Ok(None));
-    if still_running {
-        let task_id = crate::task::adopt_running(child, lang, t0, timeout_ms);
-        return json!({
-            "ok": true,
-            "timed_out": true,
-            "in_progress": true,
-            "task_id": task_id,
-            "elapsed_ms": t0.elapsed().as_millis() as u64,
-            "decision_required": "this call hit its timeoutMs still running -- it was NOT killed, it is alive in the background task registry as task_id. Dispatch the GM `task-output` verb with JSON body `{\"id\":\"<task_id>\"}` to poll its progress or final result, or dispatch the GM `task-stop` verb with the same JSON body to kill it now. These are GM verbs, not shell commands. Do not leave the task unattended.",
+    if let (Some(payload), Some(mut stdin)) = (built.stdin_payload, child.stdin.take()) {
+        std::thread::spawn(move || {
+            let _ = stdin.write_all(payload.as_bytes());
         });
     }
+    let stdout_pipe = child.stdout.take().map(drain_in_background);
+    let stderr_pipe = child.stderr.take().map(drain_in_background);
 
-    let duration_ms = t0.elapsed().as_millis() as u64;
-    let mut stdout_buf = Vec::new();
-    let mut stderr_buf = Vec::new();
-    if let Some(mut out) = child.stdout.take() {
-        let _ = std::io::Read::read_to_end(&mut out, &mut stdout_buf);
-    }
-    if let Some(mut err) = child.stderr.take() {
-        let _ = std::io::Read::read_to_end(&mut err, &mut stderr_buf);
+    let waited = child.wait_timeout(Duration::from_millis(limit_ms));
+    let timed_out = matches!(waited, Ok(None));
+    let mut killed = 0usize;
+    if timed_out {
+        killed = crate::process_tree::kill_tree(child.id());
+        let _ = child.kill();
     }
     let exit_code = child.wait().ok().and_then(|s| s.code()).unwrap_or(-1);
-
-    if let Some(f) = script_file {
-        let _ = std::fs::remove_file(f);
-    }
+    let duration_ms = t0.elapsed().as_millis() as u64;
+    let drain_deadline = Instant::now() + PIPE_DRAIN_GRACE;
+    let stdout_buf = stdout_pipe.map(|p| p.collect(drain_deadline)).unwrap_or_default();
+    let stderr_buf = stderr_pipe.map(|p| p.collect(drain_deadline)).unwrap_or_default();
 
     let stdout_raw = String::from_utf8_lossy(&stdout_buf).into_owned();
     let stderr = String::from_utf8_lossy(&stderr_buf).into_owned();
+
+    if timed_out {
+        return timeout_failure(lang, limit_ms, clamped_from, killed, duration_ms, stdout_raw, stderr);
+    }
 
     match mode {
         ExecMode::Profile => {
@@ -208,8 +275,8 @@ enum ExecMode {
     Profile,
 }
 
-pub(crate) fn build_command(lang: &str, code: &str) -> Option<(String, Vec<String>, Option<std::path::PathBuf>)> {
-    build_command_mode(lang, code, ExecMode::Default, &json!({}))
+pub(crate) fn build_command(lang: &str, code: &str) -> Option<(String, Vec<String>, Option<String>)> {
+    build_command_mode(lang, code, ExecMode::Default, &json!({})).map(|b| (b.cmd, b.args, b.stdin_payload))
 }
 
 fn build_command_mode(
@@ -217,7 +284,7 @@ fn build_command_mode(
     code: &str,
     mode: ExecMode,
     opts: &Value,
-) -> Option<(String, Vec<String>, Option<std::path::PathBuf>)> {
+) -> Option<BuiltCommand> {
     match lang {
         "nodejs" | "js" => {
             let wrapped = match mode {
@@ -296,16 +363,21 @@ fn build_command_mode(
                     )
                 }
             };
-            Some((resolve_node_cmd(), vec!["-e".to_string(), wrapped], None))
+            let cmd = resolve_node_cmd();
+            if command_is_node(&cmd) {
+                Some(BuiltCommand { cmd, args: vec!["-".to_string()], stdin_payload: Some(wrapped) })
+            } else {
+                Some(BuiltCommand { cmd, args: vec!["-e".to_string(), wrapped], stdin_payload: None })
+            }
         }
-        "python" | "py" => Some(("python".to_string(), vec!["-c".to_string(), code.to_string()], None)),
-        "bash" | "sh" | "shell" => Some((resolve_bash_cmd(), vec!["-c".to_string(), code.to_string()], None)),
-        "powershell" | "ps1" => Some((
-            "powershell".to_string(),
-            vec!["-NoProfile".to_string(), "-NonInteractive".to_string(), "-Command".to_string(), code.to_string()],
-            None,
-        )),
-        "deno" => Some(("deno".to_string(), vec!["eval".to_string(), code.to_string()], None)),
+        "python" | "py" => Some(BuiltCommand { cmd: "python".to_string(), args: vec!["-c".to_string(), code.to_string()], stdin_payload: None }),
+        "bash" | "sh" | "shell" => Some(BuiltCommand { cmd: resolve_bash_cmd(), args: vec!["-c".to_string(), code.to_string()], stdin_payload: None }),
+        "powershell" | "ps1" => Some(BuiltCommand {
+            cmd: "powershell".to_string(),
+            args: vec!["-NoProfile".to_string(), "-NonInteractive".to_string(), "-Command".to_string(), code.to_string()],
+            stdin_payload: None,
+        }),
+        "deno" => Some(BuiltCommand { cmd: "deno".to_string(), args: vec!["eval".to_string(), code.to_string()], stdin_payload: None }),
         _ => None,
     }
 }
@@ -353,6 +425,13 @@ const AGGREGATE_CPU_PROFILE_SRC: &str = r#"function aggregateCpuProfile(profile,
     culprits,
   };
 }"#;
+
+fn command_is_node(cmd: &str) -> bool {
+    Path::new(cmd)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .is_some_and(|stem| stem.eq_ignore_ascii_case("node"))
+}
 
 fn resolve_node_cmd() -> String {
     for candidate in ["node", "bun"] {

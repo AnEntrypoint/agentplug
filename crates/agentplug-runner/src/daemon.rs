@@ -1671,6 +1671,45 @@ pub fn claim_spool_request_in_place(request_path: &Path) -> Option<PathBuf> {
     fs::rename(request_path, &claim_path).ok().map(|_| claim_path)
 }
 
+const EXEC_OUTPUT_SPILL_THRESHOLD_CHARS: usize = 2000;
+
+fn exec_output_field_text(envelope: &serde_json::Value, field: &str) -> Option<String> {
+    match envelope.get(field)? {
+        serde_json::Value::Null => None,
+        serde_json::Value::String(text) if text.is_empty() => None,
+        serde_json::Value::String(text) => Some(text.clone()),
+        other => serde_json::to_string_pretty(other).ok(),
+    }
+}
+
+fn spill_large_exec_output_to_text_sibling(out_dir: &Path, verb: &str, task: &str, out_body: String) -> String {
+    let Ok(mut outer) = serde_json::from_str::<serde_json::Value>(&out_body) else { return out_body };
+    let Some(envelope_text) = outer.get("data").and_then(|d| d.as_str()) else { return out_body };
+    let Ok(envelope) = serde_json::from_str::<serde_json::Value>(envelope_text) else { return out_body };
+    if !envelope.get("stdout").is_some_and(|v| v.is_string()) {
+        return out_body;
+    }
+    let sections: Vec<(&str, String)> = ["result", "stdout", "stderr"]
+        .into_iter()
+        .filter_map(|field| exec_output_field_text(&envelope, field).map(|text| (field, text)))
+        .collect();
+    if !sections.iter().any(|(_, text)| text.chars().count() > EXEC_OUTPUT_SPILL_THRESHOLD_CHARS) {
+        return out_body;
+    }
+    let mut rendered = String::new();
+    for (field, text) in &sections {
+        rendered.push_str(&format!("## {field}\n{text}\n\n"));
+    }
+    let sibling_name = format!("{verb}-{task}.txt");
+    let sibling = out_dir.join(&sibling_name);
+    if fs::write(&sibling, rendered).is_err() {
+        return out_body;
+    }
+    let Some(obj) = outer.as_object_mut() else { return out_body };
+    obj.insert("result_file".to_string(), serde_json::Value::String(sibling.to_string_lossy().into_owned()));
+    outer.to_string()
+}
+
 pub fn write_spool_out_confirmed(out_dir: &Path, out_name: &str, out_body: &str) -> bool {
     let dest = out_dir.join(out_name);
     let tmp = out_dir.join(format!("{out_name}.tmp.{}", std::process::id()));
@@ -2006,6 +2045,7 @@ pub(crate) fn run_gm_dispatch_to_file(root: &Path, handle: &DispatchHandle, verb
         }
     };
     let out_body = patch_update_available_from_escalation(plugin_name, verb, out_body);
+    let out_body = spill_large_exec_output_to_text_sibling(out_dir, verb, task, out_body);
     let out_name = format!("{verb}-{task}.json");
     let out_confirmed = write_spool_out_confirmed(out_dir, &out_name, &out_body);
     let in_dir = root.join(".gm").join("exec-spool").join("in");

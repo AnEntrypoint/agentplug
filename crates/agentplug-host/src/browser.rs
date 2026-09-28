@@ -254,6 +254,86 @@ fn strip_mode_prefix(body: &str) -> (BrowserMode, String, &str) {
     (BrowserMode::Default, String::new(), body)
 }
 
+fn strip_debug_visibility_prefix(body: &str) -> (Option<bool>, &str) {
+    let trimmed = body.trim_start();
+    for (prefix, quiet) in [("quiet\n", true), ("debug=off\n", true), ("debug=on\n", false), ("verbose\n", false)] {
+        if let Some(rest) = trimmed.strip_prefix(prefix) {
+            return (Some(quiet), rest);
+        }
+    }
+    (None, body)
+}
+
+const QUIET_DEBUG_NOTE: &str = "network, performance and gl detail omitted (quiet is the default); put `capture` as the first body line, or `debug=on`, for the full debug block";
+const QUIET_NOTABLE_LIMIT: usize = 5;
+const QUIET_TEXT_LIMIT: usize = 200;
+
+fn truncated_text(text: &str, limit: usize) -> String {
+    if text.chars().count() <= limit {
+        return text.to_string();
+    }
+    let head: String = text.chars().take(limit).collect();
+    format!("{head}...")
+}
+
+fn console_line_text(entry: &Value) -> String {
+    entry
+        .get("args")
+        .and_then(|a| a.as_array())
+        .map(|args| args.iter().map(|a| a.as_str().map(str::to_string).unwrap_or_else(|| a.to_string())).collect::<Vec<_>>().join(" "))
+        .unwrap_or_default()
+}
+
+fn compact_debug(debug: &Value) -> Value {
+    let console = debug.get("console").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+    let console_dropped = debug.get("console_dropped").and_then(|v| v.as_u64()).unwrap_or(0);
+    let mut by_type = serde_json::Map::new();
+    for entry in &console {
+        let kind = entry.get("type").and_then(|v| v.as_str()).unwrap_or("log");
+        let seen = by_type.get(kind).and_then(|v| v.as_u64()).unwrap_or(0);
+        by_type.insert(kind.to_string(), json!(seen + 1));
+    }
+    let notable: Vec<Value> = console
+        .iter()
+        .filter(|entry| matches!(entry.get("type").and_then(|v| v.as_str()), Some("error" | "warning" | "assert")))
+        .take(QUIET_NOTABLE_LIMIT)
+        .map(|entry| json!({
+            "type": entry.get("type").cloned().unwrap_or(Value::Null),
+            "text": truncated_text(&console_line_text(entry), QUIET_TEXT_LIMIT),
+        }))
+        .collect();
+    let page_errors = debug.get("pageErrors").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+    let shown_page_errors: Vec<Value> = page_errors
+        .iter()
+        .take(QUIET_NOTABLE_LIMIT)
+        .map(|entry| json!({
+            "text": truncated_text(entry.get("text").and_then(|v| v.as_str()).unwrap_or(""), QUIET_TEXT_LIMIT),
+            "url": entry.get("url").cloned().unwrap_or(Value::Null),
+            "line": entry.get("line").cloned().unwrap_or(Value::Null),
+        }))
+        .collect();
+    let network = debug.get("network").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+    let network_dropped = debug.get("network_dropped").and_then(|v| v.as_u64()).unwrap_or(0);
+    let requests = network.iter().filter(|e| e.get("phase").and_then(|v| v.as_str()) == Some("request")).count() as u64 + network_dropped;
+    let failed: Vec<Value> = network
+        .iter()
+        .filter(|e| e.get("phase").and_then(|v| v.as_str()) == Some("response"))
+        .filter(|e| e.get("status").and_then(|v| v.as_u64()).is_some_and(|status| status >= 400))
+        .take(QUIET_NOTABLE_LIMIT)
+        .map(|e| json!({
+            "status": e.get("status").cloned().unwrap_or(Value::Null),
+            "url": truncated_text(e.get("url").and_then(|v| v.as_str()).unwrap_or(""), QUIET_TEXT_LIMIT),
+        }))
+        .collect();
+    json!({
+        "console_summary": { "total": console.len() as u64 + console_dropped, "by_type": by_type, "notable": notable },
+        "pageErrors": shown_page_errors,
+        "pageErrors_total": page_errors.len(),
+        "network_summary": { "requests": requests, "failed": failed },
+        "note": QUIET_DEBUG_NOTE,
+    })
+}
+
 fn strip_timeout_prefix(body: &str) -> (Option<u64>, &str) {
     let trimmed = body.trim_start();
     let Some(rest) = trimmed.strip_prefix("timeout=") else { return (None, body) };
@@ -1555,6 +1635,7 @@ pub fn run(body: &str, opts: &str, cwd_raw: &Path, session_id: &str) -> Value {
     };
 
     let mut timeout_override: Option<u64> = None;
+    let mut quiet_override: Option<bool> = None;
     let mut mode = BrowserMode::Default;
     let mut mode_name = String::new();
     let mut viewport = None;
@@ -1566,6 +1647,12 @@ pub fn run(body: &str, opts: &str, cwd_raw: &Path, session_id: &str) -> Value {
         if let Some(ms) = t {
             timeout_override = Some(ms);
             rest = after_timeout;
+            continue;
+        }
+        let (q, after_quiet) = strip_debug_visibility_prefix(rest);
+        if q.is_some() {
+            quiet_override = q;
+            rest = after_quiet;
             continue;
         }
         let (m, name, after_mode) = strip_mode_prefix(rest);
@@ -1593,6 +1680,7 @@ pub fn run(body: &str, opts: &str, cwd_raw: &Path, session_id: &str) -> Value {
         break;
     }
     let dom_selector = mode_name.clone();
+    let quiet_debug = quiet_override.unwrap_or(mode != BrowserMode::Capture);
     let timeout_ms = timeout_override.unwrap_or(timeout_ms);
     let script = if rest.trim().is_empty() {
         if url_default_script.trim().is_empty() && start_url.is_some() {
@@ -1687,6 +1775,8 @@ pub fn run(body: &str, opts: &str, cwd_raw: &Path, session_id: &str) -> Value {
         reuse_port
     };
     let mut known_target_id: Option<String> = None;
+    let mut launched_fresh_chrome = false;
+    let session_had_prior_page = target_id_sidecar_path(&browser_chrome_profile_dir(cwd, session_id)).exists();
     let port = match candidate_port.filter(|_| {
         let map = sessions_map().lock().unwrap_or_else(|e| e.into_inner());
         map.get(&key).is_some_and(|session| session_cdp_endpoint_responds(&session.cdp_endpoint))
@@ -1747,6 +1837,7 @@ pub fn run(body: &str, opts: &str, cwd_raw: &Path, session_id: &str) -> Value {
                             return annotate_queue_wait(json!({"ok": false, "stdout": "", "exit_code": 1, "stderr": e}), queued_behind_same_page_ms, session_id);
                         }
                     };
+                    launched_fresh_chrome = true;
                     let pid = acquired.child.as_ref().map(|c| c.id()).unwrap_or(0);
                     let new_port = acquired.port;
                     let mut map = sessions_map().lock().unwrap_or_else(|e| e.into_inner());
@@ -1874,6 +1965,10 @@ pub fn run(body: &str, opts: &str, cwd_raw: &Path, session_id: &str) -> Value {
     let cdp_error =result_value.get("__cdpError").and_then(|v| v.as_str());
     let ok = exit_code == 0 && !timed_out && cdp_error.is_none();
     let default_debug = || json!({"console": [], "pageErrors": [], "network": [], "performance": null, "gl": {"errors": [], "drawCalls": {}, "errorTotalCount": 0}});
+    let shaped_debug = |raw: Option<&Value>| -> Value {
+        let debug = raw.cloned().unwrap_or_else(default_debug);
+        if quiet_debug { compact_debug(&debug) } else { debug }
+    };
     let mut out = json!({
         "ok": ok,
         "stderr": String::from_utf8_lossy(&stderr_buf).into_owned(),
@@ -1887,26 +1982,30 @@ pub fn run(body: &str, opts: &str, cwd_raw: &Path, session_id: &str) -> Value {
     if session_created_by_this_dispatch {
         out["session_created"] = Value::Bool(true);
     }
+    if launched_fresh_chrome && session_had_prior_page && start_url.is_none() && !session_created_by_this_dispatch {
+        out["session_recycled"] = Value::Bool(true);
+        out["session_note"] = json!("this dispatch launched a fresh browser for the session (the previous one was reaped idle, evicted at the concurrent-Chrome cap, or died), so earlier page state is gone; pass url=<target> on every call that depends on a loaded page");
+    }
     let mut out = annotate_queue_wait(out, queued_behind_same_page_ms, session_id);
     if cdp_error.is_some() {
         out["result"] = Value::Null;
-        out["debug"] = result_value.get("debug").cloned().unwrap_or_else(default_debug);
+        out["debug"] = shaped_debug(result_value.get("debug"));
         return out;
     }
     let launched_real_page = matches!(mode, BrowserMode::Dom) || result_value.get("result").is_some() || result_value.get("elements").is_some();
     match mode {
         BrowserMode::Default => {
             out["result"] = result_value.get("result").cloned().unwrap_or(Value::Null);
-            out["debug"] = result_value.get("debug").cloned().unwrap_or_else(default_debug);
+            out["debug"] = shaped_debug(result_value.get("debug"));
         }
         BrowserMode::Capture => {
             out["result"] = result_value.get("result").cloned().unwrap_or(Value::Null);
-            out["debug"] = result_value.get("debug").cloned().unwrap_or_else(default_debug);
+            out["debug"] = shaped_debug(result_value.get("debug"));
         }
         BrowserMode::Profile => {
             out["result"] = result_value.get("result").cloned().unwrap_or(Value::Null);
             out["profile"] = result_value.get("profile").cloned().unwrap_or(json!({"timeframe": null, "culprits": []}));
-            out["debug"] = result_value.get("debug").cloned().unwrap_or_else(default_debug);
+            out["debug"] = shaped_debug(result_value.get("debug"));
             if let Some(p) = &artifact_path {
                 out["profile_file"] = json!(p.to_string_lossy());
             }
@@ -1914,14 +2013,14 @@ pub fn run(body: &str, opts: &str, cwd_raw: &Path, session_id: &str) -> Value {
         BrowserMode::Trace => {
             out["result"] = result_value.get("result").cloned().unwrap_or(Value::Null);
             out["trace"] = result_value.get("trace").cloned().unwrap_or(json!({"wall_us": 0, "gpu_us": 0, "viz_us": 0, "cc_us": 0, "by_category": {}}));
-            out["debug"] = result_value.get("debug").cloned().unwrap_or_else(default_debug);
+            out["debug"] = shaped_debug(result_value.get("debug"));
             if let Some(p) = &artifact_path {
                 out["trace_file"] = json!(p.to_string_lossy());
             }
         }
         BrowserMode::Screenshot => {
             out["result"] = result_value.get("result").cloned().unwrap_or(Value::Null);
-            out["debug"] = result_value.get("debug").cloned().unwrap_or_else(default_debug);
+            out["debug"] = shaped_debug(result_value.get("debug"));
             let screenshot_error = result_value.get("screenshot_error").cloned().filter(|e| !e.is_null());
             match (&artifact_path, screenshot_error) {
                 (Some(p), None) => {
@@ -1937,13 +2036,16 @@ pub fn run(body: &str, opts: &str, cwd_raw: &Path, session_id: &str) -> Value {
             out["selector"] = json!(dom_selector);
             out["match_count"] = result_value.get("match_count").cloned().unwrap_or(json!(0));
             out["elements"] = result_value.get("elements").cloned().unwrap_or(json!([]));
-            out["debug"] = result_value.get("debug").cloned().unwrap_or_else(default_debug);
+            out["debug"] = shaped_debug(result_value.get("debug"));
             if let Some(e) = result_value.get("error") {
                 if !e.is_null() {
                     out["result"] = json!({ "error": e });
                 }
             }
         }
+    }
+    if let Some(note) = result_value.get("result_note") {
+        out["result_note"] = note.clone();
     }
     if ok && !launched_real_page {
         out["ok"] = json!(false);
