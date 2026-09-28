@@ -4,6 +4,30 @@ pub(crate) fn tree_working_set_bytes(roots: &[u32]) -> HashMap<u32, u64> {
     platform::tree_working_set_bytes(roots)
 }
 
+pub(crate) fn kill_tree(root: u32) -> usize {
+    platform::kill_tree(root)
+}
+
+fn descendants_root_first(root: u32, parent_of: &HashMap<u32, u32>) -> Vec<u32> {
+    let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
+    for (pid, parent) in parent_of {
+        children.entry(*parent).or_default().push(*pid);
+    }
+    let mut order = Vec::new();
+    let mut visited = std::collections::HashSet::new();
+    let mut queue = std::collections::VecDeque::from([root]);
+    while let Some(pid) = queue.pop_front() {
+        if !visited.insert(pid) {
+            continue;
+        }
+        order.push(pid);
+        if let Some(kids) = children.get(&pid) {
+            queue.extend(kids.iter().copied());
+        }
+    }
+    order
+}
+
 fn sum_over_descendants(roots: &[u32], parent_of: &HashMap<u32, u32>, bytes_of: impl Fn(u32) -> Option<u64>) -> HashMap<u32, u64> {
     let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
     for (pid, parent) in parent_of {
@@ -41,6 +65,7 @@ mod platform {
     const TH32CS_SNAPPROCESS: u32 = 0x2;
     const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
     const PROCESS_VM_READ: u32 = 0x10;
+    const PROCESS_TERMINATE: u32 = 0x1;
     const INVALID_HANDLE_VALUE: isize = -1;
 
     #[repr(C)]
@@ -80,6 +105,7 @@ mod platform {
         fn OpenProcess(desired_access: u32, inherit_handle: i32, process_id: u32) -> isize;
         fn CloseHandle(handle: isize) -> i32;
         fn K32GetProcessMemoryInfo(process: isize, counters: *mut ProcessMemoryCountersEx, cb: u32) -> i32;
+        fn TerminateProcess(process: isize, exit_code: u32) -> i32;
     }
 
     fn parent_map() -> HashMap<u32, u32> {
@@ -121,6 +147,38 @@ mod platform {
     pub fn tree_working_set_bytes(roots: &[u32]) -> HashMap<u32, u64> {
         sum_over_descendants(roots, &parent_map(), working_set_of)
     }
+
+    fn terminate(pid: u32) -> bool {
+        // SAFETY: OpenProcess only reads its by-value arguments; a zero handle is handled below.
+        let handle = unsafe { OpenProcess(PROCESS_TERMINATE, 0, pid) };
+        if handle == 0 {
+            return false;
+        }
+        // SAFETY: handle is a live process handle opened with PROCESS_TERMINATE.
+        let ok = unsafe { TerminateProcess(handle, 1) };
+        // SAFETY: handle was opened above and is closed exactly once.
+        unsafe { CloseHandle(handle) };
+        ok != 0
+    }
+
+    fn taskkill(pid: u32) -> bool {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        std::process::Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    }
+
+    pub fn kill_tree(root: u32) -> usize {
+        let order = super::descendants_root_first(root, &parent_map());
+        order.iter().filter(|pid| terminate(**pid) || taskkill(**pid)).count()
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -153,6 +211,15 @@ mod platform {
     pub fn tree_working_set_bytes(roots: &[u32]) -> HashMap<u32, u64> {
         sum_over_descendants(roots, &parent_map(), resident_bytes_of)
     }
+
+    pub fn kill_tree(root: u32) -> usize {
+        let order = super::descendants_root_first(root, &parent_map());
+        order
+            .iter()
+            // SAFETY: kill takes plain integers and has no memory-safety preconditions.
+            .filter(|pid| unsafe { libc::kill(**pid as i32, libc::SIGKILL) } == 0)
+            .count()
+    }
 }
 
 #[cfg(not(any(windows, target_os = "linux")))]
@@ -161,5 +228,9 @@ mod platform {
 
     pub fn tree_working_set_bytes(_roots: &[u32]) -> HashMap<u32, u64> {
         HashMap::new()
+    }
+
+    pub fn kill_tree(_root: u32) -> usize {
+        0
     }
 }
