@@ -1066,7 +1066,7 @@ fn write_project_heartbeat_with_queue_info(spool_dir: &Path, busy_until: Option<
     payload["gm_processor_capacity"] = serde_json::json!(GM_PROCESSOR_CAPACITY.load(std::sync::atomic::Ordering::Relaxed));
     payload["gm_processor_capacity_reason"] = serde_json::json!(gm_processor_capacity_reason().lock().unwrap_or_else(|e| e.into_inner()).clone());
     payload["shared_store_recycle_limit_mb"] = serde_json::json!(SHARED_STORE_RECYCLE_LIMIT_MB.load(std::sync::atomic::Ordering::Relaxed));
-    payload["tool_serialization"] = serde_json::json!("fifo per plugin and verb for state-changing verbs, one dispatch per project lane (git, store, state); exec-family, codesearch, fetch, browser and read-only verbs run unserialised");
+    payload["tool_serialization"] = serde_json::json!("fifo per plugin and verb for state-changing verbs, one dispatch per project lane (git, store, state); exec-family, browser, read-only verbs and tree-scan codesearch run unserialised");
     payload["runner_version"] = serde_json::json!(env!("CARGO_PKG_VERSION"));
     payload["loaded_plugin_versions"] = serde_json::json!(loaded_plugin_versions().lock().unwrap_or_else(|e| e.into_inner()).clone());
     payload["queue_wait_ms"] = serde_json::json!(last_measured_dispatch_queue_wait_ms());
@@ -1111,7 +1111,7 @@ fn spawn_project_heartbeat_ticker(interval: Duration) -> std::thread::JoinHandle
             if !spool_dir.exists() {
                 continue;
             }
-            write_project_heartbeat(&spool_dir, busy_until_for_project_ticker(&spool_dir));
+            write_project_heartbeat(&spool_dir, busy_until_for_project_ticker(&root, &spool_dir));
         }
     })
 }
@@ -1125,8 +1125,8 @@ fn read_status_busy_until_if_future(spool_dir: &Path) -> Option<u64> {
 
 const TICKER_BUSY_UNTIL_EXTEND_MS: u64 = 60_000;
 
-fn busy_until_for_project_ticker(spool_dir: &Path) -> Option<u64> {
-    if spool_has_queued_work(spool_dir) {
+fn busy_until_for_project_ticker(root: &Path, spool_dir: &Path) -> Option<u64> {
+    if project_in_flight_count(root) > 0 || spool_has_queued_work(spool_dir) {
         return Some(now_ms() + TICKER_BUSY_UNTIL_EXTEND_MS);
     }
     read_status_busy_until_if_future(spool_dir)
@@ -1946,7 +1946,7 @@ pub(crate) fn last_measured_dispatch_queue_wait_ms() -> u64 {
     LAST_MEASURED_DISPATCH_QUEUE_WAIT_MS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-pub(crate) fn run_gm_dispatch_to_file(root: &Path, handle: &DispatchHandle, verb: &str, task: &str, body: &str, out_dir: &Path, queue_wait_ms: u64) {
+pub(crate) fn run_gm_dispatch_to_file(root: &Path, handle: &DispatchHandle, verb: &str, task: &str, body: &str, out_dir: &Path, queue_wait_ms: u64, submitted_at_ms: Option<u64>) {
     LAST_MEASURED_DISPATCH_QUEUE_WAIT_MS.store(queue_wait_ms, std::sync::atomic::Ordering::Relaxed);
     let plugin_name = if RAW_PLUGIN_SPOOL_VERBS.contains(&verb) { verb } else { "gm" };
     let inner_verb_owned: String = if plugin_name == "gm" {
@@ -1957,10 +1957,10 @@ pub(crate) fn run_gm_dispatch_to_file(root: &Path, handle: &DispatchHandle, verb
             .and_then(|v| v.get("verb").and_then(|s| s.as_str()).map(|s| s.to_string()))
             .unwrap_or_else(|| "capabilities".to_string())
     };
-    let _fairness_guard = GmFairnessGuard::acquire(root, if plugin_name == "gm" { verb } else { inner_verb_owned.as_str() });
     let tool_verb = if plugin_name == "gm" { verb } else { inner_verb_owned.as_str() };
-    let _tool_guard = ToolDispatchGuard::acquire(plugin_name, tool_verb);
-    let _dispatch_origin_scope = agentplug_host::enter_dispatch_origin_scope(task, body);
+    let _fairness_guard = GmFairnessGuard::acquire(root, tool_verb, body);
+    let _tool_guard = ToolDispatchGuard::acquire(plugin_name, tool_verb, body);
+    let _dispatch_origin_scope = agentplug_host::enter_dispatch_origin_scope(task, body, submitted_at_ms);
     let dispatch_result = if plugin_name == "gm" {
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handle.dispatch("gm", verb, body)))
     } else {
@@ -2107,7 +2107,7 @@ fn project_has_pending_dispatch_work(root: &Path) -> bool {
         }
     }
     let gm_in = root.join(".gm").join("exec-spool").join("in");
-    dir_has_any_verb_subdir_with_claimable_request(&gm_in, true)
+    project_in_flight_count(root) < MAX_CLAIMED_DISPATCHES_PER_PROJECT && dir_has_any_verb_subdir_with_claimable_request(&gm_in, true)
 }
 
 fn dispatch_project(root: &Path, project: &mut ProjectPlugins, plugin_modules: &PluginModules) -> bool {
@@ -2121,7 +2121,7 @@ fn dispatch_project(root: &Path, project: &mut ProjectPlugins, plugin_modules: &
         verb: String,
         task: String,
         body: String,
-        claimed_at: Instant,
+        submitted_at_ms: Option<u64>,
     }
     let mut claimed: Vec<ClaimedRequest> = Vec::new();
     let in_dir_scan = fs::read_dir(&in_dir);
@@ -2149,20 +2149,24 @@ fn dispatch_project(root: &Path, project: &mut ProjectPlugins, plugin_modules: &
     }
     claimable.sort_by_key(|(queued_since, _, _)| *queued_since);
     let claim_budget = MAX_CLAIMED_DISPATCHES_PER_PROJECT.saturating_sub(project_in_flight_count(root));
-    for (_, verb, file_path) in claimable.into_iter().take(claim_budget) {
+    for (queued_since, verb, file_path) in claimable.into_iter().take(claim_budget) {
         let Some(claim_path) = spool_claim_path(&file_path) else { continue };
         if fs::rename(&file_path, &claim_path).is_err() {
             continue;
         }
-        let claimed_at = Instant::now();
         let task = file_path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
         let body = fs::read_to_string(&claim_path).unwrap_or_default();
         if body.trim().is_empty() {
             let _ = fs::rename(&claim_path, &file_path);
             continue;
         }
+        let submitted_at_ms = queued_since
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .map(|since_epoch| since_epoch.as_millis() as u64)
+            .filter(|ms| *ms > 0);
         did_work = true;
-        claimed.push(ClaimedRequest { verb, task, body, claimed_at });
+        claimed.push(ClaimedRequest { verb, task, body, submitted_at_ms });
     }
 
     if claimed.is_empty() && in_dir_existed && !project_has_pending_dispatch_work(root) {
@@ -2277,18 +2281,22 @@ fn dispatch_project(root: &Path, project: &mut ProjectPlugins, plugin_modules: &
                 let detach_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
                 let key: InFlightKey = (root.to_path_buf(), req.verb.clone(), req.task.clone());
                 let failed_spawn_key = key.clone();
+                let failed_spawn_verb = req.verb.clone();
+                let failed_spawn_task = req.task.clone();
                 in_flight_map().lock().unwrap_or_else(|e| e.into_inner()).insert(key.clone(), InFlightHandle { detach: detach_flag });
 
                 let thread_root = root.to_path_buf();
                 let thread_out_dir = out_dir.clone();
-                let queue_wait_ms = req.claimed_at.elapsed().as_millis() as u64;
+                let queue_wait_ms = req.submitted_at_ms.map(|submitted| now_ms().saturating_sub(submitted)).unwrap_or(0);
                 let spawn_result = std::thread::Builder::new().name(format!("gm-dispatch-{}", req.task)).spawn(move || {
                     let _release_in_flight_entry = InFlightEntryRelease { key };
-                    run_gm_dispatch_to_file(&thread_root, &self_healing_dispatch_handle, &req.verb, &req.task, &req.body, &thread_out_dir, queue_wait_ms);
+                    run_gm_dispatch_to_file(&thread_root, &self_healing_dispatch_handle, &req.verb, &req.task, &req.body, &thread_out_dir, queue_wait_ms, req.submitted_at_ms);
                 });
                 if let Err(e) = spawn_result {
-                    eprintln!("[agentplug daemon] could not spawn a dispatch thread for {}: {e} -- the claim stays for the orphan sweep", root.display());
+                    eprintln!("[agentplug daemon] could not spawn a dispatch thread for {}: {e} -- answering the request with an error instead of leaving it claimed", root.display());
                     in_flight_map().lock().unwrap_or_else(|e| e.into_inner()).remove(&failed_spawn_key);
+                    let out_body = serde_json::json!({"ok": false, "error": format!("daemon could not start a dispatch thread: {e}"), "verb": failed_spawn_verb}).to_string();
+                    write_spool_out_and_release_claim(&out_dir, &in_dir, &failed_spawn_verb, &failed_spawn_task, &out_body);
                 }
             }
 
@@ -2376,7 +2384,7 @@ fn dispatch_project(root: &Path, project: &mut ProjectPlugins, plugin_modules: &
                     }
                 }
 
-                let _tool_guard = ToolDispatchGuard::acquire(&plugin_name, &verb);
+                let _tool_guard = ToolDispatchGuard::acquire(&plugin_name, &verb, &body);
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| project.dispatch(&plugin_name, &verb, &body)));
                 let out_name = format!("{plugin_name}-{verb}-{task}.json");
                 let out_body = match result {

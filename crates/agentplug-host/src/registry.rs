@@ -168,8 +168,6 @@ pub enum DispatchCostClass {
     Heavy,
 }
 
-const MAX_CONCURRENT_HEAVY_DISPATCHES: usize = 3;
-
 const HEAVY_DISPATCH_VERBS: &[&str] = &[
     "code_index",
     "embed",
@@ -937,10 +935,12 @@ fn tool_step_released() -> &'static Condvar {
     TOOL_STEP_RELEASED.get_or_init(Condvar::new)
 }
 
-const PARALLEL_SAFE_VERBS: &[&str] = &[
+const MAX_CONCURRENT_HEAVY_DISPATCHES: usize = 3;
+
+const UNSERIALIZED_VERBS: &[&str] = &[
     "exec_js", "lang", "nodejs", "javascript", "node", "js", "typescript", "python", "py", "bash", "sh", "shell", "zsh",
     "powershell", "ps1", "ssh", "go", "rust", "c", "cpp", "java", "deno",
-    "serp", "browser", "cdp", "fetch", "codesearch", "callers", "callees", "impact",
+    "serp", "browser", "cdp", "fetch", "callers", "callees", "impact",
     "fs_read", "fs_readdir", "fs_stat", "env_get", "kv_get", "config_resolve",
     "git_status", "branch_status", "git_log", "git_diff", "git_show", "ci-status", "git_poll",
     "status", "wait", "close", "phase-status", "prd-list", "prd-status", "mutable-list", "filter",
@@ -960,16 +960,20 @@ const STORE_LANE_VERBS: &[&str] = &[
     "cache_get", "cache_put", "cache_invalidate", "cache_stats", "kv_put", "kv_query",
 ];
 
-pub fn is_parallel_safe_verb(verb: &str) -> bool {
-    PARALLEL_SAFE_VERBS.contains(&verb)
+fn codesearch_reads_the_tree_without_indexing(verb: &str, body: &str) -> bool {
+    verb == "codesearch" && cost_class_for_dispatch(verb, body) == DispatchCostClass::Cheap
 }
 
-fn serial_lane_for_verb(verb: &str) -> Option<&'static str> {
-    if is_parallel_safe_verb(verb) {
+pub fn is_unserialized_dispatch(verb: &str, body: &str) -> bool {
+    UNSERIALIZED_VERBS.contains(&verb) || codesearch_reads_the_tree_without_indexing(verb, body)
+}
+
+fn serial_lane_for_dispatch(verb: &str, body: &str) -> Option<&'static str> {
+    if is_unserialized_dispatch(verb, body) {
         None
     } else if GIT_LANE_VERBS.contains(&verb) {
         Some("git")
-    } else if STORE_LANE_VERBS.contains(&verb) {
+    } else if STORE_LANE_VERBS.contains(&verb) || verb == "codesearch" {
         Some("store")
     } else {
         Some("state")
@@ -982,9 +986,9 @@ pub struct GmFairnessGuard {
 }
 
 impl GmFairnessGuard {
-    pub fn acquire(root: &Path, verb: &str) -> Self {
+    pub fn acquire(root: &Path, verb: &str, body: &str) -> Self {
         let root = root.to_path_buf();
-        let Some(lane) = serial_lane_for_verb(verb) else {
+        let Some(lane) = serial_lane_for_dispatch(verb, body) else {
             return Self { root, lane: None };
         };
         let mut map = gm_inflight_map().lock().unwrap_or_else(|e| e.into_inner());
@@ -1022,8 +1026,8 @@ pub struct ToolDispatchGuard {
 }
 
 impl ToolDispatchGuard {
-    pub fn acquire(plugin: &str, verb: &str) -> Self {
-        if is_parallel_safe_verb(verb) {
+    pub fn acquire(plugin: &str, verb: &str, body: &str) -> Self {
+        if is_unserialized_dispatch(verb, body) {
             return Self { key: None };
         }
         let key = format!("{plugin}\u{0}{verb}");
