@@ -456,7 +456,7 @@ function aggregateCpuProfile(profile, topN) {
 const SOFTWARE_RENDERER_PATTERN = /swiftshader|llvmpipe|softpipe|software|basic render|microsoft basic|warp/i;
 const VENDOR_PATTERNS = { nvidia: /nvidia/i, amd: /amd|radeon/i, intel: /intel/i };
 
-async function gpuReport(endpoint, probeSource, wantGpu) {
+async function gpuReport(endpoint, probeSource, wantGpu, uncapped) {
   const version = await httpJson(cdpUrl(endpoint, '/json/version'), 2000);
   if (!version || !version.webSocketDebuggerUrl) throw new Error(`CDP endpoint ${endpoint} did not answer /json/version`);
   const root = await cdpSession(version.webSocketDebuggerUrl, 5000);
@@ -470,6 +470,8 @@ async function gpuReport(endpoint, probeSource, wantGpu) {
     targetId = created.targetId;
     const attached = await page.send('Target.attachToTarget', { targetId, flatten: true });
     page.bindSession(attached.sessionId);
+    await page.send('Emulation.setFocusEmulationEnabled', { enabled: true }).catch(() => {});
+    if (uncapped) await page.send('Page.bringToFront', {}).catch(() => {});
     for (let i = 0; i < 40; i++) {
       const ready = await page.send('Runtime.evaluate', { expression: 'document.readyState', returnByValue: true }).catch(() => null);
       if (ready && ready.result && ready.result.value === 'complete') break;
@@ -524,7 +526,7 @@ async function gpuReport(endpoint, probeSource, wantGpu) {
 
 async function main() {
   const cfg = JSON.parse(process.argv[2]);
-  const { port, cdpEndpoint, startUrl, targetId, scriptFile, resultFile, timeoutMs, mode, artifactFile, viewport, claimFreshTarget, glCapture, gpuProbeFile, wantGpu } = cfg;
+  const { port, cdpEndpoint, startUrl, targetId, scriptFile, resultFile, timeoutMs, mode, artifactFile, viewport, claimFreshTarget, glCapture, gpuProbeFile, wantGpu, uncapped } = cfg;
   const endpoint = cdpEndpoint || `http://127.0.0.1:${port}`;
   const script = fs.readFileSync(scriptFile, 'utf-8');
   const target = await pickPageTarget(endpoint, startUrl, targetId, Math.min(timeoutMs, 30000), claimFreshTarget === true);
@@ -553,7 +555,8 @@ async function main() {
   const sess = resumableSession(endpoint, target, target.__liveSession || await cdpSession(target.webSocketDebuggerUrl, timeoutMs));
   try {
     if (mode === 'gpu') {
-      const report = await gpuReport(endpoint, fs.readFileSync(gpuProbeFile, 'utf-8'), wantGpu);
+      const report = await gpuReport(endpoint, fs.readFileSync(gpuProbeFile, 'utf-8'), wantGpu, uncapped === true);
+      if (uncapped === true) await sess.send('Page.bringToFront', {}).catch(() => {});
       writeResult({ result: report });
       sess.close();
       process.exit(0);
@@ -562,6 +565,7 @@ async function main() {
     if (instrumented) await sess.send('Runtime.enable', {});
     await sess.send('Page.enable', {});
     await sess.send('Emulation.setFocusEmulationEnabled', { enabled: true }).catch(() => {});
+    if (uncapped === true) await sess.send('Page.bringToFront', {}).catch(() => {});
     const collectDebug = instrumented ? await attachDebugCapture(sess, glCapture === true) : async () => undefined;
 
     if (viewport && viewport.width && viewport.height) {

@@ -1,10 +1,11 @@
 (async () => {
   const within = (promise, ms) => Promise.race([promise, new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), ms))]);
   const report = {};
+  const canvas = (document.body || document.documentElement).appendChild(document.createElement('canvas'));
+  canvas.width = canvas.height = 8;
+  let gl = null;
   try {
-    const canvas = document.createElement('canvas');
-    canvas.width = canvas.height = 8;
-    const gl = canvas.getContext('webgl2');
+    gl = canvas.getContext('webgl2');
     if (!gl) {
       report.gl = null;
     } else {
@@ -74,6 +75,10 @@
     const start = performance.now();
     const tick = (now) => {
       count += 1;
+      if (gl) {
+        gl.clearColor(count & 1, 0, 0, 1);
+        gl.clear(gl.COLOR_BUFFER_BIT);
+      }
       if (now - start >= 700) resolve({ count, ms: now - start });
       else requestAnimationFrame(tick);
     };

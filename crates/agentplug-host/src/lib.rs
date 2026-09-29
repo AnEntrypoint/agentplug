@@ -2,6 +2,7 @@ mod broker;
 mod browser;
 mod browser_engine;
 mod dispatch_origin;
+mod display;
 mod exec_js;
 mod fs_prewarm;
 mod gpu;

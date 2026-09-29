@@ -17,6 +17,13 @@ const ANTI_THROTTLE_ARGS: [&str; 5] = [
     "--disable-ipc-flooding-protection",
 ];
 
+const UNCAPPED_ARGS: [&str; 4] = [
+    "--ignore-gpu-blocklist",
+    "--enable-unsafe-webgpu",
+    "--disable-frame-rate-limit",
+    "--disable-gpu-vsync",
+];
+
 const LUID_RESOLVER_POWERSHELL: &str = r#"
 $live = @{}
 (Get-Counter '\GPU Adapter Memory(*)\Dedicated Usage').CounterSamples | ForEach-Object {
@@ -95,25 +102,59 @@ pub(crate) fn recorded_choice(profile_dir: &Path) -> Option<GpuChoice> {
     std::fs::read_to_string(choice_sidecar_path(profile_dir)).ok().and_then(|s| GpuChoice::parse(&s))
 }
 
-pub(crate) fn split_gpu_option(body: &str) -> (Option<GpuChoice>, Option<String>, String) {
+fn uncapped_sidecar_path(profile_dir: &Path) -> PathBuf {
+    profile_dir.join("uncapped.txt")
+}
+
+pub(crate) fn record_uncapped(profile_dir: &Path, uncapped: bool) {
+    let path = uncapped_sidecar_path(profile_dir);
+    if uncapped {
+        let _ = std::fs::create_dir_all(profile_dir);
+        let _ = std::fs::write(&path, "1");
+    } else {
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+pub(crate) fn recorded_uncapped(profile_dir: &Path) -> bool {
+    uncapped_sidecar_path(profile_dir).exists()
+}
+
+#[derive(Default)]
+pub(crate) struct LaunchOptions {
+    pub(crate) gpu: Option<GpuChoice>,
+    pub(crate) uncapped: bool,
+}
+
+fn apply_launch_token(options: &mut LaunchOptions, token: &str) -> Result<(), String> {
+    if token == "uncapped" {
+        options.uncapped = true;
+        return Ok(());
+    }
+    let value = token.strip_prefix("gpu=").ok_or_else(|| format!("'{token}' is not a launch option (expected gpu=nvidia|amd|intel|default or uncapped)"))?;
+    options.gpu = Some(GpuChoice::parse(value).ok_or_else(|| format!("gpu={value} is not one of nvidia|amd|intel|default"))?);
+    Ok(())
+}
+
+pub(crate) fn split_launch_options(body: &str) -> (LaunchOptions, Option<String>, String) {
     let trimmed = body.trim_start();
     let (first_line, remainder) = match trimmed.find('\n') {
         Some(nl) => (trimmed[..nl].trim_end(), &trimmed[nl + 1..]),
         None => (trimmed.trim_end(), ""),
     };
-    if let Some(value) = first_line.strip_prefix("gpu=") {
-        return match GpuChoice::parse(value) {
-            Some(choice) => (Some(choice), None, remainder.to_string()),
-            None => (None, Some(format!("gpu={value} is not one of nvidia|amd|intel|default")), body.to_string()),
-        };
+    let mut options = LaunchOptions::default();
+    let session_new_options = first_line.strip_prefix("session new").filter(|rest| rest.starts_with(char::is_whitespace));
+    let (tokens, rebuilt) = match session_new_options {
+        Some(rest) => (rest, format!("session new\n{remainder}")),
+        None if first_line == "uncapped" || first_line.starts_with("gpu=") => (first_line, remainder.to_string()),
+        None => return (options, None, body.to_string()),
+    };
+    for token in tokens.split_whitespace() {
+        if let Err(e) = apply_launch_token(&mut options, token) {
+            return (LaunchOptions::default(), Some(e), body.to_string());
+        }
     }
-    if let Some(value) = first_line.strip_prefix("session new gpu=") {
-        return match GpuChoice::parse(value) {
-            Some(choice) => (Some(choice), None, format!("session new\n{remainder}")),
-            None => (None, Some(format!("gpu={value} is not one of nvidia|amd|intel|default")), body.to_string()),
-        };
-    }
-    (None, None, body.to_string())
+    (options, None, rebuilt)
 }
 
 pub(crate) fn is_gpu_query(body: &str) -> bool {
@@ -150,8 +191,14 @@ fn resolve_luid_args(choice: GpuChoice) -> Result<Vec<String>, String> {
     }
 }
 
-pub(crate) fn launch_args(profile_dir: &Path, configured: Option<&str>) -> Result<Vec<String>, String> {
+pub(crate) fn launch_args(profile_dir: &Path, configured: Option<&str>, uncapped: bool) -> Result<Vec<String>, String> {
     let mut args: Vec<String> = ANTI_THROTTLE_ARGS.iter().map(|s| s.to_string()).collect();
+    if uncapped {
+        args.extend(UNCAPPED_ARGS.iter().map(|s| s.to_string()));
+        if cfg!(windows) {
+            args.push("--use-angle=d3d11".to_string());
+        }
+    }
     let choice = recorded_choice(profile_dir)
         .or_else(|| std::env::var("GM_BROWSER_GPU").ok().and_then(|v| GpuChoice::parse(&v)))
         .or_else(|| configured.and_then(GpuChoice::parse));
@@ -161,7 +208,29 @@ pub(crate) fn launch_args(profile_dir: &Path, configured: Option<&str>) -> Resul
     Ok(args)
 }
 
-pub(crate) fn report(node: &Path, port: u16, cdp_endpoint: &str, profile_dir: &Path, timeout_ms: u64) -> Value {
+pub(crate) fn report(node: &Path, port: u16, cdp_endpoint: &str, profile_dir: &Path, timeout_ms: u64, uncapped: bool) -> Value {
+    let topology = std::thread::spawn(crate::display::query);
+    with_display(probe_report(node, port, cdp_endpoint, profile_dir, timeout_ms, uncapped), topology, uncapped)
+}
+
+pub(crate) fn with_display_probe(probe: Value, uncapped: bool) -> Value {
+    with_display(probe, std::thread::spawn(crate::display::query), uncapped)
+}
+
+fn with_display(mut out: Value, topology: std::thread::JoinHandle<Result<crate::display::Topology, String>>, uncapped: bool) -> Value {
+    let raf_fps = out.get("fps").and_then(Value::as_u64);
+    let display = match topology.join() {
+        Ok(Ok(t)) => t.report(raf_fps, uncapped),
+        Ok(Err(e)) => json!({"uncapped": uncapped, "display_warn": e}),
+        Err(_) => json!({"uncapped": uncapped, "display_warn": "display topology probe panicked"}),
+    };
+    if let (Some(o), Value::Object(d)) = (out.as_object_mut(), display) {
+        o.extend(d);
+    }
+    out
+}
+
+fn probe_report(node: &Path, port: u16, cdp_endpoint: &str, profile_dir: &Path, timeout_ms: u64, uncapped: bool) -> Value {
     let stamp = format!("{}-{}", std::process::id(), port);
     let tmp = std::env::temp_dir();
     let helper_path = tmp.join(format!("agentplug-gpu-eval-{stamp}.mjs"));
@@ -172,7 +241,7 @@ pub(crate) fn report(node: &Path, port: u16, cdp_endpoint: &str, profile_dir: &P
         && std::fs::write(&probe_path, GPU_PROBE_JS).is_ok()
         && std::fs::write(&script_path, "void 0").is_ok();
     let outcome = if write_ok {
-        run_helper(node, &helper_path, &probe_path, &script_path, &result_path, port, cdp_endpoint, profile_dir, timeout_ms)
+        run_helper(node, &helper_path, &probe_path, &script_path, &result_path, port, cdp_endpoint, profile_dir, timeout_ms, uncapped)
     } else {
         json!({"accelerated": false, "warn": "gpu report could not write its temp helper files"})
     };
@@ -183,8 +252,9 @@ pub(crate) fn report(node: &Path, port: u16, cdp_endpoint: &str, profile_dir: &P
 }
 
 #[allow(clippy::too_many_arguments)]
-fn run_helper(node: &Path, helper: &Path, probe: &Path, script: &Path, result: &Path, port: u16, cdp_endpoint: &str, profile_dir: &Path, timeout_ms: u64) -> Value {
+fn run_helper(node: &Path, helper: &Path, probe: &Path, script: &Path, result: &Path, port: u16, cdp_endpoint: &str, profile_dir: &Path, timeout_ms: u64, uncapped: bool) -> Value {
     let cfg = json!({
+        "uncapped": uncapped,
         "port": port,
         "cdpEndpoint": cdp_endpoint,
         "scriptFile": script.to_string_lossy(),
