@@ -676,7 +676,12 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
                 serde_json::from_str(&params_str).unwrap_or(serde_json::json!({}))
             };
             let cwd = caller.data().cwd();
-            let result = crate::task::handle(&action, &params, &cwd);
+            let result = if action == crate::fs_prewarm::ACTION {
+                let extra_roots = caller.data().extra_readable_roots();
+                crate::fs_prewarm::run(&params, |p| sandboxed_guest_path_with_extra_roots(&cwd, p, &extra_roots))
+            } else {
+                crate::task::handle(&action, &params, &cwd)
+            };
             write_guest_json(&mut caller, result)
         },
     )?;
