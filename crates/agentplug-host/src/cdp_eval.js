@@ -272,7 +272,7 @@ const GL_ERROR_TRACKING_INIT_SCRIPT = `
 (() => {
   const MAX_SIGNATURES = 40;
   window.__gmGlErrors = window.__gmGlErrors || {};
-  window.__gmGlDrawCalls = window.__gmGlDrawCalls || {};
+  const drawCounts = window.__gmGlDrawCalls = window.__gmGlDrawCalls || { drawArrays: 0, drawElements: 0, drawArraysInstanced: 0, drawElementsInstanced: 0 };
   window.__gmGlErrorTotalCount = window.__gmGlErrorTotalCount || 0;
   window.__gmGlLastDrainedError = null;
   const drawFns = ['drawArrays', 'drawElements', 'drawArraysInstanced', 'drawElementsInstanced'];
@@ -280,35 +280,45 @@ const GL_ERROR_TRACKING_INIT_SCRIPT = `
   HTMLCanvasElement.prototype.getContext = function (type, ...rest) {
     const gl = origGetContext.call(this, type, ...rest);
     if (!gl || !/^webgl/.test(type) && type !== 'experimental-webgl') return gl;
+    const origGetError = gl.getError.bind(gl);
+    let withheldError = gl.NO_ERROR;
+    gl.getError = function () {
+      if (withheldError !== gl.NO_ERROR) {
+        const err = withheldError;
+        withheldError = gl.NO_ERROR;
+        return err;
+      }
+      return origGetError();
+    };
+    let sampleClock = 0;
     for (const fnName of drawFns) {
       const orig = gl[fnName];
       if (typeof orig !== 'function' || orig.__gmWrapped) continue;
-      const wrapped = function (...args) {
-        const result = orig.apply(this, args);
-        window.__gmGlDrawCalls[fnName] = (window.__gmGlDrawCalls[fnName] || 0) + 1;
-        const err = gl.getError();
+      const wrapped = function (p0, p1, p2, p3, p4) {
+        orig.call(this, p0, p1, p2, p3, p4);
+        drawCounts[fnName]++;
+        if ((++sampleClock & 31) !== 0) return;
+        const err = origGetError();
         window.__gmGlLastDrainedError = err;
-        if (err !== gl.NO_ERROR) {
-          window.__gmGlErrorTotalCount += 1;
-          const mode = args[0];
-          const isArrays = fnName === 'drawArrays' || fnName === 'drawArraysInstanced';
-          const count = isArrays ? args[2] : args[1];
-          const first = isArrays ? args[1] : undefined;
-          const instanceCount = isArrays ? args[3] : args[4];
-          const sig = fnName + '|' + err + '|' + mode + '|' + count + '|' + (instanceCount || 0);
-          const existing = window.__gmGlErrors[sig];
-          if (existing) {
-            existing.occurrenceCount += 1;
-            existing.lastDrawCallIndex = window.__gmGlDrawCalls[fnName];
-          } else if (Object.keys(window.__gmGlErrors).length < MAX_SIGNATURES) {
-            window.__gmGlErrors[sig] = {
-              fn: fnName, error: err, mode, count, first, instanceCount: instanceCount || 0,
-              occurrenceCount: 1, lastDrawCallIndex: window.__gmGlDrawCalls[fnName],
-              stack: new Error().stack,
-            };
-          }
+        if (err === gl.NO_ERROR) return;
+        if (withheldError === gl.NO_ERROR) withheldError = err;
+        window.__gmGlErrorTotalCount += 1;
+        const isArrays = fnName === 'drawArrays' || fnName === 'drawArraysInstanced';
+        const count = isArrays ? p2 : p1;
+        const first = isArrays ? p1 : undefined;
+        const instanceCount = isArrays ? p3 : p4;
+        const sig = fnName + '|' + err + '|' + p0 + '|' + count + '|' + (instanceCount || 0);
+        const existing = window.__gmGlErrors[sig];
+        if (existing) {
+          existing.occurrenceCount += 1;
+          existing.lastDrawCallIndex = drawCounts[fnName];
+        } else if (Object.keys(window.__gmGlErrors).length < MAX_SIGNATURES) {
+          window.__gmGlErrors[sig] = {
+            fn: fnName, error: err, mode: p0, count, first, instanceCount: instanceCount || 0,
+            occurrenceCount: 1, lastDrawCallIndex: drawCounts[fnName],
+            stack: new Error().stack,
+          };
         }
-        return result;
       };
       wrapped.__gmWrapped = true;
       gl[fnName] = wrapped;
