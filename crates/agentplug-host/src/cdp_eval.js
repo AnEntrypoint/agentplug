@@ -276,53 +276,75 @@ const GL_ERROR_TRACKING_INIT_SCRIPT = `
   window.__gmGlErrorTotalCount = window.__gmGlErrorTotalCount || 0;
   window.__gmGlLastDrainedError = null;
   const drawFns = ['drawArrays', 'drawElements', 'drawArraysInstanced', 'drawElementsInstanced'];
-  const origGetContext = HTMLCanvasElement.prototype.getContext;
-  HTMLCanvasElement.prototype.getContext = function (type, ...rest) {
-    const gl = origGetContext.call(this, type, ...rest);
-    if (!gl || !/^webgl/.test(type) && type !== 'experimental-webgl') return gl;
-    const origGetError = gl.getError.bind(gl);
-    let withheldError = gl.NO_ERROR;
+  const FRAME_DRAIN_ATTRIBUTION = 'drained once per animation frame; attributed to the last draw call issued before the drain';
+  const contextsDrawnThisFrame = [];
+  const trackedSet = new WeakSet();
+  let drainScheduled = false;
+  const recordFrameError = (ctx, err) => {
+    window.__gmGlErrorTotalCount += 1;
+    const fnName = ctx.lastFn;
+    const isArrays = fnName === 'drawArrays' || fnName === 'drawArraysInstanced';
+    const count = isArrays ? ctx.p2 : ctx.p1;
+    const first = isArrays ? ctx.p1 : undefined;
+    const instanceCount = isArrays ? ctx.p3 : ctx.p4;
+    const sig = fnName + '|' + err + '|' + ctx.p0 + '|' + count + '|' + (instanceCount || 0);
+    const existing = window.__gmGlErrors[sig];
+    if (existing) {
+      existing.occurrenceCount += 1;
+      existing.lastDrawCallIndex = drawCounts[fnName];
+    } else if (Object.keys(window.__gmGlErrors).length < MAX_SIGNATURES) {
+      window.__gmGlErrors[sig] = {
+        fn: fnName, error: err, mode: ctx.p0, count, first, instanceCount: instanceCount || 0,
+        occurrenceCount: 1, lastDrawCallIndex: drawCounts[fnName],
+        stack: FRAME_DRAIN_ATTRIBUTION,
+      };
+    }
+  };
+  const drainOncePerFrame = () => {
+    drainScheduled = false;
+    for (const ctx of contextsDrawnThisFrame) {
+      ctx.drewSinceDrain = false;
+      const err = ctx.origGetError();
+      window.__gmGlLastDrainedError = err;
+      if (err === ctx.gl.NO_ERROR) continue;
+      if (ctx.withheldError === ctx.gl.NO_ERROR) ctx.withheldError = err;
+      recordFrameError(ctx, err);
+    }
+    contextsDrawnThisFrame.length = 0;
+  };
+  const scheduleDrain = () => {
+    if (drainScheduled) return;
+    drainScheduled = true;
+    requestAnimationFrame(drainOncePerFrame);
+  };
+  const track = (gl) => {
+    const ctx = { gl, origGetError: gl.getError.bind(gl), withheldError: gl.NO_ERROR, drewSinceDrain: false, lastFn: null, p0: 0, p1: 0, p2: 0, p3: 0, p4: 0 };
     gl.getError = function () {
-      if (withheldError !== gl.NO_ERROR) {
-        const err = withheldError;
-        withheldError = gl.NO_ERROR;
+      if (ctx.withheldError !== gl.NO_ERROR) {
+        const err = ctx.withheldError;
+        ctx.withheldError = gl.NO_ERROR;
         return err;
       }
-      return origGetError();
+      return ctx.origGetError();
     };
-    let sampleClock = 0;
     for (const fnName of drawFns) {
       const orig = gl[fnName];
-      if (typeof orig !== 'function' || orig.__gmWrapped) continue;
+      if (typeof orig !== 'function') continue;
       const wrapped = function (p0, p1, p2, p3, p4) {
         orig.call(this, p0, p1, p2, p3, p4);
         drawCounts[fnName]++;
-        if ((++sampleClock & 31) !== 0) return;
-        const err = origGetError();
-        window.__gmGlLastDrainedError = err;
-        if (err === gl.NO_ERROR) return;
-        if (withheldError === gl.NO_ERROR) withheldError = err;
-        window.__gmGlErrorTotalCount += 1;
-        const isArrays = fnName === 'drawArrays' || fnName === 'drawArraysInstanced';
-        const count = isArrays ? p2 : p1;
-        const first = isArrays ? p1 : undefined;
-        const instanceCount = isArrays ? p3 : p4;
-        const sig = fnName + '|' + err + '|' + p0 + '|' + count + '|' + (instanceCount || 0);
-        const existing = window.__gmGlErrors[sig];
-        if (existing) {
-          existing.occurrenceCount += 1;
-          existing.lastDrawCallIndex = drawCounts[fnName];
-        } else if (Object.keys(window.__gmGlErrors).length < MAX_SIGNATURES) {
-          window.__gmGlErrors[sig] = {
-            fn: fnName, error: err, mode: p0, count, first, instanceCount: instanceCount || 0,
-            occurrenceCount: 1, lastDrawCallIndex: drawCounts[fnName],
-            stack: new Error().stack,
-          };
-        }
+        ctx.lastFn = fnName; ctx.p0 = p0; ctx.p1 = p1; ctx.p2 = p2; ctx.p3 = p3; ctx.p4 = p4;
+        if (!ctx.drewSinceDrain) { ctx.drewSinceDrain = true; contextsDrawnThisFrame.push(ctx); scheduleDrain(); }
       };
       wrapped.__gmWrapped = true;
       gl[fnName] = wrapped;
     }
+  };
+  const origGetContext = HTMLCanvasElement.prototype.getContext;
+  HTMLCanvasElement.prototype.getContext = function (type, ...rest) {
+    const gl = origGetContext.call(this, type, ...rest);
+    if (!gl || !/^webgl/.test(type) && type !== 'experimental-webgl') return gl;
+    if (!trackedSet.has(gl)) { trackedSet.add(gl); track(gl); }
     return gl;
   };
 })();
