@@ -188,6 +188,7 @@ function resumableSession(endpoint, target, first) {
     onIdLessNotification: null,
     send(method, params) {
       if (method.endsWith('.enable') || method.startsWith('Emulation.set')) replayedSetup.set(method, params);
+      if (method.endsWith('.disable')) replayedSetup.delete(method.replace(/\.disable$/, '.enable'));
       return live.send(method, params);
     },
     async reattach(deadline) {
@@ -224,7 +225,7 @@ async function evaluateParkedSurvivingReconnect(sess, wrapped, timeoutMs) {
   }
 }
 
-async function navigateIfNeededThenEvaluateOverCdp(sess, script, startUrl, timeoutMs) {
+async function navigateIfNeededThenEvaluateOverCdp(sess, script, startUrl, timeoutMs, keepNetworkEvents = false) {
   let navigationFailure = null;
   if (startUrl) {
     await sess.send('Network.enable', {});
@@ -246,6 +247,7 @@ async function navigateIfNeededThenEvaluateOverCdp(sess, script, startUrl, timeo
     }
     await new Promise((r) => setTimeout(r, 1200));
     sess.onIdLessNotification = prevOnIdLessNotification;
+    if (!keepNetworkEvents) await sess.send('Network.disable', {}).catch(() => {});
   }
   const trimmedScript = script.trim();
   const exprAttempt = `(async () => { return (\n${trimmedScript}\n); })()`;
@@ -314,7 +316,7 @@ const GL_ERROR_TRACKING_INIT_SCRIPT = `
 })();
 `;
 
-async function attachDebugCapture(sess) {
+async function attachDebugCapture(sess, glCapture) {
   const consoleLines = [];
   const networkEvents = [];
   const pageErrors = [];
@@ -338,7 +340,7 @@ async function attachDebugCapture(sess) {
     }
   };
   await sess.send('Network.enable', {});
-  await sess.send('Page.addScriptToEvaluateOnNewDocument', { source: GL_ERROR_TRACKING_INIT_SCRIPT });
+  if (glCapture) await sess.send('Page.addScriptToEvaluateOnNewDocument', { source: GL_ERROR_TRACKING_INIT_SCRIPT });
   const NETWORK_CAP = 30;
   const CONSOLE_CAP = 50;
   const boundedNetwork = () => {
@@ -411,9 +413,78 @@ function aggregateCpuProfile(profile, topN) {
   };
 }
 
+const SOFTWARE_RENDERER_PATTERN = /swiftshader|llvmpipe|softpipe|software|basic render|microsoft basic|warp/i;
+const VENDOR_PATTERNS = { nvidia: /nvidia/i, amd: /amd|radeon/i, intel: /intel/i };
+
+async function gpuReport(endpoint, probeSource, wantGpu) {
+  const version = await httpJson(cdpUrl(endpoint, '/json/version'), 2000);
+  if (!version || !version.webSocketDebuggerUrl) throw new Error(`CDP endpoint ${endpoint} did not answer /json/version`);
+  const root = await cdpSession(version.webSocketDebuggerUrl, 5000);
+  const page = await cdpSession(version.webSocketDebuggerUrl, 5000);
+  const server = http.createServer((_, res) => { res.setHeader('content-type', 'text/html'); res.end('<!doctype html><title>gpu</title>'); });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  let targetId = null;
+  try {
+    const info = await root.send('SystemInfo.getInfo', {});
+    const created = await page.send('Target.createTarget', { url: `http://127.0.0.1:${server.address().port}/` });
+    targetId = created.targetId;
+    const attached = await page.send('Target.attachToTarget', { targetId, flatten: true });
+    page.bindSession(attached.sessionId);
+    for (let i = 0; i < 40; i++) {
+      const ready = await page.send('Runtime.evaluate', { expression: 'document.readyState', returnByValue: true }).catch(() => null);
+      if (ready && ready.result && ready.result.value === 'complete') break;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    let evaluated = null;
+    for (let attempt = 0; attempt < 3 && !evaluated; attempt++) {
+      try {
+        evaluated = await page.send('Runtime.evaluate', { expression: probeSource, awaitPromise: true, returnByValue: true });
+      } catch (e) {
+        if (attempt === 2) throw e;
+        await new Promise((resolve) => setTimeout(resolve, 500));
+      }
+    }
+    const probe = (evaluated.result && evaluated.result.value) || {};
+    const aux = (info.gpu && info.gpu.auxAttributes) || {};
+    const features = (info.gpu && info.gpu.featureStatus) || {};
+    const adapter = probe.gpu ? `${probe.gpu.vendor || '?'}/${probe.gpu.arch || '?'}` : null;
+    const reasons = [];
+    if (!probe.gl) reasons.push('no webgl2');
+    else if (!probe.glDraw) reasons.push('webgl2 draw failed');
+    if (SOFTWARE_RENDERER_PATTERN.test(`${probe.gl || ''} ${probe.gpu ? Object.values(probe.gpu).join(' ') : ''}`)) reasons.push('software renderer');
+    if (probe.gpu && probe.gpu.fallback) reasons.push('webgpu fallback adapter');
+    if (features.webgpu === 'enabled' && probe.gpu && probe.gpuCompute !== true) reasons.push('webgpu compute failed');
+    if (features.gpu_compositing !== 'enabled') reasons.push(`gpu_compositing ${features.gpu_compositing}`);
+    if (wantGpu && VENDOR_PATTERNS[wantGpu] && !VENDOR_PATTERNS[wantGpu].test(probe.gl || '')) reasons.push(`requested gpu=${wantGpu} but renderer is ${probe.gl}`);
+    const report = {
+      accelerated: reasons.length === 0,
+      gl: probe.gl,
+      angle: aux.displayType,
+      skia: aux.skiaBackendType,
+      webgl: features.webgl,
+      webgpu: features.webgpu,
+      adapter: adapter ? adapter + (probe.gpu.fallback ? '/FALLBACK' : '') : 'none',
+      draw: probe.glDraw === true,
+      compute: probe.gpuCompute === true,
+      fps: probe.fps,
+      focused: probe.focused,
+      visibility: probe.visibility,
+    };
+    if (wantGpu) report.want = wantGpu;
+    if (reasons.length) report.warn = `NOT ACCELERATED OR MISMATCHED: ${reasons.join('; ')} -- perf and visual witnesses from this session are untrustworthy`;
+    else if (probe.fps < 30) report.warn = `rAF only ${probe.fps}fps on an idle page -- session is throttled or the display is slow; perf witnesses are untrustworthy`;
+    return report;
+  } finally {
+    if (targetId) await root.send('Target.closeTarget', { targetId }).catch(() => {});
+    root.close();
+    page.close();
+    server.close();
+  }
+}
+
 async function main() {
   const cfg = JSON.parse(process.argv[2]);
-  const { port, cdpEndpoint, startUrl, targetId, scriptFile, resultFile, timeoutMs, mode, artifactFile, viewport, claimFreshTarget } = cfg;
+  const { port, cdpEndpoint, startUrl, targetId, scriptFile, resultFile, timeoutMs, mode, artifactFile, viewport, claimFreshTarget, glCapture, gpuProbeFile, wantGpu } = cfg;
   const endpoint = cdpEndpoint || `http://127.0.0.1:${port}`;
   const script = fs.readFileSync(scriptFile, 'utf-8');
   const target = await pickPageTarget(endpoint, startUrl, targetId, Math.min(timeoutMs, 30000), claimFreshTarget === true);
@@ -441,10 +512,17 @@ async function main() {
   watchdogTimer.unref();
   const sess = resumableSession(endpoint, target, target.__liveSession || await cdpSession(target.webSocketDebuggerUrl, timeoutMs));
   try {
-    await sess.send('Runtime.enable', {});
+    if (mode === 'gpu') {
+      const report = await gpuReport(endpoint, fs.readFileSync(gpuProbeFile, 'utf-8'), wantGpu);
+      writeResult({ result: report });
+      sess.close();
+      process.exit(0);
+    }
+    const instrumented = mode === 'capture' || mode === 'profile' || mode === 'trace';
+    if (instrumented) await sess.send('Runtime.enable', {});
     await sess.send('Page.enable', {});
     await sess.send('Emulation.setFocusEmulationEnabled', { enabled: true }).catch(() => {});
-    const collectDebug = await attachDebugCapture(sess);
+    const collectDebug = instrumented ? await attachDebugCapture(sess, glCapture === true) : async () => undefined;
 
     if (viewport && viewport.width && viewport.height) {
       await sess.send('Emulation.setDeviceMetricsOverride', {
@@ -461,7 +539,7 @@ async function main() {
     }
 
     if (mode === 'capture') {
-      const res = await navigateIfNeededThenEvaluateOverCdp(sess, script, startUrl, timeoutMs);
+      const res = await navigateIfNeededThenEvaluateOverCdp(sess, script, startUrl, timeoutMs, true);
       const debug = await collectDebug();
       if (res.exceptionDetails) {
         const msg = res.exceptionDetails.exception?.description || res.exceptionDetails.text || 'evaluate exception';
@@ -481,7 +559,7 @@ async function main() {
       await sess.send('Profiler.enable', {});
       await sess.send('Profiler.setSamplingInterval', { interval: 100 });
       await sess.send('Profiler.start', {});
-      const res = await navigateIfNeededThenEvaluateOverCdp(sess, script, startUrl, timeoutMs);
+      const res = await navigateIfNeededThenEvaluateOverCdp(sess, script, startUrl, timeoutMs, true);
       const stopRes = await sess.send('Profiler.stop', {});
       const agg = aggregateCpuProfile(stopRes && stopRes.profile, 20);
       const debug = await collectDebug();
@@ -509,7 +587,7 @@ async function main() {
       };
       await sess.send('Tracing.start', { categories: 'disabled-by-default-devtools.timeline,devtools.timeline,disabled-by-default-devtools.timeline.frame', transferMode: 'ReportEvents' });
       const w0 = Date.now();
-      const res = await navigateIfNeededThenEvaluateOverCdp(sess, script, startUrl, timeoutMs);
+      const res = await navigateIfNeededThenEvaluateOverCdp(sess, script, startUrl, timeoutMs, true);
       const wallUs = (Date.now() - w0) * 1000;
       const tracingDone = new Promise((resolve) => {
         const prevOnIdLessNotification = sess.onIdLessNotification;
