@@ -48,6 +48,8 @@ pub(crate) struct BrowserRuntimeConfig {
     gpu: Option<String>,
     #[serde(default)]
     headless_disable_gpu: Option<bool>,
+    #[serde(default)]
+    uncapped: Option<bool>,
 }
 
 type BrowserConfig = BrowserRuntimeConfig;
@@ -78,6 +80,7 @@ impl BrowserRuntimeConfig {
     fn enable_webgpu(&self) -> bool { self.enable_webgpu.unwrap_or(false) }
     fn headless_disable_gpu(&self) -> bool { self.headless_disable_gpu.unwrap_or(false) }
     fn configured_gpu(&self) -> Option<&str> { self.gpu.as_deref() }
+    fn uncapped(&self) -> bool { self.uncapped.unwrap_or(false) }
     fn chrome_idle_ttl(&self) -> Duration {
         Duration::from_secs(self.chrome_idle_ttl_seconds.filter(|s| *s > 0).unwrap_or(DEFAULT_CHROME_IDLE_TTL_SECONDS))
     }
@@ -1363,6 +1366,7 @@ fn session_close(cwd: &Path, target_session_id: &str, require_found: bool) -> Va
             .filter(|adopted_id| adopted_id == target_session_id)
             .and_then(|_| remove_tracked())
     });
+    crate::gpu::record_uncapped(&browser_chrome_profile_dir(cwd, target_session_id), false);
     match removed {
         Some(session) => {
             kill_session(session);
@@ -1416,7 +1420,19 @@ enum SessionCommand<'a> {
     List,
     Close(&'a str),
     Reset(&'a str),
+    Unknown(&'a str),
     None,
+}
+
+fn unknown_session_subcommand<'a>(first_line: &'a str, remainder: &str) -> Option<&'a str> {
+    let rest = first_line.strip_prefix("session")?;
+    if rest.is_empty() {
+        return remainder.trim().is_empty().then_some("");
+    }
+    let rest = rest.strip_prefix([' ', '\t'])?.trim();
+    let word = rest.split_whitespace().next().unwrap_or("");
+    let is_command_word = word.starts_with(|c: char| c.is_ascii_alphabetic()) && word.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    (is_command_word && !matches!(word, "in" | "instanceof")).then_some(rest)
 }
 
 fn parse_session_command(body: &str) -> (SessionCommand<'_>, &str) {
@@ -1435,14 +1451,20 @@ fn parse_session_command(body: &str) -> (SessionCommand<'_>, &str) {
     if matches!(first_line, "session close-all" | "session close all" | "close-all") {
         return (SessionCommand::CloseAll, remainder);
     }
-    if first_line == "session close" {
+    if first_line == "session close" || first_line == "session kill" {
         return (SessionCommand::Close(""), remainder);
     }
-    if let Some(id) = first_line.strip_prefix("session close ") {
+    if let Some(id) = first_line.strip_prefix("session close ").or_else(|| first_line.strip_prefix("session kill ")) {
         return (SessionCommand::Close(id.trim()), remainder);
     }
     if let Some(id) = first_line.strip_prefix("session reset ") {
         return (SessionCommand::Reset(id.trim()), remainder);
+    }
+    if first_line == "session reset" {
+        return (SessionCommand::Reset(""), remainder);
+    }
+    if let Some(sub) = unknown_session_subcommand(first_line, remainder) {
+        return (SessionCommand::Unknown(sub), remainder);
     }
     (SessionCommand::None, body)
 }
@@ -1522,7 +1544,7 @@ fn chrome_launch_args(profile_dir: &Path, port: u16, headless: bool, no_sandbox:
     if cfg.enable_webgpu() && !headless {
         args.push("--enable-unsafe-webgpu".to_string());
     }
-    args.extend(crate::gpu::launch_args(profile_dir, cfg.configured_gpu())?);
+    args.extend(crate::gpu::launch_args(profile_dir, cfg.configured_gpu(), cfg.uncapped() || crate::gpu::recorded_uncapped(profile_dir))?);
     if no_sandbox {
         args.extend(["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"].map(String::from));
     }
@@ -1531,6 +1553,8 @@ fn chrome_launch_args(profile_dir: &Path, port: u16, headless: bool, no_sandbox:
         args.push(format!("--disable-extensions-except={ext}"));
     }
     args.extend(partition_chrome_extra_args(cfg).0);
+    let mut seen = std::collections::HashSet::new();
+    args.retain(|a| seen.insert(a.clone()));
     Ok(args)
 }
 
@@ -1707,24 +1731,46 @@ pub fn run(body: &str, opts: &str, cwd_raw: &Path, session_id: &str) -> Value {
     let resolved_session_id = origin.page_session(explicit_session_id, session_id);
     let session_id = resolved_session_id.as_str();
 
-    let (gpu_choice, gpu_option_error, gpu_normalized_body) = crate::gpu::split_gpu_option(inner_body);
-    if let Some(e) = gpu_option_error {
+    let (launch_options, launch_option_error, launch_normalized_body) = crate::gpu::split_launch_options(inner_body);
+    if let Some(e) = launch_option_error {
         return json!({"ok": false, "stdout": "", "exit_code": 1, "stderr": e});
     }
-    let inner_body: &str = &gpu_normalized_body;
+    let inner_body: &str = &launch_normalized_body;
+    let gpu_choice = launch_options.gpu;
     let gpu_profile_dir = browser_chrome_profile_dir(cwd, session_id);
-    if let Some(choice) = gpu_choice {
-        let previous = crate::gpu::recorded_choice(&gpu_profile_dir);
-        crate::gpu::record_choice(&gpu_profile_dir, Some(choice));
-        if previous != Some(choice) {
-            let stale = sessions_map().lock().unwrap_or_else(|e| e.into_inner()).remove(&session_key(cwd, session_id));
+    let (session_command, after_session_command) = parse_session_command(inner_body);
+    if let SessionCommand::Unknown(sub) = session_command {
+        let problem = if sub.is_empty() { "'session' needs a subcommand".to_string() } else { format!("unknown session subcommand '{sub}'") };
+        return json!({"ok": false, "stdout": "", "exit_code": 1,
+            "stderr": format!("{problem} -- supported: session new [gpu=<vendor>] [uncapped] | session list | session close [<id>] | session close-all | session reset <id>; no browser was launched")});
+    }
+    let want_uncapped = launch_options.uncapped || (browser_cfg.uncapped() && matches!(session_command, SessionCommand::None));
+    if gpu_choice.is_some() || want_uncapped {
+        let key = session_key(cwd, session_id);
+        let lifecycle_lock = session_lifecycle_lock_for_key(&key);
+        let _launch_mode_change_waits_for_in_flight_eval = lifecycle_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let choice_changed = gpu_choice.is_some_and(|c| crate::gpu::recorded_choice(&gpu_profile_dir) != Some(c));
+        let uncapped_changed = want_uncapped && !crate::gpu::recorded_uncapped(&gpu_profile_dir);
+        if let Some(choice) = gpu_choice {
+            crate::gpu::record_choice(&gpu_profile_dir, Some(choice));
+        }
+        if want_uncapped {
+            crate::gpu::record_uncapped(&gpu_profile_dir, true);
+        }
+        if choice_changed || uncapped_changed {
+            let stale = sessions_map().lock().unwrap_or_else(|e| e.into_inner()).remove(&key);
             if let Some(session) = stale {
                 kill_session(session);
             }
         }
     }
 
-    let (session_command, after_session_command) = parse_session_command(inner_body);
+    let uncapped = browser_cfg.uncapped()
+        || match session_command {
+            SessionCommand::New => launch_options.uncapped,
+            SessionCommand::Reset(id) if id == session_id => false,
+            _ => crate::gpu::recorded_uncapped(&gpu_profile_dir),
+        };
     let trailing_body_present = !after_session_command.trim().is_empty();
     let mut session_created_by_this_dispatch = false;
     let inner_body: &str = match session_command {
@@ -1732,13 +1778,14 @@ pub fn run(body: &str, opts: &str, cwd_raw: &Path, session_id: &str) -> Value {
             if gpu_choice.is_none() {
                 crate::gpu::record_choice(&gpu_profile_dir, None);
             }
+            crate::gpu::record_uncapped(&gpu_profile_dir, launch_options.uncapped || browser_cfg.uncapped());
             let created = session_new(cwd, session_id, owner_gm_session.as_deref(), &browser_cfg, engine);
             if !trailing_body_present || created.get("ok") != Some(&Value::Bool(true)) {
                 let mut created = created;
                 let created_port = created.get("port").and_then(|p| p.as_u64()).map(|p| p as u16);
                 if let (Some(created_port), true) = (created_port, created.get("ok") == Some(&Value::Bool(true)) && engine == crate::browser_engine::Engine::Chrome) {
                     let endpoint = format!("http://127.0.0.1:{created_port}");
-                    created["gpu"] = crate::gpu::report(&node, created_port, &endpoint, &gpu_profile_dir, 30_000);
+                    created["gpu"] = crate::gpu::report(&node, created_port, &endpoint, &gpu_profile_dir, 30_000, uncapped);
                 }
                 return created;
             }
@@ -1783,7 +1830,7 @@ pub fn run(body: &str, opts: &str, cwd_raw: &Path, session_id: &str) -> Value {
             return json!({"ok": false, "stdout": "", "exit_code": 1,
                 "stderr": format!("session reset requires an explicit id, e.g. 'session reset {caller_implicit_session}' for this gm session's own page")});
         }
-        SessionCommand::None => inner_body,
+        SessionCommand::None | SessionCommand::Unknown(_) => inner_body,
     };
 
     let mut timeout_override: Option<u64> = None;
@@ -2035,6 +2082,7 @@ pub fn run(body: &str, opts: &str, cwd_raw: &Path, session_id: &str) -> Value {
         "targetId": known_target_id,
         "claimFreshTarget": engine == crate::browser_engine::Engine::Steel,
         "glCapture": mode == BrowserMode::Capture && mode_name == "gl",
+        "uncapped": uncapped,
         "gpuProbeFile": gpu_probe_path.as_ref().map(|p| p.to_string_lossy().into_owned()),
         "wantGpu": crate::gpu::recorded_choice(&gpu_profile_dir).filter(|c| *c != crate::gpu::GpuChoice::Default).map(crate::gpu::GpuChoice::label),
         "scriptFile": script_path.to_string_lossy(),
@@ -2202,7 +2250,7 @@ pub fn run(body: &str, opts: &str, cwd_raw: &Path, session_id: &str) -> Value {
             }
         }
         BrowserMode::Gpu => {
-            out["result"] = result_value.get("result").cloned().unwrap_or(Value::Null);
+            out["result"] = crate::gpu::with_display_probe(result_value.get("result").cloned().unwrap_or(Value::Null), uncapped);
         }
         BrowserMode::Dom => {
             out["selector"] = json!(dom_selector);
@@ -2223,7 +2271,7 @@ pub fn run(body: &str, opts: &str, cwd_raw: &Path, session_id: &str) -> Value {
         out["engine_note"] = json!("lightpanda has no native Windows binary here; the browser verb was served by local Chrome, exactly as the cdp verb would");
     }
     if ok && mode != BrowserMode::Gpu && engine == crate::browser_engine::Engine::Chrome && (launched_fresh_chrome || session_created_by_this_dispatch) {
-        out["gpu"] = crate::gpu::report(&node, port, &cdp_endpoint, &gpu_profile_dir, 30_000);
+        out["gpu"] = crate::gpu::report(&node, port, &cdp_endpoint, &gpu_profile_dir, 30_000, uncapped);
     }
     if ok && !launched_real_page {
         out["ok"] = json!(false);
