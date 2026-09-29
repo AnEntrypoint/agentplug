@@ -106,7 +106,7 @@ pub fn select_engine(cwd: &Path, requested: Option<&str>) -> Engine {
     }
     let effective = requested.map(|s| s.to_string()).or_else(|| load_engine_file_config(cwd).engine);
     match effective.as_deref() {
-        Some("lightpanda") if lightpanda_reachable(cwd) => Engine::Lightpanda,
+        Some("lightpanda") if lightpanda_native_binary_available() && lightpanda_reachable(cwd) => Engine::Lightpanda,
         Some("chrome") | Some("cdp") | None | Some(_) => Engine::Chrome,
     }
 }
