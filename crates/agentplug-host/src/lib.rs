@@ -3,6 +3,7 @@ mod browser;
 mod browser_engine;
 mod dispatch_origin;
 mod exec_js;
+mod gpu;
 mod host_state;
 mod http_agent;
 mod memory_pressure;
