@@ -2133,7 +2133,7 @@ pub fn run(body: &str, opts: &str, cwd_raw: &Path, session_id: &str) -> Value {
 
     let cdp_error =result_value.get("__cdpError").and_then(|v| v.as_str());
     let ok = exit_code == 0 && !timed_out && cdp_error.is_none();
-    let default_debug = || json!({"instrumented": false, "hint": "no console/network/pageError capture in this mode; prefix the body with `capture` (or `capture gl` for GL error tracking: draw calls are counted and getError is sampled every 32nd draw, errors are re-served to the page's own getError) to collect it"});
+    let default_debug = || json!({"instrumented": false, "hint": "no console/network/pageError capture in this mode; prefix the body with `capture` (or `capture gl` for GL error tracking: draw calls are counted and getError is drained once per animation frame, errors are attributed to the frame's last draw and re-served to the page's own getError) to collect it"});
     let shaped_debug = |raw: Option<&Value>| -> Value {
         let debug = raw.cloned().unwrap_or_else(default_debug);
         if quiet_debug && debug.get("instrumented") != Some(&Value::Bool(false)) { compact_debug(&debug) } else { debug }
