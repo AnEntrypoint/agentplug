@@ -8,6 +8,7 @@ mod fs_prewarm;
 mod gpu;
 mod host_state;
 mod http_agent;
+mod idle_reap;
 mod memory_pressure;
 mod oxibrowser_driver;
 mod process_tree;
