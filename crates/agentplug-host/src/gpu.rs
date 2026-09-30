@@ -124,6 +124,11 @@ pub(crate) fn recorded_uncapped(profile_dir: &Path) -> bool {
 pub(crate) struct LaunchOptions {
     pub(crate) gpu: Option<GpuChoice>,
     pub(crate) uncapped: bool,
+    pub(crate) idle_reap: Option<crate::idle_reap::IdleReap>,
+}
+
+fn is_launch_token(token: &str) -> bool {
+    token == "uncapped" || token.starts_with("gpu=") || crate::idle_reap::IdleReap::parse_launch_token(token).is_some()
 }
 
 fn apply_launch_token(options: &mut LaunchOptions, token: &str) -> Result<(), String> {
@@ -131,7 +136,11 @@ fn apply_launch_token(options: &mut LaunchOptions, token: &str) -> Result<(), St
         options.uncapped = true;
         return Ok(());
     }
-    let value = token.strip_prefix("gpu=").ok_or_else(|| format!("'{token}' is not a launch option (expected gpu=nvidia|amd|intel|default or uncapped)"))?;
+    if let Some(reap) = crate::idle_reap::IdleReap::parse_launch_token(token) {
+        options.idle_reap = Some(reap?);
+        return Ok(());
+    }
+    let value = token.strip_prefix("gpu=").ok_or_else(|| format!("'{token}' is not a launch option (expected gpu=nvidia|amd|intel|default, uncapped, keep_alive or idle_timeout_ms=<ms>)"))?;
     options.gpu = Some(GpuChoice::parse(value).ok_or_else(|| format!("gpu={value} is not one of nvidia|amd|intel|default"))?);
     Ok(())
 }
@@ -146,7 +155,7 @@ pub(crate) fn split_launch_options(body: &str) -> (LaunchOptions, Option<String>
     let session_new_options = first_line.strip_prefix("session new").filter(|rest| rest.starts_with(char::is_whitespace));
     let (tokens, rebuilt) = match session_new_options {
         Some(rest) => (rest, format!("session new\n{remainder}")),
-        None if first_line == "uncapped" || first_line.starts_with("gpu=") => (first_line, remainder.to_string()),
+        None if first_line == "uncapped" || first_line.starts_with("gpu=") || (!first_line.is_empty() && first_line.split_whitespace().all(is_launch_token)) => (first_line, remainder.to_string()),
         None => return (options, None, body.to_string()),
     };
     for token in tokens.split_whitespace() {
