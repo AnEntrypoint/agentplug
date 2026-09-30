@@ -9,6 +9,8 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 use wait_timeout::ChildExt;
 
+use crate::idle_reap::IdleReap;
+
 pub(crate) const CDP_EVAL_JS: &str = include_str!("cdp_eval.js");
 const EXTENSION_LOAD_JS: &str = include_str!("extension_load.js");
 const DEFAULT_CHROME_IDLE_TTL_SECONDS: u64 = 300;
@@ -209,6 +211,8 @@ pub(crate) fn cdp_endpoint_ready_probe(endpoint: &str, deadline: Instant, cfg: &
     cdp_endpoint_ready(endpoint, deadline, cfg)
 }
 
+const BARE_URL_LINE_SCHEMES: [&str; 5] = ["http://", "https://", "about:blank", "file://", "data:"];
+
 fn strip_url_prefix(body: &str) -> (Option<String>, String, &str) {
     let trimmed = body.trim_start();
     if let Some(rest) = trimmed.strip_prefix("url=") {
@@ -217,7 +221,7 @@ fn strip_url_prefix(body: &str) -> (Option<String>, String, &str) {
         }
         return (Some(rest.trim().to_string()), String::new(), "");
     }
-    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+    if BARE_URL_LINE_SCHEMES.iter().any(|scheme| trimmed.starts_with(scheme)) {
         if let Some(nl) = trimmed.find('\n') {
             return (Some(trimmed[..nl].trim().to_string()), String::new(), &trimmed[nl + 1..]);
         }
@@ -411,6 +415,7 @@ struct BrowserSession {
     target_id: Option<String>,
     owns_process: bool,
     engine: crate::browser_engine::Engine,
+    idle_reap: Option<IdleReap>,
 }
 
 static SESSIONS: OnceLock<Mutex<HashMap<String, BrowserSession>>> = OnceLock::new();
@@ -452,13 +457,22 @@ fn kill_session(mut session: BrowserSession) {
     if !session.owns_process {
         return;
     }
-    kill_pid(session.pid);
+    let launched_by_this_process = session.child.is_some();
     if let Some(mut child) = session.child.take() {
+        kill_pid(child.id());
         let _ = child.kill();
         let _ = child.wait();
     }
     let profile_dir = browser_chrome_profile_dir(&session.cwd, &session.session_id);
-    kill_chrome_processes_left_on_profile(&profile_dir);
+    let killed_on_profile = kill_chrome_processes_left_on_profile(&profile_dir);
+    if !launched_by_this_process && killed_on_profile == 0 {
+        eprintln!(
+            "[agentplug browser] session {} (adopted pid {}) matched no chrome whose --user-data-dir is {} -- nothing killed; an adopted pid is never killed by number alone because it may have been reused by an unrelated process",
+            session.session_id,
+            session.pid,
+            profile_dir.display()
+        );
+    }
     let _ = std::fs::remove_file(pid_sidecar_path(&profile_dir));
     let _ = std::fs::remove_file(port_sidecar_path(&profile_dir));
     let _ = std::fs::remove_file(session_id_sidecar_path(&profile_dir));
@@ -466,10 +480,12 @@ fn kill_session(mut session: BrowserSession) {
     let _ = std::fs::remove_file(last_used_sidecar_path(&profile_dir));
 }
 
-fn kill_chrome_processes_left_on_profile(profile_dir: &Path) {
-    for pid in pids_of_chrome_processes_using_profile_dir(&list_chrome_processes(), profile_dir) {
-        kill_pid(pid);
+fn kill_chrome_processes_left_on_profile(profile_dir: &Path) -> usize {
+    let pids = pids_of_chrome_processes_using_profile_dir(&list_chrome_processes(), profile_dir);
+    for pid in &pids {
+        kill_pid(*pid);
     }
+    pids.len()
 }
 
 fn pid_sidecar_path(profile_dir: &Path) -> PathBuf {
@@ -588,6 +604,7 @@ fn try_adopt_orphaned_session(cwd: &Path, session_id_hint: Option<&str>, profile
                 target_id,
                 owns_process: true,
                 engine: crate::browser_engine::Engine::Chrome,
+                idle_reap: crate::idle_reap::recorded(profile_dir),
             },
         );
     }
@@ -702,6 +719,13 @@ fn reap_os_orphans(cwd: &Path) {
         }
         if chrome_singleton_lock_present(&path) {
             let processes = chrome_processes_this_pass.get_or_insert_with(list_chrome_processes);
+            if let Some(owner) = live_foreign_owner_of_profile_chrome(processes, &path) {
+                eprintln!(
+                    "[agentplug browser] leaving chrome on profile {} alone -- its root process was launched by pid {owner}, which is alive and is not this daemon",
+                    path.display()
+                );
+                continue;
+            }
             for pid in pids_of_chrome_processes_using_profile_dir(processes, &path) {
                 eprintln!(
                     "[agentplug browser] reaping OS-orphaned chrome pid={} (profile {}, no owning session in this process -- crash/hard-exit orphan, not adoptable)",
@@ -903,6 +927,16 @@ fn pids_of_chrome_processes_using_profile_dir(processes: &[(u32, String)], profi
         .collect()
 }
 
+fn live_foreign_owner_of_profile_chrome(processes: &[(u32, String)], profile_dir: &Path) -> Option<u32> {
+    let wanted = profile_dir_key(&profile_dir.to_string_lossy());
+    processes
+        .iter()
+        .filter(|(_, cmdline)| is_gm_launched_root_chrome_process(cmdline))
+        .filter(|(_, cmdline)| cmdline_flag_value(cmdline, "--user-data-dir=").is_some_and(|dir| profile_dir_key(&dir) == wanted))
+        .filter_map(|(pid, _)| parent_pid_of(*pid))
+        .find(|parent| *parent != std::process::id() && pid_is_alive(*parent))
+}
+
 fn strip_windows_verbatim_prefix(path: &str) -> String {
     if let Some(unc) = path.strip_prefix(r"\\?\UNC\") {
         return format!(r"\\{unc}");
@@ -956,7 +990,11 @@ fn profile_launched_within(profile_dir: &Path, grace: Duration) -> bool {
         .any(|age| age < grace)
 }
 
-fn reap_globally_orphaned_gm_chromes() {
+fn profile_is_under_served_root(profile_key: &str, served_gm_dir_keys: &std::collections::HashSet<String>) -> bool {
+    profile_key.rsplit_once('/').is_some_and(|(gm_dir, _)| served_gm_dir_keys.contains(gm_dir))
+}
+
+fn reap_globally_orphaned_gm_chromes(served_roots: &[PathBuf]) {
     if !this_process_is_the_registered_daemon() {
         eprintln!(
             "[agentplug browser] skipping global gm-chrome orphan reap -- a different process is the fresh registered daemon, this process cannot safely judge liveness of sessions it does not own"
@@ -969,13 +1007,18 @@ fn reap_globally_orphaned_gm_chromes() {
             .map(|s| profile_dir_key(&browser_chrome_profile_dir(&s.cwd, &s.session_id).to_string_lossy()))
             .collect()
     };
+    let served_gm_dir_keys: std::collections::HashSet<String> =
+        served_roots.iter().map(|root| profile_dir_key(&browser_profiles_root_for_orphan_scan(root).to_string_lossy())).collect();
+    if served_gm_dir_keys.is_empty() {
+        return;
+    }
     for (pid, cmdline) in list_chrome_processes() {
         if !is_gm_launched_root_chrome_process(&cmdline) {
             continue;
         }
         let Some(profile_dir) = cmdline_flag_value(&cmdline, "--user-data-dir=") else { continue };
         let profile_key = profile_dir_key(&profile_dir);
-        if !is_gm_owned_chrome_profile_dir(&profile_key) {
+        if !is_gm_owned_chrome_profile_dir(&profile_key) || !profile_is_under_served_root(&profile_key, &served_gm_dir_keys) {
             continue;
         }
         if claimed_profile_dirs.contains(&profile_key) {
@@ -1020,7 +1063,7 @@ pub fn reap_idle_sessions_and_os_orphans_across_every_known_project_root(roots: 
         reap_os_orphans(root);
     }
     reap_sessions_for_deregistered_roots(&canonical_roots);
-    reap_globally_orphaned_gm_chromes();
+    reap_globally_orphaned_gm_chromes(&canonical_roots);
 }
 
 fn reap_sessions_for_deregistered_roots(roots: &[std::path::PathBuf]) {
@@ -1061,19 +1104,20 @@ fn process_uptime() -> Duration {
     PROCESS_STARTED.get_or_init(Instant::now).elapsed()
 }
 
-fn effective_idle_timeout(owner_gm_session: Option<&str>, owns_process: bool, cfg: &BrowserConfig) -> Duration {
+fn effective_idle_timeout(session: &BrowserSession, cfg: &BrowserConfig) -> Option<Duration> {
+    match session.idle_reap {
+        Some(IdleReap::Never) => return None,
+        Some(IdleReap::After(explicit)) => return Some(explicit),
+        None => {}
+    }
     let long_ceiling = cfg.session_idle_timeout();
     let short_ceiling = cfg.session_owner_gone_idle_timeout();
-    let session_ceiling = if owner_gm_session_is_stale(owner_gm_session, short_ceiling) {
+    let session_ceiling = if owner_gm_session_is_stale(session.owner_gm_session.as_deref(), short_ceiling) {
         short_ceiling.min(long_ceiling)
     } else {
         long_ceiling
     };
-    if owns_process {
-        session_ceiling.min(cfg.chrome_idle_ttl())
-    } else {
-        session_ceiling
-    }
+    Some(if session.owns_process { session_ceiling.min(cfg.chrome_idle_ttl()) } else { session_ceiling })
 }
 
 fn dispatch_in_flight(key: &str) -> bool {
@@ -1089,7 +1133,7 @@ fn reap_idle_sessions(cwd: &Path, cfg: &BrowserConfig) {
         .iter()
         .filter(|(k, s)| {
             s.cwd == cwd
-                && s.last_used.elapsed() > effective_idle_timeout(s.owner_gm_session.as_deref(), s.owns_process, cfg)
+                && effective_idle_timeout(s, cfg).is_some_and(|timeout| s.last_used.elapsed() > timeout)
                 && !dispatch_in_flight(k)
         })
         .map(|(k, _)| k.clone())
@@ -1097,13 +1141,14 @@ fn reap_idle_sessions(cwd: &Path, cfg: &BrowserConfig) {
     let mut reaped = Vec::new();
     for k in dead_keys {
         if let Some(session) = map.remove(&k) {
-            let timeout = effective_idle_timeout(session.owner_gm_session.as_deref(), session.owns_process, cfg);
+            let timeout_ms = effective_idle_timeout(&session, cfg).map(|t| t.as_millis()).unwrap_or_default();
             let owner_gone = owner_gm_session_is_stale(session.owner_gm_session.as_deref(), cfg.session_owner_gone_idle_timeout());
             eprintln!(
-                "[agentplug browser] reaping idle session {} (idle {}ms > {}ms, owner_gm_session={:?}, owner_gone={})",
+                "[agentplug browser] reaping idle session {} (idle {}ms > {}ms, idle_reap={}, owner_gm_session={:?}, owner_gone={})",
                 session.session_id,
                 session.last_used.elapsed().as_millis(),
-                timeout.as_millis(),
+                timeout_ms,
+                IdleReap::report(session.idle_reap),
                 session.owner_gm_session,
                 owner_gone
             );
@@ -1144,6 +1189,7 @@ struct OwnedChrome {
     project: PathBuf,
     session_id: String,
     idle: Duration,
+    keep_alive: bool,
 }
 
 fn owned_chrome_sessions() -> Vec<OwnedChrome> {
@@ -1164,6 +1210,7 @@ fn owned_chrome_sessions() -> Vec<OwnedChrome> {
             project: s.cwd.clone(),
             session_id: s.session_id.clone(),
             idle: s.last_used.elapsed(),
+            keep_alive: s.idle_reap == Some(IdleReap::Never),
         })
         .collect()
 }
@@ -1188,7 +1235,7 @@ impl Drop for ChromeLaunchReservation {
 fn chrome_cap_exceeded_message(cap: usize, live: &[OwnedChrome]) -> String {
     let listing = live
         .iter()
-        .map(|s| format!("pid {} project {} session '{}' idle {}s", s.pid, s.project.display(), s.session_id, s.idle.as_secs()))
+        .map(|s| format!("pid {} project {} session '{}' idle {}s{}", s.pid, s.project.display(), s.session_id, s.idle.as_secs(), if s.keep_alive { " keep_alive" } else { "" }))
         .collect::<Vec<_>>()
         .join("; ");
     format!(
@@ -1213,7 +1260,7 @@ fn reserve_chrome_launch_slot(cfg: &BrowserConfig, engine: crate::browser_engine
     while occupied(&live) >= cap {
         let victim = live
             .iter()
-            .filter(|s| s.key != launching_key && s.idle >= LRU_EVICTION_IDLE_FLOOR && !dispatch_in_flight(&s.key))
+            .filter(|s| s.key != launching_key && !s.keep_alive && s.idle >= LRU_EVICTION_IDLE_FLOOR && !dispatch_in_flight(&s.key))
             .max_by_key(|s| s.idle)
             .map(|s| (s.key.clone(), s.pid, s.idle));
         let Some((victim_key, victim_pid, victim_idle)) = victim else {
@@ -1273,17 +1320,19 @@ fn session_new(cwd: &Path, session_id: &str, owner_gm_session: Option<&str>, cfg
                     target_id: None,
                     owns_process: acquired.owns_process,
                     engine,
+                    idle_reap: crate::idle_reap::recorded(&browser_chrome_profile_dir(cwd, session_id)),
                 },
             );
             drop(map);
             record_owner_gm_session(cwd, session_id, owner_gm_session);
-            json!({"ok": true, "stdout": "", "exit_code": 0, "stderr": "", "session_id": session_id, "owner_gm_session": owner_gm_session, "port": port})
+            json!({"ok": true, "stdout": "", "exit_code": 0, "stderr": "", "session_id": session_id, "owner_gm_session": owner_gm_session, "port": port, "idle_reap": IdleReap::report(crate::idle_reap::recorded(&browser_chrome_profile_dir(cwd, session_id)))})
         }
         Err(e) => json!({"ok": false, "stdout": "", "exit_code": 1, "stderr": e}),
     }
 }
 
 fn session_list(cwd: &Path, caller_gm_session: Option<&str>, caller_implicit_session: &str) -> Value {
+    let cfg = BrowserConfig::load(cwd);
     let mut map = sessions_map().lock().unwrap_or_else(|e| e.into_inner());
     let keys_for_cwd: Vec<String> = map
         .iter()
@@ -1298,6 +1347,7 @@ fn session_list(cwd: &Path, caller_gm_session: Option<&str>, caller_implicit_ses
             continue;
         }
         if let Some(s) = map.get(&k) {
+            let idle_timeout_ms = effective_idle_timeout(s, &cfg).map(|t| t.as_millis() as u64);
             let owner_last_seen_ms = s
                 .owner_gm_session
                 .as_deref()
@@ -1315,6 +1365,8 @@ fn session_list(cwd: &Path, caller_gm_session: Option<&str>, caller_implicit_ses
                 "alive": true,
                 "idle_ms": s.last_used.elapsed().as_millis() as u64,
                 "idle_seconds": s.last_used.elapsed().as_secs(),
+                "idle_reap": IdleReap::report(s.idle_reap),
+                "idle_timeout_ms": idle_timeout_ms,
                 "owner_last_dispatch_ms": owner_last_seen_ms,
                 "target_id": s.target_id,
                 "engine": format!("{:?}", s.engine),
@@ -1333,7 +1385,6 @@ fn session_list(cwd: &Path, caller_gm_session: Option<&str>, caller_implicit_ses
         let pid = entry["pid"].as_u64().map(|p| p as u32);
         entry["working_set_mb"] = json!(pid.and_then(working_set_mb));
     }
-    let cfg = BrowserConfig::load(cwd);
     let chrome_sessions_all_projects: Vec<Value> = all_chrome
         .iter()
         .map(|s| json!({
@@ -1341,6 +1392,7 @@ fn session_list(cwd: &Path, caller_gm_session: Option<&str>, caller_implicit_ses
             "project": s.project.display().to_string(),
             "pid": s.pid,
             "idle_seconds": s.idle.as_secs(),
+            "keep_alive": s.keep_alive,
             "working_set_mb": working_set_mb(s.pid),
         }))
         .collect();
@@ -1367,6 +1419,7 @@ fn session_close(cwd: &Path, target_session_id: &str, require_found: bool) -> Va
             .and_then(|_| remove_tracked())
     });
     crate::gpu::record_uncapped(&browser_chrome_profile_dir(cwd, target_session_id), false);
+    crate::idle_reap::record(&browser_chrome_profile_dir(cwd, target_session_id), None);
     match removed {
         Some(session) => {
             kill_session(session);
@@ -1765,6 +1818,17 @@ pub fn run(body: &str, opts: &str, cwd_raw: &Path, session_id: &str) -> Value {
         }
     }
 
+    match (&session_command, launch_options.idle_reap) {
+        (SessionCommand::New, requested) => crate::idle_reap::record(&gpu_profile_dir, requested),
+        (_, Some(requested)) => {
+            crate::idle_reap::record(&gpu_profile_dir, Some(requested));
+            if let Some(live) = sessions_map().lock().unwrap_or_else(|e| e.into_inner()).get_mut(&session_key(cwd, session_id)) {
+                live.idle_reap = Some(requested);
+            }
+        }
+        (_, None) => {}
+    }
+
     let uncapped = browser_cfg.uncapped()
         || match session_command {
             SessionCommand::New => launch_options.uncapped,
@@ -2064,6 +2128,7 @@ pub fn run(body: &str, opts: &str, cwd_raw: &Path, session_id: &str) -> Value {
                             target_id: None,
                             owns_process: acquired.owns_process,
                             engine,
+                            idle_reap: crate::idle_reap::recorded(&browser_chrome_profile_dir(cwd, session_id)),
                         },
                     );
                     drop(map);

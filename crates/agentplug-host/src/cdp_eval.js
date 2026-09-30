@@ -231,14 +231,11 @@ async function navigateIfNeededThenEvaluateOverCdp(sess, script, startUrl, timeo
     await sess.send('Network.enable', {});
     await sess.send('Page.enable', {});
     const prevOnIdLessNotification = sess.onIdLessNotification;
-    let mainFrameRequestId = null;
+    const failedDocumentLoadsByRequestId = new Map();
     sess.onIdLessNotification = (msg) => {
       if (prevOnIdLessNotification) prevOnIdLessNotification(msg);
-      if (msg.method === 'Network.requestWillBeSent' && msg.params && msg.params.type === 'Document' && !mainFrameRequestId) {
-        mainFrameRequestId = msg.params.requestId;
-      }
-      if (msg.method === 'Network.loadingFailed' && msg.params && msg.params.requestId === mainFrameRequestId) {
-        navigationFailure = msg.params.errorText || 'loading failed';
+      if (msg.method === 'Network.loadingFailed' && msg.params && msg.params.type === 'Document') {
+        failedDocumentLoadsByRequestId.set(msg.params.requestId, msg.params.errorText || 'loading failed');
       }
     };
     const navResult = await sess.send('Page.navigate', { url: startUrl });
@@ -247,6 +244,10 @@ async function navigateIfNeededThenEvaluateOverCdp(sess, script, startUrl, timeo
     }
     await new Promise((r) => setTimeout(r, 1200));
     sess.onIdLessNotification = prevOnIdLessNotification;
+    const ownNavigationRequestId = navResult && navResult.loaderId;
+    if (!navigationFailure && ownNavigationRequestId && failedDocumentLoadsByRequestId.has(ownNavigationRequestId)) {
+      navigationFailure = failedDocumentLoadsByRequestId.get(ownNavigationRequestId);
+    }
     if (!keepNetworkEvents) await sess.send('Network.disable', {}).catch(() => {});
   }
   const trimmedScript = script.trim();
@@ -258,7 +259,7 @@ async function navigateIfNeededThenEvaluateOverCdp(sess, script, startUrl, timeo
     try {
       new AsyncFunction(`"use strict"; return (\n${trimmedScript}\n);`);
       wrapped = exprAttempt;
-    } catch (_) { /* not a single valid expression -- use the statement-body form */ }
+    } catch (_) {}
   }
   const result = await evaluateParkedSurvivingReconnect(sess, wrapped, timeoutMs);
   result.statementBodyWithoutReturn = wrapped === stmtAttempt && !/\breturn\b/.test(trimmedScript);
