@@ -524,7 +524,141 @@ async function gpuReport(endpoint, probeSource, wantGpu, uncapped) {
   }
 }
 
+const TRACE_CATEGORIES = [
+  'devtools.timeline', 'disabled-by-default-devtools.timeline', 'disabled-by-default-devtools.timeline.frame',
+  'toplevel', 'gpu', 'gpu.service', 'viz', 'cc', 'benchmark', 'blink.user_timing', 'v8.execute',
+];
+const TRACE_FLUSH_WATCHDOG_MARGIN_MS = 300;
+const TRACE_STREAM_CHUNK_BYTES = 1 << 20;
+const TRACE_THREADS_REPORTED = 12;
+const TRACE_CATEGORIES_REPORTED = 15;
+
+async function startTraceRecording(sess) {
+  const recording = { bufferPercentFull: 0 };
+  let markComplete;
+  recording.complete = new Promise((resolve) => { markComplete = resolve; });
+  const prevOnIdLessNotification = sess.onIdLessNotification;
+  sess.onIdLessNotification = (msg) => {
+    if (prevOnIdLessNotification) prevOnIdLessNotification(msg);
+    if (msg.method === 'Tracing.bufferUsage') recording.bufferPercentFull = Math.max(recording.bufferPercentFull, (msg.params && msg.params.percentFull) || 0);
+    if (msg.method === 'Tracing.tracingComplete') markComplete(msg.params || {});
+  };
+  await sess.send('Tracing.start', {
+    traceConfig: { recordMode: 'recordAsMuchAsPossible', includedCategories: TRACE_CATEGORIES },
+    transferMode: 'ReturnAsStream',
+    streamFormat: 'json',
+    streamCompression: 'none',
+    bufferUsageReportingInterval: 500,
+  });
+  return recording;
+}
+
+async function readTraceStream(sess, handle, deadline, artifactFile) {
+  const chunks = [];
+  let bytes = 0;
+  if (artifactFile) fs.writeFileSync(artifactFile, '');
+  for (;;) {
+    if (Date.now() > deadline) return { chunks, bytes, error: `trace stream read passed the dispatch deadline after ${bytes} bytes -- raise timeout= so the trace transfer fits inside the dispatch` };
+    const chunk = await sess.send('IO.read', { handle, size: TRACE_STREAM_CHUNK_BYTES });
+    const buf = chunk.base64Encoded ? Buffer.from(chunk.data || '', 'base64') : Buffer.from(chunk.data || '', 'utf8');
+    chunks.push(buf);
+    bytes += buf.length;
+    if (artifactFile) fs.appendFileSync(artifactFile, buf);
+    if (chunk.eof) return { chunks, bytes, error: null };
+  }
+}
+
+async function stopTraceRecordingToFile(sess, recording, deadline, artifactFile) {
+  const endedAt = Date.now();
+  await sess.send('Tracing.end', {});
+  const completion = await Promise.race([
+    recording.complete,
+    new Promise((resolve) => setTimeout(() => resolve(null), Math.max(0, deadline - Date.now()))),
+  ]);
+  const flushMs = Date.now() - endedAt;
+  const base = { events: [], bytes: 0, flushMs, bufferPercentFull: recording.bufferPercentFull, dataLoss: !!(completion && completion.dataLossOccurred) };
+  if (!completion) return { ...base, error: `Tracing.tracingComplete did not arrive within ${flushMs}ms of Tracing.end -- raise timeout= so the trace flush fits inside the dispatch` };
+  if (!completion.stream) return { ...base, error: 'Tracing.tracingComplete carried no stream handle' };
+  const read = await readTraceStream(sess, completion.stream, deadline, artifactFile);
+  await sess.send('IO.close', { handle: completion.stream }).catch(() => {});
+  const transfer = { ...base, bytes: read.bytes, flushMs: Date.now() - endedAt };
+  if (read.error) return { ...transfer, error: read.error };
+  try {
+    const parsed = JSON.parse(Buffer.concat(read.chunks).toString('utf8'));
+    return { ...transfer, events: Array.isArray(parsed) ? parsed : (parsed.traceEvents || []), error: null };
+  } catch (e) {
+    return { ...transfer, error: `trace stream of ${read.bytes} bytes did not parse as JSON: ${e && e.message || e}` };
+  }
+}
+
+function mergedIntervalLength(intervals) {
+  intervals.sort((a, b) => a[0] - b[0]);
+  let total = 0, start = -Infinity, end = -Infinity;
+  for (const [s, e] of intervals) {
+    if (s > end) { if (end > start) total += end - start; start = s; end = e; }
+    else if (e > end) end = e;
+  }
+  if (end > start) total += end - start;
+  return total;
+}
+
+function summarizeTrace(captured) {
+  const processNames = new Map();
+  const threadNames = new Map();
+  for (const e of captured.events) {
+    if (e.ph !== 'M' || !e.args) continue;
+    if (e.name === 'process_name') processNames.set(e.pid, e.args.name);
+    else if (e.name === 'thread_name') threadNames.set(`${e.pid}:${e.tid}`, e.args.name);
+  }
+  const threads = new Map();
+  const byCategory = {};
+  let eventCount = 0;
+  for (const e of captured.events) {
+    if (e.ph === 'M') continue;
+    eventCount++;
+    const key = `${e.pid}:${e.tid}`;
+    let t = threads.get(key);
+    if (!t) { t = { pid: e.pid, tid: e.tid, events: 0, intervals: [], open: [] }; threads.set(key, t); }
+    t.events++;
+    if (e.ph === 'X' && e.dur > 0) {
+      t.intervals.push([e.ts, e.ts + e.dur]);
+      byCategory[e.cat || 'unknown'] = (byCategory[e.cat || 'unknown'] || 0) + e.dur;
+    } else if (e.ph === 'B') t.open.push(e.ts);
+    else if (e.ph === 'E' && t.open.length) t.intervals.push([t.open.pop(), e.ts]);
+  }
+  const rows = Array.from(threads.values()).map((t) => ({
+    process: processNames.get(t.pid) || null,
+    thread: threadNames.get(`${t.pid}:${t.tid}`) || null,
+    pid: t.pid,
+    tid: t.tid,
+    busy_us: Math.round(mergedIntervalLength(t.intervals)),
+    events: t.events,
+  })).sort((a, b) => b.busy_us - a.busy_us);
+  const busyOf = (processPattern, threadName) => rows
+    .filter((r) => r.thread === threadName && processPattern.test(r.process || ''))
+    .reduce((sum, r) => sum + r.busy_us, 0);
+  const gpuProcessEvents = rows.filter((r) => /GPU Process/.test(r.process || '')).reduce((sum, r) => sum + r.events, 0);
+  const error = captured.error || (eventCount === 0 ? 'the trace holds no events besides metadata' : null);
+  const summary = {
+    main_us: busyOf(/Renderer/, 'CrRendererMain'),
+    cc_us: busyOf(/Renderer/, 'Compositor'),
+    gpu_us: busyOf(/GPU Process/, 'CrGpuMain'),
+    viz_us: busyOf(/GPU Process|Browser/, 'VizCompositorThread'),
+    event_count: eventCount,
+    gpu_process_events: gpuProcessEvents,
+    trace_bytes: captured.bytes,
+    flush_ms: captured.flushMs,
+    data_loss: captured.dataLoss,
+    buffer_percent_full: captured.bufferPercentFull,
+    threads: rows.slice(0, TRACE_THREADS_REPORTED),
+    by_category: Object.fromEntries(Object.entries(byCategory).sort((a, b) => b[1] - a[1]).slice(0, TRACE_CATEGORIES_REPORTED)),
+  };
+  if (error) summary.trace_error = error;
+  return summary;
+}
+
 async function main() {
+  const startedAt = Date.now();
   const cfg = JSON.parse(process.argv[2]);
   const { port, cdpEndpoint, startUrl, targetId, scriptFile, resultFile, timeoutMs, mode, artifactFile, viewport, claimFreshTarget, glCapture, gpuProbeFile, wantGpu, uncapped } = cfg;
   const endpoint = cdpEndpoint || `http://127.0.0.1:${port}`;
@@ -623,35 +757,12 @@ async function main() {
     }
 
     if (mode === 'trace') {
-      const traceEvents = [];
-      sess.onIdLessNotification = (msg) => {
-        if (msg.method === 'Tracing.dataCollected') {
-          for (const e of (msg.params.value || [])) traceEvents.push(e);
-        }
-      };
-      await sess.send('Tracing.start', { categories: 'disabled-by-default-devtools.timeline,devtools.timeline,disabled-by-default-devtools.timeline.frame', transferMode: 'ReportEvents' });
+      const recording = await startTraceRecording(sess);
       const w0 = Date.now();
       const res = await navigateIfNeededThenEvaluateOverCdp(sess, script, startUrl, timeoutMs, true);
       const wallUs = (Date.now() - w0) * 1000;
-      const tracingDone = new Promise((resolve) => {
-        const prevOnIdLessNotification = sess.onIdLessNotification;
-        sess.onIdLessNotification = (msg) => {
-          prevOnIdLessNotification(msg);
-          if (msg.method === 'Tracing.tracingComplete') resolve();
-        };
-      });
-      await sess.send('Tracing.end', {});
-      await Promise.race([tracingDone, new Promise((r) => setTimeout(r, 5000))]);
-      const byCategory = {};
-      let gpuUs = 0, vizUs = 0, ccUs = 0;
-      for (const e of traceEvents) {
-        const cat = e.cat || 'unknown';
-        const dur = e.dur || 0;
-        byCategory[cat] = (byCategory[cat] || 0) + dur;
-        if (/gpu/i.test(e.name || '') || /GPU/.test(cat)) gpuUs += dur;
-        if (/composit/i.test(e.name || '')) ccUs += dur;
-        if (/raster|paint|layer/i.test(e.name || '')) vizUs += dur;
-      }
+      const flushDeadline = startedAt + watchdogDeadline - TRACE_FLUSH_WATCHDOG_MARGIN_MS;
+      const captured = await stopTraceRecordingToFile(sess, recording, flushDeadline, artifactFile);
       if (res.exceptionDetails) {
         const msg = res.exceptionDetails.exception?.description || res.exceptionDetails.text || 'evaluate exception';
         writeResult({ __cdpError: msg });
@@ -661,9 +772,8 @@ async function main() {
       }
       const value = res.result && ('value' in res.result) ? res.result.value : null;
       const debug = await collectDebug();
-      const envelope = { result: value === undefined ? null : value, trace: { wall_us: wallUs, gpu_us: gpuUs, viz_us: vizUs, cc_us: ccUs, by_category: byCategory }, debug };
+      const envelope = { result: value === undefined ? null : value, trace: { wall_us: wallUs, ...summarizeTrace(captured) }, debug };
       writeResult(envelope);
-      if (artifactFile) { try { fs.writeFileSync(artifactFile, JSON.stringify(traceEvents)); } catch (_) {} }
       sess.close();
       process.exit(0);
     }
