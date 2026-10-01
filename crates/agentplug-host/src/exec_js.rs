@@ -1,7 +1,8 @@
+use std::ffi::OsString;
 use std::io::{Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -86,6 +87,49 @@ fn timeout_failure(lang: &str, limit_ms: u64, clamped_from: Option<u64>, killed:
     v
 }
 
+fn exec_path_dirs() -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = std::env::var_os("PATH")
+        .map(|value| std::env::split_paths(&value).collect())
+        .unwrap_or_default();
+    if let Some(extra) = std::env::var_os("GM_EXEC_PATH_EXTRA") {
+        dirs.extend(std::env::split_paths(&extra).filter(|dir| !dir.as_os_str().is_empty()));
+    }
+    if let Some(login) = login_shell_path() {
+        dirs.extend(std::env::split_paths(&login).filter(|dir| !dir.as_os_str().is_empty()));
+    }
+    dirs.extend(
+        ["/config/tools", "/config/workspace/google-cloud-sdk/bin", "/config/go-install", "/config/.gm-tools"]
+            .into_iter()
+            .map(PathBuf::from)
+            .filter(|dir| dir.is_dir()),
+    );
+    let mut seen = std::collections::HashSet::new();
+    dirs.retain(|dir| seen.insert(dir.clone()));
+    dirs
+}
+
+fn login_shell_path() -> Option<OsString> {
+    if cfg!(windows) {
+        return None;
+    }
+    let shell = std::env::var_os("SHELL").unwrap_or_else(|| OsString::from("/bin/sh"));
+    let output = Command::new(shell).args(["-lc", "printf %s \"$PATH\""]).stderr(Stdio::null()).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8(output.stdout).ok()?;
+    let value = text.lines().rev().find(|line| !line.trim().is_empty())?.trim();
+    if value.is_empty() { None } else { Some(OsString::from(value)) }
+}
+
+fn exec_path() -> &'static OsString {
+    static EXEC_PATH: OnceLock<OsString> = OnceLock::new();
+    EXEC_PATH.get_or_init(|| {
+        std::env::join_paths(exec_path_dirs())
+            .unwrap_or_else(|_| std::env::var_os("PATH").unwrap_or_default())
+    })
+}
+
 pub fn run(code: &str, opts: &Value, cwd: &Path) -> Value {
     let lang = opts.get("lang").and_then(|v| v.as_str()).unwrap_or("nodejs");
     let (limit_ms, clamped_from) = match resolve_limit(opts) {
@@ -121,6 +165,7 @@ pub fn run(code: &str, opts: &Value, cwd: &Path) -> Value {
     let mut command = Command::new(&built.cmd);
     command
         .args(&built.args)
+        .env("PATH", exec_path())
         .current_dir(cwd)
         .stdin(if built.stdin_payload.is_some() { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::piped())
