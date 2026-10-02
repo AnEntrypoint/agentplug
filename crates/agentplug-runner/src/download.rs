@@ -9,33 +9,55 @@ use agentplug_host::install_dir;
 pub fn sha256_hex(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
-    hasher.finalize().iter().map(|b| format!("{b:02x}")).collect()
+    hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 fn is_download_tmp_name(name: &str) -> bool {
-    let Some(suffix) = name.rsplit_once(".tmp.").map(|(_, s)| s) else { return false };
+    let Some(suffix) = name.rsplit_once(".tmp.").map(|(_, s)| s) else {
+        return false;
+    };
     !suffix.is_empty() && suffix.bytes().all(|b| b.is_ascii_digit())
 }
 
 fn gc_stale_tmp_files_in(dir: &Path, min_age: Duration) {
-    let Ok(entries) = fs::read_dir(dir) else { return };
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
     let now = std::time::SystemTime::now();
     for entry in entries.flatten() {
         let path = entry.path();
-        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default();
         if !is_download_tmp_name(name) {
             continue;
         }
         let Ok(meta) = entry.metadata() else { continue };
-        let Ok(modified) = meta.modified() else { continue };
-        let Ok(age) = now.duration_since(modified) else { continue };
+        let Ok(modified) = meta.modified() else {
+            continue;
+        };
+        let Ok(age) = now.duration_since(modified) else {
+            continue;
+        };
         if age < min_age {
             continue;
         }
         if let Err(e) = fs::remove_file(&path) {
-            eprintln!("[agentplug] failed to gc stale tmp file {}: {e}", path.display());
+            eprintln!(
+                "[agentplug] failed to gc stale tmp file {}: {e}",
+                path.display()
+            );
         } else {
-            eprintln!("[agentplug] gc'd stale tmp file {} (age {}s)", path.display(), age.as_secs());
+            eprintln!(
+                "[agentplug] gc'd stale tmp file {} (age {}s)",
+                path.display(),
+                age.as_secs()
+            );
         }
     }
 }
@@ -53,7 +75,9 @@ fn extract_version_from_release_url(url: &str) -> Option<String> {
     let idx = url.find("/releases/download/")?;
     let rest = &url[idx + "/releases/download/".len()..];
     let tag = rest.split('/').next()?;
-    if tag.is_empty() { return None; }
+    if tag.is_empty() {
+        return None;
+    }
     Some(tag.trim_start_matches('v').to_string())
 }
 
@@ -62,13 +86,24 @@ fn resolve_latest_tag_via_release_page(repo: &str) -> Option<String> {
     let resp = agentplug_host::shared_agent().get(&page_url).call().ok()?;
     let resolved_url = resp.get_url();
     let idx = resolved_url.find("/releases/tag/")?;
-    let tag = resolved_url[idx + "/releases/tag/".len()..].split('/').next()?;
-    if tag.is_empty() { return None; }
+    let tag = resolved_url[idx + "/releases/tag/".len()..]
+        .split('/')
+        .next()?;
+    if tag.is_empty() {
+        return None;
+    }
     Some(tag.trim_start_matches('v').to_string())
 }
 
-fn try_ensure_plugin_installed_via_direct_release_latest(spec: &PluginAssetSpec, dest: &Path, version_file: &Path) -> anyhow::Result<PathBuf> {
-    let sha_url = format!("https://github.com/{}/releases/latest/download/{}.wasm.sha256", spec.repo, spec.asset_basename);
+fn try_ensure_plugin_installed_via_direct_release_latest(
+    spec: &PluginAssetSpec,
+    dest: &Path,
+    version_file: &Path,
+) -> anyhow::Result<PathBuf> {
+    let sha_url = format!(
+        "https://github.com/{}/releases/latest/download/{}.wasm.sha256",
+        spec.repo, spec.asset_basename
+    );
     let sha_resp = agentplug_host::shared_agent().get(&sha_url).call()?;
     let resolved_url = sha_resp.get_url().to_string();
     let version = extract_version_from_release_url(&resolved_url)
@@ -77,11 +112,21 @@ fn try_ensure_plugin_installed_via_direct_release_latest(spec: &PluginAssetSpec,
             anyhow::anyhow!("could not determine release tag from redirect target {resolved_url} (requested {sha_url}), and the releases/latest page fallback also failed")
         })?;
     let sha_line = sha_resp.into_string()?;
-    let expected_sha = sha_line.split_whitespace().next()
-        .ok_or_else(|| anyhow::anyhow!("empty sha256 sidecar for {} at {sha_url}", spec.asset_basename))?
+    let expected_sha = sha_line
+        .split_whitespace()
+        .next()
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "empty sha256 sidecar for {} at {sha_url}",
+                spec.asset_basename
+            )
+        })?
         .to_string();
 
-    let wasm_url = format!("https://github.com/{}/releases/latest/download/{}.wasm", spec.repo, spec.asset_basename);
+    let wasm_url = format!(
+        "https://github.com/{}/releases/latest/download/{}.wasm",
+        spec.repo, spec.asset_basename
+    );
     snapshot_prev_wasm_and_version(dest, version_file);
     download_and_verify(&wasm_url, dest, &expected_sha)?;
     fs::write(version_file, &version)?;
@@ -93,18 +138,26 @@ fn try_ensure_plugin_installed_via_direct_release_latest(spec: &PluginAssetSpec,
 }
 
 fn github_api_request(url: &str) -> ureq::Request {
-    agentplug_host::shared_agent().get(url).set("User-Agent", "agentplug-runner")
+    agentplug_host::shared_agent()
+        .get(url)
+        .set("User-Agent", "agentplug-runner")
 }
 
 fn github_token() -> Option<String> {
-    std::env::var("GITHUB_TOKEN").or_else(|_| std::env::var("GH_TOKEN")).ok().filter(|t| !t.is_empty())
+    std::env::var("GITHUB_TOKEN")
+        .or_else(|_| std::env::var("GH_TOKEN"))
+        .ok()
+        .filter(|t| !t.is_empty())
 }
 
 fn github_api_call(url: &str) -> Result<ureq::Response, ureq::Error> {
     let Some(token) = github_token() else {
         return github_api_request(url).call();
     };
-    match github_api_request(url).set("Authorization", &format!("Bearer {token}")).call() {
+    match github_api_request(url)
+        .set("Authorization", &format!("Bearer {token}"))
+        .call()
+    {
         Err(ureq::Error::Status(401, _)) => {
             eprintln!("[agentplug] GITHUB_TOKEN/GH_TOKEN rejected (401 Bad credentials) fetching {url} -- retrying unauthenticated");
             github_api_request(url).call()
@@ -122,12 +175,20 @@ fn describe_github_api_error(url: &str, err: ureq::Error) -> anyhow::Error {
                 "GitHub API rate-limited fetching {url} (403, ratelimit-remaining={remaining}, ratelimit-reset={reset} unix secs) -- set GITHUB_TOKEN or GH_TOKEN to raise the limit from 60/hr to 5000/hr"
             )
         }
-        ureq::Error::Status(code, _) => anyhow::anyhow!("GitHub API returned {code} fetching {url}"),
-        ureq::Error::Transport(_) => anyhow::Error::from(err).context(format!("network error fetching {url}")),
+        ureq::Error::Status(code, _) => {
+            anyhow::anyhow!("GitHub API returned {code} fetching {url}")
+        }
+        ureq::Error::Transport(_) => {
+            anyhow::Error::from(err).context(format!("network error fetching {url}"))
+        }
     }
 }
 
-pub fn download_and_verify(url: &str, dest: &Path, expected_sha256_hex: &str) -> anyhow::Result<()> {
+pub fn download_and_verify(
+    url: &str,
+    dest: &Path,
+    expected_sha256_hex: &str,
+) -> anyhow::Result<()> {
     let resp = agentplug_host::shared_agent().get(url).call()?;
     let mut reader = resp.into_reader();
     let mut bytes = Vec::new();
@@ -141,7 +202,9 @@ pub fn download_and_verify(url: &str, dest: &Path, expected_sha256_hex: &str) ->
     }
     let actual = sha256_hex(&bytes);
     if !actual.eq_ignore_ascii_case(expected_sha256_hex) {
-        anyhow::bail!("sha256 mismatch downloading {url}: expected {expected_sha256_hex}, got {actual}");
+        anyhow::bail!(
+            "sha256 mismatch downloading {url}: expected {expected_sha256_hex}, got {actual}"
+        );
     }
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent)?;
@@ -156,7 +219,10 @@ pub fn download_and_verify(url: &str, dest: &Path, expected_sha256_hex: &str) ->
     if let Err(e) = write_result {
         if let Err(rm_err) = fs::remove_file(&tmp) {
             if rm_err.kind() != std::io::ErrorKind::NotFound {
-                eprintln!("[agentplug] failed to remove incomplete tmp file {}: {rm_err}", tmp.display());
+                eprintln!(
+                    "[agentplug] failed to remove incomplete tmp file {}: {rm_err}",
+                    tmp.display()
+                );
             }
         }
         return Err(e);
@@ -176,13 +242,34 @@ fn gm_asset_basename() -> &'static str {
 
 fn builtin_plugin_asset_spec(plugin_name: &str) -> Option<PluginAssetSpec> {
     match plugin_name {
-        "gm" => Some(PluginAssetSpec { repo: "AnEntrypoint/plugkit-bin".to_string(), asset_basename: gm_asset_basename().to_string() }),
-        "bert" => Some(PluginAssetSpec { repo: "AnEntrypoint/agentplug-bert-bin".to_string(), asset_basename: "bert".to_string() }),
-        "libsql" => Some(PluginAssetSpec { repo: "AnEntrypoint/agentplug-libsql-bin".to_string(), asset_basename: "libsql".to_string() }),
-        "treesitter" => Some(PluginAssetSpec { repo: "AnEntrypoint/agentplug-treesitter-bin".to_string(), asset_basename: "treesitter".to_string() }),
-        "oxibrowser" => Some(PluginAssetSpec { repo: "AnEntrypoint/obrowser-bin".to_string(), asset_basename: "oxibrowser".to_string() }),
-        "crux" => Some(PluginAssetSpec { repo: "AnEntrypoint/agentplug-crux-bin".to_string(), asset_basename: "crux".to_string() }),
-        "liqology" => Some(PluginAssetSpec { repo: "AnEntrypoint/liqology".to_string(), asset_basename: "liqology".to_string() }),
+        "gm" => Some(PluginAssetSpec {
+            repo: "AnEntrypoint/plugkit-bin".to_string(),
+            asset_basename: gm_asset_basename().to_string(),
+        }),
+        "bert" => Some(PluginAssetSpec {
+            repo: "AnEntrypoint/agentplug-bert-bin".to_string(),
+            asset_basename: "bert".to_string(),
+        }),
+        "libsql" => Some(PluginAssetSpec {
+            repo: "AnEntrypoint/agentplug-libsql-bin".to_string(),
+            asset_basename: "libsql".to_string(),
+        }),
+        "treesitter" => Some(PluginAssetSpec {
+            repo: "AnEntrypoint/agentplug-treesitter-bin".to_string(),
+            asset_basename: "treesitter".to_string(),
+        }),
+        "oxibrowser" => Some(PluginAssetSpec {
+            repo: "AnEntrypoint/obrowser-bin".to_string(),
+            asset_basename: "oxibrowser".to_string(),
+        }),
+        "crux" => Some(PluginAssetSpec {
+            repo: "AnEntrypoint/agentplug-crux-bin".to_string(),
+            asset_basename: "crux".to_string(),
+        }),
+        "liqology" => Some(PluginAssetSpec {
+            repo: "AnEntrypoint/liqology".to_string(),
+            asset_basename: "liqology".to_string(),
+        }),
         _ => None,
     }
 }
@@ -196,7 +283,9 @@ struct ProjectPluginSpec {
 
 fn project_declared_plugin_specs(project_root: &Path) -> Vec<ProjectPluginSpec> {
     let path = project_root.join(".agentplug").join("plugins.json");
-    let Ok(raw) = fs::read_to_string(&path) else { return Vec::new() };
+    let Ok(raw) = fs::read_to_string(&path) else {
+        return Vec::new();
+    };
     match serde_json::from_str::<Vec<ProjectPluginSpec>>(&raw) {
         Ok(specs) => specs,
         Err(e) => {
@@ -206,11 +295,17 @@ fn project_declared_plugin_specs(project_root: &Path) -> Vec<ProjectPluginSpec> 
     }
 }
 
-fn plugin_asset_spec_for_roots(plugin_name: &str, known_roots: &[PathBuf]) -> Option<PluginAssetSpec> {
+fn plugin_asset_spec_for_roots(
+    plugin_name: &str,
+    known_roots: &[PathBuf],
+) -> Option<PluginAssetSpec> {
     for root in known_roots {
         for spec in project_declared_plugin_specs(root) {
             if spec.name == plugin_name {
-                return Some(PluginAssetSpec { repo: spec.repo, asset_basename: spec.asset_basename });
+                return Some(PluginAssetSpec {
+                    repo: spec.repo,
+                    asset_basename: spec.asset_basename,
+                });
             }
         }
     }
@@ -228,11 +323,15 @@ fn plugin_asset_spec(plugin_name: &str) -> Option<PluginAssetSpec> {
 }
 
 pub fn plugin_wasm_path(plugin_name: &str) -> PathBuf {
-    install_dir().join("plugins").join(format!("{plugin_name}.wasm"))
+    install_dir()
+        .join("plugins")
+        .join(format!("{plugin_name}.wasm"))
 }
 
 fn plugin_version_path(plugin_name: &str) -> PathBuf {
-    install_dir().join("plugins").join(format!("{plugin_name}.version"))
+    install_dir()
+        .join("plugins")
+        .join(format!("{plugin_name}.version"))
 }
 
 fn snapshot_prev_wasm_and_version(dest: &Path, version_file: &Path) {
@@ -263,7 +362,10 @@ fn runner_version_path() -> PathBuf {
 }
 
 pub fn installed_runner_version() -> Option<String> {
-    fs::read_to_string(runner_version_path()).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+    fs::read_to_string(runner_version_path())
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 pub fn fetch_latest_runner_version() -> anyhow::Result<Option<String>> {
@@ -271,11 +373,18 @@ pub fn fetch_latest_runner_version() -> anyhow::Result<Option<String>> {
     match github_api_call(&url) {
         Ok(resp) => {
             let body: serde_json::Value = serde_json::from_str(&resp.into_string()?)?;
-            Ok(body.get("tag_name").and_then(|v| v.as_str()).map(|s| s.trim_start_matches('v').to_string()))
+            Ok(body
+                .get("tag_name")
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim_start_matches('v').to_string()))
         }
         Err(api_err) => {
-            let Some(asset) = runner_asset_name() else { return Err(describe_github_api_error(&url, api_err)) };
-            let probe_url = format!("https://github.com/{RUNNER_BIN_REPO}/releases/latest/download/{asset}.sha256");
+            let Some(asset) = runner_asset_name() else {
+                return Err(describe_github_api_error(&url, api_err));
+            };
+            let probe_url = format!(
+                "https://github.com/{RUNNER_BIN_REPO}/releases/latest/download/{asset}.sha256"
+            );
             match agentplug_host::shared_agent().get(&probe_url).call() {
                 Ok(resp) => {
                     let resolved_url = resp.get_url().to_string();
@@ -288,8 +397,12 @@ pub fn fetch_latest_runner_version() -> anyhow::Result<Option<String>> {
 }
 
 pub fn stage_runner_self_update() -> anyhow::Result<Option<(PathBuf, String)>> {
-    let Some(asset) = runner_asset_name() else { return Ok(None) };
-    let Some(latest) = fetch_latest_runner_version()? else { return Ok(None) };
+    let Some(asset) = runner_asset_name() else {
+        return Ok(None);
+    };
+    let Some(latest) = fetch_latest_runner_version()? else {
+        return Ok(None);
+    };
     if marker_is_trustworthy_and_current(latest.as_str()) {
         return Ok(None);
     }
@@ -298,17 +411,34 @@ pub fn stage_runner_self_update() -> anyhow::Result<Option<(PathBuf, String)>> {
         .map(|e| e.eq_ignore_ascii_case("new"))
         .unwrap_or(false);
     let mut current_exe = std::env::current_exe()?;
-    while current_exe.extension().map(|e| e.eq_ignore_ascii_case("new")).unwrap_or(false) {
+    while current_exe
+        .extension()
+        .map(|e| e.eq_ignore_ascii_case("new"))
+        .unwrap_or(false)
+    {
         current_exe = current_exe.with_extension("");
     }
-    let staged_suffix = if running_from_staged_path { "new2" } else { "new" };
+    let staged_suffix = if running_from_staged_path {
+        "new2"
+    } else {
+        "new"
+    };
     let staged = current_exe.with_extension(
-        current_exe.extension().map(|e| format!("{}.{staged_suffix}", e.to_string_lossy())).unwrap_or_else(|| staged_suffix.to_string())
+        current_exe
+            .extension()
+            .map(|e| format!("{}.{staged_suffix}", e.to_string_lossy()))
+            .unwrap_or_else(|| staged_suffix.to_string()),
     );
     let base = format!("https://github.com/{RUNNER_BIN_REPO}/releases/download/v{latest}");
-    let sha_line = agentplug_host::shared_agent().get(&format!("{base}/{asset}.sha256")).call()?.into_string()?;
-    let expected_sha = sha_line.split_whitespace().next()
-        .ok_or_else(|| anyhow::anyhow!("empty sha256 sidecar for {asset} at {base}"))?.to_string();
+    let sha_line = agentplug_host::shared_agent()
+        .get(&format!("{base}/{asset}.sha256"))
+        .call()?
+        .into_string()?;
+    let expected_sha = sha_line
+        .split_whitespace()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("empty sha256 sidecar for {asset} at {base}"))?
+        .to_string();
     download_and_verify(&format!("{base}/{asset}"), &staged, &expected_sha)?;
     #[cfg(not(windows))]
     {
@@ -321,7 +451,9 @@ pub fn stage_runner_self_update() -> anyhow::Result<Option<(PathBuf, String)>> {
 }
 
 fn marker_is_trustworthy_and_current(latest: &str) -> bool {
-    let Some(marker) = installed_runner_version() else { return false };
+    let Some(marker) = installed_runner_version() else {
+        return false;
+    };
     if marker != latest {
         return false;
     }
@@ -346,7 +478,10 @@ pub fn fetch_latest_plugin_version(plugin_name: &str) -> anyhow::Result<Option<S
     let Some(spec) = plugin_asset_spec(plugin_name) else {
         anyhow::bail!("unknown plugin {plugin_name} -- not registered in agentplug-runner's plugin_asset_spec map");
     };
-    let url = format!("https://api.github.com/repos/{}/releases?per_page=100", spec.repo);
+    let url = format!(
+        "https://api.github.com/repos/{}/releases?per_page=100",
+        spec.repo
+    );
     let resp = github_api_call(&url).map_err(|e| describe_github_api_error(&url, e))?;
     let body: serde_json::Value = serde_json::from_str(&resp.into_string()?)?;
     let Some(releases) = body.as_array() else {
@@ -354,34 +489,54 @@ pub fn fetch_latest_plugin_version(plugin_name: &str) -> anyhow::Result<Option<S
     };
     let wanted_names: [String; 2] = [
         format!("{}.wasm", spec.asset_basename),
-        if spec.asset_basename == "plugkit-slim" { "plugkit.wasm".to_string() } else { format!("{}.wasm", spec.asset_basename) },
+        if spec.asset_basename == "plugkit-slim" {
+            "plugkit.wasm".to_string()
+        } else {
+            format!("{}.wasm", spec.asset_basename)
+        },
     ];
     for release in releases {
         let has_asset = release
             .get("assets")
             .and_then(|a| a.as_array())
-            .map(|assets| assets.iter().any(|a| {
-                a.get("name").and_then(|n| n.as_str()).map(|n| wanted_names.iter().any(|w| w == n)).unwrap_or(false)
-            }))
+            .map(|assets| {
+                assets.iter().any(|a| {
+                    a.get("name")
+                        .and_then(|n| n.as_str())
+                        .map(|n| wanted_names.iter().any(|w| w == n))
+                        .unwrap_or(false)
+                })
+            })
             .unwrap_or(false);
         if has_asset {
-            return Ok(release.get("tag_name").and_then(|v| v.as_str()).map(|s| s.trim_start_matches('v').to_string()));
+            return Ok(release
+                .get("tag_name")
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim_start_matches('v').to_string()));
         }
     }
     Ok(None)
 }
 
 pub fn installed_plugin_version(plugin_name: &str) -> Option<String> {
-    fs::read_to_string(plugin_version_path(plugin_name)).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+    fs::read_to_string(plugin_version_path(plugin_name))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 pub fn is_recognized_release_semver(version: &str) -> bool {
     let segments: Vec<&str> = version.split('.').collect();
-    segments.len() == 3 && segments.iter().all(|seg| !seg.is_empty() && seg.chars().all(|c| c.is_ascii_digit()))
+    segments.len() == 3
+        && segments
+            .iter()
+            .all(|seg| !seg.is_empty() && seg.chars().all(|c| c.is_ascii_digit()))
 }
 
 fn local_dev_sideload_marker_path(plugin_name: &str) -> PathBuf {
-    install_dir().join("plugins").join(format!("{plugin_name}.local-dev-sideload.json"))
+    install_dir()
+        .join("plugins")
+        .join(format!("{plugin_name}.local-dev-sideload.json"))
 }
 
 fn warn_local_dev_sideload_loudly(plugin_name: &str, installed: &str) {
@@ -409,7 +564,9 @@ fn now_ms_for_marker() -> u64 {
 }
 
 pub fn read_local_dev_sideload_marker(plugin_name: &str) -> Option<serde_json::Value> {
-    fs::read_to_string(local_dev_sideload_marker_path(plugin_name)).ok().and_then(|s| serde_json::from_str(&s).ok())
+    fs::read_to_string(local_dev_sideload_marker_path(plugin_name))
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
 }
 
 fn clear_local_dev_sideload_marker(plugin_name: &str) {
@@ -417,7 +574,9 @@ fn clear_local_dev_sideload_marker(plugin_name: &str) {
 }
 
 fn known_bad_version_marker_path(plugin_name: &str) -> PathBuf {
-    install_dir().join("plugins").join(format!("{plugin_name}.known-bad-versions.json"))
+    install_dir()
+        .join("plugins")
+        .join(format!("{plugin_name}.known-bad-versions.json"))
 }
 
 pub fn clear_all_known_bad_version_markers() {
@@ -456,14 +615,27 @@ fn fetch_remote_wasm_sha256(plugin_name: &str, version: &str) -> anyhow::Result<
     let Some(spec) = plugin_asset_spec(plugin_name) else {
         anyhow::bail!("unknown plugin {plugin_name} -- not registered in agentplug-runner's plugin_asset_spec map");
     };
-    let base = format!("https://github.com/{}/releases/download/v{version}", spec.repo);
-    let sha_line = agentplug_host::shared_agent().get(&format!("{base}/{}.wasm.sha256", spec.asset_basename)).call()?.into_string()?;
-    sha_line.split_whitespace().next().map(str::to_string)
-        .ok_or_else(|| anyhow::anyhow!("empty sha256 sidecar for {} at {base}", spec.asset_basename))
+    let base = format!(
+        "https://github.com/{}/releases/download/v{version}",
+        spec.repo
+    );
+    let sha_line = agentplug_host::shared_agent()
+        .get(&format!("{base}/{}.wasm.sha256", spec.asset_basename))
+        .call()?
+        .into_string()?;
+    sha_line
+        .split_whitespace()
+        .next()
+        .map(str::to_string)
+        .ok_or_else(|| {
+            anyhow::anyhow!("empty sha256 sidecar for {} at {base}", spec.asset_basename)
+        })
 }
 
 fn installed_wasm_sha256(plugin_name: &str) -> Option<String> {
-    fs::read(plugin_wasm_path(plugin_name)).ok().map(|bytes| sha256_hex(&bytes))
+    fs::read(plugin_wasm_path(plugin_name))
+        .ok()
+        .map(|bytes| sha256_hex(&bytes))
 }
 
 pub fn refresh_plugin_if_stale(plugin_name: &str) -> anyhow::Result<Option<String>> {
@@ -482,7 +654,10 @@ pub fn refresh_plugin_if_stale(plugin_name: &str) -> anyhow::Result<Option<Strin
         return Ok(None);
     };
     if latest == installed {
-        match (fetch_remote_wasm_sha256(plugin_name, &latest), installed_wasm_sha256(plugin_name)) {
+        match (
+            fetch_remote_wasm_sha256(plugin_name, &latest),
+            installed_wasm_sha256(plugin_name),
+        ) {
             (Ok(remote_sha), Some(local_sha)) if !remote_sha.eq_ignore_ascii_case(&local_sha) => {
                 eprintln!("[agentplug daemon] plugin {plugin_name} version {latest} matches but the released asset's sha256 has changed ({remote_sha} vs installed {local_sha}) -- re-fetching under the same tag");
             }
@@ -535,17 +710,24 @@ fn normalize_newlines(s: &str) -> String {
 }
 
 fn home_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).map(PathBuf::from)
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
 }
 
 fn installed_skill_roots(home: &Path) -> [PathBuf; 2] {
-    [home.join(".agents").join("skills"), home.join(".claude").join("skills")]
+    [
+        home.join(".agents").join("skills"),
+        home.join(".claude").join("skills"),
+    ]
 }
 
 fn discover_installed_skill_names(home: &Path) -> anyhow::Result<Vec<String>> {
     let mut names = std::collections::BTreeSet::new();
     for root in installed_skill_roots(home) {
-        let Ok(entries) = fs::read_dir(&root) else { continue };
+        let Ok(entries) = fs::read_dir(&root) else {
+            continue;
+        };
         for entry in entries.flatten() {
             if !entry.path().is_dir() {
                 continue;
@@ -564,7 +746,10 @@ fn fetch_remote_skill_md(skill_name: &str) -> anyhow::Result<String> {
     let url = format!(
         "https://raw.githubusercontent.com/{SKILL_MD_REMOTE_REPO}/{SKILL_MD_REMOTE_BRANCH}/skills/{skill_name}/SKILL.md"
     );
-    Ok(agentplug_host::shared_agent().get(&url).call()?.into_string()?)
+    Ok(agentplug_host::shared_agent()
+        .get(&url)
+        .call()?
+        .into_string()?)
 }
 
 pub fn refresh_installed_skill_md() -> anyhow::Result<Vec<PathBuf>> {
@@ -594,7 +779,9 @@ pub fn refresh_installed_skill_md() -> anyhow::Result<Vec<PathBuf>> {
                 continue;
             }
             let needs_write = match fs::read_to_string(&target) {
-                Ok(existing) => sha256_hex(normalize_newlines(&existing).as_bytes()) != bundled_hash,
+                Ok(existing) => {
+                    sha256_hex(normalize_newlines(&existing).as_bytes()) != bundled_hash
+                }
                 Err(_) => true,
             };
             if !needs_write {
@@ -607,10 +794,17 @@ pub fn refresh_installed_skill_md() -> anyhow::Result<Vec<PathBuf>> {
         }
     }
     if !refreshed.is_empty() {
-        eprintln!("[agentplug daemon] SKILL.md refreshed: {} target(s)", refreshed.len());
+        eprintln!(
+            "[agentplug daemon] SKILL.md refreshed: {} target(s)",
+            refreshed.len()
+        );
     }
     if !failures.is_empty() {
-        eprintln!("[agentplug daemon] SKILL.md refresh had {} failure(s): {}", failures.len(), failures.join("; "));
+        eprintln!(
+            "[agentplug daemon] SKILL.md refresh had {} failure(s): {}",
+            failures.len(),
+            failures.join("; ")
+        );
     }
     Ok(refreshed)
 }
@@ -618,16 +812,23 @@ pub fn refresh_installed_skill_md() -> anyhow::Result<Vec<PathBuf>> {
 const PLUGIN_INSTALL_RETRY_COOLDOWN: Duration = Duration::from_secs(30);
 
 fn plugin_install_failure_marker_path(plugin_name: &str) -> PathBuf {
-    install_dir().join("plugins").join(format!("{plugin_name}.install-backoff-ts"))
+    install_dir()
+        .join("plugins")
+        .join(format!("{plugin_name}.install-backoff-ts"))
 }
 
 fn read_plugin_install_failure_elapsed(plugin_name: &str) -> Option<Duration> {
     let raw = fs::read_to_string(plugin_install_failure_marker_path(plugin_name)).ok()?;
     let failed_at_ms: u64 = raw.trim().parse().ok()?;
-    Some(Duration::from_millis(now_ms_for_marker().saturating_sub(failed_at_ms)))
+    Some(Duration::from_millis(
+        now_ms_for_marker().saturating_sub(failed_at_ms),
+    ))
 }
 
-pub fn ensure_plugin_installed(plugin_name: &str, explicit_version: Option<&str>) -> anyhow::Result<PathBuf> {
+pub fn ensure_plugin_installed(
+    plugin_name: &str,
+    explicit_version: Option<&str>,
+) -> anyhow::Result<PathBuf> {
     let dest = plugin_wasm_path(plugin_name);
     if dest.exists() && explicit_version.is_none() {
         return Ok(dest);
@@ -660,7 +861,9 @@ pub fn ensure_plugin_installed(plugin_name: &str, explicit_version: Option<&str>
     if explicit_version.is_none() {
         let marker = plugin_install_failure_marker_path(plugin_name);
         match &result {
-            Ok(_) => { let _ = fs::remove_file(&marker); }
+            Ok(_) => {
+                let _ = fs::remove_file(&marker);
+            }
             Err(_) => {
                 if let Some(parent) = marker.parent() {
                     let _ = fs::create_dir_all(parent);
@@ -672,11 +875,18 @@ pub fn ensure_plugin_installed(plugin_name: &str, explicit_version: Option<&str>
     result
 }
 
-fn ensure_plugin_installed_via_github(plugin_name: &str, explicit_version: Option<&str>, spec: &PluginAssetSpec, dest: &Path, version_file: &Path) -> anyhow::Result<PathBuf> {
+fn ensure_plugin_installed_via_github(
+    plugin_name: &str,
+    explicit_version: Option<&str>,
+    spec: &PluginAssetSpec,
+    dest: &Path,
+    version_file: &Path,
+) -> anyhow::Result<PathBuf> {
     let version = match explicit_version {
         Some(v) => v.to_string(),
-        None => fetch_latest_plugin_version(plugin_name)?
-            .ok_or_else(|| anyhow::anyhow!("could not resolve latest version for plugin {plugin_name}"))?,
+        None => fetch_latest_plugin_version(plugin_name)?.ok_or_else(|| {
+            anyhow::anyhow!("could not resolve latest version for plugin {plugin_name}")
+        })?,
     };
 
     if dest.exists() {
@@ -687,7 +897,10 @@ fn ensure_plugin_installed_via_github(plugin_name: &str, explicit_version: Optio
         }
     }
 
-    let base = format!("https://github.com/{}/releases/download/v{version}", spec.repo);
+    let base = format!(
+        "https://github.com/{}/releases/download/v{version}",
+        spec.repo
+    );
 
     let sha_url = format!("{base}/{}.wasm.sha256", spec.asset_basename);
     let mut effective_basename = spec.asset_basename.as_str();
@@ -695,13 +908,19 @@ fn ensure_plugin_installed_via_github(plugin_name: &str, explicit_version: Optio
         Ok(resp) => resp,
         Err(_) if spec.asset_basename == "plugkit-slim" => {
             effective_basename = "plugkit";
-            agentplug_host::shared_agent().get(&format!("{base}/plugkit.wasm.sha256")).call()?
+            agentplug_host::shared_agent()
+                .get(&format!("{base}/plugkit.wasm.sha256"))
+                .call()?
         }
         Err(e) => return Err(e.into()),
     };
     let wasm_url = format!("{base}/{effective_basename}.wasm");
     let sha_line = sha_resp.into_string()?;
-    let expected_sha = sha_line.split_whitespace().next().ok_or_else(|| anyhow::anyhow!("empty sha256 sidecar for {effective_basename} at {base}"))?.to_string();
+    let expected_sha = sha_line
+        .split_whitespace()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("empty sha256 sidecar for {effective_basename} at {base}"))?
+        .to_string();
 
     snapshot_prev_wasm_and_version(dest, version_file);
     download_and_verify(&wasm_url, dest, &expected_sha)?;

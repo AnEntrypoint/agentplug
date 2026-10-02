@@ -8,6 +8,38 @@ pub(crate) fn kill_tree(root: u32) -> usize {
     platform::kill_tree(root)
 }
 
+pub(crate) struct ProcessContainment {
+    #[cfg(unix)]
+    process_group: u32,
+    #[cfg(windows)]
+    job: platform::Job,
+}
+
+pub(crate) fn establish_containment(
+    child: &std::process::Child,
+) -> Result<ProcessContainment, String> {
+    Ok(ProcessContainment {
+        #[cfg(unix)]
+        process_group: child.id(),
+        #[cfg(windows)]
+        job: platform::Job::assign(child)?,
+    })
+}
+
+pub(crate) fn terminate_containment(containment: &ProcessContainment, root: u32) -> usize {
+    let mut killed = kill_tree(root);
+    #[cfg(unix)]
+    {
+        killed += (unsafe { libc::kill(-(containment.process_group as i32), libc::SIGKILL) } == 0)
+            as usize;
+    }
+    #[cfg(windows)]
+    {
+        killed += platform::terminate_job(&containment.job) as usize;
+    }
+    killed
+}
+
 fn descendants_root_first(root: u32, parent_of: &HashMap<u32, u32>) -> Vec<u32> {
     let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
     for (pid, parent) in parent_of {
@@ -28,7 +60,11 @@ fn descendants_root_first(root: u32, parent_of: &HashMap<u32, u32>) -> Vec<u32> 
     order
 }
 
-fn sum_over_descendants(roots: &[u32], parent_of: &HashMap<u32, u32>, bytes_of: impl Fn(u32) -> Option<u64>) -> HashMap<u32, u64> {
+fn sum_over_descendants(
+    roots: &[u32],
+    parent_of: &HashMap<u32, u32>,
+    bytes_of: impl Fn(u32) -> Option<u64>,
+) -> HashMap<u32, u64> {
     let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
     for (pid, parent) in parent_of {
         children.entry(*parent).or_default().push(*pid);
@@ -61,6 +97,64 @@ fn sum_over_descendants(roots: &[u32], parent_of: &HashMap<u32, u32>, bytes_of: 
 mod platform {
     use super::sum_over_descendants;
     use std::collections::HashMap;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+        SetInformationJobObject, TerminateJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    };
+
+    pub struct Job(usize);
+
+    impl Job {
+        pub fn assign(child: &std::process::Child) -> Result<Self, String> {
+            let handle = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+            if handle.is_null() {
+                return Err(format!(
+                    "CreateJobObjectW failed: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+            let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+            limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            let configured = unsafe {
+                SetInformationJobObject(
+                    handle,
+                    JobObjectExtendedLimitInformation,
+                    (&limits as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+                    std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                )
+            };
+            if configured == 0 {
+                unsafe { CloseHandle(handle as isize) };
+                return Err(format!(
+                    "SetInformationJobObject failed: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+            let assigned =
+                unsafe { AssignProcessToJobObject(handle, child.as_raw_handle() as HANDLE) };
+            if assigned == 0 {
+                unsafe { CloseHandle(handle as isize) };
+                return Err(format!(
+                    "AssignProcessToJobObject failed: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+            Ok(Self(handle as usize))
+        }
+    }
+
+    impl Drop for Job {
+        fn drop(&mut self) {
+            unsafe { CloseHandle(self.0 as isize) };
+        }
+    }
+
+    pub fn terminate_job(job: &Job) -> bool {
+        (unsafe { TerminateJobObject(job.0 as HANDLE, 1) }) != 0
+    }
 
     const TH32CS_SNAPPROCESS: u32 = 0x2;
     const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
@@ -104,7 +198,11 @@ mod platform {
         fn Process32NextW(snapshot: isize, entry: *mut ProcessEntry32W) -> i32;
         fn OpenProcess(desired_access: u32, inherit_handle: i32, process_id: u32) -> isize;
         fn CloseHandle(handle: isize) -> i32;
-        fn K32GetProcessMemoryInfo(process: isize, counters: *mut ProcessMemoryCountersEx, cb: u32) -> i32;
+        fn K32GetProcessMemoryInfo(
+            process: isize,
+            counters: *mut ProcessMemoryCountersEx,
+            cb: u32,
+        ) -> i32;
         fn TerminateProcess(process: isize, exit_code: u32) -> i32;
     }
 
@@ -132,11 +230,15 @@ mod platform {
 
     fn working_set_of(pid: u32) -> Option<u64> {
         // SAFETY: OpenProcess only reads its by-value arguments; a zero handle is handled below.
-        let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ, 0, pid) };
+        let handle =
+            unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ, 0, pid) };
         if handle == 0 {
             return None;
         }
-        let mut counters = ProcessMemoryCountersEx { cb: std::mem::size_of::<ProcessMemoryCountersEx>() as u32, ..Default::default() };
+        let mut counters = ProcessMemoryCountersEx {
+            cb: std::mem::size_of::<ProcessMemoryCountersEx>() as u32,
+            ..Default::default()
+        };
         // SAFETY: handle is a live process handle and counters is a writable struct whose cb matches its size.
         let ok = unsafe { K32GetProcessMemoryInfo(handle, &mut counters, counters.cb) };
         // SAFETY: handle was opened above and is closed exactly once.
@@ -177,7 +279,10 @@ mod platform {
 
     pub fn kill_tree(root: u32) -> usize {
         let order = super::descendants_root_first(root, &parent_map());
-        order.iter().filter(|pid| terminate(**pid) || taskkill(**pid)).count()
+        order
+            .iter()
+            .filter(|pid| terminate(**pid) || taskkill(**pid))
+            .count()
     }
 }
 
@@ -188,12 +293,28 @@ mod platform {
 
     fn parent_map() -> HashMap<u32, u32> {
         let mut parents = HashMap::new();
-        let Ok(entries) = std::fs::read_dir("/proc") else { return parents };
+        let Ok(entries) = std::fs::read_dir("/proc") else {
+            return parents;
+        };
         for entry in entries.flatten() {
-            let Some(pid) = entry.file_name().to_str().and_then(|n| n.parse::<u32>().ok()) else { continue };
-            let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else { continue };
-            let Some(after_comm) = stat.rsplit_once(')').map(|(_, rest)| rest) else { continue };
-            if let Some(ppid) = after_comm.split_whitespace().nth(1).and_then(|p| p.parse::<u32>().ok()) {
+            let Some(pid) = entry
+                .file_name()
+                .to_str()
+                .and_then(|n| n.parse::<u32>().ok())
+            else {
+                continue;
+            };
+            let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
+                continue;
+            };
+            let Some(after_comm) = stat.rsplit_once(')').map(|(_, rest)| rest) else {
+                continue;
+            };
+            if let Some(ppid) = after_comm
+                .split_whitespace()
+                .nth(1)
+                .and_then(|p| p.parse::<u32>().ok())
+            {
                 parents.insert(pid, ppid);
             }
         }
