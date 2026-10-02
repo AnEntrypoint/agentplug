@@ -3300,81 +3300,76 @@ pub fn try_dispatch_via_daemon(
     }
 }
 
-fn configure_github_cli_config_dir() -> bool {
-    if std::env::var_os("GH_CONFIG_DIR").is_some() {
-        return true;
+fn github_cli_config_candidates() -> Vec<(PathBuf, &'static str)> {
+    let mut candidates = Vec::new();
+    if let Some(path) = std::env::var_os("AGENTPLUG_GH_CONFIG_DIR") {
+        candidates.push((PathBuf::from(path), "AGENTPLUG_GH_CONFIG_DIR"));
     }
-    let Some(requested) = std::env::var_os("AGENTPLUG_GH_CONFIG_DIR") else {
-        return false;
-    };
-    let requested = PathBuf::from(requested);
+    if let Some(path) = std::env::var_os("XDG_CONFIG_HOME") {
+        candidates.push((PathBuf::from(path).join("gh"), "XDG_CONFIG_HOME"));
+    }
+    #[cfg(target_os = "macos")]
+    if let Some(home) = std::env::var_os("HOME") {
+        candidates.push((
+            PathBuf::from(home).join("Library/Application Support/gh"),
+            "HOME",
+        ));
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    if let Some(home) = std::env::var_os("HOME") {
+        candidates.push((PathBuf::from(home).join(".config/gh"), "HOME"));
+    }
+    #[cfg(windows)]
+    if let Some(path) = std::env::var_os("APPDATA") {
+        candidates.push((PathBuf::from(path).join("GitHub CLI"), "APPDATA"));
+    }
+    candidates
+}
+
+fn usable_github_cli_config_dir(requested: &Path) -> Option<PathBuf> {
     if !requested.is_absolute() {
-        eprintln!(
-            "[agentplug daemon] ignored AGENTPLUG_GH_CONFIG_DIR: it must be an absolute directory"
-        );
-        return false;
+        return None;
     }
-    let Ok(directory) = requested.canonicalize() else {
-        eprintln!(
-            "[agentplug daemon] ignored AGENTPLUG_GH_CONFIG_DIR: its directory is unavailable"
-        );
-        return false;
-    };
+    let directory = requested.canonicalize().ok()?;
     if !directory.is_dir() || !directory.join("hosts.yml").is_file() {
-        eprintln!("[agentplug daemon] ignored AGENTPLUG_GH_CONFIG_DIR: no GitHub CLI credential store is present");
-        return false;
+        return None;
     }
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        let Ok(metadata) = directory.metadata() else {
-            eprintln!(
-                "[agentplug daemon] ignored AGENTPLUG_GH_CONFIG_DIR: its metadata is unavailable"
-            );
-            return false;
-        };
-        if metadata.uid() != unsafe { libc::geteuid() } {
-            eprintln!("[agentplug daemon] ignored AGENTPLUG_GH_CONFIG_DIR: the credential directory is not owned by this user");
-            return false;
+        if directory.metadata().ok()?.uid() != unsafe { libc::geteuid() } {
+            return None;
         }
     }
-    std::env::set_var("GH_CONFIG_DIR", &directory);
-    eprintln!(
-            "[agentplug daemon] configured GitHub CLI credentials from AGENTPLUG_GH_CONFIG_DIR without copying credential data"
-        );
-    true
+    Some(directory)
 }
 
-fn seed_github_token_from_gh_cli_if_unset() {
-    if std::env::var_os("GITHUB_TOKEN").is_some() || std::env::var_os("GH_TOKEN").is_some() {
-        return;
+fn configure_github_cli_config_dir() -> bool {
+    if std::env::var_os("GH_CONFIG_DIR").is_some() {
+        return true;
     }
-    let mut gh_cmd = std::process::Command::new("gh");
-    gh_cmd.args(["auth", "token"]);
-    #[cfg(windows)]
-    {
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        gh_cmd.creation_flags(CREATE_NO_WINDOW);
+    let mut seen = HashSet::new();
+    for (candidate, source) in github_cli_config_candidates() {
+        if !seen.insert(candidate.clone()) {
+            continue;
+        }
+        let Some(directory) = usable_github_cli_config_dir(&candidate) else {
+            continue;
+        };
+        std::env::set_var("GH_CONFIG_DIR", &directory);
+        eprintln!(
+                "[agentplug daemon] configured GitHub CLI credentials from {source} without copying credential data"
+            );
+        return true;
     }
-    let Ok(output) = gh_cmd.output() else {
-        return;
-    };
-    if !output.status.success() {
-        return;
-    }
-    let token = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if token.is_empty() {
-        return;
-    }
-    std::env::set_var("GH_TOKEN", &token);
-    eprintln!("[agentplug daemon] seeded GH_TOKEN from `gh auth token` -- ci-status and other GitHub API verbs now run authenticated, avoiding the unauthenticated 60/hr rate limit");
+    false
 }
 
 pub fn run_daemon() -> anyhow::Result<()> {
     if let Some(owner_pid) = shared_daemon_owner_that_would_refuse_this_process() {
         record_wasted_daemon_start();
         eprintln!(
-            "[agentplug daemon] shared daemon pid {owner_pid} already owns the ownership lock and its heartbeat is fresh -- exiting before the registry announce and the `gh auth token` seed, nothing shared was touched"
+                "[agentplug daemon] shared daemon pid {owner_pid} already owns the ownership lock and its heartbeat is fresh -- exiting before the registry announce and credential-store discovery, nothing shared was touched"
         );
         return Ok(());
     }
@@ -3395,9 +3390,7 @@ pub fn run_daemon() -> anyhow::Result<()> {
     }
 
     clear_wasted_daemon_start_backoff();
-    if !configure_github_cli_config_dir() {
-        seed_github_token_from_gh_cli_if_unset();
-    }
+    configure_github_cli_config_dir();
 
     let plugin_modules = PluginModules::new()?;
     let previously_recorded_version = installed_runner_version();
@@ -3406,6 +3399,93 @@ pub fn run_daemon() -> anyhow::Result<()> {
         let _ = record_runner_version(env!("CARGO_PKG_VERSION"));
     }
     run_daemon_body(plugin_modules)
+}
+
+#[cfg(all(test, unix, not(target_os = "macos")))]
+mod tests {
+    use super::*;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn prefers_explicit_then_xdg_then_platform_default_gh_stores() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let root = std::env::temp_dir().join(format!(
+            "agentplug-gh-config-test-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let explicit_dir = root.join("explicit");
+        let xdg_config_home = root.join("xdg");
+        let xdg_dir = xdg_config_home.join("gh");
+        let home = root.join("home");
+        let default_dir = home.join(".config/gh");
+        for directory in [&explicit_dir, &xdg_dir, &default_dir] {
+            fs::create_dir_all(directory).unwrap();
+            fs::write(directory.join("hosts.yml"), "github.com:\n").unwrap();
+        }
+
+        let original_gh_config_dir = std::env::var_os("GH_CONFIG_DIR");
+        let original_xdg_config_home = std::env::var_os("XDG_CONFIG_HOME");
+        let original_home = std::env::var_os("HOME");
+        let original_agentplug_gh_config_dir = std::env::var_os("AGENTPLUG_GH_CONFIG_DIR");
+        std::env::remove_var("GH_CONFIG_DIR");
+        std::env::set_var("AGENTPLUG_GH_CONFIG_DIR", &explicit_dir);
+        std::env::set_var("XDG_CONFIG_HOME", &xdg_config_home);
+        std::env::set_var("HOME", &home);
+
+        assert!(configure_github_cli_config_dir());
+        assert_eq!(
+            std::env::var_os("GH_CONFIG_DIR").map(PathBuf::from),
+            Some(explicit_dir.canonicalize().unwrap())
+        );
+
+        std::env::remove_var("GH_CONFIG_DIR");
+        std::env::remove_var("AGENTPLUG_GH_CONFIG_DIR");
+        assert!(configure_github_cli_config_dir());
+        assert_eq!(
+            std::env::var_os("GH_CONFIG_DIR").map(PathBuf::from),
+            Some(xdg_dir.canonicalize().unwrap())
+        );
+
+        std::env::remove_var("GH_CONFIG_DIR");
+        std::env::remove_var("XDG_CONFIG_HOME");
+        assert!(configure_github_cli_config_dir());
+        assert_eq!(
+            std::env::var_os("GH_CONFIG_DIR").map(PathBuf::from),
+            Some(default_dir.canonicalize().unwrap())
+        );
+
+        match original_gh_config_dir {
+            Some(value) => std::env::set_var("GH_CONFIG_DIR", value),
+            None => std::env::remove_var("GH_CONFIG_DIR"),
+        }
+        match original_xdg_config_home {
+            Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
+        match original_home {
+            Some(value) => std::env::set_var("HOME", value),
+            None => std::env::remove_var("HOME"),
+        }
+        match original_agentplug_gh_config_dir {
+            Some(value) => std::env::set_var("AGENTPLUG_GH_CONFIG_DIR", value),
+            None => std::env::remove_var("AGENTPLUG_GH_CONFIG_DIR"),
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn rejects_a_directory_without_a_github_cli_credential_store() {
+        let root = std::env::temp_dir().join(format!(
+            "agentplug-gh-config-missing-hosts-test-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        assert!(usable_github_cli_config_dir(&root).is_none());
+        fs::remove_dir_all(root).unwrap();
+    }
 }
 
 fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
