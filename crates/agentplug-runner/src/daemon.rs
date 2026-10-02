@@ -3346,6 +3346,7 @@ fn usable_github_cli_config_dir(requested: &Path) -> Option<PathBuf> {
 
 fn configure_github_cli_config_dir() -> bool {
     if std::env::var_os("GH_CONFIG_DIR").is_some() {
+        agentplug_host::set_github_cli_config_dir(None);
         return true;
     }
     let mut seen = HashSet::new();
@@ -3356,7 +3357,7 @@ fn configure_github_cli_config_dir() -> bool {
         let Some(directory) = usable_github_cli_config_dir(&candidate) else {
             continue;
         };
-        std::env::set_var("GH_CONFIG_DIR", &directory);
+        agentplug_host::set_github_cli_config_dir(Some(directory));
         eprintln!(
                 "[agentplug daemon] configured GitHub CLI credentials from {source} without copying credential data"
             );
@@ -3436,23 +3437,21 @@ mod tests {
 
         assert!(configure_github_cli_config_dir());
         assert_eq!(
-            std::env::var_os("GH_CONFIG_DIR").map(PathBuf::from),
+            agentplug_host::github_cli_config_dir(),
             Some(explicit_dir.canonicalize().unwrap())
         );
 
-        std::env::remove_var("GH_CONFIG_DIR");
         std::env::remove_var("AGENTPLUG_GH_CONFIG_DIR");
         assert!(configure_github_cli_config_dir());
         assert_eq!(
-            std::env::var_os("GH_CONFIG_DIR").map(PathBuf::from),
+            agentplug_host::github_cli_config_dir(),
             Some(xdg_dir.canonicalize().unwrap())
         );
 
-        std::env::remove_var("GH_CONFIG_DIR");
         std::env::remove_var("XDG_CONFIG_HOME");
         assert!(configure_github_cli_config_dir());
         assert_eq!(
-            std::env::var_os("GH_CONFIG_DIR").map(PathBuf::from),
+            agentplug_host::github_cli_config_dir(),
             Some(default_dir.canonicalize().unwrap())
         );
 
@@ -3472,6 +3471,7 @@ mod tests {
             Some(value) => std::env::set_var("AGENTPLUG_GH_CONFIG_DIR", value),
             None => std::env::remove_var("AGENTPLUG_GH_CONFIG_DIR"),
         }
+        agentplug_host::set_github_cli_config_dir(None);
         fs::remove_dir_all(root).unwrap();
     }
 
