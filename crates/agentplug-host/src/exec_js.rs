@@ -43,10 +43,15 @@ fn exec_path_dirs() -> Vec<PathBuf> {
         dirs.extend(std::env::split_paths(&login).filter(|dir| !dir.as_os_str().is_empty()));
     }
     dirs.extend(
-        ["/config/tools", "/config/workspace/google-cloud-sdk/bin", "/config/go-install", "/config/.gm-tools"]
-            .into_iter()
-            .map(PathBuf::from)
-            .filter(|dir| dir.is_dir()),
+        [
+            "/config/tools",
+            "/config/workspace/google-cloud-sdk/bin",
+            "/config/go-install",
+            "/config/.gm-tools",
+        ]
+        .into_iter()
+        .map(PathBuf::from)
+        .filter(|dir| dir.is_dir()),
     );
     let mut seen = std::collections::HashSet::new();
     dirs.retain(|dir| seen.insert(dir.clone()));
@@ -58,13 +63,25 @@ fn login_shell_path() -> Option<OsString> {
         return None;
     }
     let shell = std::env::var_os("SHELL").unwrap_or_else(|| OsString::from("/bin/sh"));
-    let output = Command::new(shell).args(["-lc", "printf %s \"$PATH\""]).stderr(Stdio::null()).output().ok()?;
+    let output = Command::new(shell)
+        .args(["-lc", "printf %s \"$PATH\""])
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
     if !output.status.success() {
         return None;
     }
     let text = String::from_utf8(output.stdout).ok()?;
-    let value = text.lines().rev().find(|line| !line.trim().is_empty())?.trim();
-    if value.is_empty() { None } else { Some(OsString::from(value)) }
+    let value = text
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())?
+        .trim();
+    if value.is_empty() {
+        None
+    } else {
+        Some(OsString::from(value))
+    }
 }
 
 fn exec_path() -> &'static OsString {
