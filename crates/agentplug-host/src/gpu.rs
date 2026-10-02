@@ -99,7 +99,9 @@ pub(crate) fn record_choice(profile_dir: &Path, choice: Option<GpuChoice>) {
 }
 
 pub(crate) fn recorded_choice(profile_dir: &Path) -> Option<GpuChoice> {
-    std::fs::read_to_string(choice_sidecar_path(profile_dir)).ok().and_then(|s| GpuChoice::parse(&s))
+    std::fs::read_to_string(choice_sidecar_path(profile_dir))
+        .ok()
+        .and_then(|s| GpuChoice::parse(&s))
 }
 
 fn uncapped_sidecar_path(profile_dir: &Path) -> PathBuf {
@@ -128,7 +130,9 @@ pub(crate) struct LaunchOptions {
 }
 
 fn is_launch_token(token: &str) -> bool {
-    token == "uncapped" || token.starts_with("gpu=") || crate::idle_reap::IdleReap::parse_launch_token(token).is_some()
+    token == "uncapped"
+        || token.starts_with("gpu=")
+        || crate::idle_reap::IdleReap::parse_launch_token(token).is_some()
 }
 
 fn apply_launch_token(options: &mut LaunchOptions, token: &str) -> Result<(), String> {
@@ -141,7 +145,10 @@ fn apply_launch_token(options: &mut LaunchOptions, token: &str) -> Result<(), St
         return Ok(());
     }
     let value = token.strip_prefix("gpu=").ok_or_else(|| format!("'{token}' is not a launch option (expected gpu=nvidia|amd|intel|default, uncapped, keep_alive or idle_timeout_ms=<ms>)"))?;
-    options.gpu = Some(GpuChoice::parse(value).ok_or_else(|| format!("gpu={value} is not one of nvidia|amd|intel|default"))?);
+    options.gpu = Some(
+        GpuChoice::parse(value)
+            .ok_or_else(|| format!("gpu={value} is not one of nvidia|amd|intel|default"))?,
+    );
     Ok(())
 }
 
@@ -152,10 +159,17 @@ pub(crate) fn split_launch_options(body: &str) -> (LaunchOptions, Option<String>
         None => (trimmed.trim_end(), ""),
     };
     let mut options = LaunchOptions::default();
-    let session_new_options = first_line.strip_prefix("session new").filter(|rest| rest.starts_with(char::is_whitespace));
+    let session_new_options = first_line
+        .strip_prefix("session new")
+        .filter(|rest| rest.starts_with(char::is_whitespace));
     let (tokens, rebuilt) = match session_new_options {
         Some(rest) => (rest, format!("session new\n{remainder}")),
-        None if first_line == "uncapped" || first_line.starts_with("gpu=") || (!first_line.is_empty() && first_line.split_whitespace().all(is_launch_token)) => (first_line, remainder.to_string()),
+        None if first_line == "uncapped"
+            || first_line.starts_with("gpu=")
+            || (!first_line.is_empty() && first_line.split_whitespace().all(is_launch_token)) =>
+        {
+            (first_line, remainder.to_string())
+        }
         None => return (options, None, body.to_string()),
     };
     for token in tokens.split_whitespace() {
@@ -178,10 +192,20 @@ fn resolve_luid_args(choice: GpuChoice) -> Result<Vec<String>, String> {
         return Err(format!("gpu={} selection is only implemented on Windows (ANGLE d3d11 adapter LUID); on this OS use gpu=default and select via the OS", choice.label()));
     }
     let output = Command::new("powershell")
-        .args(["-NoProfile", "-NonInteractive", "-Command", LUID_RESOLVER_POWERSHELL])
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            LUID_RESOLVER_POWERSHELL,
+        ])
         .stdin(Stdio::null())
         .output()
-        .map_err(|e| format!("gpu={}: powershell LUID lookup failed to start: {e}", choice.label()))?;
+        .map_err(|e| {
+            format!(
+                "gpu={}: powershell LUID lookup failed to start: {e}",
+                choice.label()
+            )
+        })?;
     let listing = String::from_utf8_lossy(&output.stdout);
     let luid = listing
         .lines()
@@ -190,17 +214,28 @@ fn resolve_luid_args(choice: GpuChoice) -> Result<Vec<String>, String> {
         .find(|(description, _)| choice.description_matches(description))
         .map(|(_, luid)| luid.trim().to_string());
     match luid {
-        Some(luid) => Ok(vec!["--use-angle=d3d11".to_string(), format!("--use-adapter-luid={luid}")]),
+        Some(luid) => Ok(vec![
+            "--use-angle=d3d11".to_string(),
+            format!("--use-adapter-luid={luid}"),
+        ]),
         None => Err(format!(
             "gpu={}: no live {} adapter found among: {}",
             choice.label(),
             choice.label(),
-            listing.lines().filter_map(|l| l.split_once('|').map(|(d, _)| d.to_string())).collect::<Vec<_>>().join(", ")
+            listing
+                .lines()
+                .filter_map(|l| l.split_once('|').map(|(d, _)| d.to_string()))
+                .collect::<Vec<_>>()
+                .join(", ")
         )),
     }
 }
 
-pub(crate) fn launch_args(profile_dir: &Path, configured: Option<&str>, uncapped: bool) -> Result<Vec<String>, String> {
+pub(crate) fn launch_args(
+    profile_dir: &Path,
+    configured: Option<&str>,
+    uncapped: bool,
+) -> Result<Vec<String>, String> {
     let mut args: Vec<String> = ANTI_THROTTLE_ARGS.iter().map(|s| s.to_string()).collect();
     if uncapped {
         args.extend(UNCAPPED_ARGS.iter().map(|s| s.to_string()));
@@ -209,7 +244,11 @@ pub(crate) fn launch_args(profile_dir: &Path, configured: Option<&str>, uncapped
         }
     }
     let choice = recorded_choice(profile_dir)
-        .or_else(|| std::env::var("GM_BROWSER_GPU").ok().and_then(|v| GpuChoice::parse(&v)))
+        .or_else(|| {
+            std::env::var("GM_BROWSER_GPU")
+                .ok()
+                .and_then(|v| GpuChoice::parse(&v))
+        })
         .or_else(|| configured.and_then(GpuChoice::parse));
     if let Some(choice) = choice {
         args.extend(resolve_luid_args(choice)?);
@@ -217,16 +256,31 @@ pub(crate) fn launch_args(profile_dir: &Path, configured: Option<&str>, uncapped
     Ok(args)
 }
 
-pub(crate) fn report(node: &Path, port: u16, cdp_endpoint: &str, profile_dir: &Path, timeout_ms: u64, uncapped: bool) -> Value {
+pub(crate) fn report(
+    node: &Path,
+    port: u16,
+    cdp_endpoint: &str,
+    profile_dir: &Path,
+    timeout_ms: u64,
+    uncapped: bool,
+) -> Value {
     let topology = std::thread::spawn(crate::display::query);
-    with_display(probe_report(node, port, cdp_endpoint, profile_dir, timeout_ms, uncapped), topology, uncapped)
+    with_display(
+        probe_report(node, port, cdp_endpoint, profile_dir, timeout_ms, uncapped),
+        topology,
+        uncapped,
+    )
 }
 
 pub(crate) fn with_display_probe(probe: Value, uncapped: bool) -> Value {
     with_display(probe, std::thread::spawn(crate::display::query), uncapped)
 }
 
-fn with_display(mut out: Value, topology: std::thread::JoinHandle<Result<crate::display::Topology, String>>, uncapped: bool) -> Value {
+fn with_display(
+    mut out: Value,
+    topology: std::thread::JoinHandle<Result<crate::display::Topology, String>>,
+    uncapped: bool,
+) -> Value {
     let raf_fps = out.get("fps").and_then(Value::as_u64);
     let display = match topology.join() {
         Ok(Ok(t)) => t.report(raf_fps, uncapped),
@@ -239,7 +293,14 @@ fn with_display(mut out: Value, topology: std::thread::JoinHandle<Result<crate::
     out
 }
 
-fn probe_report(node: &Path, port: u16, cdp_endpoint: &str, profile_dir: &Path, timeout_ms: u64, uncapped: bool) -> Value {
+fn probe_report(
+    node: &Path,
+    port: u16,
+    cdp_endpoint: &str,
+    profile_dir: &Path,
+    timeout_ms: u64,
+    uncapped: bool,
+) -> Value {
     let stamp = format!("{}-{}", std::process::id(), port);
     let tmp = std::env::temp_dir();
     let helper_path = tmp.join(format!("agentplug-gpu-eval-{stamp}.mjs"));
@@ -250,7 +311,18 @@ fn probe_report(node: &Path, port: u16, cdp_endpoint: &str, profile_dir: &Path, 
         && std::fs::write(&probe_path, GPU_PROBE_JS).is_ok()
         && std::fs::write(&script_path, "void 0").is_ok();
     let outcome = if write_ok {
-        run_helper(node, &helper_path, &probe_path, &script_path, &result_path, port, cdp_endpoint, profile_dir, timeout_ms, uncapped)
+        run_helper(
+            node,
+            &helper_path,
+            &probe_path,
+            &script_path,
+            &result_path,
+            port,
+            cdp_endpoint,
+            profile_dir,
+            timeout_ms,
+            uncapped,
+        )
     } else {
         json!({"accelerated": false, "warn": "gpu report could not write its temp helper files"})
     };
@@ -261,7 +333,18 @@ fn probe_report(node: &Path, port: u16, cdp_endpoint: &str, profile_dir: &Path, 
 }
 
 #[allow(clippy::too_many_arguments)]
-fn run_helper(node: &Path, helper: &Path, probe: &Path, script: &Path, result: &Path, port: u16, cdp_endpoint: &str, profile_dir: &Path, timeout_ms: u64, uncapped: bool) -> Value {
+fn run_helper(
+    node: &Path,
+    helper: &Path,
+    probe: &Path,
+    script: &Path,
+    result: &Path,
+    port: u16,
+    cdp_endpoint: &str,
+    profile_dir: &Path,
+    timeout_ms: u64,
+    uncapped: bool,
+) -> Value {
     let cfg = json!({
         "uncapped": uncapped,
         "port": port,
@@ -275,7 +358,11 @@ fn run_helper(node: &Path, helper: &Path, probe: &Path, script: &Path, result: &
     })
     .to_string();
     let mut cmd = Command::new(node);
-    cmd.arg(helper).arg(&cfg).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped());
+    cmd.arg(helper)
+        .arg(&cfg)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -283,17 +370,28 @@ fn run_helper(node: &Path, helper: &Path, probe: &Path, script: &Path, result: &
     }
     let mut child = match cmd.spawn() {
         Ok(c) => c,
-        Err(e) => return json!({"accelerated": false, "warn": format!("gpu report helper failed to start: {e}")}),
+        Err(e) => {
+            return json!({"accelerated": false, "warn": format!("gpu report helper failed to start: {e}")})
+        }
     };
-    let finished = matches!(child.wait_timeout(Duration::from_millis(timeout_ms + 3000)), Ok(Some(_)));
+    let finished = matches!(
+        child.wait_timeout(Duration::from_millis(timeout_ms + 3000)),
+        Ok(Some(_))
+    );
     if !finished {
         let _ = child.kill();
         let _ = child.wait();
         return json!({"accelerated": false, "warn": "gpu report timed out"});
     }
-    let envelope: Value = std::fs::read_to_string(result).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or(Value::Null);
+    let envelope: Value = std::fs::read_to_string(result)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or(Value::Null);
     if let Some(err) = envelope.get("__cdpError").and_then(|v| v.as_str()) {
         return json!({"accelerated": false, "warn": format!("gpu probe failed: {err}")});
     }
-    envelope.get("result").cloned().unwrap_or_else(|| json!({"accelerated": false, "warn": "gpu probe returned nothing"}))
+    envelope
+        .get("result")
+        .cloned()
+        .unwrap_or_else(|| json!({"accelerated": false, "warn": "gpu probe returned nothing"}))
 }

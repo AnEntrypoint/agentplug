@@ -25,7 +25,11 @@ pub fn run(params: &Value, sandbox: impl Fn(&str) -> Option<PathBuf>) -> Value {
     if requested.len() > MAX_PATHS_PER_CALL {
         return json!({"ok": false, "error": format!("fs_prewarm accepts at most {MAX_PATHS_PER_CALL} paths per call, got {}", requested.len())});
     }
-    let admitted: Vec<PathBuf> = requested.iter().filter_map(|v| v.as_str()).filter_map(&sandbox).collect();
+    let admitted: Vec<PathBuf> = requested
+        .iter()
+        .filter_map(|v| v.as_str())
+        .filter_map(&sandbox)
+        .collect();
     let refused = requested.len() - admitted.len();
     let next = AtomicUsize::new(0);
     let warmed = AtomicUsize::new(0);
@@ -35,7 +39,9 @@ pub fn run(params: &Value, sandbox: impl Fn(&str) -> Option<PathBuf>) -> Value {
             scope.spawn(|| loop {
                 let i = next.fetch_add(1, Ordering::Relaxed);
                 let Some(path) = admitted.get(i) else { break };
-                if read_and_discard(path) { warmed.fetch_add(1, Ordering::Relaxed); }
+                if read_and_discard(path) {
+                    warmed.fetch_add(1, Ordering::Relaxed);
+                }
             });
         }
     });

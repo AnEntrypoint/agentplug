@@ -9,29 +9,41 @@ mod gpu;
 mod host_state;
 mod http_agent;
 mod idle_reap;
+mod imports;
+mod install;
 mod memory_pressure;
 mod oxibrowser_driver;
 mod process_tree;
-mod task;
-mod imports;
-mod install;
 mod registry;
+mod task;
 
 pub use broker::{
-    begin_rolling_update, reap_drained, register_provider, register_provider_with_weight, route, set_policy, shift_traffic, status as broker_status,
-    unregister_provider, BrokerStatus, LoadBalancePolicy, ProviderStatus, RouteLease,
+    begin_rolling_update, reap_drained, register_provider, register_provider_with_weight, route,
+    set_policy, shift_traffic, status as broker_status, unregister_provider, BrokerStatus,
+    LoadBalancePolicy, ProviderStatus, RouteLease,
 };
-pub use browser::{canonical_project_root, close_all_sessions, reap_idle_sessions_and_os_orphans_across_every_known_project_root, run as browser_run};
+pub use browser::{
+    canonical_project_root, close_all_sessions,
+    reap_idle_sessions_and_os_orphans_across_every_known_project_root, run as browser_run,
+};
 pub use dispatch_origin::{enter_dispatch_origin_scope, DispatchOriginScope};
 pub use host_state::HostState;
 pub use http_agent::{build_agent, shared_agent};
 pub use imports::{git_subprocess_timeout_ms, register_env_imports, register_wasi};
 pub use install::{install_dir, plugins_dir, wasmtime_cache_dir};
-pub use memory_pressure::{process_private_bytes_tracking_retained_wasm_peak_unlike_working_set, reset_shared_dispatch_count, shared_dispatches_since_release};
+pub use memory_pressure::{
+    process_private_bytes_tracking_retained_wasm_peak_unlike_working_set,
+    reset_shared_dispatch_count, shared_dispatches_since_release,
+};
 pub use registry::{
-    advance_plugin_fiber, epoch_ticks_for_seconds, get_active_provider, read_plugin_lifecycle, read_project_plugin_list, release_shared_plugin, set_gm_pool_size, set_side_plugin_pool_size, RELEASABLE_SHARED_PLUGINS,
-    note_shared_plugin_bytes_current, request_shared_store_swap, shared_plugin_slot_content_hashes, shared_plugin_slot_snapshot_without_blocking, shared_plugin_swap_pending_hashes,
-    cost_class_for_dispatch, cost_class_for_verb, DispatchCostClass, DispatchHandle, GmFairnessGuard, PluginFiberLifecycle, ProjectPlugins, SharedPluginPool, SlotContentSnapshot, ToolDispatchGuard, EPOCH_TICK_INTERVAL_MS, PLUGIN_IDLE_EVICT_MS,
+    advance_plugin_fiber, cost_class_for_dispatch, cost_class_for_verb, epoch_ticks_for_seconds,
+    get_active_provider, note_shared_plugin_bytes_current, read_plugin_lifecycle,
+    read_project_plugin_list, release_shared_plugin, request_shared_store_swap, set_gm_pool_size,
+    set_side_plugin_pool_size, shared_plugin_slot_content_hashes,
+    shared_plugin_slot_snapshot_without_blocking, shared_plugin_swap_pending_hashes,
+    DispatchCostClass, DispatchHandle, GmFairnessGuard, PluginFiberLifecycle, ProjectPlugins,
+    SharedPluginPool, SlotContentSnapshot, ToolDispatchGuard, EPOCH_TICK_INTERVAL_MS,
+    PLUGIN_IDLE_EVICT_MS, RELEASABLE_SHARED_PLUGINS,
 };
 
 use std::sync::OnceLock;
@@ -65,5 +77,8 @@ pub fn build_engine() -> anyhow::Result<Engine> {
 
 pub fn now_ms() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }

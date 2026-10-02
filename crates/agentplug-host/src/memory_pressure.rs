@@ -24,12 +24,20 @@ mod platform {
 
     extern "system" {
         fn GetCurrentProcess() -> isize;
-        fn K32GetProcessMemoryInfo(process: isize, counters: *mut ProcessMemoryCountersEx, cb: u32) -> i32;
+        fn K32GetProcessMemoryInfo(
+            process: isize,
+            counters: *mut ProcessMemoryCountersEx,
+            cb: u32,
+        ) -> i32;
     }
 
     pub fn process_private_bytes() -> Option<u64> {
-        let mut counters = ProcessMemoryCountersEx { cb: std::mem::size_of::<ProcessMemoryCountersEx>() as u32, ..Default::default() };
-        let ok = unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut counters, counters.cb) };
+        let mut counters = ProcessMemoryCountersEx {
+            cb: std::mem::size_of::<ProcessMemoryCountersEx>() as u32,
+            ..Default::default()
+        };
+        let ok =
+            unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut counters, counters.cb) };
         if ok == 0 {
             return None;
         }
@@ -45,9 +53,19 @@ mod platform {
         let mut swap_kb = None;
         for line in status.lines() {
             if let Some(rest) = line.strip_prefix("RssAnon:") {
-                anon_kb = rest.trim().trim_end_matches("kB").trim().parse::<u64>().ok();
+                anon_kb = rest
+                    .trim()
+                    .trim_end_matches("kB")
+                    .trim()
+                    .parse::<u64>()
+                    .ok();
             } else if let Some(rest) = line.strip_prefix("VmSwap:") {
-                swap_kb = rest.trim().trim_end_matches("kB").trim().parse::<u64>().ok();
+                swap_kb = rest
+                    .trim()
+                    .trim_end_matches("kB")
+                    .trim()
+                    .parse::<u64>()
+                    .ok();
             }
         }
         Some((anon_kb? + swap_kb.unwrap_or(0)) * 1024)
