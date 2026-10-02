@@ -3300,6 +3300,51 @@ pub fn try_dispatch_via_daemon(
     }
 }
 
+fn configure_github_cli_config_dir() -> bool {
+    if std::env::var_os("GH_CONFIG_DIR").is_some() {
+        return false;
+    }
+    let Some(requested) = std::env::var_os("AGENTPLUG_GH_CONFIG_DIR") else {
+        return false;
+    };
+    let requested = PathBuf::from(requested);
+    if !requested.is_absolute() {
+        eprintln!(
+            "[agentplug daemon] ignored AGENTPLUG_GH_CONFIG_DIR: it must be an absolute directory"
+        );
+        return false;
+    }
+    let Ok(directory) = requested.canonicalize() else {
+        eprintln!(
+            "[agentplug daemon] ignored AGENTPLUG_GH_CONFIG_DIR: its directory is unavailable"
+        );
+        return false;
+    };
+    if !directory.is_dir() || !directory.join("hosts.yml").is_file() {
+        eprintln!("[agentplug daemon] ignored AGENTPLUG_GH_CONFIG_DIR: no GitHub CLI credential store is present");
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let Ok(metadata) = directory.metadata() else {
+            eprintln!(
+                "[agentplug daemon] ignored AGENTPLUG_GH_CONFIG_DIR: its metadata is unavailable"
+            );
+            return false;
+        };
+        if metadata.uid() != unsafe { libc::geteuid() } {
+            eprintln!("[agentplug daemon] ignored AGENTPLUG_GH_CONFIG_DIR: the credential directory is not owned by this user");
+            return false;
+        }
+    }
+    std::env::set_var("GH_CONFIG_DIR", &directory);
+    eprintln!(
+            "[agentplug daemon] configured GitHub CLI credentials from AGENTPLUG_GH_CONFIG_DIR without copying credential data"
+        );
+    true
+}
+
 fn seed_github_token_from_gh_cli_if_unset() {
     if std::env::var_os("GITHUB_TOKEN").is_some() || std::env::var_os("GH_TOKEN").is_some() {
         return;
@@ -3350,7 +3395,9 @@ pub fn run_daemon() -> anyhow::Result<()> {
     }
 
     clear_wasted_daemon_start_backoff();
-    seed_github_token_from_gh_cli_if_unset();
+    if !configure_github_cli_config_dir() {
+        seed_github_token_from_gh_cli_if_unset();
+    }
 
     let plugin_modules = PluginModules::new()?;
     let previously_recorded_version = installed_runner_version();
