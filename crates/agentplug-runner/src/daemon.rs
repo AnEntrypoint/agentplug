@@ -3302,7 +3302,7 @@ pub fn try_dispatch_via_daemon(
 
 fn configure_github_cli_config_dir() -> bool {
     if std::env::var_os("GH_CONFIG_DIR").is_some() {
-        return false;
+        return true;
     }
     let Some(requested) = std::env::var_os("AGENTPLUG_GH_CONFIG_DIR") else {
         return false;
