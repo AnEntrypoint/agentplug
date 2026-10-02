@@ -13,7 +13,10 @@ fn extra_trust_anchor_pem_path() -> Option<std::path::PathBuf> {
         .filter(|p| p.exists())
 }
 
-fn load_extra_trust_anchors(store: &mut rustls::RootCertStore, pem_path: &std::path::Path) -> anyhow::Result<usize> {
+fn load_extra_trust_anchors(
+    store: &mut rustls::RootCertStore,
+    pem_path: &std::path::Path,
+) -> anyhow::Result<usize> {
     let file = std::fs::File::open(pem_path)?;
     let mut reader = std::io::BufReader::new(file);
     let mut added = 0usize;

@@ -53,7 +53,11 @@ impl HostState {
         let mut builder = WasiCtxBuilder::new();
         builder.inherit_stderr();
         if let Err(e) = builder.preopened_dir(fs_root, "/", DirPerms::all(), FilePerms::all()) {
-            eprintln!("[agentplug] WARNING: failed to preopen fs root {} for WASI ({}): {e}", fs_root.display(), plugin_name);
+            eprintln!(
+                "[agentplug] WARNING: failed to preopen fs root {} for WASI ({}): {e}",
+                fs_root.display(),
+                plugin_name
+            );
         }
         let wasi = builder.build_p1();
         Self {
@@ -85,29 +89,47 @@ impl HostState {
     }
 
     pub fn set_call_deadline_secs(&self, secs: u64) {
-        *self.call_deadline_secs.lock().unwrap_or_else(|e| e.into_inner()) = secs;
+        *self
+            .call_deadline_secs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = secs;
     }
 
     pub fn call_deadline_secs(&self) -> u64 {
-        *self.call_deadline_secs.lock().unwrap_or_else(|e| e.into_inner())
+        *self
+            .call_deadline_secs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
     }
 
     pub fn note_lost_response(&self, reason: String) {
-        *self.lost_response_reason.lock().unwrap_or_else(|e| e.into_inner()) = Some(reason);
+        *self
+            .lost_response_reason
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(reason);
     }
 
     pub fn take_lost_response(&self) -> Option<String> {
-        self.lost_response_reason.lock().unwrap_or_else(|e| e.into_inner()).take()
+        self.lost_response_reason
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
     }
 
     pub fn allow_extra_root(&self, root: PathBuf) {
-        let mut roots = self.extra_readable_roots.lock().unwrap_or_else(|e| e.into_inner());
+        let mut roots = self
+            .extra_readable_roots
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if !roots.contains(&root) {
             roots.push(root);
         }
     }
 
     pub fn extra_readable_roots(&self) -> Vec<PathBuf> {
-        self.extra_readable_roots.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        self.extra_readable_roots
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 }

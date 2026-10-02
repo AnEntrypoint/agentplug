@@ -18,19 +18,31 @@ pub(crate) struct Topology {
 impl Topology {
     fn clone_partners(&self, t: &ActiveTarget) -> impl Iterator<Item = &ActiveTarget> {
         let (source, target) = (t.source, t.target);
-        self.targets.iter().filter(move |o| o.source == source && o.target != target)
+        self.targets
+            .iter()
+            .filter(move |o| o.source == source && o.target != target)
     }
 
     pub(crate) fn refresh_cap_hz(&self) -> Option<u32> {
-        self.targets.iter().map(|t| t.refresh_hz).fold(None, |m: Option<f64>, r| Some(m.map_or(r, |m| m.max(r)))).map(|r| r.round() as u32)
+        self.targets
+            .iter()
+            .map(|t| t.refresh_hz)
+            .fold(None, |m: Option<f64>, r| Some(m.map_or(r, |m| m.max(r))))
+            .map(|r| r.round() as u32)
     }
 
     pub(crate) fn clone_with_virtual(&self) -> bool {
-        self.targets.iter().any(|t| t.virtual_display && self.clone_partners(t).any(|p| !p.virtual_display))
+        self.targets
+            .iter()
+            .any(|t| t.virtual_display && self.clone_partners(t).any(|p| !p.virtual_display))
     }
 
     fn capped_panel(&self) -> Option<&ActiveTarget> {
-        self.targets.iter().find(|t| !t.virtual_display && t.preferred_hz > t.refresh_hz + 1.0 && self.clone_partners(t).next().is_some())
+        self.targets.iter().find(|t| {
+            !t.virtual_display
+                && t.preferred_hz > t.refresh_hz + 1.0
+                && self.clone_partners(t).next().is_some()
+        })
     }
 
     pub(crate) fn report(&self, raf_fps: Option<u64>, uncapped: bool) -> Value {
@@ -48,7 +60,16 @@ impl Topology {
             )).collect::<Vec<_>>(),
         });
         if let Some(panel) = self.capped_panel() {
-            let partners: Vec<String> = self.clone_partners(panel).map(|p| format!("{}{}", p.monitor, if p.virtual_display { "(virtual)" } else { "" })).collect();
+            let partners: Vec<String> = self
+                .clone_partners(panel)
+                .map(|p| {
+                    format!(
+                        "{}{}",
+                        p.monitor,
+                        if p.virtual_display { "(virtual)" } else { "" }
+                    )
+                })
+                .collect();
             out["display_warn"] = json!(format!(
                 "{} can run {}Hz but is cloned with {} so the desktop runs {}Hz{}; for real frame rates extend or disconnect the clone partner (Win+P -> Extend, or disable the virtual display) -- not changed automatically",
                 panel.monitor,
@@ -156,7 +177,14 @@ mod win {
     #[link(name = "user32")]
     extern "system" {
         fn GetDisplayConfigBufferSizes(flags: u32, paths: *mut u32, modes: *mut u32) -> i32;
-        fn QueryDisplayConfig(flags: u32, paths: *mut u32, path_array: *mut PathInfo, modes: *mut u32, mode_array: *mut ModeInfo, topology: *mut u32) -> i32;
+        fn QueryDisplayConfig(
+            flags: u32,
+            paths: *mut u32,
+            path_array: *mut PathInfo,
+            modes: *mut u32,
+            mode_array: *mut ModeInfo,
+            topology: *mut u32,
+        ) -> i32;
         fn DisplayConfigGetDeviceInfo(packet: *mut Header) -> i32;
     }
 
@@ -182,7 +210,12 @@ mod win {
     }
 
     fn header<T>(kind: u32, adapter: Luid, id: u32) -> Header {
-        Header { kind, size: std::mem::size_of::<T>() as u32, adapter, id }
+        Header {
+            kind,
+            size: std::mem::size_of::<T>() as u32,
+            adapter,
+            id,
+        }
     }
 
     fn wide(s: &[u16]) -> String {
@@ -190,11 +223,20 @@ mod win {
     }
 
     fn hz(num: u32, den: u32) -> f64 {
-        if den == 0 { 0.0 } else { num as f64 / den as f64 }
+        if den == 0 {
+            0.0
+        } else {
+            num as f64 / den as f64
+        }
     }
 
     fn monitor_id(device_path: &str, fallback: String) -> String {
-        device_path.split('#').nth(1).filter(|s| !s.is_empty()).map(str::to_string).unwrap_or(fallback)
+        device_path
+            .split('#')
+            .nth(1)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .unwrap_or(fallback)
     }
 
     fn device_info<T>(packet: &mut T) -> bool {
@@ -204,7 +246,9 @@ mod win {
     fn active_paths() -> Result<Vec<PathInfo>, String> {
         for _ in 0..QUERY_ATTEMPTS {
             let (mut path_count, mut mode_count) = (0u32, 0u32);
-            let rc = unsafe { GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &mut path_count, &mut mode_count) };
+            let rc = unsafe {
+                GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &mut path_count, &mut mode_count)
+            };
             if rc != 0 {
                 return Err(format!("GetDisplayConfigBufferSizes failed ({rc})"));
             }
@@ -213,7 +257,16 @@ mod win {
             }
             let mut paths = vec![PathInfo::default(); path_count as usize];
             let mut modes = vec![ModeInfo([0; 8]); mode_count.max(1) as usize];
-            let rc = unsafe { QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &mut path_count, paths.as_mut_ptr(), &mut mode_count, modes.as_mut_ptr(), std::ptr::null_mut()) };
+            let rc = unsafe {
+                QueryDisplayConfig(
+                    QDC_ONLY_ACTIVE_PATHS,
+                    &mut path_count,
+                    paths.as_mut_ptr(),
+                    &mut mode_count,
+                    modes.as_mut_ptr(),
+                    std::ptr::null_mut(),
+                )
+            };
             match rc {
                 0 => {
                     paths.truncate(path_count as usize);
@@ -223,7 +276,9 @@ mod win {
                 _ => return Err(format!("QueryDisplayConfig failed ({rc})")),
             }
         }
-        Err(format!("QueryDisplayConfig kept reporting a changed topology across {QUERY_ATTEMPTS} attempts"))
+        Err(format!(
+            "QueryDisplayConfig kept reporting a changed topology across {QUERY_ATTEMPTS} attempts"
+        ))
     }
 
     pub(super) fn query() -> Result<Topology, String> {
@@ -232,11 +287,36 @@ mod win {
             .iter()
             .map(|p| {
                 let t = p.target;
-                let mut name = TargetName { header: header::<TargetName>(GET_TARGET_NAME, t.adapter, t.id), flags: 0, output_technology: 0, edid_manufacture: 0, edid_product: 0, connector: 0, friendly: [0; 64], device_path: [0; 128] };
+                let mut name = TargetName {
+                    header: header::<TargetName>(GET_TARGET_NAME, t.adapter, t.id),
+                    flags: 0,
+                    output_technology: 0,
+                    edid_manufacture: 0,
+                    edid_product: 0,
+                    connector: 0,
+                    friendly: [0; 64],
+                    device_path: [0; 128],
+                };
                 let named = device_info(&mut name);
-                let mut preferred = PreferredMode { header: header::<PreferredMode>(GET_TARGET_PREFERRED_MODE, t.adapter, t.id), width: 0, height: 0, pixel_rate: 0, hsync: [0; 2], vsync: [0; 2], rest: [0; 6] };
-                let preferred_hz = if device_info(&mut preferred) { hz(preferred.vsync[0], preferred.vsync[1]) } else { 0.0 };
-                let device_path = if named { wide(&name.device_path) } else { String::new() };
+                let mut preferred = PreferredMode {
+                    header: header::<PreferredMode>(GET_TARGET_PREFERRED_MODE, t.adapter, t.id),
+                    width: 0,
+                    height: 0,
+                    pixel_rate: 0,
+                    hsync: [0; 2],
+                    vsync: [0; 2],
+                    rest: [0; 6],
+                };
+                let preferred_hz = if device_info(&mut preferred) {
+                    hz(preferred.vsync[0], preferred.vsync[1])
+                } else {
+                    0.0
+                };
+                let device_path = if named {
+                    wide(&name.device_path)
+                } else {
+                    String::new()
+                };
                 let refresh_hz = hz(t.refresh_num, t.refresh_den);
                 ActiveTarget {
                     target: (t.adapter.low, t.adapter.high, t.id),
@@ -245,7 +325,8 @@ mod win {
                     refresh_hz,
                     preferred_hz: preferred_hz.max(refresh_hz),
                     virtual_display: t.output_technology == OUTPUT_INDIRECT_VIRTUAL
-                        || parent_device_id(&device_path).is_some_and(|id| id.to_ascii_uppercase().starts_with("ROOT\\")),
+                        || parent_device_id(&device_path)
+                            .is_some_and(|id| id.to_ascii_uppercase().starts_with("ROOT\\")),
                 }
             })
             .collect();
