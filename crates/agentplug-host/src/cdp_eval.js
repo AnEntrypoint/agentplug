@@ -826,7 +826,7 @@ async function main() {
         });
       `;
       const wrapped = `(async () => { try { ${domScript} } catch (__e) { return { __domError: String(__e && __e.message || __e) }; } })()`;
-      const res = await sess.send('Runtime.evaluate', { expression: wrapped, awaitPromise: true, returnByValue: true, userGesture: true, timeout: timeoutMs });
+      const res = await navigateIfNeededThenEvaluateOverCdp(sess, wrapped, startUrl, timeoutMs);
       if (res.exceptionDetails) {
         const msg = res.exceptionDetails.exception?.description || res.exceptionDetails.text || 'evaluate exception';
         writeResult({ __cdpError: msg });
