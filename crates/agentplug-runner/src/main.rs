@@ -217,14 +217,22 @@ fn selfcheck_registry() -> anyhow::Result<()> {
 
     let engine = build_engine()?;
     let module = Module::new(&engine, SELFCHECK_SUCCESS_WAT)?;
-    let root = std::env::temp_dir().join(format!("agentplug-selfcheck-registry-{}", std::process::id()));
+    let root = std::env::temp_dir().join(format!(
+        "agentplug-selfcheck-registry-{}-{}",
+        std::process::id(),
+        agentplug_host::now_ms()
+    ));
+    std::fs::create_dir_all(&root)?;
     let mut project = ProjectPlugins::new(root.clone());
     project.load_plugin(&engine, "gm", &module, "hash-a")?;
     let out = project.dispatch("gm", "probe", "{}")?;
     assert_eq!(out, "ok", "fresh slot must serve a real dispatch through the compiled module");
     println!("[selfcheck-registry] fresh gm slot dispatched and returned {out:?}");
 
-    let gm_slot_count = shared_plugin_slot_content_hashes("gm").len();
+    let gm_slot_count = shared_plugin_slot_content_hashes("gm")
+        .iter()
+        .filter(|hash| hash.as_deref() == Some("hash-a"))
+        .count();
     let (evicted_now, deferred) = request_shared_store_swap("gm", "hash-a");
     println!("[selfcheck-registry] swap request against {gm_slot_count} idle slot(s): evicted_now={evicted_now} deferred={deferred}");
     assert_eq!((evicted_now, deferred), (gm_slot_count, 0), "every idle slot holding the old hash must be evicted immediately, nothing deferred");
@@ -237,6 +245,7 @@ fn selfcheck_registry() -> anyhow::Result<()> {
 
     note_shared_plugin_bytes_current("gm", "hash-b");
     assert!(shared_plugin_swap_pending_hashes("gm").is_empty(), "marking hash-b current must leave no pending swap hashes");
+    std::fs::remove_dir_all(root)?;
     println!("[selfcheck-registry] all invariants witnessed live through real wasmtime dispatch: PASS");
     Ok(())
 }
@@ -413,6 +422,14 @@ fn clear_standalone_status(status_path: &std::path::Path) {
     map.remove("shared_process");
     map.insert("ts".to_string(), serde_json::json!(agentplug_host::now_ms()));
     let _ = fs::write(status_path, serde_json::Value::Object(map).to_string());
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn selfcheck_registry_witnesses_a_real_slot_swap() {
+        super::selfcheck_registry().unwrap();
+    }
 }
 
 fn run_spool_watcher_single_process(project: &mut ProjectPlugins, spool_dir: &std::path::Path) -> anyhow::Result<()> {

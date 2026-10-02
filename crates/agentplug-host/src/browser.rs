@@ -68,7 +68,17 @@ impl BrowserRuntimeConfig {
     fn cdp_poll_interval(&self) -> Duration { Duration::from_millis(self.cdp_poll_interval_ms.unwrap_or(250)) }
     pub(crate) fn chrome_ready_deadline(&self) -> Duration { Duration::from_millis(self.chrome_ready_deadline_ms.unwrap_or(30_000)) }
     fn eval_timeout_grace(&self) -> u64 { self.eval_timeout_grace_ms.unwrap_or(6000) }
-    fn headless(&self) -> bool { self.headless.unwrap_or(false) }
+    fn headless(&self) -> bool {
+        self.headless.unwrap_or_else(|| {
+            match std::env::var("GM_BROWSER_HEADLESS").as_deref() {
+                Ok("1") | Ok("true") => true,
+                Ok("0") | Ok("false") => false,
+                _ => cfg!(target_os = "linux")
+                    && std::env::var_os("DISPLAY").is_none()
+                    && std::env::var_os("WAYLAND_DISPLAY").is_none(),
+            }
+        })
+    }
     fn session_idle_timeout(&self) -> Duration {
         Duration::from_millis(self.session_idle_timeout_ms.unwrap_or(30 * 60 * 1000))
     }
