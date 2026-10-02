@@ -29,7 +29,10 @@ pub use browser::{
 pub use dispatch_origin::{enter_dispatch_origin_scope, DispatchOriginScope};
 pub use host_state::HostState;
 pub use http_agent::{build_agent, shared_agent};
-pub use imports::{git_subprocess_timeout_ms, register_env_imports, register_wasi};
+pub use imports::{
+    git_subprocess_timeout_ms, github_cli_config_dir, register_env_imports, register_wasi,
+    set_github_cli_config_dir,
+};
 pub use install::{install_dir, plugins_dir, wasmtime_cache_dir};
 pub use memory_pressure::{
     process_private_bytes_tracking_retained_wasm_peak_unlike_working_set,

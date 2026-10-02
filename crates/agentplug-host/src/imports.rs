@@ -138,7 +138,46 @@ fn normalize_lexically(path: &std::path::Path) -> Option<PathBuf> {
             other => out.push(other.as_os_str()),
         }
     }
+
     Some(out)
+}
+
+fn github_cli_config_dir_slot() -> &'static Mutex<Option<PathBuf>> {
+    static SLOT: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
+    SLOT.get_or_init(|| Mutex::new(None))
+}
+
+pub fn set_github_cli_config_dir(directory: Option<PathBuf>) {
+    *github_cli_config_dir_slot()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = directory;
+}
+
+pub fn github_cli_config_dir() -> Option<PathBuf> {
+    github_cli_config_dir_slot()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
+fn configure_github_git_credentials(command: &mut std::process::Command) {
+    if let Some(directory) = github_cli_config_dir() {
+        command.env("GH_CONFIG_DIR", directory);
+    }
+    let config_count = std::env::var("GIT_CONFIG_COUNT")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(0);
+    command
+        .env("GIT_CONFIG_COUNT", (config_count + 1).to_string())
+        .env(
+            format!("GIT_CONFIG_KEY_{config_count}"),
+            "credential.https://github.com.helper",
+        )
+        .env(
+            format!("GIT_CONFIG_VALUE_{config_count}"),
+            "!gh auth git-credential",
+        );
 }
 
 fn user_gm_root() -> Option<PathBuf> {
@@ -1072,9 +1111,10 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
                     "exit_code": -1,
                 });
                 return write_guest_json(&mut caller, v);
-            }
-            let mut git_cmd = std::process::Command::new("git");
-            git_cmd.args(&argv).current_dir(&cwd).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+                }
+                let mut git_cmd = std::process::Command::new("git");
+                git_cmd.args(&argv).current_dir(&cwd).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+                configure_github_git_credentials(&mut git_cmd);
             #[cfg(windows)]
             {
                 use std::os::windows::process::CommandExt;
@@ -1154,4 +1194,34 @@ fn safe_name(s: &str) -> String {
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    static CREDENTIAL_CONFIG_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn scopes_the_github_cli_store_and_helper_to_git_children() {
+        let _guard = CREDENTIAL_CONFIG_LOCK.lock().unwrap();
+        let credential_dir = PathBuf::from("/tmp/agentplug-gh-config");
+        set_github_cli_config_dir(Some(credential_dir.clone()));
+        let mut command = std::process::Command::new("git");
+        configure_github_git_credentials(&mut command);
+        let envs: HashMap<_, _> = command.get_envs().collect();
+        assert_eq!(
+            envs.get(std::ffi::OsStr::new("GH_CONFIG_DIR"))
+                .and_then(|value| *value),
+            Some(credential_dir.as_os_str())
+        );
+        let helper_present = envs.iter().any(|(key, value)| {
+            key.to_string_lossy().starts_with("GIT_CONFIG_KEY_")
+                && value.is_some_and(|value| {
+                    value == std::ffi::OsStr::new("credential.https://github.com.helper")
+                })
+        });
+        assert!(helper_present);
+        set_github_cli_config_dir(None);
+    }
 }
