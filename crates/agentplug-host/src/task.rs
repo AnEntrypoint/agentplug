@@ -3,6 +3,7 @@ use std::io::Read;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Mutex, OnceLock};
+use std::time::Duration;
 
 use serde_json::{json, Value};
 
@@ -10,6 +11,7 @@ struct TaskEntry {
     child: Child,
     lang: String,
     started_ms: u64,
+    adopted_ms: u64,
     timeout_ms: u64,
     stdout: Vec<u8>,
     stderr: Vec<u8>,
@@ -35,6 +37,45 @@ fn next_id(counter_seed: u64) -> String {
     format!("task-{:x}", counter_seed)
 }
 
+fn kill_deadline_ms(entry: &TaskEntry) -> u64 {
+    entry.adopted_ms.saturating_add(entry.timeout_ms)
+}
+
+fn reap_overdue_once() {
+    let overdue: Vec<String> = {
+        let reg = registry().lock().unwrap_or_else(|e| e.into_inner());
+        let now = now_ms();
+        reg.iter()
+            .filter(|(_, e)| e.finished_ms.is_none() && now >= kill_deadline_ms(e))
+            .map(|(id, _)| id.clone())
+            .collect()
+    };
+    for id in overdue {
+        let mut entry = {
+            let mut reg = registry().lock().unwrap_or_else(|e| e.into_inner());
+            match reg.remove(&id) {
+                Some(e) => e,
+                None => continue,
+            }
+        };
+        poll_entry(&mut entry);
+        let mut reg = registry().lock().unwrap_or_else(|e| e.into_inner());
+        reg.insert(id, entry);
+    }
+}
+
+const REAP_INTERVAL_MS: u64 = 2_000;
+
+fn ensure_reaper() {
+    static REAPER: OnceLock<()> = OnceLock::new();
+    REAPER.get_or_init(|| {
+        std::thread::spawn(move || loop {
+            std::thread::sleep(Duration::from_millis(REAP_INTERVAL_MS));
+            reap_overdue_once();
+        });
+    });
+}
+
 fn poll_entry(entry: &mut TaskEntry) {
     if entry.finished_ms.is_some() {
         return;
@@ -51,7 +92,7 @@ fn poll_entry(entry: &mut TaskEntry) {
             entry.finished_ms = Some(now_ms());
         }
         Ok(None) => {
-            if now_ms().saturating_sub(entry.started_ms) > entry.timeout_ms {
+            if now_ms() >= kill_deadline_ms(entry) {
                 let _ = entry.child.kill();
                 let _ = entry.child.wait();
                 if let Some(mut out) = entry.child.stdout.take() {
@@ -81,19 +122,24 @@ fn entry_summary(id: &str, entry: &TaskEntry) -> Value {
 
 pub fn adopt_running(child: std::process::Child, lang: &str, started: std::time::Instant, timeout_ms: u64) -> String {
     let started_ms = now_ms().saturating_sub(started.elapsed().as_millis() as u64);
+    let adopted_ms = now_ms();
     let id = next_id(started_ms ^ (child.id() as u64));
     let entry = TaskEntry {
         child,
         lang: lang.to_string(),
         started_ms,
+        adopted_ms,
         timeout_ms,
         stdout: Vec::new(),
         stderr: Vec::new(),
         exit_code: None,
         finished_ms: None,
     };
-    let mut reg = registry().lock().unwrap();
-    reg.insert(id.clone(), entry);
+    {
+        let mut reg = registry().lock().unwrap();
+        reg.insert(id.clone(), entry);
+    }
+    ensure_reaper();
     id
 }
 
@@ -133,14 +179,18 @@ fn spawn(params: &Value, cwd: &Path) -> Value {
         child,
         lang: lang.to_string(),
         started_ms: started,
+        adopted_ms: started,
         timeout_ms,
         stdout: Vec::new(),
         stderr: Vec::new(),
         exit_code: None,
         finished_ms: None,
     };
-    let mut reg = registry().lock().unwrap();
-    reg.insert(id.clone(), entry);
+    {
+        let mut reg = registry().lock().unwrap();
+        reg.insert(id.clone(), entry);
+    }
+    ensure_reaper();
     json!({"ok": true, "id": id, "started_ms": started})
 }
 
