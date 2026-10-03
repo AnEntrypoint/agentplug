@@ -177,9 +177,10 @@ fn resolve_luid_args(choice: GpuChoice) -> Result<Vec<String>, String> {
     if !cfg!(windows) {
         return Err(format!("gpu={} selection is only implemented on Windows (ANGLE d3d11 adapter LUID); on this OS use gpu=default and select via the OS", choice.label()));
     }
-    let output = Command::new("powershell")
-        .args(["-NoProfile", "-NonInteractive", "-Command", LUID_RESOLVER_POWERSHELL])
-        .stdin(Stdio::null())
+    let mut luid_cmd = Command::new("powershell");
+    luid_cmd.args(["-NoProfile", "-NonInteractive", "-Command", LUID_RESOLVER_POWERSHELL]).stdin(Stdio::null());
+    crate::windowless::apply_windowless(&mut luid_cmd);
+    let output = luid_cmd
         .output()
         .map_err(|e| format!("gpu={}: powershell LUID lookup failed to start: {e}", choice.label()))?;
     let listing = String::from_utf8_lossy(&output.stdout);
@@ -278,8 +279,7 @@ fn run_helper(node: &Path, helper: &Path, probe: &Path, script: &Path, result: &
     cmd.arg(helper).arg(&cfg).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped());
     #[cfg(windows)]
     {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x0800_0000);
+        crate::windowless::apply_windowless(&mut cmd);
     }
     let mut child = match cmd.spawn() {
         Ok(c) => c,
