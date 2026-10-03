@@ -59,6 +59,7 @@ fn reconcile_plugin_manifest(
 }
 
 fn main() -> anyhow::Result<()> {
+    agentplug_host::ensure_hidden_console();
     suppress_crash_dialogs();
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {

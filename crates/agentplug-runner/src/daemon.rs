@@ -512,11 +512,10 @@ fn is_daemon_fresh() -> bool {
 
 #[cfg(windows)]
 fn pid_is_alive(pid: u64) -> bool {
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    let output = std::process::Command::new("tasklist")
-        .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
-        .creation_flags(CREATE_NO_WINDOW)
-        .output();
+    let mut cmd = std::process::Command::new("tasklist");
+    cmd.args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"]);
+    agentplug_host::apply_windowless(&mut cmd);
+    let output = cmd.output();
     match output {
         Ok(o) => {
             let s = String::from_utf8_lossy(&o.stdout);
@@ -627,11 +626,7 @@ fn run_git_bounded(args: &[&str]) -> anyhow::Result<std::process::Output> {
     use wait_timeout::ChildExt;
     let mut cmd = std::process::Command::new("git");
     cmd.args(args).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
-    #[cfg(windows)]
-    {
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        cmd.creation_flags(CREATE_NO_WINDOW);
-    }
+    agentplug_host::apply_windowless(&mut cmd);
     let mut child = cmd.spawn()?;
     let timeout_ms = agentplug_host::git_subprocess_timeout_ms();
     let stdout_drain_thread = child.stdout.take().map(spawn_pipe_drain_thread);
@@ -684,11 +679,7 @@ fn sync_instruction_source_if_configured(root: &Path) -> anyhow::Result<()> {
 fn staged_binary_self_check(staged_exe: &Path, expected_version: &str) -> bool {
     let mut cmd = std::process::Command::new(staged_exe);
     cmd.arg("--version");
-    #[cfg(windows)]
-    {
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        cmd.creation_flags(CREATE_NO_WINDOW);
-    }
+    agentplug_host::apply_windowless(&mut cmd);
     let output = cmd.output();
     match output {
         Ok(out) if out.status.success() => {
@@ -2637,8 +2628,7 @@ fn seed_github_token_from_gh_cli_if_unset() {
     gh_cmd.args(["auth", "token"]);
     #[cfg(windows)]
     {
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        gh_cmd.creation_flags(CREATE_NO_WINDOW);
+        agentplug_host::apply_windowless(&mut gh_cmd);
     }
     let Ok(output) = gh_cmd.output() else {
         return;
@@ -2769,11 +2759,7 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
             let staged_age = now_ms().saturating_sub(staged_at_ms);
             let mut boot_check_cmd = std::process::Command::new(&staged_path);
             boot_check_cmd.arg("--version");
-            #[cfg(windows)]
-            {
-                const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-                boot_check_cmd.creation_flags(CREATE_NO_WINDOW);
-            }
+            agentplug_host::apply_windowless(&mut boot_check_cmd);
             match boot_check_cmd.output() {
                 Ok(out) if out.status.success() => {
                     let version = String::from_utf8_lossy(&out.stdout).trim().trim_start_matches('v').to_string();

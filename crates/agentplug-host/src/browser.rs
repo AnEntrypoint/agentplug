@@ -639,10 +639,9 @@ fn run_bounded_capturing_stdout(cmd: &mut Command) -> Option<Vec<u8>> {
 
 #[cfg(windows)]
 fn pid_is_alive(pid: u32) -> bool {
-    use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     let mut cmd = Command::new("tasklist");
-    cmd.args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"]).creation_flags(CREATE_NO_WINDOW);
+    cmd.args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"]);
+    crate::windowless::apply_windowless(&mut cmd);
     match run_bounded_capturing_stdout(&mut cmd) {
         Some(stdout) => {
             let s = String::from_utf8_lossy(&stdout);
@@ -777,9 +776,7 @@ fn session_liveness_recheck(port: u16, cdp_endpoint: &str, browser_cfg: &Browser
         .stderr(Stdio::null());
     #[cfg(windows)]
     {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        spawn_cmd.creation_flags(CREATE_NO_WINDOW);
+        crate::windowless::apply_windowless(&mut spawn_cmd);
     }
     let spawn = spawn_cmd.spawn();
     let alive = match spawn {
@@ -807,12 +804,10 @@ fn session_liveness_recheck(port: u16, cdp_endpoint: &str, browser_cfg: &Browser
 
 #[cfg(windows)]
 fn kill_pid(pid: u32) {
-    use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    let _ = Command::new("taskkill")
-        .args(["/PID", &pid.to_string(), "/F", "/T"])
-        .creation_flags(CREATE_NO_WINDOW)
-        .output();
+    let mut cmd = Command::new("taskkill");
+    cmd.args(["/PID", &pid.to_string(), "/F", "/T"]);
+    crate::windowless::apply_windowless(&mut cmd);
+    let _ = cmd.output();
 }
 
 #[cfg(not(windows))]
@@ -842,8 +837,6 @@ fn wmi_circuit_breaker_open() -> bool {
 
 #[cfg(windows)]
 fn list_chrome_processes() -> Vec<(u32, String)> {
-    use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     if wmi_circuit_breaker_open() {
         return Vec::new();
     }
@@ -853,8 +846,8 @@ fn list_chrome_processes() -> Vec<(u32, String)> {
         "-NonInteractive",
         "-Command",
         "Get-CimInstance Win32_Process -Filter \"Name='chrome.exe'\" | ForEach-Object { \"$($_.ProcessId)|$($_.CommandLine)\" }",
-    ])
-    .creation_flags(CREATE_NO_WINDOW);
+    ]);
+    crate::windowless::apply_windowless(&mut cmd);
     let Some(stdout) = run_bounded_capturing_stdout(&mut cmd) else {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -894,16 +887,14 @@ fn list_chrome_processes() -> Vec<(u32, String)> {
 
 #[cfg(windows)]
 fn parent_pid_of(pid: u32) -> Option<u32> {
-    use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     let mut cmd = Command::new("powershell.exe");
     cmd.args([
         "-NoProfile",
         "-NonInteractive",
         "-Command",
         &format!("(Get-CimInstance Win32_Process -Filter \"ProcessId={pid}\").ParentProcessId"),
-    ])
-    .creation_flags(CREATE_NO_WINDOW);
+    ]);
+    crate::windowless::apply_windowless(&mut cmd);
     String::from_utf8_lossy(&run_bounded_capturing_stdout(&mut cmd)?).trim().parse().ok()
 }
 
@@ -1639,9 +1630,7 @@ fn spawn_chrome_once(
     }
     #[cfg(windows)]
     {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        cmd.creation_flags(CREATE_NO_WINDOW);
+        crate::windowless::apply_windowless(&mut cmd);
     }
     let log_path = chrome_launch_log_path(profile_dir);
     let log_file = std::fs::OpenOptions::new()
@@ -1684,7 +1673,10 @@ pub(crate) fn load_extension_after_launch(cwd: &Path, session_id: &str, port: u1
         log_line("failed to write extension_load.js helper to temp dir");
         return;
     }
-    let output = Command::new(&node).arg(&script_path).arg(port.to_string()).arg(ext_path).output();
+    let mut ext_cmd = Command::new(&node);
+    ext_cmd.arg(&script_path).arg(port.to_string()).arg(ext_path);
+    crate::windowless::apply_windowless(&mut ext_cmd);
+    let output = ext_cmd.output();
     let _ = std::fs::remove_file(&script_path);
     match output {
         Ok(out) => {
@@ -2186,7 +2178,7 @@ pub fn run(body: &str, opts: &str, cwd_raw: &Path, session_id: &str) -> Value {
     {
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        spawn_cmd.creation_flags(CREATE_NO_WINDOW);
+        crate::windowless::apply_windowless(&mut spawn_cmd);
     }
     let spawn = spawn_cmd.spawn();
 

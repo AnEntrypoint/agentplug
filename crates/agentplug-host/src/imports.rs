@@ -911,9 +911,7 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
             git_cmd.args(&argv).current_dir(&cwd).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
             #[cfg(windows)]
             {
-                use std::os::windows::process::CommandExt;
-                const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-                git_cmd.creation_flags(CREATE_NO_WINDOW);
+                crate::windowless::apply_windowless(&mut git_cmd);
             }
             let v = match git_cmd.spawn() {
                 Ok(mut child) => {
