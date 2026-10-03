@@ -2176,8 +2176,6 @@ pub fn run(body: &str, opts: &str, cwd_raw: &Path, session_id: &str) -> Value {
         .stderr(Stdio::piped());
     #[cfg(windows)]
     {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         crate::windowless::apply_windowless(&mut spawn_cmd);
     }
     let spawn = spawn_cmd.spawn();
