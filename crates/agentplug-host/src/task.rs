@@ -115,9 +115,7 @@ fn spawn(params: &Value, cwd: &Path) -> Value {
         .stderr(Stdio::piped());
     #[cfg(windows)]
     {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        command.creation_flags(CREATE_NO_WINDOW);
+        crate::windowless::apply_windowless(&mut command);
     }
     let mut child = match command.spawn() {
         Ok(c) => c,

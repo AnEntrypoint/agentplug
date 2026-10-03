@@ -124,9 +124,7 @@ fn spawn_lightpanda_once(binary: &Path, port: u16, profile_dir: &Path) -> Result
     cmd.args(["serve", "--host", "127.0.0.1", "--port", &port.to_string()]);
     #[cfg(windows)]
     {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        cmd.creation_flags(CREATE_NO_WINDOW);
+        crate::windowless::apply_windowless(&mut cmd);
     }
     let log_path = profile_dir.join("lightpanda-launch.log");
     let _ = std::fs::create_dir_all(profile_dir);
