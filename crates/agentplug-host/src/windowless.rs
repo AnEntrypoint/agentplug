@@ -37,7 +37,7 @@ pub fn ensure_hidden_console() {
     #[cfg(windows)]
     {
         unsafe {
-            if GetConsoleWindow() != 0 {
+            if has_console() {
                 return;
             }
             let saved_stdin = GetStdHandle(STD_INPUT_HANDLE);
