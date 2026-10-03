@@ -49,19 +49,20 @@ fn cwd_is_inside_a_spool_tree(cwd: &Path) -> bool {
 }
 
 pub fn register_project(cwd: &Path) -> anyhow::Result<()> {
-    if cwd_is_inside_a_spool_tree(cwd) {
+    let cwd = agentplug_host::project_root(cwd);
+    if cwd_is_inside_a_spool_tree(&cwd) {
         anyhow::bail!(
             "refusing to register {} as a project root -- its own path is already inside a .gm/exec-spool tree, which means this is spool runtime state (in/out/status files), not a genuine project directory. Launch the spool from the actual project root instead.",
             cwd.display()
         );
     }
-    provision_gm_spool_verb_dirs(cwd)?;
+    provision_gm_spool_verb_dirs(&cwd)?;
     let path = registry_path();
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
     let existing = fs::read_to_string(&path).unwrap_or_default();
-    let cwd_str = agentplug_host::canonical_project_root(cwd).to_string_lossy().to_string();
+    let cwd_str = agentplug_host::canonical_project_root(&cwd).to_string_lossy().to_string();
 
     let mut live: Vec<String> = Vec::new();
     let mut dropped = 0usize;
@@ -75,7 +76,7 @@ pub fn register_project(cwd: &Path) -> anyhow::Result<()> {
             dropped += 1;
             continue;
         }
-        let canonical = agentplug_host::canonical_project_root(Path::new(entry)).to_string_lossy().to_string();
+        let canonical = agentplug_host::project_root(Path::new(entry)).to_string_lossy().to_string();
         respelled |= canonical != entry;
         if live.iter().any(|e| e == &canonical) {
             respelled = true;
@@ -113,7 +114,7 @@ pub(crate) fn read_registry() -> Vec<PathBuf> {
         if entry.is_empty() || !Path::new(entry).exists() {
             continue;
         }
-        let canonical = agentplug_host::canonical_project_root(Path::new(entry));
+        let canonical = agentplug_host::project_root(Path::new(entry));
         if !roots.contains(&canonical) {
             roots.push(canonical);
         }
@@ -2538,10 +2539,11 @@ fn unanswered_dispatch_report(error_code: &str, error: String, plugin: &str, ver
 
 pub fn try_dispatch_via_daemon(cwd: &Path, plugin: &str, verb: &str, body: &str) -> DaemonDispatchOutcome {
     use DaemonDispatchOutcome::{Answered, ClaimedUnanswered, NeverClaimedRunLocally};
+    let cwd = agentplug_host::project_root(cwd);
     if std::env::var("AGENTPLUG_NO_DAEMON").is_ok() {
         return NeverClaimedRunLocally;
     }
-    if let Err(e) = register_project(cwd) {
+    if let Err(e) = register_project(&cwd) {
         eprintln!("[agentplug] {e}");
         return NeverClaimedRunLocally;
     }

@@ -21,7 +21,7 @@ pub use broker::{
     begin_rolling_update, reap_drained, register_provider, register_provider_with_weight, route, set_policy, shift_traffic, status as broker_status,
     unregister_provider, BrokerStatus, LoadBalancePolicy, ProviderStatus, RouteLease,
 };
-pub use browser::{canonical_project_root, close_all_sessions, reap_idle_sessions_and_os_orphans_across_every_known_project_root, run as browser_run};
+pub use browser::{canonical_project_root, project_root, close_all_sessions, reap_idle_sessions_and_os_orphans_across_every_known_project_root, run as browser_run};
 pub use dispatch_origin::{enter_dispatch_origin_scope, DispatchOriginScope};
 pub use host_state::HostState;
 pub use http_agent::{build_agent, shared_agent};

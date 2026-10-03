@@ -90,6 +90,7 @@ fn main() -> anyhow::Result<()> {
             let cwd = std::env::var("CLAUDE_PROJECT_DIR")
                 .map(PathBuf::from)
                 .unwrap_or_else(|_| std::env::current_dir().expect("cwd unavailable"));
+            let cwd = agentplug_host::project_root(&cwd);
             let spool_dir = cwd.join(".gm").join("exec-spool");
             std::fs::create_dir_all(&spool_dir)?;
 
@@ -157,7 +158,7 @@ fn main() -> anyhow::Result<()> {
             let plugin = args.get(2).cloned().unwrap_or_else(|| "gm".to_string());
             let verb = args.get(3).cloned().unwrap_or_default();
             let body = args.get(4).cloned().unwrap_or_else(|| "{}".to_string());
-            let cwd = std::env::current_dir()?;
+            let cwd = agentplug_host::project_root(&std::env::current_dir()?);
 
             match daemon::try_dispatch_via_daemon(&cwd, &plugin, &verb, &body) {
                 daemon::DaemonDispatchOutcome::Answered(out) => {
