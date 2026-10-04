@@ -942,7 +942,10 @@ pub fn canonical_project_root(path: &Path) -> PathBuf {
 
 pub fn project_root(path: &Path) -> PathBuf {
     let canonical = canonical_project_root(path);
-    match std::process::Command::new("git").arg("-C").arg(&canonical).args(["rev-parse", "--show-toplevel"]).output() {
+    let mut git_cmd = std::process::Command::new("git");
+    git_cmd.arg("-C").arg(&canonical).args(["rev-parse", "--show-toplevel"]);
+    crate::windowless::apply_windowless(&mut git_cmd);
+    match git_cmd.output() {
         Ok(out) if out.status.success() => {
             let top = String::from_utf8_lossy(&out.stdout).lines().next().unwrap_or("").trim().to_string();
             if top.is_empty() { canonical } else { canonical_project_root(Path::new(&top)) }

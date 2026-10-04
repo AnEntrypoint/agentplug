@@ -1,4 +1,5 @@
-﻿mod daemon;
+﻿mod build_info;
+mod daemon;
 mod download;
 
 use std::path::PathBuf;
@@ -189,6 +190,27 @@ fn main() -> anyhow::Result<()> {
             println!("{out}");
             Ok(())
         }
+        "update-runner" => {
+            match download::stage_runner_self_update()? {
+                Some((staged, version)) => println!("staged verified runner {version} at {}", staged.display()),
+                None => println!("no runner update to stage"),
+            }
+            Ok(())
+        }
+        "--build-info" | "build-info" => {
+            println!("{}", serde_json::to_string_pretty(&build_info::document())?);
+            Ok(())
+        }
+        "pin-local-build" => {
+            let sha = download::pin_local_build()?;
+            println!("pinned the installed runner as a locally built binary (sha256 {sha}) -- the auto-updater will not overwrite it");
+            Ok(())
+        }
+        "unpin-local-build" => {
+            download::unpin_local_build()?;
+            println!("cleared the local-build pin -- the auto-updater may replace this runner again");
+            Ok(())
+        }
         "--version" | "version" => {
             println!("agentplug-runner {}", env!("CARGO_PKG_VERSION"));
             Ok(())
@@ -199,7 +221,7 @@ fn main() -> anyhow::Result<()> {
         "selfcheck-spool-claim" => selfcheck_spool_claim(),
         other => {
             eprintln!(
-                "agentplug-runner: unknown command '{other}'. Usage: agentplug-runner <plugin <name> [version]|spool|daemon|takeover <version>|dispatch [plugin] <verb> [body]|reap-orphans|sweep-spool [root]|selfcheck-registry|selfcheck-inflight|version>"
+                "agentplug-runner: unknown command '{other}'. Usage: agentplug-runner <plugin <name> [version]|spool|daemon|takeover <version>|dispatch [plugin] <verb> [body]|reap-orphans|sweep-spool [root]|update-runner|trust-status|build-info|pin-local-build|unpin-local-build|selfcheck-registry|selfcheck-inflight|version>"
             );
             std::process::exit(1);
         }
