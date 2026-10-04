@@ -1006,6 +1006,9 @@ fn staged_runner_awaiting_handoff() -> Option<(u64, u64)> {
     let staged = canonical.with_extension(
         canonical.extension().map(|e| format!("{}.new", e.to_string_lossy())).unwrap_or_else(|| "new".to_string()),
     );
+    if std::env::current_exe().ok().as_deref() == Some(staged.as_path()) {
+        return None;
+    }
     if staged_matches_running(&canonical, &staged) {
         let _ = fs::remove_file(&staged);
         let _ = fs::remove_file(takeover_ready_path());
@@ -1224,6 +1227,33 @@ fn consecutive_handoff_failures() -> &'static Mutex<(String, u32)> {
 
 const HANDOFF_ESCALATION_THRESHOLD: u32 = 3;
 
+const HANDOFF_RETRY_BACKOFF: Duration = Duration::from_secs(30 * 60);
+
+fn handoff_retry_backoff_slot() -> &'static Mutex<Option<(String, Instant)>> {
+    static SLOT: OnceLock<Mutex<Option<(String, Instant)>>> = OnceLock::new();
+    SLOT.get_or_init(|| Mutex::new(None))
+}
+
+fn handoff_backed_off(version: &str) -> bool {
+    let slot = handoff_retry_backoff_slot().lock().unwrap_or_else(|e| e.into_inner());
+    match slot.as_ref() {
+        Some((blocked, until)) => blocked == version && Instant::now() < *until,
+        None => false,
+    }
+}
+
+fn record_handoff_backoff(version: &str) {
+    *handoff_retry_backoff_slot().lock().unwrap_or_else(|e| e.into_inner()) =
+        Some((version.to_string(), Instant::now() + HANDOFF_RETRY_BACKOFF));
+}
+
+fn clear_handoff_backoff(version: &str) {
+    let mut slot = handoff_retry_backoff_slot().lock().unwrap_or_else(|e| e.into_inner());
+    if slot.as_ref().map(|(v, _)| v.as_str()) == Some(version) {
+        *slot = None;
+    }
+}
+
 fn runner_update_escalation_path() -> PathBuf {
     install_dir().join("runner-update-escalation.json")
 }
@@ -1245,13 +1275,16 @@ pub(crate) fn patch_update_available_from_escalation(plugin: &str, verb: &str, r
 
 fn record_handoff_failure(version: &str, reason: String) {
     record_handoff_attempt(Some(reason.clone()));
+    record_handoff_backoff(version);
     let mut slot = consecutive_handoff_failures().lock().unwrap_or_else(|e| e.into_inner());
     if slot.0 != version {
         *slot = (version.to_string(), 1);
     } else {
         slot.1 += 1;
     }
-    if slot.1 < HANDOFF_ESCALATION_THRESHOLD {
+    // Escalate exactly once per version: rewriting the marker on every later failure would reset
+    // since_ts and re-surface the block on every dispatch until the daemon restarts.
+    if slot.1 != HANDOFF_ESCALATION_THRESHOLD {
         return;
     }
     let command = if cfg!(windows) {
@@ -1277,6 +1310,7 @@ fn clear_handoff_escalation(version: &str) {
     if slot.0 == version {
         *slot = (String::new(), 0);
     }
+    clear_handoff_backoff(version);
     let _ = fs::remove_file(runner_update_escalation_path());
 }
 
@@ -2770,13 +2804,25 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
             agentplug_host::apply_windowless(&mut boot_check_cmd);
             match boot_check_cmd.output() {
                 Ok(out) if out.status.success() => {
-                    let version = String::from_utf8_lossy(&out.stdout).trim().trim_start_matches('v').to_string();
-                    eprintln!(
-                        "[agentplug daemon] found pre-existing staged runner {} (version {version}) at boot, age {}ms -- adopting its on-disk mtime so a daemon restart does not reset the starve clock",
-                        staged_path.display(), staged_age
-                    );
-                    pending_self_update = Some((staged_path, version));
-                    pending_self_update_staged_at = Instant::now().checked_sub(Duration::from_millis(staged_age));
+                    let version = String::from_utf8_lossy(&out.stdout)
+                        .split_whitespace()
+                        .last()
+                        .unwrap_or_default()
+                        .trim_start_matches('v')
+                        .to_string();
+                    if version.is_empty() {
+                        eprintln!(
+                            "[agentplug daemon] pre-existing staged runner {} printed an unparseable --version ({:?}) -- ignoring it rather than handing off to an unknown version",
+                            staged_path.display(), String::from_utf8_lossy(&out.stdout).trim()
+                        );
+                    } else {
+                        eprintln!(
+                            "[agentplug daemon] found pre-existing staged runner {} (version {version}) at boot, age {}ms -- adopting its on-disk mtime so a daemon restart does not reset the starve clock",
+                            staged_path.display(), staged_age
+                        );
+                        pending_self_update = Some((staged_path.clone(), version));
+                        pending_self_update_staged_at = Instant::now().checked_sub(Duration::from_millis(staged_age));
+                    }
                 }
                 Ok(out) => {
                     eprintln!(
@@ -3041,12 +3087,20 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
             write_persisted_poll_ts(&persisted_runner_poll_ts_path(), poll_ts);
             match crate::download::stage_runner_self_update() {
                 Ok(Some((staged, version))) => {
-                    eprintln!("[agentplug daemon] staged self-update to {version} at {}", staged.display());
-                    if pending_self_update.is_none() {
-                        pending_self_update_staged_at = Some(Instant::now());
+                    if handoff_backed_off(&version) {
+                        let _ = fs::remove_file(&staged);
+                        eprintln!(
+                            "[agentplug daemon] staged self-update to {version} is inside its {}s retry backoff after a failed handoff -- dropping it instead of retrying on every tick",
+                            HANDOFF_RETRY_BACKOFF.as_secs()
+                        );
+                    } else {
+                        eprintln!("[agentplug daemon] staged self-update to {version} at {}", staged.display());
+                        if pending_self_update.is_none() {
+                            pending_self_update_staged_at = Some(Instant::now());
+                        }
+                        pending_self_update = Some((staged, version));
+                        record_runner_poll_error(None);
                     }
-                    pending_self_update = Some((staged, version));
-                    record_runner_poll_error(None);
                 }
                 Ok(None) => record_runner_poll_error(None),
                 Err(e) => {
@@ -3067,7 +3121,11 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
             .unwrap_or(false);
         let force_handoff_despite_in_flight = self_update_starved && detached_still_running && self_update_hard_capped;
         let force_handoff_never_idle = self_update_starved && self_update_hard_capped && !detached_still_running && any_work;
-        if (!any_work && !detached_still_running) || force_handoff_despite_in_flight || force_handoff_never_idle {
+        let self_update_backed_off = pending_self_update.as_ref().map(|(_, v)| handoff_backed_off(v)).unwrap_or(false);
+        if self_update_backed_off {
+            pending_self_update_staged_at = None;
+        }
+        if !self_update_backed_off && ((!any_work && !detached_still_running) || force_handoff_despite_in_flight || force_handoff_never_idle) {
             if let Some((staged, version)) = pending_self_update.take() {
                 let claims_the_successor_inherits = snapshot_in_flight_claims();
                 write_handoff_inherited_claims(&version, &claims_the_successor_inherits);
@@ -3094,7 +3152,15 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
                     return Ok(());
                 }
                 clear_handoff_inherited_claims();
-                pending_self_update = Some((staged, version));
+                if staged.exists() {
+                    pending_self_update = Some((staged, version));
+                } else {
+                    pending_self_update_staged_at = None;
+                    eprintln!(
+                        "[agentplug daemon] dropping the self-update to {version}: the staged exe {} no longer exists after the failed handoff, so retrying it every tick would only fail faster -- the next scheduled poll re-stages it",
+                        staged.display()
+                    );
+                }
             }
         }
 
