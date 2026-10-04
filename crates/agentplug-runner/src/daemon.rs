@@ -2681,6 +2681,7 @@ pub fn run_daemon() -> anyhow::Result<()> {
         crate::download::clear_all_known_bad_version_markers();
         let _ = record_runner_version(env!("CARGO_PKG_VERSION"));
     }
+    crate::download::sync_local_build_pin();
     run_daemon_body(plugin_modules)
 }
 
