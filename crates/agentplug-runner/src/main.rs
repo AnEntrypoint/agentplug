@@ -1,6 +1,7 @@
 ﻿mod build_info;
 mod daemon;
 mod download;
+mod update_trust;
 
 use std::path::PathBuf;
 
@@ -195,6 +196,10 @@ fn main() -> anyhow::Result<()> {
                 Some((staged, version)) => println!("staged verified runner {version} at {}", staged.display()),
                 None => println!("no runner update to stage"),
             }
+            Ok(())
+        }
+        "trust-status" => {
+            println!("{}", serde_json::to_string_pretty(&update_trust::status())?);
             Ok(())
         }
         "--build-info" | "build-info" => {
