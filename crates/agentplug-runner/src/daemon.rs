@@ -761,6 +761,13 @@ fn promote_staged_exe_to_canonical(version: &str) -> bool {
         );
         return false;
     }
+    if let Some(reason) = crate::download::installed_runner_blocks_promotion(&canonical) {
+        eprintln!(
+            "[agentplug daemon] takeover: refusing to promote {version} onto {} -- {reason}; this process keeps running from the staged copy instead of overwriting it",
+            canonical.display()
+        );
+        return false;
+    }
     let Ok(staged) = std::env::current_exe() else { return false };
     if staged == canonical {
         return false;
