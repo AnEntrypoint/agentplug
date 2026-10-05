@@ -102,17 +102,20 @@ publishing a signature is just uploading that one file to the same release:
 gh release upload v0.1.200 ./agentplug-runner-windows-x64.exe.sig --repo AnEntrypoint/agentplug-bin
 ```
 
-CI holds no private key, so it cannot produce a signature -- it only attaches
-one. `release.yml` reads a committed `release-signatures/manifest.json`
-(`{"entries": [<doc>, ...]}`) and requires exactly one well-formed document for
-every built runner asset. The document must name that asset, the release version,
-and its exact sha256, have schema version 1, a non-negative integer sequence, and
-at least one complete ed25519 signature. CI verifies every document against
-`release-signatures/trusted-keys.json` with the same acceptance logic used by the
-runner. A missing, duplicate, malformed, mismatched, or untrusted entry fails the
-release before any asset is published. Produce the manifest entries offline with
-`agentplug-sign sign` as above, add the offline signer's public key to that trust
-file, then commit the manifest and trust file to `main`.
+The protected `runner-release-signing` GitHub Environment holds
+`AGENTPLUG_RELEASE_SIGNING_KEY`, a 64-hex-digit ed25519 seed, and exposes it only
+to the single `sign` job after its environment gate passes. Its public key's id is
+the non-secret `AGENTPLUG_RELEASE_SIGNING_KEY_ID` Environment variable. That job
+downloads every built runner, signs it, and verifies the generated document under
+an ephemeral enforce-mode trust file before it passes the artifacts to the
+publisher. The publisher has the repository publishing token but never the signing
+key. A missing or malformed signing configuration, invalid signature, or failed
+verification fails before any asset is published.
+
+The public key must be pinned into each strict updater's `trusted-keys.json`
+through the normal offline key-distribution process before releases signed by that
+key can install there. The signing secret is not committed, printed, uploaded, or
+written outside the signing job's temporary directory.
 
 ## Verifying locally
 
