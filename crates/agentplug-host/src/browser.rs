@@ -239,6 +239,7 @@ enum BrowserMode {
     Screenshot,
     Dom,
     Gpu,
+    CdpRaw,
 }
 
 fn strip_mode_prefix(body: &str) -> (BrowserMode, String, &str) {
@@ -262,6 +263,10 @@ fn strip_mode_prefix(body: &str) -> (BrowserMode, String, &str) {
             None => (rest.trim().to_string(), ""),
         };
         return (BrowserMode::Screenshot, name, remainder);
+    }
+    if let Some(rest) = trimmed.strip_prefix("cdp ") {
+        let method = rest.lines().next().unwrap_or("").trim().to_string();
+        return (BrowserMode::CdpRaw, method, trimmed.strip_prefix("cdp ").unwrap_or(rest));
     }
     if let Some(rest) = trimmed.strip_prefix("dom=") {
         let (selector, remainder) = match rest.find('\n') {
@@ -1995,7 +2000,7 @@ pub fn run(body: &str, opts: &str, cwd_raw: &Path, session_id: &str) -> Value {
     let script_path = tmp.join(format!("agentplug-cdp-script-{stamp}.js"));
     let result_path = tmp.join(format!("agentplug-cdp-result-{stamp}.json"));
     let artifact_path = match mode {
-        BrowserMode::Default | BrowserMode::Dom | BrowserMode::Gpu => None,
+        BrowserMode::Default | BrowserMode::Dom | BrowserMode::Gpu | BrowserMode::CdpRaw => None,
         BrowserMode::Screenshot => {
             let dir = cwd.join(".gm").join("witness");
             let _ = std::fs::create_dir_all(&dir);
@@ -2318,6 +2323,9 @@ pub fn run(body: &str, opts: &str, cwd_raw: &Path, session_id: &str) -> Value {
                 (None, None) => {}
             }
         }
+        BrowserMode::CdpRaw => {
+            out["result"] = result_value.get("result").cloned().unwrap_or(Value::Null);
+        }
         BrowserMode::Gpu => {
             out["result"] = crate::gpu::with_display_probe(result_value.get("result").cloned().unwrap_or(Value::Null), uncapped);
         }
@@ -2371,6 +2379,7 @@ fn mode_label(mode: BrowserMode) -> &'static str {
         BrowserMode::Screenshot => "screenshot",
         BrowserMode::Dom => "dom",
         BrowserMode::Gpu => "gpu",
+        BrowserMode::CdpRaw => "cdpraw",
     }
 }
 
