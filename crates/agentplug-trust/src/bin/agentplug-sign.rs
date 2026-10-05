@@ -16,7 +16,8 @@ const USAGE: &str = "agentplug-sign <command>
       Print the public key (hex) of a secret key.
 
   sign --key <file.secret> [--key <file2.secret> ...] --artifact <file> --version <x.y.z> --sequence <n>
-       [--name <published asset name>] [--merge <existing.sig>] [--out <file.sig>]
+           [--name <published asset name>] [--merge <existing.sig>] [--out <file.sig>]
+           [--allow-ci]
       Sign sha256(artifact) + artifact name + version + sequence. --name defaults to the file name.
       --merge adds these signatures to an existing .sig for the same statement (threshold-2 flow).
 
@@ -80,6 +81,24 @@ fn refuse_in_ci() -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+fn refuse_signing_in_ci(args: &Args) -> Result<(), String> {
+    let protected_release = std::env::var("GITHUB_ACTIONS")
+        .map(|value| value == "true")
+        .unwrap_or(false)
+        && std::env::var("AGENTPLUG_RELEASE_SIGNING_KEY")
+            .map(|value| !value.is_empty())
+            .unwrap_or(false);
+    if args.has("allow-ci") && protected_release {
+        return Ok(());
+    }
+    if args.has("allow-ci") {
+        return Err(
+            "--allow-ci requires GitHub Actions and AGENTPLUG_RELEASE_SIGNING_KEY from the protected release-signing environment".to_string(),
+        );
+    }
+    refuse_in_ci()
 }
 
 fn inside_git_worktree(path: &Path) -> bool {
@@ -165,7 +184,7 @@ fn pubkey(args: &Args) -> Result<i32, String> {
 }
 
 fn sign(args: &Args) -> Result<i32, String> {
-    refuse_in_ci()?;
+    refuse_signing_in_ci(args)?;
     let artifact_path = PathBuf::from(args.one("artifact")?);
     let version = args.one("version")?.to_string();
     let sequence: u64 = args

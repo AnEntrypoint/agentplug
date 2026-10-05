@@ -102,7 +102,7 @@ jobs:
           path: release-assets/*
           retention-days: 1
 
-  publish-host-linux-arm64:
+  build-host-linux-arm64:
     needs: bump
     runs-on: ubuntu-24.04-arm
     steps:
@@ -124,48 +124,53 @@ jobs:
           cp target/aarch64-unknown-linux-gnu/release/agentplug-runner release-assets/agentplug-runner-linux-arm64
           cd release-assets
           sha256sum agentplug-runner-linux-arm64 | sed 's/ \*/  /' > agentplug-runner-linux-arm64.sha256
-      - name: Attach offline signatures
-        shell: bash
-        env:
-          SIGNATURE_MANIFEST: release-signatures/manifest.json
-        run: |
-          scripts/attach-release-signatures.sh release-assets "$SIGNATURE_MANIFEST" "${{ needs.bump.outputs.version }}" . release-signatures
-      - name: Publish host release asset
-        env:
-          GH_TOKEN: ${{ secrets.PUBLISHER_TOKEN }}
-          VER: ${{ needs.bump.outputs.version }}
-          REPO: AnEntrypoint/agentplug-bin
-          SHA: ${{ github.sha }}
-        run: |
-          set -e
-          cd release-assets
-          if ! gh release view "v$VER" --repo "$REPO" >/dev/null 2>&1; then
-            gh release create "v$VER" --repo "$REPO" --title "agentplug-runner v$VER" --notes "Auto-published from agentplug CI at $SHA"
-          fi
-          gh release upload "v$VER" --repo "$REPO" --clobber *
-          for f in *; do test "$(curl -sL -o /dev/null -w '%{http_code}' "https://github.com/$REPO/releases/download/v$VER/$f")" = 200; done
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: agentplug-runner-linux-arm64
+          path: release-assets/*
+          retention-days: 1
 
-  publish:
-    needs: [bump, build, publish-host-linux-arm64]
+  sign:
+    needs: [bump, build, build-host-linux-arm64]
     runs-on: ubuntu-latest
+    environment: runner-release-signing
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
         with:
           ref: main
-          path: signature-source
-          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
+        with:
+          toolchain: stable
 
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
           path: release-assets
           merge-multiple: true
 
-      - name: Attach offline signatures
+      - name: Sign and verify release assets
         shell: bash
         env:
-          SIGNATURE_MANIFEST: signature-source/release-signatures/manifest.json
+          AGENTPLUG_RELEASE_SIGNING_KEY: ${{ secrets.AGENTPLUG_RELEASE_SIGNING_KEY }}
+          AGENTPLUG_RELEASE_SIGNING_KEY_ID: ${{ vars.AGENTPLUG_RELEASE_SIGNING_KEY_ID }}
+          CI: "true"
         run: |
-          signature-source/scripts/attach-release-signatures.sh release-assets "$SIGNATURE_MANIFEST" "${{ needs.bump.outputs.version }}" signature-source signature-source/release-signatures
+          scripts/sign-release-assets.sh release-assets "${{ needs.bump.outputs.version }}" .
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: signed-release-assets
+          path: release-assets/*
+          retention-days: 1
+
+  publish:
+    needs: [bump, sign]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: signed-release-assets
+          path: release-assets
 
       - name: Publish release
         env:
