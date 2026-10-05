@@ -61,6 +61,23 @@ fn reconcile_plugin_manifest(
     Ok(reloaded)
 }
 
+fn release_bootstrap_status() -> serde_json::Value {
+    serde_json::json!({
+        "runner_version": env!("CARGO_PKG_VERSION"),
+        "local_source_promotion_supported": false,
+        "reason": "A checked-out source change is not an install artifact and cannot be promoted by the updater.",
+        "supported_route": [
+            "Publish the source through the normal repository release workflow.",
+            "Let CI build and publish the next release artifact.",
+            "Let the installed runner stage and verify that strictly newer artifact."
+        ],
+        "not_performed": [
+            "Reading, exporting, or copying GitHub credentials.",
+            "Replacing a runner binary or plugin from a local checkout."
+        ]
+    })
+}
+
 fn main() -> anyhow::Result<()> {
     agentplug_host::ensure_hidden_console();
     suppress_crash_dialogs();
@@ -222,6 +239,13 @@ fn main() -> anyhow::Result<()> {
             }
             Ok(())
         }
+        "release-bootstrap-status" => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&release_bootstrap_status())?
+            );
+            Ok(())
+        }
         "trust-status" => {
             println!("{}", serde_json::to_string_pretty(&update_trust::status())?);
             Ok(())
@@ -252,7 +276,7 @@ fn main() -> anyhow::Result<()> {
         "selfcheck-spool-claim" => selfcheck_spool_claim(),
         other => {
             eprintln!(
-                "agentplug-runner: unknown command '{other}'. Usage: agentplug-runner <plugin <name> [version]|spool|daemon|takeover <version>|dispatch [plugin] <verb> [body]|reap-orphans|sweep-spool [root]|update-runner|trust-status|build-info|pin-local-build|unpin-local-build|selfcheck-registry|selfcheck-inflight|version>"
+                "agentplug-runner: unknown command '{other}'. Usage: agentplug-runner <plugin <name> [version]|spool|daemon|takeover <version>|dispatch [plugin] <verb> [body]|reap-orphans|sweep-spool [root]|update-runner|release-bootstrap-status|trust-status|build-info|pin-local-build|unpin-local-build|selfcheck-registry|selfcheck-inflight|version>"
             );
             std::process::exit(1);
         }
