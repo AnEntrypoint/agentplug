@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use wasmtime::{Engine, Module};
 
-use crate::install::{legacy_wasmtime_cache_dir, precompiled_dir};
+use crate::install::{legacy_wasmtime_cache_dir, precompiled_dir, system_precompiled_dir};
 
 const PRECOMPILED_EXTENSION: &str = "cwasm";
 
@@ -101,6 +101,18 @@ fn deserialize_file_backed(engine: &Engine, artifact_path: &Path) -> anyhow::Res
     unsafe { Module::deserialize_file(engine, artifact_path) }.map_err(|e| anyhow::anyhow!("{e:#}"))
 }
 
+fn system_artifact_path(engine: &Engine, plugin_name: &str, content_hash: &str) -> Option<PathBuf> {
+    let local_dir = precompiled_dir();
+    let system_dir = system_precompiled_dir();
+    (system_dir != local_dir).then(|| {
+        system_dir.join(precompiled_file_name(
+            plugin_name,
+            content_hash,
+            &engine_compatibility_key(engine),
+        ))
+    })
+}
+
 pub fn load_module_file_backed(
     engine: &Engine,
     wasm_path: &Path,
@@ -122,6 +134,17 @@ pub fn load_module_file_backed(
             }
         }
     }
+    if let Some(system_artifact) = system_artifact_path(engine, plugin_name, content_hash) {
+        if system_artifact.exists() {
+            if let Ok(module) = deserialize_file_backed(engine, &system_artifact) {
+                return Ok(module);
+            }
+        }
+    }
+    eprintln!(
+        "[agentplug precompiled] compiling {plugin_name} from {} because no compatible cached artifact is available",
+        wasm_path.display()
+    );
     let started = std::time::Instant::now();
     write_precompiled_artifact(engine, wasm_path, &artifact_path)?;
     remove_superseded_artifacts_for(plugin_name, &artifact_path);

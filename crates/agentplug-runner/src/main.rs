@@ -5,7 +5,7 @@ mod update_trust;
 
 use std::path::PathBuf;
 
-use agentplug_host::{advance_plugin_fiber, build_engine, get_active_provider, ProjectPlugins};
+use agentplug_host::{build_engine, ProjectPlugins};
 use wasmtime::Module;
 
 #[cfg(windows)]
@@ -20,46 +20,6 @@ fn suppress_crash_dialogs() {
 
 #[cfg(not(windows))]
 fn suppress_crash_dialogs() {}
-
-fn reconcile_plugin_manifest(
-    project: &mut ProjectPlugins,
-    engine: &wasmtime::Engine,
-    desired: &[(&str, Option<&str>)],
-) -> anyhow::Result<Vec<String>> {
-    let mut reloaded = Vec::new();
-    for (name, explicit_version) in desired {
-        let wasm = match download::ensure_plugin_installed(name, *explicit_version) {
-            Ok(p) => p,
-            Err(_) => continue,
-        };
-        let bytes = match std::fs::read(&wasm) {
-            Ok(b) => b,
-            Err(_) => continue,
-        };
-        let content_hash = download::sha256_hex(&bytes);
-        let module =
-            match agentplug_host::load_module_file_backed(engine, &wasm, name, &content_hash) {
-                Ok(m) => m,
-                Err(_) => {
-                    advance_plugin_fiber(name, false, None);
-                    continue;
-                }
-            };
-        let load_result = project.load_plugin(engine, name, &module, &content_hash);
-        advance_plugin_fiber(name, load_result.is_ok(), Some(&content_hash));
-        if load_result.is_ok() {
-            if let Some(active) = get_active_provider(name) {
-                if active != content_hash {
-                    eprintln!(
-                        "reconcile_plugin_manifest: {name} loaded {content_hash} but broker's active provider still reports {active} (multi-slot pool, expected under partial fill)"
-                    );
-                }
-            }
-            reloaded.push(name.to_string());
-        }
-    }
-    Ok(reloaded)
-}
 
 fn release_bootstrap_status() -> serde_json::Value {
     serde_json::json!({
@@ -219,12 +179,6 @@ fn main() -> anyhow::Result<()> {
                 agentplug_host::load_module_file_backed(&engine, &wasm, &plugin, &content_hash)?;
             let mut project = ProjectPlugins::new(cwd);
             project.load_plugin(&engine, &plugin, &module, &content_hash)?;
-            let siblings: Vec<(&str, Option<&str>)> = ["libsql", "bert", "treesitter"]
-                .iter()
-                .filter(|side| **side != plugin)
-                .map(|side| (*side, None))
-                .collect();
-            let _ = reconcile_plugin_manifest(&mut project, &engine, &siblings)?;
             let out = project.dispatch(&plugin, &verb, &body)?;
             let out = daemon::patch_update_available_from_escalation(&plugin, &verb, out);
             println!("{out}");
