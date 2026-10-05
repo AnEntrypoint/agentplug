@@ -1151,6 +1151,120 @@ fn spawn_project_heartbeat_ticker(interval: Duration) -> std::thread::JoinHandle
     })
 }
 
+static DREAM_RSI_LAST_CYCLE_DISPATCH_TS: OnceLock<Mutex<HashMap<PathBuf, u64>>> = OnceLock::new();
+
+fn dream_rsi_last_cycle_dispatch_ts() -> &'static Mutex<HashMap<PathBuf, u64>> {
+    DREAM_RSI_LAST_CYCLE_DISPATCH_TS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+const DREAM_RSI_MIN_NEW_OBSERVATIONS_PER_CYCLE: u64 = 20;
+const DREAM_RSI_MIN_CYCLE_SPACING_MS: u64 = 15 * 60 * 1000;
+
+fn dream_rsi_count_observations(dream_rsi_dir: &Path) -> u64 {
+    let Ok(entries) = fs::read_dir(dream_rsi_dir) else {
+        return 0;
+    };
+    let mut total: u64 = 0;
+    for entry in entries.flatten() {
+        let obs_path = entry.path().join("observations.json");
+        let Ok(bytes) = fs::read(&obs_path) else {
+            continue;
+        };
+        if let Ok(serde_json::Value::Array(arr)) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+            total += arr.len() as u64;
+        }
+    }
+    total
+}
+
+/// Dream-RSI cycle trigger: observes `.gm/dream-rsi/*/observations.json`
+/// counts already written by ordinary gm session dispatches (see
+/// `.gm/next-step.md`'s "Grounded Dream-RSI replay" section) and, once
+/// `DREAM_RSI_MIN_NEW_OBSERVATIONS_PER_CYCLE` new observations have
+/// accumulated since the last fired cycle (and at least
+/// `DREAM_RSI_MIN_CYCLE_SPACING_MS` has elapsed), writes one real
+/// `dreamrsi-replay` spool dispatch (`rs-plugkit`'s
+/// `orchestrator::dream_rsi::handle_replay`, registered in
+/// `orchestrator/mod.rs`) for the project's own wasm plugin to pick up.
+///
+/// `dreamrsi-replay` is read-only: it scores the incumbent policy against
+/// the live discovery tree and returns the result, writing nothing. This
+/// trigger deliberately never dispatches `dreamrsi-select`, because that
+/// verb's current implementation (`handle_select`) writes
+/// `active-strategy.json` directly -- an unattended call would be exactly
+/// the autonomous redeploy `.gm/next-step.md`'s "Grounded Dream-RSI replay"
+/// section forbids ("deploy an accepted strategy only through the normal
+/// PRD, mutable, phase, authorization, and evidence paths"). Promoting this
+/// trigger to call `dreamrsi-select` (or any future authorization-gated
+/// propose-only verb the sibling `dreamrsi-offline-scoring-and-selection`
+/// PRD row may add) is a future row's decision, not this one's.
+fn dream_rsi_maybe_dispatch_cycle(root: &Path, spool_dir: &Path) {
+    let dream_rsi_dir = root.join(".gm").join("dream-rsi");
+    if !dream_rsi_dir.exists() {
+        return;
+    }
+    let observation_count = dream_rsi_count_observations(&dream_rsi_dir);
+    let now = now_ms();
+
+    let mut last_ts_map = dream_rsi_last_cycle_dispatch_ts().lock().unwrap_or_else(|e| e.into_inner());
+    let last_fired = last_ts_map.get(root).copied();
+    let cursor_path = dream_rsi_dir.join(".last-cycle-observation-count");
+    let baseline_count: u64 = fs::read_to_string(&cursor_path).ok().and_then(|s| s.trim().parse().ok()).unwrap_or(0);
+
+    let spacing_ok = last_fired.map(|ts| now.saturating_sub(ts) >= DREAM_RSI_MIN_CYCLE_SPACING_MS).unwrap_or(true);
+    let new_observations = observation_count.saturating_sub(baseline_count);
+    let data_threshold_met = new_observations >= DREAM_RSI_MIN_NEW_OBSERVATIONS_PER_CYCLE;
+
+    if !(spacing_ok && data_threshold_met) {
+        return;
+    }
+
+    let in_dir = spool_dir.join("in").join("dreamrsi-replay");
+    if fs::create_dir_all(&in_dir).is_err() {
+        return;
+    }
+    let session_id = format!("daemon-dreamrsi-tick-{now}");
+    let payload = serde_json::json!({
+        "SESSION_ID": session_id,
+        "trigger": "unattended-daemon-tick",
+        "new_observation_count": new_observations,
+        "total_observation_count": observation_count,
+        "authorization_note": "read-only replay/scoring; no unattended redeploy -- see .gm/next-step.md Grounded Dream-RSI replay",
+    })
+    .to_string();
+
+    let tmp_path = in_dir.join(format!(".tmp-{now}"));
+    let final_path = in_dir.join(format!("{session_id}-1.txt"));
+    if fs::write(&tmp_path, &payload).is_err() {
+        return;
+    }
+    if fs::rename(&tmp_path, &final_path).is_err() {
+        let _ = fs::remove_file(&tmp_path);
+        return;
+    }
+
+    last_ts_map.insert(root.to_path_buf(), now);
+    drop(last_ts_map);
+    let _ = fs::write(&cursor_path, observation_count.to_string());
+}
+
+fn spawn_dream_rsi_cycle_ticker(interval: Duration) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || loop {
+        std::thread::sleep(interval);
+        if heartbeat_authority_lost() {
+            return;
+        }
+        let roots = known_project_roots().lock().unwrap_or_else(|e| e.into_inner()).clone();
+        for root in roots {
+            let spool_dir = root.join(".gm").join("exec-spool");
+            if !spool_dir.exists() {
+                continue;
+            }
+            dream_rsi_maybe_dispatch_cycle(&root, &spool_dir);
+        }
+    })
+}
+
 fn read_status_busy_until_if_future(spool_dir: &Path) -> Option<u64> {
     let text = fs::read_to_string(spool_dir.join(".status.json")).ok()?;
     let value: serde_json::Value = serde_json::from_str(&text).ok()?;
@@ -2888,6 +3002,9 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
 
     const PROJECT_HEARTBEAT_TICK_INTERVAL_MS: u64 = 3_000;
     let _project_heartbeat_ticker = spawn_project_heartbeat_ticker(Duration::from_millis(PROJECT_HEARTBEAT_TICK_INTERVAL_MS));
+
+    const DREAM_RSI_CYCLE_TICK_INTERVAL_MS: u64 = 60_000;
+    let _dream_rsi_cycle_ticker = spawn_dream_rsi_cycle_ticker(Duration::from_millis(DREAM_RSI_CYCLE_TICK_INTERVAL_MS));
 
     loop {
         if heartbeat_authority_lost() {
