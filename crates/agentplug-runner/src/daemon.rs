@@ -1210,6 +1210,7 @@ fn write_daemon_heartbeat(project_count: usize, plugin_module_count: usize) {
             "last_handoff_attempt_ts": handoff_attempt.as_ref().map(|(ts, _)| serde_json::json!(ts)).unwrap_or(serde_json::Value::Null),
             "last_handoff_error": handoff_attempt.as_ref().and_then(|(_, err)| err.clone()),
             "last_completed_runner_swap": read_last_completed_runner_swap().unwrap_or(serde_json::Value::Null),
+            "runner_version_parity": runner_version_parity_json(),
             "runner_update_trust_mode": crate::update_trust::runner_mode_str(),
             "runner_signature_required": crate::update_trust::strict_mode(),
             "runner_unverified_update": crate::update_trust::unverified_promotion().unwrap_or(serde_json::Value::Null),
@@ -1223,15 +1224,159 @@ fn last_completed_runner_swap_path() -> PathBuf {
 }
 
 fn record_completed_runner_swap(version: &str) {
-    let _ = fs::write(
-        last_completed_runner_swap_path(),
-        serde_json::json!({ "version": version, "swapped_at_ts": now_ms() }).to_string(),
-    );
+    let sha256 = canonical_runner_exe_path()
+        .and_then(|p| fs::read(p).ok())
+        .map(|bytes| crate::download::sha256_hex(&bytes));
+    let mut record = serde_json::json!({ "version": version, "swapped_at_ts": now_ms() });
+    if let Some(sha256) = sha256 {
+        record["sha256"] = serde_json::json!(sha256);
+    }
+    let _ = fs::write(last_completed_runner_swap_path(), record.to_string());
 }
 
 fn read_last_completed_runner_swap() -> Option<serde_json::Value> {
     let text = fs::read_to_string(last_completed_runner_swap_path()).ok()?;
     serde_json::from_str(&text).ok()
+}
+
+fn read_recorded_swap_field(field: &str) -> Option<String> {
+    read_last_completed_runner_swap()?.get(field)?.as_str().map(|s| s.to_string())
+}
+
+struct RunnerVersionParity {
+    exe: Option<String>,
+    sha256: Option<String>,
+    exe_reported_version: Option<String>,
+    compiled_version: String,
+    installed_version_file: Option<String>,
+    recorded_swap_version: Option<String>,
+    recorded_swap_sha256: Option<String>,
+    pinned_local_build_sha256: Option<String>,
+}
+
+fn exe_reported_runner_version(exe: &Path) -> Option<String> {
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("--version");
+    agentplug_host::apply_windowless(&mut cmd);
+    let out = cmd.output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let version = String::from_utf8_lossy(&out.stdout)
+        .split_whitespace()
+        .last()
+        .unwrap_or_default()
+        .trim_start_matches('v')
+        .to_string();
+    if version.is_empty() { None } else { Some(version) }
+}
+
+fn probe_runner_version_parity() -> RunnerVersionParity {
+    let exe = canonical_runner_exe_path();
+    let sha256 = exe.as_ref().and_then(|p| fs::read(p).ok()).map(|b| crate::download::sha256_hex(&b));
+    let pinned_local_build_sha256 = crate::download::local_build_pin_record()
+        .as_ref()
+        .and_then(|v| v.get("sha256"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    RunnerVersionParity {
+        exe: exe.as_ref().map(|p| p.display().to_string()),
+        sha256,
+        exe_reported_version: exe.as_ref().and_then(|p| exe_reported_runner_version(p)),
+        compiled_version: env!("CARGO_PKG_VERSION").to_string(),
+        installed_version_file: installed_runner_version(),
+        recorded_swap_version: read_recorded_swap_field("version"),
+        recorded_swap_sha256: read_recorded_swap_field("sha256"),
+        pinned_local_build_sha256,
+    }
+}
+
+impl RunnerVersionParity {
+    fn live_sha256(&self) -> &str {
+        self.sha256.as_deref().unwrap_or("unreadable")
+    }
+
+    fn sha_matches(&self, candidate: Option<&String>) -> bool {
+        candidate.map(|c| c.eq_ignore_ascii_case(self.live_sha256())).unwrap_or(false)
+    }
+
+    fn installed_by_recorded_swap(&self) -> bool {
+        self.sha_matches(self.recorded_swap_sha256.as_ref())
+    }
+
+    fn installed_by_local_build_pin(&self) -> bool {
+        self.sha_matches(self.pinned_local_build_sha256.as_ref())
+    }
+
+    fn disagreements(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        let live = self.live_sha256();
+        if !self.installed_by_recorded_swap() && !self.installed_by_local_build_pin() {
+            if self.recorded_swap_sha256.is_none() && self.pinned_local_build_sha256.is_none() {
+                out.push(format!(
+                    "no completed runner swap and no local-build pin names which bytes should be live, so this daemon runs sha256 {live} on trust alone"
+                ));
+            } else {
+                out.push(format!(
+                    "this daemon runs sha256 {live} but the last completed runner swap names sha256 {} and the local-build pin names sha256 {} -- the live bytes were installed by neither",
+                    self.recorded_swap_sha256.as_deref().unwrap_or("none"),
+                    self.pinned_local_build_sha256.as_deref().unwrap_or("none")
+                ));
+            }
+        }
+        if let Some(reported) = self.exe_reported_version.as_deref() {
+            if reported != self.compiled_version {
+                out.push(format!(
+                    "the runner exe at {} reports --version {reported} but this daemon was compiled as {} -- the exe on disk was replaced after this process started",
+                    self.exe.as_deref().unwrap_or("an unresolvable path"),
+                    self.compiled_version
+                ));
+            }
+        }
+        if let Some(installed) = self.installed_version_file.as_deref() {
+            if installed != self.compiled_version {
+                out.push(format!(
+                    "{} records {installed} but this daemon was compiled as {} -- the version file and the live binary disagree",
+                    crate::download::runner_version_path().display(),
+                    self.compiled_version
+                ));
+            }
+        }
+        if let Some(swap) = self.recorded_swap_version.as_deref() {
+            if swap != self.compiled_version && !self.installed_by_local_build_pin() {
+                out.push(format!(
+                    "the last completed runner swap records version {swap} but this daemon was compiled as {} and is not the pinned local build -- the bytes that are meant to be live are not the bytes running",
+                    self.compiled_version
+                ));
+            }
+        }
+        out
+    }
+
+    fn json(&self) -> serde_json::Value {
+        let disagreements = self.disagreements();
+        serde_json::json!({
+            "agrees": disagreements.is_empty(),
+            "exe": self.exe,
+            "exe_sha256": self.sha256,
+            "exe_reported_version": self.exe_reported_version,
+            "compiled_version": self.compiled_version,
+            "installed_version_file": self.installed_version_file,
+            "recorded_swap_version": self.recorded_swap_version,
+            "recorded_swap_sha256": self.recorded_swap_sha256,
+            "pinned_local_build_sha256": self.pinned_local_build_sha256,
+            "disagreements": disagreements,
+        })
+    }
+}
+
+fn runner_version_parity() -> &'static RunnerVersionParity {
+    static SLOT: OnceLock<RunnerVersionParity> = OnceLock::new();
+    SLOT.get_or_init(probe_runner_version_parity)
+}
+
+fn runner_version_parity_json() -> serde_json::Value {
+    runner_version_parity().json()
 }
 
 fn canonical_runner_exe_path() -> Option<PathBuf> {
@@ -3254,6 +3399,7 @@ pub fn run_daemon() -> anyhow::Result<()> {
 
     clear_wasted_daemon_start_backoff();
     seed_github_token_from_gh_cli_if_unset();
+    runner_version_parity();
 
     let plugin_modules = PluginModules::new()?;
     let previously_recorded_version = installed_runner_version();
@@ -3363,12 +3509,18 @@ fn spawn_update_poll_worker(daemon_cfg: DaemonConfig) -> std::sync::mpsc::Receiv
 fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
     HEARTBEAT_DAEMON_BOOT_TS.store(now_ms(), std::sync::atomic::Ordering::Relaxed);
     write_daemon_heartbeat(0, 0);
+    let parity = runner_version_parity();
     eprintln!(
-        "[agentplug daemon] BOOT pid={} version={} ts={}",
+        "[agentplug daemon] BOOT pid={} version={} exe_sha256={} runner_version_parity={} ts={}",
         std::process::id(),
         env!("CARGO_PKG_VERSION"),
+        parity.live_sha256(),
+        if parity.disagreements().is_empty() { "ok" } else { "MISMATCH" },
         now_ms()
     );
+    for disagreement in parity.disagreements() {
+        eprintln!("[agentplug daemon] RUNNER VERSION PARITY MISMATCH: {disagreement}");
+    }
 
     ensure_daemon_guard();
 
