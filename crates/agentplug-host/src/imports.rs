@@ -160,24 +160,44 @@ pub fn github_cli_config_dir() -> Option<PathBuf> {
         .clone()
 }
 
+#[cfg(windows)]
+const EMPTY_GIT_CONFIG_OR_HOOK_PATH: &str = "NUL";
+
+#[cfg(not(windows))]
+const EMPTY_GIT_CONFIG_OR_HOOK_PATH: &str = "/dev/null";
+
+fn is_inherited_git_config_key(key: &std::ffi::OsStr) -> bool {
+    let key = key.to_string_lossy().to_ascii_uppercase();
+    matches!(
+        key.as_str(),
+        "GIT_CONFIG_COUNT"
+            | "GIT_CONFIG_GLOBAL"
+            | "GIT_CONFIG_NOSYSTEM"
+            | "GIT_CONFIG_PARAMETERS"
+            | "GIT_CONFIG_SYSTEM"
+    ) || key.starts_with("GIT_CONFIG_KEY_")
+        || key.starts_with("GIT_CONFIG_VALUE_")
+}
+
 fn configure_github_git_credentials(command: &mut std::process::Command) {
+    for (key, _) in std::env::vars_os() {
+        if is_inherited_git_config_key(&key) {
+            command.env_remove(key);
+        }
+    }
     if let Some(directory) = github_cli_config_dir() {
         command.env("GH_CONFIG_DIR", directory);
     }
-    let config_count = std::env::var("GIT_CONFIG_COUNT")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(0);
     command
-        .env("GIT_CONFIG_COUNT", (config_count + 1).to_string())
-        .env(
-            format!("GIT_CONFIG_KEY_{config_count}"),
-            "credential.https://github.com.helper",
-        )
-        .env(
-            format!("GIT_CONFIG_VALUE_{config_count}"),
-            "!gh auth git-credential",
-        );
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", EMPTY_GIT_CONFIG_OR_HOOK_PATH)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GCM_INTERACTIVE", "Never")
+        .env("GIT_CONFIG_COUNT", "2")
+        .env("GIT_CONFIG_KEY_0", "core.hooksPath")
+        .env("GIT_CONFIG_VALUE_0", EMPTY_GIT_CONFIG_OR_HOOK_PATH)
+        .env("GIT_CONFIG_KEY_1", "credential.https://github.com.helper")
+        .env("GIT_CONFIG_VALUE_1", "!gh auth git-credential");
 }
 
 fn user_gm_root() -> Option<PathBuf> {
@@ -1128,16 +1148,34 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
                 });
                 return write_guest_json(&mut caller, v);
                 }
-                let mut git_cmd = std::process::Command::new("git");
-                git_cmd.args(&argv).current_dir(&cwd).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
-                configure_github_git_credentials(&mut git_cmd);
-            #[cfg(windows)]
-            {
-                crate::windowless::apply_windowless(&mut git_cmd);
-            }
-            let v = match git_cmd.spawn() {
-                Ok(mut child) => {
-                    let cap_hit = Arc::new(AtomicBool::new(false));
+                    let mut git_cmd = std::process::Command::new("git");
+                    git_cmd.args(&argv).current_dir(&cwd).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+                    configure_github_git_credentials(&mut git_cmd);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::process::CommandExt;
+                    git_cmd.process_group(0);
+                }
+                #[cfg(windows)]
+                {
+                    crate::windowless::apply_windowless(&mut git_cmd);
+                }
+                let v = match git_cmd.spawn() {
+                    Ok(mut child) => {
+                        let containment = match crate::process_tree::establish_containment(&child) {
+                            Ok(containment) => containment,
+                            Err(error) => {
+                                crate::process_tree::kill_tree(child.id());
+                                let _ = child.kill();
+                                let _ = child.wait();
+                                return write_guest_json(&mut caller, serde_json::json!({
+                                    "stdout": "",
+                                    "stderr": format!("git process containment failed: {error}"),
+                                    "exit_code": -1,
+                                }));
+                            }
+                        };
+                        let cap_hit = Arc::new(AtomicBool::new(false));
                     let out_handle = child.stdout.take().map(|o| drain_reader_capped(o, HOST_GIT_STDOUT_CAP_BYTES, cap_hit.clone()));
                     let err_handle = child.stderr.take().map(|e| drain_reader_capped(e, HOST_GIT_STDERR_CAP_BYTES, cap_hit.clone()));
                     let timeout_ms = git_subprocess_timeout_ms();
@@ -1146,9 +1184,9 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
                     let mut timed_out = false;
                     let mut cap_stopped = false;
                     loop {
-                        if cap_hit.load(Ordering::SeqCst) {
-                            let _ = child.kill();
-                            let _ = child.wait();
+                            if cap_hit.load(Ordering::SeqCst) {
+                                crate::process_tree::terminate_containment(&containment, child.id());
+                                let _ = child.wait();
                             cap_stopped = true;
                             break;
                         }
@@ -1157,9 +1195,9 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
                             Ok(None) => {}
                             Err(_) => break,
                         }
-                        if Instant::now() >= deadline {
-                            let _ = child.kill();
-                            let _ = child.wait();
+                            if Instant::now() >= deadline {
+                                crate::process_tree::terminate_containment(&containment, child.id());
+                                let _ = child.wait();
                             timed_out = true;
                             break;
                         }
