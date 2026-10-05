@@ -208,28 +208,22 @@ mod platform {
 
     fn parent_map() -> HashMap<u32, u32> {
         let mut parents = HashMap::new();
-        // SAFETY: plain Win32 snapshot call with constant arguments; the returned handle is checked and closed below.
         let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
         if snapshot == INVALID_HANDLE_VALUE || snapshot == 0 {
             return parents;
         }
-        // SAFETY: ProcessEntry32W is a plain-old-data C struct for which all-zero bytes are a valid value.
         let mut entry: ProcessEntry32W = unsafe { std::mem::zeroed() };
         entry.size = std::mem::size_of::<ProcessEntry32W>() as u32;
-        // SAFETY: snapshot is a live handle and entry is a properly sized, writable ProcessEntry32W.
         let mut more = unsafe { Process32FirstW(snapshot, &mut entry) } != 0;
         while more {
             parents.insert(entry.process_id, entry.parent_process_id);
-            // SAFETY: same handle and entry as the First call above.
             more = unsafe { Process32NextW(snapshot, &mut entry) } != 0;
         }
-        // SAFETY: snapshot is the live handle created above and is closed exactly once.
         unsafe { CloseHandle(snapshot) };
         parents
     }
 
     fn working_set_of(pid: u32) -> Option<u64> {
-        // SAFETY: OpenProcess only reads its by-value arguments; a zero handle is handled below.
         let handle =
             unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ, 0, pid) };
         if handle == 0 {
@@ -239,9 +233,7 @@ mod platform {
             cb: std::mem::size_of::<ProcessMemoryCountersEx>() as u32,
             ..Default::default()
         };
-        // SAFETY: handle is a live process handle and counters is a writable struct whose cb matches its size.
         let ok = unsafe { K32GetProcessMemoryInfo(handle, &mut counters, counters.cb) };
-        // SAFETY: handle was opened above and is closed exactly once.
         unsafe { CloseHandle(handle) };
         (ok != 0).then_some(counters.working_set_size as u64)
     }
@@ -251,14 +243,11 @@ mod platform {
     }
 
     fn terminate(pid: u32) -> bool {
-        // SAFETY: OpenProcess only reads its by-value arguments; a zero handle is handled below.
         let handle = unsafe { OpenProcess(PROCESS_TERMINATE, 0, pid) };
         if handle == 0 {
             return false;
         }
-        // SAFETY: handle is a live process handle opened with PROCESS_TERMINATE.
         let ok = unsafe { TerminateProcess(handle, 1) };
-        // SAFETY: handle was opened above and is closed exactly once.
         unsafe { CloseHandle(handle) };
         ok != 0
     }
@@ -324,7 +313,6 @@ mod platform {
     fn resident_bytes_of(pid: u32) -> Option<u64> {
         let statm = std::fs::read_to_string(format!("/proc/{pid}/statm")).ok()?;
         let resident_pages: u64 = statm.split_whitespace().nth(1)?.parse().ok()?;
-        // SAFETY: sysconf takes a constant name and has no memory-safety preconditions.
         let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
         (page_size > 0).then(|| resident_pages * page_size as u64)
     }
@@ -337,7 +325,6 @@ mod platform {
         let order = super::descendants_root_first(root, &parent_map());
         order
             .iter()
-            // SAFETY: kill takes plain integers and has no memory-safety preconditions.
             .filter(|pid| unsafe { libc::kill(**pid as i32, libc::SIGKILL) } == 0)
             .count()
     }
