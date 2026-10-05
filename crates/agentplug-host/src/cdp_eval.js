@@ -104,12 +104,12 @@ function cdpSession(wsUrl, timeoutMs) {
       pending.clear();
     };
     const sessObj = {
-      send(method, params) {
+      send(method, params, sessionId) {
         const id = nextId++;
         return new Promise((res, rej) => {
           pending.set(id, { res, rej });
           const body = { id, method, params: params || {} };
-          if (boundSessionId) body.sessionId = boundSessionId;
+          if (sessionId || boundSessionId) body.sessionId = sessionId || boundSessionId;
           ws.send(JSON.stringify(body));
         });
       },
@@ -658,6 +658,270 @@ function summarizeTrace(captured) {
   return summary;
 }
 
+const RAW_DIRECTIVE = /^(cdp|events|wait)[ \t]+(.*)$/;
+const RAW_EVENT_NAME = /^[A-Z]\w*\.\w+$/;
+const RAW_BLOCK_NAME = /^[A-Za-z_]\w*$/;
+const RAW_REFERENCE = /^\$([A-Za-z_]\w*|\d+)((?:\.[\w$-]+|\[\d+\])*)$/;
+const RAW_AUTO_ENABLED_DOMAINS = new Set(['Debugger', 'Network', 'Log', 'Runtime', 'Page', 'Profiler']);
+const RAW_BROWSER_LEVEL_DOMAINS = new Set(['Browser', 'SystemInfo']);
+const RAW_BROWSER_LEVEL_TARGET_METHODS = new Set(['createBrowserContext', 'disposeBrowserContext', 'getBrowserContexts', 'createTarget', 'closeTarget', 'getTargets', 'attachToTarget', 'activateTarget']);
+const RAW_EVENT_LIMIT_DEFAULT = 200;
+const RAW_EVENT_LIMIT_MAX = 5000;
+const RAW_EVENTS_BYTES_CAP = 400000;
+const RAW_EVENT_PARAMS_BYTES_CAP = 6000;
+const RAW_WAIT_TIMEOUT_DEFAULT_MS = 10000;
+const RAW_DEADLINE_MARGIN_MS = 400;
+const RAW_POLL_MS = 25;
+const NOT_ENABLED_HINT = ' -- CDP domain state belongs to the connection of one dispatch: a domain enabled by an earlier dispatch is not enabled now. Put `cdp <Domain>.enable` (or an `events <Domain.event>` line, which enables it) in the same body as the command that needs it';
+
+function parseRawWhere(clause, line) {
+  const parsed = /^([^~=\s]+)([~=])(.+)$/.exec(clause);
+  if (!parsed) throw new Error(`line ${line}: \`where\` needs <param.path>~<substring> or <param.path>=<value>, got '${clause}'`);
+  return { path: parsed[1], op: parsed[2], value: parsed[3] };
+}
+
+function takeRawOption(tokens, name) {
+  const last = tokens[tokens.length - 1] || '';
+  if (!last.startsWith(`${name}=`)) return null;
+  const value = Number(last.slice(name.length + 1));
+  if (!Number.isInteger(value) || value < 0) return null;
+  tokens.pop();
+  return value;
+}
+
+function splitRawWhere(tokens, line) {
+  const at = tokens.indexOf('where');
+  if (at < 0) return { head: tokens, where: null };
+  return { head: tokens.slice(0, at), where: parseRawWhere(tokens.slice(at + 1).join(' '), line) };
+}
+
+function startRawStep(kind, rest, line) {
+  if (kind === 'cdp') {
+    const parsed = /^(\S+)(?:[ \t]+on[ \t]+(\S+))?(?:[ \t]+as[ \t]+(\S+))?$/.exec(rest);
+    if (!parsed || !RAW_EVENT_NAME.test(parsed[1])) throw new Error(`line ${line}: expected \`cdp <Domain.method> [on <targetId|$ref>] [as <name>]\`, got 'cdp ${rest.slice(0, 80)}'`);
+    if (parsed[3] && !RAW_BLOCK_NAME.test(parsed[3])) throw new Error(`line ${line}: block name '${parsed[3]}' must be a letter or underscore followed by letters, digits or underscores (a bare number already means block position)`);
+    return { kind, method: parsed[1], on: parsed[2] || null, name: parsed[3] || null, paramsText: '', line };
+  }
+  const tokens = rest.split(/\s+/).filter(Boolean);
+  if (kind === 'events') {
+    const limit = takeRawOption(tokens, 'limit');
+    const { head, where } = splitRawWhere(tokens, line);
+    const bad = head.find((n) => !RAW_EVENT_NAME.test(n));
+    if (!head.length || bad) throw new Error(`line ${line}: \`events\` takes CDP event names like Debugger.scriptParsed, got '${bad || ''}'`);
+    return { kind, names: head, where, limit, count: 0, line };
+  }
+  if (tokens.length === 1 && /^\d+$/.test(tokens[0])) return { kind: 'sleep', ms: Number(tokens[0]), line };
+  const timeoutMs = takeRawOption(tokens, 'timeout');
+  const { head, where } = splitRawWhere(tokens, line);
+  if (head.length !== 1 || !RAW_EVENT_NAME.test(head[0])) throw new Error(`line ${line}: \`wait\` takes a millisecond count or one CDP event name, got '${head.join(' ')}'`);
+  return { kind: 'waitEvent', name: head[0], where, timeoutMs, lastMatchSeq: 0, line };
+}
+
+function parseRawBody(script) {
+  const steps = [];
+  let current = null;
+  script.split(/\r?\n/).forEach((text, index) => {
+    const directive = RAW_DIRECTIVE.exec(text);
+    if (directive) {
+      current = startRawStep(directive[1], directive[2].trim(), index + 1);
+      steps.push(current);
+      return;
+    }
+    if (!text.trim()) return;
+    if (!current || current.kind !== 'cdp') throw new Error(`line ${index + 1}: '${text.slice(0, 80)}' is not a cdp/events/wait directive and follows no \`cdp <Method>\` line`);
+    current.paramsText += `${text}\n`;
+  });
+  const named = new Set();
+  for (const step of steps) {
+    if (step.kind !== 'cdp' || !step.name) continue;
+    if (named.has(step.name)) throw new Error(`line ${step.line}: block name '${step.name}' is used twice`);
+    named.add(step.name);
+  }
+  return steps;
+}
+
+function rawPathSegments(path) {
+  return path.match(/[^.\[\]]+/g) || [];
+}
+
+function rawOwnField(cursor, segment) {
+  return cursor !== null && typeof cursor === 'object' && Object.prototype.hasOwnProperty.call(cursor, segment);
+}
+
+function rawMatches(where, params) {
+  if (!where) return true;
+  let cursor = params;
+  for (const segment of rawPathSegments(where.path)) {
+    if (!rawOwnField(cursor, segment)) return false;
+    cursor = cursor[segment];
+  }
+  if (cursor === undefined || cursor === null) return false;
+  return where.op === '~' ? String(cursor).includes(where.value) : String(cursor) === where.value;
+}
+
+function rawBlocksSummary(context) {
+  const earlier = context.byIndex.slice(1).map((b) => `${b.index} ${b.method}${b.name ? ` as ${b.name}` : ''}`);
+  return earlier.length ? `earlier blocks: ${earlier.join(', ')}` : 'no earlier block ran';
+}
+
+function lookupRawReference(head, pathText, context, where, original) {
+  const byPosition = /^\d+$/.test(head);
+  const block = byPosition ? context.byIndex[Number(head)] : context.byName.get(head);
+  if (!block) throw new Error(`${where} references ${original} but no earlier block is ${byPosition ? `number ${head}` : `named '${head}'`} (${rawBlocksSummary(context)}); write $$${original.slice(1)} for the literal text ${original}`);
+  let cursor = block.result;
+  for (const segment of rawPathSegments(pathText)) {
+    if (!rawOwnField(cursor, segment)) {
+      const have = cursor !== null && typeof cursor === 'object' ? Object.keys(cursor).join(', ') || 'no fields' : JSON.stringify(cursor);
+      throw new Error(`${where} references ${original} but the result of block ${block.index} (${block.method}) has no field '${segment}' (it has: ${have})`);
+    }
+    cursor = cursor[segment];
+  }
+  return cursor;
+}
+
+function resolveRawReferences(value, context, where) {
+  if (typeof value === 'string') {
+    const reference = RAW_REFERENCE.exec(value);
+    if (reference) return lookupRawReference(reference[1], reference[2], context, where, value);
+    return value.startsWith('$$') && RAW_REFERENCE.test(value.slice(1)) ? value.slice(1) : value;
+  }
+  if (Array.isArray(value)) return value.map((item) => resolveRawReferences(item, context, where));
+  if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, resolveRawReferences(item, context, where)]));
+  return value;
+}
+
+function rawEventCapture() {
+  const capture = { events: [], dropped: 0, truncated: false, bytes: 0 };
+  capture.record = (matchingSteps, msg, startedAt) => {
+    const json = JSON.stringify(msg.params || {});
+    const oversized = Buffer.byteLength(json) > RAW_EVENT_PARAMS_BYTES_CAP;
+    const size = oversized ? RAW_EVENT_PARAMS_BYTES_CAP : Buffer.byteLength(json);
+    const step = matchingSteps.find((s) => s.count < Math.min(s.limit === null ? RAW_EVENT_LIMIT_DEFAULT : s.limit, RAW_EVENT_LIMIT_MAX));
+    if (!step || capture.bytes + size > RAW_EVENTS_BYTES_CAP) {
+      capture.dropped++;
+      capture.truncated = true;
+      return;
+    }
+    step.count++;
+    capture.bytes += size;
+    const event = { event: msg.method, t_ms: Date.now() - startedAt, params: oversized ? { __truncated: true, bytes: Buffer.byteLength(json), keys: Object.keys(msg.params || {}) } : msg.params };
+    if (msg.sessionId) event.session = msg.sessionId;
+    capture.events.push(event);
+  };
+  return capture;
+}
+
+function isBrowserLevelRawMethod(method) {
+  const [domain, name] = method.split('.');
+  return RAW_BROWSER_LEVEL_DOMAINS.has(domain) || (domain === 'Target' && RAW_BROWSER_LEVEL_TARGET_METHODS.has(name));
+}
+
+function rawRouter(sess, endpoint, onNotification) {
+  const router = { browserConnection: null, attached: new Map() };
+  const browser = async () => {
+    if (router.browserConnection) return router.browserConnection;
+    const version = await httpJson(cdpUrl(endpoint, '/json/version'), 2000);
+    if (!version || !version.webSocketDebuggerUrl) throw new Error(`CDP endpoint ${endpoint} did not answer /json/version, so browser-level commands (Browser.*, SystemInfo.*, Target.createTarget and friends) cannot be sent`);
+    router.browserConnection = await cdpSession(version.webSocketDebuggerUrl, 5000);
+    router.browserConnection.onIdLessNotification = onNotification;
+    return router.browserConnection;
+  };
+  router.send = async (method, params, targetId) => {
+    if (targetId) {
+      const connection = await browser();
+      if (!router.attached.has(targetId)) router.attached.set(targetId, (await connection.send('Target.attachToTarget', { targetId, flatten: true })).sessionId);
+      const result = await connection.send(method, params, router.attached.get(targetId));
+      if (method === 'Page.close') router.attached.delete(targetId);
+      return result;
+    }
+    if (method === 'Target.closeTarget' && params && params.targetId) router.attached.delete(params.targetId);
+    if (isBrowserLevelRawMethod(method)) return (await browser()).send(method, params);
+    return sess.send(method, params);
+  };
+  router.close = () => { if (router.browserConnection) router.browserConnection.close(); };
+  return router;
+}
+
+function raceRawDeadline(promise, deadline) {
+  let timer;
+  const expired = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error('no answer before the dispatch deadline')), Math.max(0, deadline - Date.now()));
+  });
+  return Promise.race([promise, expired]).finally(() => clearTimeout(timer));
+}
+
+async function runCdpRaw(sess, script, watchdogAt, endpoint) {
+  const deadline = watchdogAt - RAW_DEADLINE_MARGIN_MS;
+  const steps = parseRawBody(script);
+  if (!steps.some((s) => s.kind === 'cdp')) throw new Error('the cdp raw body holds no `cdp <Domain.method>` block');
+  const eventSteps = steps.filter((s) => s.kind === 'events');
+  const waitSteps = steps.filter((s) => s.kind === 'waitEvent');
+  const startedAt = Date.now();
+  const capture = rawEventCapture();
+  let arrivalSeq = 0;
+  const onNotification = (msg) => {
+    arrivalSeq++;
+    for (const step of waitSteps) {
+      if (step.name === msg.method && rawMatches(step.where, msg.params)) step.lastMatchSeq = arrivalSeq;
+    }
+    const matchingSteps = eventSteps.filter((step) => step.names.includes(msg.method) && rawMatches(step.where, msg.params));
+    if (matchingSteps.length) capture.record(matchingSteps, msg, startedAt);
+  };
+  sess.onIdLessNotification = onNotification;
+  const router = rawRouter(sess, endpoint, onNotification);
+  const explicitDomains = new Set(steps.filter((s) => s.kind === 'cdp' && s.method.endsWith('.enable')).map((s) => s.method.split('.')[0]));
+  const wantedDomains = new Set([...eventSteps.flatMap((s) => s.names), ...waitSteps.map((s) => s.name)].map((name) => name.split('.')[0]));
+  const autoEnabled = [...wantedDomains].filter((d) => RAW_AUTO_ENABLED_DOMAINS.has(d) && !explicitDomains.has(d));
+  const results = [];
+  const context = { byIndex: [null], byName: new Map() };
+  const bareResults = steps.every((s) => s.kind === 'cdp');
+  const shaped = (forPartial) => (bareResults && !forPartial
+    ? (results.length === 1 ? results[0] : results)
+    : { results, events: capture.events, events_dropped: capture.dropped, events_truncated: capture.truncated, auto_enabled: autoEnabled, elapsed_ms: Date.now() - startedAt });
+  let lastBlockStartSeq = 0;
+  try {
+    for (const domain of autoEnabled) await raceRawDeadline(sess.send(`${domain}.enable`, {}), deadline);
+    for (const step of steps) {
+      if (step.kind === 'cdp') {
+        lastBlockStartSeq = arrivalSeq;
+        const index = results.length + 1;
+        const where = `block ${index} (${step.method})`;
+        let params = {};
+        if (step.paramsText.trim()) {
+          try { params = JSON.parse(step.paramsText); } catch (e) { throw new Error(`${where}: params are not valid JSON: ${e.message}`); }
+        }
+        params = resolveRawReferences(params, context, where);
+        const targetId = step.on ? resolveRawReferences(step.on, context, where) : null;
+        let result;
+        try { result = await raceRawDeadline(router.send(step.method, params, targetId), deadline); } catch (e) {
+          const message = String(e && e.message || e);
+          throw new Error(`${where} failed: ${message}${/not enabled/i.test(message) ? NOT_ENABLED_HINT : ''}`);
+        }
+        results.push(result);
+        const block = { index, method: step.method, name: step.name, result };
+        context.byIndex[index] = block;
+        if (step.name) context.byName.set(step.name, block);
+      } else if (step.kind === 'sleep') {
+        await new Promise((r) => setTimeout(r, Math.max(0, Math.min(step.ms, deadline - Date.now()))));
+      } else if (step.kind === 'waitEvent') {
+        const budget = step.timeoutMs === null ? RAW_WAIT_TIMEOUT_DEFAULT_MS : step.timeoutMs;
+        const until = Date.now() + Math.max(0, Math.min(budget, deadline - Date.now()));
+        while (step.lastMatchSeq <= lastBlockStartSeq) {
+          if (Date.now() >= until) throw new Error(`line ${step.line}: \`wait ${step.name}\` saw no matching event since the previous cdp block started, within ${budget}ms or the dispatch deadline`);
+          await new Promise((r) => setTimeout(r, RAW_POLL_MS));
+        }
+      }
+    }
+  } catch (e) {
+    e.partial = shaped(true);
+    throw e;
+  } finally {
+    router.close();
+  }
+  return shaped(false);
+}
+
+
 async function main() {
   const startedAt = Date.now();
   const cfg = JSON.parse(process.argv[2]);
@@ -697,16 +961,7 @@ async function main() {
       process.exit(0);
     }
     if (mode === 'cdpraw') {
-      const results = [];
-      for (const block of script.split(/\r?\n(?=cdp )/)) {
-        const text = block.replace(/^cdp /, '');
-        const newline = text.indexOf('\n');
-        const method = (newline < 0 ? text : text.slice(0, newline)).trim();
-        const rawParams = newline < 0 ? '' : text.slice(newline + 1).trim();
-        const params = rawParams ? JSON.parse(rawParams) : {};
-        results.push(await sess.send(method, params));
-      }
-      writeResult({ result: results.length === 1 ? results[0] : results });
+      writeResult({ result: await runCdpRaw(sess, script, startedAt + watchdogDeadline, endpoint) });
       sess.close();
       process.exit(0);
     }
@@ -878,7 +1133,7 @@ async function main() {
     sess.close();
     process.exit(0);
   } catch (e) {
-    writeResult({ __cdpError: String(e && e.message || e) });
+    writeResult({ __cdpError: String(e && e.message || e), partial: e && e.partial });
     process.stderr.write(`cdp-eval: ${e && e.message || e}\n`);
     try { sess.close(); } catch (_) {}
     process.exit(1);
