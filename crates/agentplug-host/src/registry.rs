@@ -275,9 +275,11 @@ impl Drop for HeavyDispatchAdmission {
 
 impl SharedPluginPool {
     pub fn new(plugin_name: &str, size: usize) -> Self {
+        let size = size.max(1);
         Self {
             plugin_name: plugin_name.to_string(),
-            slots: (0..size.max(1)).map(|_| Arc::new(Mutex::new(None))).collect(),
+            slots: (0..size).map(|_| Arc::new(Mutex::new(None))).collect(),
+            last_observed_slot_hashes: Mutex::new(vec![None; size]),
             hashes_to_evict_when_their_in_flight_dispatch_completes: Mutex::new(std::collections::HashSet::new()),
             ticket_queue: Mutex::new(TicketQueue {
                 cheap: ClassTicketQueue { next_ticket: 0, now_serving: 0 },
@@ -416,10 +418,13 @@ impl SharedPluginPool {
     }
 
     pub fn slot_content_hashes(&self) -> Vec<Option<String>> {
-        self.slots
-            .iter()
-            .map(|s| s.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|h| h.content_hash.clone()))
-            .collect()
+        let mut observed = self.last_observed_slot_hashes.lock().unwrap_or_else(|e| e.into_inner());
+        for (index, slot) in self.slots.iter().enumerate() {
+            if let Ok(guard) = slot.try_lock() {
+                observed[index] = guard.as_ref().map(|h| h.content_hash.clone());
+            }
+        }
+        observed.clone()
     }
 
     pub(crate) fn any_instantiated_within(&self, timeout_ms: u64) -> bool {
