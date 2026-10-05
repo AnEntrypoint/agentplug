@@ -1907,6 +1907,7 @@ pub(crate) type InFlightKey = (PathBuf, String, String);
 
 pub(crate) struct InFlightHandle {
     pub(crate) detach: Arc<std::sync::atomic::AtomicBool>,
+    pub(crate) clock: crate::dispatch_watchdog::DispatchClock,
 }
 
 static IN_FLIGHT: OnceLock<Mutex<HashMap<InFlightKey, InFlightHandle>>> = OnceLock::new();
@@ -2166,7 +2167,7 @@ fn existing_inflight_claim(in_dir: &Path, verb: &str, task: &str) -> Option<(Pat
         .find(|(claim, _)| claim.exists())
 }
 
-fn inflight_claim_path(in_dir: &Path, verb: &str, task: &str) -> PathBuf {
+pub(crate) fn inflight_claim_path(in_dir: &Path, verb: &str, task: &str) -> PathBuf {
     existing_inflight_claim(in_dir, verb, task)
         .map(|(claim, _)| claim)
         .unwrap_or_else(|| inflight_claim_path_with_extension(in_dir, verb, task, spool_request_extension(verb)))
@@ -2456,6 +2457,10 @@ pub(crate) fn run_gm_dispatch_to_file(root: &Path, handle: &DispatchHandle, verb
     let _fairness_guard = GmFairnessGuard::acquire(root, tool_verb, body);
     let _tool_guard = ToolDispatchGuard::acquire(plugin_name, tool_verb, body);
     let _dispatch_origin_scope = agentplug_host::enter_dispatch_origin_scope(task, body, submitted_at_ms);
+    let in_flight_key: InFlightKey = (root.to_path_buf(), verb.to_string(), task.to_string());
+    if let Some(handle) = in_flight_map().lock().unwrap_or_else(|e| e.into_inner()).get(&in_flight_key) {
+        handle.clock.started_at_ms.store(now_ms(), std::sync::atomic::Ordering::Relaxed);
+    }
     let dispatch_result = if plugin_name == "gm" {
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handle.dispatch("gm", verb, body)))
     } else {
@@ -2475,6 +2480,10 @@ pub(crate) fn run_gm_dispatch_to_file(root: &Path, handle: &DispatchHandle, verb
             serde_json::json!({"ok": false, "error": format!("dispatch panicked: {msg}"), "verb": verb}).to_string()
         }
     };
+    if crate::dispatch_watchdog::take_reaped(&in_flight_key) {
+        eprintln!("[agentplug daemon] {verb}/{task} for {} finished after the watchdog had already reaped it -- its late result is discarded so the caller keeps the reaped answer", root.display());
+        return;
+    }
     let out_body = patch_update_available_from_escalation(plugin_name, verb, out_body);
     let out_body = spill_large_exec_output_to_text_sibling(out_dir, verb, task, out_body);
     let out_name = format!("{verb}-{task}.json");
@@ -2752,7 +2761,7 @@ fn dispatch_project(root: &Path, project: &mut ProjectPlugins, plugin_modules: &
         }
         in_flight_map().lock().unwrap_or_else(|e| e.into_inner()).insert(
             (root.to_path_buf(), verb.clone(), task.clone()),
-            InFlightHandle { detach: Arc::new(std::sync::atomic::AtomicBool::new(false)) },
+            InFlightHandle { detach: Arc::new(std::sync::atomic::AtomicBool::new(false)), clock: crate::dispatch_watchdog::DispatchClock::at_claim(&body) },
         );
         let submitted_at_ms = queued_since
             .duration_since(std::time::UNIX_EPOCH)
@@ -2814,82 +2823,101 @@ fn dispatch_project(root: &Path, project: &mut ProjectPlugins, plugin_modules: &
     if gm_requests.is_empty() {
         answer_bg_converts(bg_convert_requests);
     } else {
-        let mut gm_load_failure_reason: Option<String> = None;
-        for plugin_name in &requested_plugins {
-            if project.is_loaded(plugin_name) {
-                continue;
-            }
-            let Some((module, content_hash)) = plugin_modules.module_with_hash(plugin_name) else {
-                let reason = match read_plugin_compile_failure(plugin_name) {
-                    Some(compile_err) => format!("plugin {plugin_name} failed to compile/install: {compile_err}"),
-                    None => format!("plugin {plugin_name} not yet compiled for {}: dispatch this thread's own get_or_compile could not run against the shared PluginModules from a worker thread -- see plugin_modules.get_or_compile() call in run_daemon's pre-chunk warm pass", root.display()),
+        answer_bg_converts(bg_convert_requests);
+        let view = project.detached_view();
+        let engine = plugin_modules.engine.clone();
+        let module_table = plugin_modules.modules_with_hashes();
+        let batch_root = root.to_path_buf();
+        let batch_in_dir = in_dir.clone();
+        let batch_out_dir = out_dir.clone();
+        let batch_name = format!("gm-batch-{}", gm_requests.first().map(|r| r.task.as_str()).unwrap_or("empty"));
+        let batch_failed_tasks: Vec<(String, String)> = gm_requests.iter().map(|r| (r.verb.clone(), r.task.clone())).collect();
+        let batch = std::thread::Builder::new().name(batch_name).spawn(move || {
+            let root = batch_root.as_path();
+            let in_dir = batch_in_dir;
+            let out_dir = batch_out_dir;
+            let mut gm_load_failure_reason: Option<String> = None;
+            for plugin_name in &requested_plugins {
+                if view.is_loaded(plugin_name) {
+                    continue;
+                }
+                let Some((module, content_hash)) = module_table.get(plugin_name).map(|(m, h)| (m, h.as_str())) else {
+                    let reason = match read_plugin_compile_failure(plugin_name) {
+                        Some(compile_err) => format!("plugin {plugin_name} failed to compile/install: {compile_err}"),
+                        None => format!("plugin {plugin_name} not yet compiled for {}: dispatch this thread's own get_or_compile could not run against the shared PluginModules from a worker thread -- see plugin_modules.get_or_compile() call in run_daemon's pre-chunk warm pass", root.display()),
+                    };
+                    eprintln!("[agentplug daemon] {reason}");
+                    if plugin_name == "gm" { gm_load_failure_reason = Some(reason); }
+                    continue;
                 };
-                eprintln!("[agentplug daemon] {reason}");
-                if plugin_name == "gm" { gm_load_failure_reason = Some(reason); }
-                continue;
-            };
-            if let Err(e) = project.load_plugin(&plugin_modules.engine, plugin_name, module, content_hash) {
-                let reason = format!("failed to instantiate plugin {plugin_name} for {}: {e:#}", root.display());
-                eprintln!("[agentplug daemon] {reason}");
-                match crate::download::record_plugin_load_failure_and_rollback(plugin_name) {
-                    Ok(true) => {
-                        eprintln!(
-                            "[agentplug daemon] {plugin_name} rolled back after instantiate failure -- retry this dispatch; the rolled-back version will compile and load on the next attempt"
-                        );
+                if let Err(e) = view.load_plugin(&engine, plugin_name, module, content_hash) {
+                    let reason = format!("failed to instantiate plugin {plugin_name} for {}: {e:#}", root.display());
+                    eprintln!("[agentplug daemon] {reason}");
+                    match crate::download::record_plugin_load_failure_and_rollback(plugin_name) {
+                        Ok(true) => {
+                            eprintln!(
+                                "[agentplug daemon] {plugin_name} rolled back after instantiate failure -- retry this dispatch; the rolled-back version will compile and load on the next attempt"
+                            );
+                        }
+                        Ok(false) => {
+                            eprintln!(
+                                "[agentplug daemon] {plugin_name} instantiate failure has no prior working version to roll back to (first install, or no .wasm.prev backup exists) -- cannot self-recover"
+                            );
+                        }
+                        Err(rollback_err) => {
+                            eprintln!(
+                                "[agentplug daemon] {plugin_name} rollback after instantiate failure itself failed: {rollback_err:#}"
+                            );
+                        }
                     }
-                    Ok(false) => {
-                        eprintln!(
-                            "[agentplug daemon] {plugin_name} instantiate failure has no prior working version to roll back to (first install, or no .wasm.prev backup exists) -- cannot self-recover"
-                        );
-                    }
-                    Err(rollback_err) => {
-                        eprintln!(
-                            "[agentplug daemon] {plugin_name} rollback after instantiate failure itself failed: {rollback_err:#}"
-                        );
-                    }
-                }
-                if plugin_name == "gm" { gm_load_failure_reason = Some(reason); }
-            }
-        }
-
-        if !project.is_loaded("gm") {
-            let error_message = match &gm_load_failure_reason {
-                Some(reason) => format!("gm plugin failed to load for this project: {reason}"),
-                None => "gm plugin failed to load for this project (see daemon stderr for the compile/install/instantiate failure)".to_string(),
-            };
-            for req in &gm_requests {
-                let out_body = serde_json::json!({"ok": false, "error": error_message, "verb": req.verb}).to_string();
-                write_spool_out_and_release_claim(&out_dir, &in_dir, &req.verb, &req.task, &out_body);
-            }
-            answer_bg_converts(bg_convert_requests);
-        } else {
-            for req in gm_requests {
-                let self_healing_dispatch_handle = project.dispatch_handle_with_reload(Some((plugin_modules.engine.clone(), plugin_modules.modules_with_hashes())));
-                let detach_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
-                let key: InFlightKey = (root.to_path_buf(), req.verb.clone(), req.task.clone());
-                let failed_spawn_key = key.clone();
-                let failed_spawn_verb = req.verb.clone();
-                let failed_spawn_task = req.task.clone();
-                in_flight_map().lock().unwrap_or_else(|e| e.into_inner()).insert(key.clone(), InFlightHandle { detach: detach_flag });
-
-                let thread_root = root.to_path_buf();
-                let thread_out_dir = out_dir.clone();
-                let queue_wait_ms = req.submitted_at_ms.map(|submitted| now_ms().saturating_sub(submitted)).unwrap_or(0);
-                let spawn_result = std::thread::Builder::new().name(format!("gm-dispatch-{}", req.task)).spawn(move || {
-                    let _release_in_flight_entry = InFlightEntryRelease { key };
-                    run_gm_dispatch_to_file(&thread_root, &self_healing_dispatch_handle, &req.verb, &req.task, &req.body, &thread_out_dir, queue_wait_ms, req.submitted_at_ms);
-                });
-                if let Err(e) = spawn_result {
-                    eprintln!("[agentplug daemon] could not spawn a dispatch thread for {}: {e} -- answering the request with an error instead of leaving it claimed", root.display());
-                    in_flight_map().lock().unwrap_or_else(|e| e.into_inner()).remove(&failed_spawn_key);
-                    let out_body = serde_json::json!({"ok": false, "error": format!("daemon could not start a dispatch thread: {e}"), "verb": failed_spawn_verb}).to_string();
-                    write_spool_out_and_release_claim(&out_dir, &in_dir, &failed_spawn_verb, &failed_spawn_task, &out_body);
+                    if plugin_name == "gm" { gm_load_failure_reason = Some(reason); }
                 }
             }
 
-            answer_bg_converts(bg_convert_requests);
-            write_project_heartbeat(&spool_dir, Some(now_ms() + TICKER_BUSY_UNTIL_EXTEND_MS));
+            if !view.is_loaded("gm") {
+                let error_message = match &gm_load_failure_reason {
+                    Some(reason) => format!("gm plugin failed to load for this project: {reason}"),
+                    None => "gm plugin failed to load for this project (see daemon stderr for the compile/install/instantiate failure)".to_string(),
+                };
+                for req in &gm_requests {
+                    let out_body = serde_json::json!({"ok": false, "error": error_message, "verb": req.verb}).to_string();
+                    write_spool_out_and_release_claim(&out_dir, &in_dir, &req.verb, &req.task, &out_body);
+                }
+            } else {
+                for req in gm_requests {
+                    let self_healing_dispatch_handle = view.dispatch_handle_with_reload(Some((engine.clone(), module_table.clone())));
+                    let detach_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                    let key: InFlightKey = (root.to_path_buf(), req.verb.clone(), req.task.clone());
+                    let failed_spawn_key = key.clone();
+                    let failed_spawn_verb = req.verb.clone();
+                    let failed_spawn_task = req.task.clone();
+                    in_flight_map().lock().unwrap_or_else(|e| e.into_inner()).entry(key.clone()).or_insert_with(|| InFlightHandle { detach: detach_flag, clock: crate::dispatch_watchdog::DispatchClock::at_claim(&req.body) });
+
+                    let thread_root = root.to_path_buf();
+                    let thread_out_dir = out_dir.clone();
+                    let queue_wait_ms = req.submitted_at_ms.map(|submitted| now_ms().saturating_sub(submitted)).unwrap_or(0);
+                    let spawn_result = std::thread::Builder::new().name(format!("gm-dispatch-{}", req.task)).spawn(move || {
+                        let _release_in_flight_entry = InFlightEntryRelease { key };
+                        run_gm_dispatch_to_file(&thread_root, &self_healing_dispatch_handle, &req.verb, &req.task, &req.body, &thread_out_dir, queue_wait_ms, req.submitted_at_ms);
+                    });
+                    if let Err(e) = spawn_result {
+                        eprintln!("[agentplug daemon] could not spawn a dispatch thread for {}: {e} -- answering the request with an error instead of leaving it claimed", root.display());
+                        in_flight_map().lock().unwrap_or_else(|e| e.into_inner()).remove(&failed_spawn_key);
+                        let out_body = serde_json::json!({"ok": false, "error": format!("daemon could not start a dispatch thread: {e}"), "verb": failed_spawn_verb}).to_string();
+                        write_spool_out_and_release_claim(&out_dir, &in_dir, &failed_spawn_verb, &failed_spawn_task, &out_body);
+                    }
+                }
+            }
+        });
+        if let Err(e) = batch {
+            eprintln!("[agentplug daemon] could not start the dispatch batch thread for {}: {e} -- answering its requests with an error instead of leaving them claimed", root.display());
+            for (verb, task) in batch_failed_tasks {
+                let out_body = serde_json::json!({"ok": false, "error": format!("daemon could not start a dispatch batch thread: {e}"), "verb": verb}).to_string();
+                write_spool_out_and_release_claim(&out_dir, &in_dir, &verb, &task, &out_body);
+            }
         }
+        write_project_heartbeat(&spool_dir, Some(now_ms() + TICKER_BUSY_UNTIL_EXTEND_MS));
+        did_work = true;
     }
 
     if did_work {
@@ -2927,69 +2955,82 @@ fn dispatch_project(root: &Path, project: &mut ProjectPlugins, plugin_modules: &
                 let task = file_path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
                 let body = fs::read_to_string(&claim_path).unwrap_or_default();
 
-                let write_pd_out = |out_name: &str, out_body: &str| {
-                    let tmp = pd_out.join(format!("{out_name}.tmp.{}", std::process::id()));
-                    if fs::write(&tmp, out_body).is_ok() {
-                        let _ = fs::rename(&tmp, pd_out.join(out_name));
-                        let _ = fs::write(pd_out.join(format!("{out_name}.ready")), b"");
-                    }
-                    let _ = fs::remove_file(&claim_path);
-                };
+                let mut view = project.detached_view();
+                let engine = plugin_modules.engine.clone();
+                let module_pair = plugin_modules.module_with_hash(&plugin_name).map(|(m, h)| (m.clone(), h.to_string()));
+                let thread_root = root.to_path_buf();
+                let pd_out = pd_out.clone();
+                let thread_name = format!("plugin-dispatch-{task}");
+                let spawned = std::thread::Builder::new().name(thread_name).spawn(move || {
+                    let root = thread_root.as_path();
+                    let write_pd_out = |out_name: &str, out_body: &str| {
+                        let tmp = pd_out.join(format!("{out_name}.tmp.{}", std::process::id()));
+                        if fs::write(&tmp, out_body).is_ok() {
+                            let _ = fs::rename(&tmp, pd_out.join(out_name));
+                            let _ = fs::write(pd_out.join(format!("{out_name}.ready")), b"");
+                        }
+                        let _ = fs::remove_file(&claim_path);
+                    };
 
-                {
-                    let current = plugin_modules.module_with_hash(&plugin_name)
-                        .map(|(_, hash)| project.is_loaded_current(&plugin_name, hash))
-                        .unwrap_or_else(|| project.is_loaded(&plugin_name));
-                    if !current {
-                        let Some((module, content_hash)) = plugin_modules.module_with_hash(&plugin_name) else {
-                            let out_name = format!("{plugin_name}-{verb}-{task}.json");
-                            let out_body = serde_json::json!({"ok": false, "error": format!("plugin {plugin_name} not compiled yet for this daemon -- retry shortly")}).to_string();
-                            write_pd_out(&out_name, &out_body);
-                            return true;
-                        };
-                        if let Err(e) = project.load_plugin(&plugin_modules.engine, &plugin_name, module, content_hash) {
-                            let out_name = format!("{plugin_name}-{verb}-{task}.json");
-                            let out_body = serde_json::json!({"ok": false, "error": format!("plugin instantiate failed: {e:#}")}).to_string();
-                            write_pd_out(&out_name, &out_body);
-                            return true;
+                    {
+                        let current = module_pair.as_ref()
+                            .map(|(_, hash)| view.is_loaded_current(&plugin_name, hash))
+                            .unwrap_or_else(|| view.is_loaded(&plugin_name));
+                        if !current {
+                            let Some((module, content_hash)) = module_pair.as_ref() else {
+                                let out_name = format!("{plugin_name}-{verb}-{task}.json");
+                                let out_body = serde_json::json!({"ok": false, "error": format!("plugin {plugin_name} not compiled yet for this daemon -- retry shortly")}).to_string();
+                                write_pd_out(&out_name, &out_body);
+                                return;
+                            };
+                            if let Err(e) = view.load_plugin(&engine, &plugin_name, module, content_hash) {
+                                let out_name = format!("{plugin_name}-{verb}-{task}.json");
+                                let out_body = serde_json::json!({"ok": false, "error": format!("plugin instantiate failed: {e:#}")}).to_string();
+                                write_pd_out(&out_name, &out_body);
+                                return;
+                            }
                         }
                     }
-                }
 
-                if let Some(reason) = shared_store_recycle_reason_independent_of_daemon_idle_state(&DaemonConfig::load()) {
-                    let mut released: Vec<&str> = Vec::new();
-                    for shared_name in agentplug_host::RELEASABLE_SHARED_PLUGINS {
-                        if shared_name != plugin_name && agentplug_host::release_shared_plugin(shared_name) {
-                            released.push(shared_name);
+                    if let Some(reason) = shared_store_recycle_reason_independent_of_daemon_idle_state(&DaemonConfig::load()) {
+                        let mut released: Vec<&str> = Vec::new();
+                        for shared_name in agentplug_host::RELEASABLE_SHARED_PLUGINS {
+                            if shared_name != plugin_name && agentplug_host::release_shared_plugin(shared_name) {
+                                released.push(shared_name);
+                            }
+                        }
+                        agentplug_host::reset_shared_dispatch_count();
+                        if !released.is_empty() {
+                            eprintln!(
+                                "[agentplug daemon] pre-dispatch release of shared Stores {released:?} before {plugin_name}/{verb} -- {reason}"
+                            );
                         }
                     }
-                    agentplug_host::reset_shared_dispatch_count();
-                    if !released.is_empty() {
-                        eprintln!(
-                            "[agentplug daemon] pre-dispatch release of shared Stores {released:?} before {plugin_name}/{verb} -- {reason}"
-                        );
-                    }
-                }
 
-                let _tool_guard = ToolDispatchGuard::acquire(&plugin_name, &verb, &body);
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| project.dispatch(&plugin_name, &verb, &body)));
-                let out_name = format!("{plugin_name}-{verb}-{task}.json");
-                let out_body = match result {
-                    Ok(Ok(s)) if !s.is_empty() => s,
-                    Ok(Ok(_)) => serde_json::json!({"ok": false, "error": "empty dispatch result"}).to_string(),
-                    Ok(Err(e)) => serde_json::json!({"ok": false, "error": describe_dispatch_error_naming_wasm_trap_kind_distinctly_from_a_guest_logic_error(&e)}).to_string(),
-                    Err(panic_payload) => {
-                        let msg = panic_payload
-                            .downcast_ref::<&str>()
-                            .map(|s| s.to_string())
-                            .or_else(|| panic_payload.downcast_ref::<String>().cloned())
-                            .unwrap_or_else(|| "panic with non-string payload".to_string());
-                        eprintln!("[agentplug daemon] plugin {plugin_name} verb {verb} PANICKED for {}: {msg}", root.display());
-                        serde_json::json!({"ok": false, "error": format!("dispatch panicked: {msg}"), "verb": verb}).to_string()
-                    }
-                };
-                let out_body = patch_update_available_from_escalation(&plugin_name, &verb, out_body);
-                write_pd_out(&out_name, &out_body);
+                    let _tool_guard = ToolDispatchGuard::acquire(&plugin_name, &verb, &body);
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| view.dispatch(&plugin_name, &verb, &body)));
+                    let out_name = format!("{plugin_name}-{verb}-{task}.json");
+                    let out_body = match result {
+                        Ok(Ok(s)) if !s.is_empty() => s,
+                        Ok(Ok(_)) => serde_json::json!({"ok": false, "error": "empty dispatch result"}).to_string(),
+                        Ok(Err(e)) => serde_json::json!({"ok": false, "error": describe_dispatch_error_naming_wasm_trap_kind_distinctly_from_a_guest_logic_error(&e)}).to_string(),
+                        Err(panic_payload) => {
+                            let msg = panic_payload
+                                .downcast_ref::<&str>()
+                                .map(|s| s.to_string())
+                                .or_else(|| panic_payload.downcast_ref::<String>().cloned())
+                                .unwrap_or_else(|| "panic with non-string payload".to_string());
+                            eprintln!("[agentplug daemon] plugin {plugin_name} verb {verb} PANICKED for {}: {msg}", root.display());
+                            serde_json::json!({"ok": false, "error": format!("dispatch panicked: {msg}"), "verb": verb}).to_string()
+                        }
+                    };
+                    let out_body = patch_update_available_from_escalation(&plugin_name, &verb, out_body);
+                    write_pd_out(&out_name, &out_body);
+                    return;
+                });
+                if let Err(e) = spawned {
+                    eprintln!("[agentplug daemon] could not start a plugin-dispatch thread for {}: {e}", root.display());
+                }
                 return true;
             }
         }
@@ -3303,15 +3344,47 @@ fn spawn_update_poll_worker(daemon_cfg: DaemonConfig) -> std::sync::mpsc::Receiv
     staged_rx
 }
 
+fn running_exe_identity() -> (String, String) {
+    let Ok(exe) = std::env::current_exe() else { return ("unknown".to_string(), "unreadable".to_string()) };
+    let sha = fs::read(&exe).map(|bytes| crate::download::sha256_hex(&bytes)).unwrap_or_else(|e| format!("unreadable:{e}"));
+    (exe.display().to_string(), sha)
+}
+
+fn version_triple(version: &str) -> Option<(u64, u64, u64)> {
+    let mut parts = version.trim().trim_start_matches('v').split('.').map(|p| p.parse::<u64>());
+    Some((parts.next()?.ok()?, parts.next()?.ok()?, parts.next()?.ok()?))
+}
+
+fn warn_if_running_below_pinned_minimum() {
+    let pin_path = install_dir().join("agentplug-runner.min-version");
+    let Ok(pinned) = fs::read_to_string(&pin_path) else { return };
+    let (Some(pinned_triple), Some(running_triple)) = (version_triple(&pinned), version_triple(env!("CARGO_PKG_VERSION"))) else {
+        eprintln!("[agentplug daemon] {} holds {:?}, which is not a MAJOR.MINOR.PATCH version -- the pinned-minimum check is skipped", pin_path.display(), pinned.trim());
+        return;
+    };
+    if running_triple < pinned_triple {
+        eprintln!(
+            "[agentplug daemon] RUNNER BELOW PINNED MINIMUM: running {} but {} pins {} -- a restore or downgrade put an older binary in place; install a build at or above the pin",
+            env!("CARGO_PKG_VERSION"),
+            pin_path.display(),
+            pinned.trim()
+        );
+    }
+}
+
 fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
     HEARTBEAT_DAEMON_BOOT_TS.store(now_ms(), std::sync::atomic::Ordering::Relaxed);
     write_daemon_heartbeat(0, 0);
+    let (boot_exe, boot_exe_sha256) = running_exe_identity();
     eprintln!(
-        "[agentplug daemon] BOOT pid={} version={} ts={}",
+        "[agentplug daemon] BOOT pid={} version={} exe={} sha256={} ts={}",
         std::process::id(),
         env!("CARGO_PKG_VERSION"),
+        boot_exe,
+        boot_exe_sha256,
         now_ms()
     );
+    warn_if_running_below_pinned_minimum();
 
     ensure_daemon_guard();
 
@@ -3426,6 +3499,7 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
         .checked_sub(Duration::from_millis(5 * 60 * 1000))
         .unwrap_or_else(Instant::now);
 
+    crate::dispatch_watchdog::spawn();
     let _heartbeat_ticker = spawn_heartbeat_ticker(heartbeat_interval);
     write_daemon_heartbeat(0, 0);
 

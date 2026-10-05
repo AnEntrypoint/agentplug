@@ -760,7 +760,11 @@ impl ProjectPlugins {
             .unwrap_or(false)
     }
 
-    pub fn load_plugin(&mut self, engine: &Engine, plugin_name: &str, module: &Module, content_hash: &str) -> anyhow::Result<()> {
+    pub fn detached_view(&self) -> ProjectPlugins {
+        ProjectPlugins { root: self.root.clone(), siblings: self.siblings.clone(), last_active: Instant::now() }
+    }
+
+    pub fn load_plugin(&self, engine: &Engine, plugin_name: &str, module: &Module, content_hash: &str) -> anyhow::Result<()> {
         if is_stateless_shared_plugin(plugin_name) {
             let pool = shared_plugin_pool(plugin_name);
             let has_current = pool.slots_for_fill().iter().any(|slot| {
