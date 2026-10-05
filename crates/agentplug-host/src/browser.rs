@@ -2725,7 +2725,6 @@ pub fn run(body: &str, opts: &str, cwd_raw: &Path, session_id: &str) -> Value {
                                 );
                             }
                         };
-                    launched_fresh_chrome = true;
                     let pid = acquired.child.as_ref().map(|c| c.id()).unwrap_or(0);
                     let new_port = acquired.port;
                     let mut map = sessions_map().lock().unwrap_or_else(|e| e.into_inner());
