@@ -203,16 +203,30 @@ pub fn run(code: &str, opts: &Value, cwd: &Path) -> Value {
 
     let waited = child.wait_timeout(Duration::from_millis(limit_ms));
     if matches!(waited, Ok(None)) {
-        let task_id =
-            crate::task::adopt_running(child, containment, lang, t0, stdout_pipe, stderr_pipe);
+        crate::process_tree::terminate_containment(&containment, child.id());
+        let _ = child.kill();
+        let exit_code = child
+            .wait()
+            .ok()
+            .and_then(|status| status.code())
+            .unwrap_or(-1);
+        let drain_deadline = Instant::now() + Duration::from_millis(1500);
+        let stdout = stdout_pipe
+            .map(|pipe| pipe.collect_with_grace(drain_deadline))
+            .unwrap_or_default();
+        let stderr = stderr_pipe
+            .map(|pipe| pipe.collect_with_grace(drain_deadline))
+            .unwrap_or_default();
         return json!({
-            "ok": true,
+            "ok": false,
             "timed_out": true,
-            "in_progress": true,
-            "task_id": task_id,
+            "killed": true,
+            "error_code": "exec_timeout",
+            "limit_ms": limit_ms,
             "elapsed_ms": t0.elapsed().as_millis() as u64,
-            "task_timeout_ms": 30 * 60 * 1000,
-            "decision_required": "this call hit its timeoutMs while work was still running; it remains alive in the task registry as task_id. Poll task-output with {\"id\":\"<task_id>\"} for progress or final output, or call task-stop with that id to kill it. The adopted task is killed if it remains active for 30 minutes."
+            "stdout": String::from_utf8_lossy(&stdout),
+            "stderr": String::from_utf8_lossy(&stderr),
+            "exit_code": exit_code,
         });
     }
     let exit_code = child.wait().ok().and_then(|s| s.code()).unwrap_or(-1);
@@ -639,77 +653,6 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use serde_json::json;
-
-    #[test]
-    fn foreground_timeout_hands_live_pipes_to_task_until_complete() {
-        let _guard = crate::task::test_registry_guard();
-        let result = super::run(
-            "printf '%s' before-; head -c 131072 /dev/zero | tr '\\000' x; printf '%s' -middle-; printf '%s' err-before- >&2; sleep 0.2; printf '%s' after; printf '%s' err-after >&2; (sleep 0.5; printf '%s' tail; printf '%s' err-tail >&2) &",
-            &json!({"lang": "bash", "timeoutMs": 100}),
-            Path::new("."),
-        );
-        assert_eq!(result.get("ok").and_then(|v| v.as_bool()), Some(true));
-        assert_eq!(
-            result.get("timed_out").and_then(|v| v.as_bool()),
-            Some(true)
-        );
-        assert_eq!(
-            result.get("in_progress").and_then(|v| v.as_bool()),
-            Some(true)
-        );
-        assert_eq!(
-            result.get("task_timeout_ms").and_then(|v| v.as_u64()),
-            Some(30 * 60 * 1000)
-        );
-        let id = result
-            .get("task_id")
-            .and_then(|v| v.as_str())
-            .expect("handoff task id")
-            .to_string();
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let mut saw_finished_before_drains = false;
-        let final_output = loop {
-            let output = crate::task::handle(
-                "output",
-                &json!({"id": id, "max_bytes": 200_000}),
-                Path::new("."),
-            );
-            let finished = output.get("running").and_then(|v| v.as_bool()) == Some(false);
-            let stdout = output
-                .get("stdout")
-                .and_then(|v| v.as_str())
-                .expect("stdout");
-            let stderr = output
-                .get("stderr")
-                .and_then(|v| v.as_str())
-                .expect("stderr");
-            if finished && !stdout.contains("tail") && !stderr.contains("err-tail") {
-                saw_finished_before_drains = true;
-            }
-            if finished && stdout.contains("tail") && stderr.contains("err-tail") {
-                break output;
-            }
-            assert!(Instant::now() < deadline, "adopted task did not finish");
-            std::thread::sleep(Duration::from_millis(20));
-        };
-        assert!(saw_finished_before_drains);
-        let stdout = final_output
-            .get("stdout")
-            .and_then(|v| v.as_str())
-            .expect("stdout");
-        let stderr = final_output
-            .get("stderr")
-            .and_then(|v| v.as_str())
-            .expect("stderr");
-        assert!(stdout.starts_with("before-"));
-        assert!(stdout.contains("-middle-aftertail"));
-        assert_eq!(stdout.matches('x').count(), 131072);
-        assert_eq!(stderr, "err-before-err-aftererr-tail");
-        assert_eq!(
-            final_output.get("exit_code").and_then(|v| v.as_i64()),
-            Some(0)
-        );
-    }
 
     #[test]
     fn exited_foreground_child_hands_late_descendant_output_to_task() {
