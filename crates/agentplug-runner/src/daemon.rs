@@ -1632,7 +1632,7 @@ impl PluginModules {
                 }
             }
             eprintln!("[agentplug daemon] compiling {plugin_name}.wasm (shared across every project that uses it)...");
-            let module = Module::from_file(&self.engine, &wasm_path)?;
+            let module = agentplug_host::load_module_file_backed(&self.engine, &wasm_path, plugin_name, &on_disk_hash)?;
             self.modules.insert(plugin_name.to_string(), module);
             self.loaded_content_hash.insert(plugin_name.to_string(), on_disk_hash.clone());
             loaded_plugin_content_hashes()
@@ -2424,14 +2424,7 @@ fn dispatch_project(root: &Path, project: &mut ProjectPlugins, plugin_modules: &
     write_project_heartbeat(&spool_dir, read_status_busy_until_if_future(&spool_dir));
 
     let requested_plugins = {
-        let mut list = vec![
-            "gm".to_string(),
-            "libsql".to_string(),
-            "bert".to_string(),
-            "treesitter".to_string(),
-            "oxibrowser".to_string(),
-            "crux".to_string(),
-        ];
+        let mut list = vec!["gm".to_string()];
         for extra in read_project_plugin_list(root) {
             if !list.contains(&extra) {
                 list.push(extra);
