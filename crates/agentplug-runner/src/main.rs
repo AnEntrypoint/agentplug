@@ -1,5 +1,6 @@
 ﻿mod build_info;
 mod daemon;
+mod dispatch_watchdog;
 mod download;
 mod update_trust;
 
@@ -365,7 +366,7 @@ fn selfcheck_inflight_cleanup() -> anyhow::Result<()> {
     daemon::in_flight_map()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .insert(key.clone(), daemon::InFlightHandle { detach: Arc::new(AtomicBool::new(false)) });
+        .insert(key.clone(), daemon::InFlightHandle { detach: Arc::new(AtomicBool::new(false)), clock: crate::dispatch_watchdog::DispatchClock::at_claim("") });
 
     daemon::run_gm_dispatch_to_file(&root, &handle, "verbX", "taskY", "{}", &out_dir, 0, None);
 
