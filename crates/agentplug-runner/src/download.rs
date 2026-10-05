@@ -83,6 +83,30 @@ fn extract_version_from_release_url(url: &str) -> Option<String> {
     Some(tag.trim_start_matches('v').to_string())
 }
 
+fn is_safe_identifier_component(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
+fn is_safe_plugin_name(plugin_name: &str) -> bool {
+    plugin_name
+        .bytes()
+        .next()
+        .is_some_and(|byte| byte.is_ascii_alphanumeric())
+        && is_safe_identifier_component(plugin_name)
+}
+
+fn is_safe_github_repo(repo: &str) -> bool {
+    let mut segments = repo.split('/');
+    matches!(
+        (segments.next(), segments.next(), segments.next()),
+        (Some(owner), Some(name), None)
+            if is_safe_identifier_component(owner) && is_safe_identifier_component(name)
+    )
+}
+
 fn resolve_latest_tag_via_release_page(repo: &str) -> Option<String> {
     let page_url = format!("https://github.com/{repo}/releases/latest");
     let resp = agentplug_host::shared_agent().get(&page_url).call().ok()?;
@@ -113,7 +137,20 @@ fn try_ensure_plugin_installed_via_direct_release_latest(
         .ok_or_else(|| {
             anyhow::anyhow!("could not determine release tag from redirect target {resolved_url} (requested {sha_url}), and the releases/latest page fallback also failed")
         })?;
-    let sha_line = sha_resp.into_string()?;
+    if !is_recognized_release_semver(&version) {
+        anyhow::bail!(
+            "latest release tag {version:?} for {} is not X.Y.Z semver",
+            spec.repo
+        );
+    }
+    let base = format!(
+        "https://github.com/{}/releases/download/v{version}",
+        spec.repo
+    );
+    let sha_line = agentplug_host::shared_agent()
+        .get(&format!("{base}/{}.wasm.sha256", spec.asset_basename))
+        .call()?
+        .into_string()?;
     let expected_sha = sha_line
         .split_whitespace()
         .next()
@@ -125,10 +162,7 @@ fn try_ensure_plugin_installed_via_direct_release_latest(
         })?
         .to_string();
 
-    let wasm_url = format!(
-        "https://github.com/{}/releases/latest/download/{}.wasm",
-        spec.repo, spec.asset_basename
-    );
+    let wasm_url = format!("{base}/{}.wasm", spec.asset_basename);
     let artifact = format!("{}.wasm", spec.asset_basename);
     let running = installed_plugin_version_from_file(version_file);
     let identity = AssetIdentity {
@@ -136,9 +170,9 @@ fn try_ensure_plugin_installed_via_direct_release_latest(
         version: &version,
         running: running.as_deref(),
     };
-    snapshot_prev_wasm_and_version(dest, version_file);
-    download_and_verify(&wasm_url, dest, &expected_sha, &identity)?;
-    fs::write(version_file, &version)?;
+    snapshot_prev_wasm_and_version(dest, version_file)?;
+    let finalized = download_and_verify(&wasm_url, dest, &expected_sha, &identity)?;
+    record_plugin_install(dest, version_file, &version, &identity, &finalized)?;
     eprintln!(
         "[agentplug] {} installed via direct release-asset download {wasm_url} (api.github.com path failed or was blocked)",
         spec.asset_basename
@@ -240,7 +274,6 @@ pub fn download_and_verify(
         return Err(e);
     }
     fs::rename(&tmp, dest)?;
-    update_trust::installed(identity, &finalized);
     Ok(finalized)
 }
 
@@ -294,13 +327,32 @@ struct ProjectPluginSpec {
     asset_basename: String,
 }
 
+fn project_plugin_spec_is_safe(spec: &ProjectPluginSpec) -> bool {
+    is_safe_plugin_name(&spec.name)
+        && is_safe_github_repo(&spec.repo)
+        && is_safe_identifier_component(&spec.asset_basename)
+}
+
 fn project_declared_plugin_specs(project_root: &Path) -> Vec<ProjectPluginSpec> {
     let path = project_root.join(".agentplug").join("plugins.json");
     let Ok(raw) = fs::read_to_string(&path) else {
         return Vec::new();
     };
     match serde_json::from_str::<Vec<ProjectPluginSpec>>(&raw) {
-        Ok(specs) => specs,
+        Ok(specs) => specs
+            .into_iter()
+            .filter(|spec| {
+                let safe = project_plugin_spec_is_safe(spec);
+                if !safe {
+                    eprintln!(
+                        "[agentplug] {} has an unsafe plugin spec for {:?} -- ignoring it",
+                        path.display(),
+                        spec.name
+                    );
+                }
+                safe
+            })
+            .collect(),
         Err(e) => {
             eprintln!("[agentplug] {} exists but does not parse as an array of {{name,repo,asset_basename}} -- ignoring: {e}", path.display());
             Vec::new()
@@ -354,13 +406,55 @@ fn installed_plugin_version_from_file(version_file: &Path) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-fn snapshot_prev_wasm_and_version(dest: &Path, version_file: &Path) {
+fn snapshot_prev_wasm_and_version(dest: &Path, version_file: &Path) -> anyhow::Result<()> {
     if dest.exists() {
-        let _ = fs::copy(dest, dest.with_extension("wasm.prev"));
+        fs::copy(dest, dest.with_extension("wasm.prev"))?;
     }
     if version_file.exists() {
-        let _ = fs::copy(version_file, version_file.with_extension("version.prev"));
+        fs::copy(version_file, version_file.with_extension("version.prev"))?;
     }
+    Ok(())
+}
+
+fn restore_plugin_snapshot(dest: &Path, version_file: &Path) -> anyhow::Result<()> {
+    let prev_dest = dest.with_extension("wasm.prev");
+    let prev_version_file = version_file.with_extension("version.prev");
+    if prev_dest.exists() {
+        fs::copy(prev_dest, dest)?;
+    } else if let Err(error) = fs::remove_file(dest) {
+        if error.kind() != std::io::ErrorKind::NotFound {
+            return Err(error.into());
+        }
+    }
+    if prev_version_file.exists() {
+        fs::copy(prev_version_file, version_file)?;
+    } else if let Err(error) = fs::remove_file(version_file) {
+        if error.kind() != std::io::ErrorKind::NotFound {
+            return Err(error.into());
+        }
+    }
+    Ok(())
+}
+
+fn record_plugin_install(
+    dest: &Path,
+    version_file: &Path,
+    version: &str,
+    identity: &AssetIdentity,
+    finalized: &update_trust::Finalized,
+) -> anyhow::Result<()> {
+    if let Err(write_error) = fs::write(version_file, version) {
+        return match restore_plugin_snapshot(dest, version_file) {
+            Ok(()) => Err(anyhow::anyhow!(
+                "could not record installed plugin version {version}: {write_error}; restored the prior plugin snapshot"
+            )),
+            Err(rollback_error) => Err(anyhow::anyhow!(
+                "could not record installed plugin version {version}: {write_error}; restoring the prior plugin snapshot also failed: {rollback_error}"
+            )),
+        };
+    }
+    update_trust::installed(identity, finalized);
+    Ok(())
 }
 
 const RUNNER_BIN_REPO: &str = "AnEntrypoint/agentplug-bin";
@@ -690,6 +784,7 @@ pub fn stage_runner_self_update() -> anyhow::Result<Option<(PathBuf, String)>> {
         &identity,
     )?;
     update_trust::record_stage_outcome(&staged, &identity, &finalized);
+    update_trust::installed(&identity, &finalized);
     #[cfg(not(windows))]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -904,8 +999,9 @@ pub fn refresh_plugin_if_stale(plugin_name: &str) -> anyhow::Result<Option<Strin
     let Some(latest) = fetch_latest_plugin_version(plugin_name)? else {
         return Ok(None);
     };
-    if latest == installed {
-        match (
+    match compare_release_semver(&latest, &installed) {
+        Some(std::cmp::Ordering::Greater) => {}
+        Some(std::cmp::Ordering::Equal) => match (
             fetch_remote_wasm_sha256(plugin_name, &latest),
             installed_wasm_sha256(plugin_name),
         ) {
@@ -913,6 +1009,18 @@ pub fn refresh_plugin_if_stale(plugin_name: &str) -> anyhow::Result<Option<Strin
                 eprintln!("[agentplug daemon] plugin {plugin_name} version {latest} matches but the released asset's sha256 has changed ({remote_sha} vs installed {local_sha}) -- re-fetching under the same tag");
             }
             _ => return Ok(None),
+        },
+        Some(std::cmp::Ordering::Less) => {
+            eprintln!(
+                "[agentplug daemon] plugin {plugin_name} latest release {latest} is older than installed {installed} -- refusing downgrade"
+            );
+            return Ok(None);
+        }
+        None => {
+            eprintln!(
+                "[agentplug daemon] plugin {plugin_name} latest release {latest:?} is not X.Y.Z semver -- refusing update"
+            );
+            return Ok(None);
         }
     }
     if read_known_bad_versions(plugin_name).contains(&latest) {
@@ -1080,6 +1188,16 @@ pub fn ensure_plugin_installed(
     plugin_name: &str,
     explicit_version: Option<&str>,
 ) -> anyhow::Result<PathBuf> {
+    if !is_safe_plugin_name(plugin_name) {
+        anyhow::bail!(
+            "plugin name {plugin_name:?} is not a safe identifier (expected an ASCII alphanumeric name with optional '.', '_' or '-')"
+        );
+    }
+    if let Some(version) = explicit_version {
+        if !is_recognized_release_semver(version) {
+            anyhow::bail!("requested plugin version {version:?} is not X.Y.Z semver");
+        }
+    }
     let dest = plugin_wasm_path(plugin_name);
     if dest.exists() && explicit_version.is_none() {
         return Ok(dest);
@@ -1103,12 +1221,13 @@ pub fn ensure_plugin_installed(
     let result = match ensure_plugin_installed_via_github(plugin_name, explicit_version, &spec, &dest, &version_file) {
         Ok(path) => Ok(path),
         Err(github_api_err) if github_api_err.downcast_ref::<UpdateRejected>().is_some() => Err(github_api_err),
-        Err(github_api_err) => match try_ensure_plugin_installed_via_direct_release_latest(&spec, &dest, &version_file) {
+        Err(github_api_err) if explicit_version.is_none() => match try_ensure_plugin_installed_via_direct_release_latest(&spec, &dest, &version_file) {
             Ok(path) => Ok(path),
             Err(direct_err) => Err(anyhow::anyhow!(
                 "plugin {plugin_name} install failed on all paths -- GitHub API: {github_api_err:#}; direct release download: {direct_err:#}"
             )),
         },
+        Err(github_api_err) => Err(github_api_err),
     };
     if explicit_version.is_none() {
         let marker = plugin_install_failure_marker_path(plugin_name);
@@ -1181,8 +1300,8 @@ fn ensure_plugin_installed_via_github(
         version: &version,
         running: running.as_deref(),
     };
-    snapshot_prev_wasm_and_version(dest, version_file);
-    download_and_verify(&wasm_url, dest, &expected_sha, &identity)?;
-    fs::write(version_file, &version)?;
+    snapshot_prev_wasm_and_version(dest, version_file)?;
+    let finalized = download_and_verify(&wasm_url, dest, &expected_sha, &identity)?;
+    record_plugin_install(dest, version_file, &version, &identity, &finalized)?;
     Ok(dest.to_path_buf())
 }
