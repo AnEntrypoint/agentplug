@@ -609,6 +609,35 @@ pub fn get_active_provider(plugin_name: &str) -> Option<String> {
         .next()
 }
 
+pub type SiblingPools = Arc<Mutex<HashMap<String, Arc<SharedPluginPool>>>>;
+
+pub type SiblingReloadSource = (Engine, HashMap<String, (Module, String)>);
+
+static SIBLING_RELOAD_SOURCE: OnceLock<Mutex<Option<Arc<SiblingReloadSource>>>> = OnceLock::new();
+
+pub fn set_sibling_reload_source(source: SiblingReloadSource) {
+    let slot = SIBLING_RELOAD_SOURCE.get_or_init(|| Mutex::new(None));
+    *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(source));
+}
+
+pub fn ensure_sibling_registered(root: &Path, plugin_name: &str, siblings: &SiblingPools) -> bool {
+    if siblings.lock().unwrap_or_else(|e| e.into_inner()).contains_key(plugin_name) {
+        return true;
+    }
+    let source = {
+        let slot = SIBLING_RELOAD_SOURCE.get_or_init(|| Mutex::new(None));
+        slot.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    };
+    let Some(source) = source else { return false };
+    let handle = DispatchHandle {
+        root: root.to_path_buf(),
+        siblings: siblings.clone(),
+        reload_source: Some(source.as_ref().clone()),
+    };
+    let _ = handle.reinstantiate_plugin_into_pool_slot_if_reload_source_available(plugin_name);
+    siblings.lock().unwrap_or_else(|e| e.into_inner()).contains_key(plugin_name)
+}
+
 fn resolve_routed_plugin_name(plugin_name: &str) -> (String, Option<crate::broker::RouteLease>) {
     match crate::broker::route(plugin_name) {
         Some(lease) => {
