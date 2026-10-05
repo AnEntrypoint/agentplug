@@ -1334,8 +1334,13 @@ pub fn run_takeover(version: &str) -> anyhow::Result<()> {
     eprintln!("[agentplug daemon] takeover: readiness marker written, waiting for old daemon to release ownership");
     for _ in 0..480 {
         if read_owner_pid().is_none() && claim_ownership() {
-            record_runner_version(version)?;
-            crate::download::clear_all_known_bad_version_markers();
+            if let Err(error) = record_runner_version(version) {
+                eprintln!(
+                    "[agentplug daemon] takeover: could not record running version {version}: {error} -- continuing with the verified staged runner so the old daemon is not left without a successor; a later boot will reconcile the marker"
+                );
+            } else {
+                crate::download::clear_all_known_bad_version_markers();
+            }
             let promoted = promote_staged_exe_to_canonical(version, running_before.as_deref());
             if promoted {
                 if let Some(canonical) = canonical_runner_exe_path() {
