@@ -679,17 +679,47 @@ fn is_daemon_fresh() -> bool {
 
 #[cfg(windows)]
 fn pid_is_alive(pid: u64) -> bool {
-    let mut cmd = std::process::Command::new("tasklist");
-    cmd.args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"]);
-    agentplug_host::apply_windowless(&mut cmd);
-    let output = cmd.output();
-    match output {
-        Ok(o) => {
-            let s = String::from_utf8_lossy(&o.stdout);
-            s.lines().next().map(|l| l.contains(',')).unwrap_or(false)
-        }
-        Err(_) => true,
+    use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ACCESS_DENIED};
+    use windows_sys::Win32::System::Threading::{GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+    const STILL_ACTIVE: u32 = 259;
+    let Ok(pid32) = u32::try_from(pid) else { return false };
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid32) };
+    if handle.is_null() {
+        return unsafe { GetLastError() } == ERROR_ACCESS_DENIED;
     }
+    let mut exit_code = 0u32;
+    let queried = unsafe { GetExitCodeProcess(handle, &mut exit_code) } != 0;
+    unsafe { CloseHandle(handle) };
+    !queried || exit_code == STILL_ACTIVE
+}
+
+const SPOOL_LAUNCHER_HARD_DEADLINE: Duration = Duration::from_secs(90);
+
+pub fn claim_spool_launcher_slot(spool_dir: &Path) -> bool {
+    let slot = spool_dir.join(".spool-launcher.pid");
+    let me = std::process::id() as u64;
+    if let Some(holder) = fs::read_to_string(&slot).ok().and_then(|s| s.trim().parse::<u64>().ok()) {
+        if holder != me && pid_is_alive(holder) {
+            return false;
+        }
+    }
+    let tmp = slot.with_extension(format!("pid.tmp.{me}"));
+    if fs::write(&tmp, me.to_string()).is_err() {
+        return false;
+    }
+    if fs::rename(&tmp, &slot).is_err() {
+        let _ = fs::remove_file(&tmp);
+        return false;
+    }
+    fs::read_to_string(&slot).ok().and_then(|s| s.trim().parse::<u64>().ok()) == Some(me)
+}
+
+pub fn arm_spool_launcher_deadline() {
+    std::thread::spawn(|| {
+        std::thread::sleep(SPOOL_LAUNCHER_HARD_DEADLINE);
+        eprintln!("[agentplug] spool launcher exceeded {}s without converging -- exiting so a wedged launch never lingers", SPOOL_LAUNCHER_HARD_DEADLINE.as_secs());
+        std::process::exit(2);
+    });
 }
 
 #[cfg(not(windows))]
