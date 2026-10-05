@@ -91,19 +91,15 @@ const GM_SPOOL_VERBS: &[&str] = &[
     "close",
     "filter",
     "git_status",
-        "branch_status",
-        "git_remote",
+    "branch_status",
     "git_push",
-    "git_tag",
     "git_add",
     "git_commit",
     "git_finalize",
     "git_log",
     "git_diff",
     "git_show",
-        "git_fetch",
-        "git_remote",
-    "git_clone",
+    "git_fetch",
     "git_pull",
     "ci-status",
     "git_branch",
@@ -136,19 +132,20 @@ fn cwd_is_inside_a_spool_tree(cwd: &Path) -> bool {
 }
 
 pub fn register_project(cwd: &Path) -> anyhow::Result<()> {
-    if cwd_is_inside_a_spool_tree(cwd) {
+    let cwd = agentplug_host::project_root(cwd);
+    if cwd_is_inside_a_spool_tree(&cwd) {
         anyhow::bail!(
             "refusing to register {} as a project root -- its own path is already inside a .gm/exec-spool tree, which means this is spool runtime state (in/out/status files), not a genuine project directory. Launch the spool from the actual project root instead.",
             cwd.display()
         );
     }
-    provision_gm_spool_verb_dirs(cwd)?;
+    provision_gm_spool_verb_dirs(&cwd)?;
     let path = registry_path();
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
     let existing = fs::read_to_string(&path).unwrap_or_default();
-    let cwd_str = agentplug_host::canonical_project_root(cwd)
+    let cwd_str = agentplug_host::canonical_project_root(&cwd)
         .to_string_lossy()
         .to_string();
 
@@ -164,9 +161,7 @@ pub fn register_project(cwd: &Path) -> anyhow::Result<()> {
             dropped += 1;
             continue;
         }
-        let canonical = agentplug_host::canonical_project_root(Path::new(entry))
-            .to_string_lossy()
-            .to_string();
+        let canonical = cached_project_root(entry).to_string_lossy().to_string();
         respelled |= canonical != entry;
         if live.iter().any(|e| e == &canonical) {
             respelled = true;
@@ -200,6 +195,27 @@ fn describe_dispatch_error_naming_wasm_trap_kind_distinctly_from_a_guest_logic_e
     }
 }
 
+const REGISTRY_ENTRY_ROOT_CACHE_TTL: Duration = Duration::from_secs(600);
+
+fn cached_project_root(entry: &str) -> PathBuf {
+    static SLOT: OnceLock<Mutex<HashMap<String, (Instant, PathBuf)>>> = OnceLock::new();
+    let cache = SLOT.get_or_init(|| Mutex::new(HashMap::new()));
+    let fresh = cache
+        .lock()
+        .ok()
+        .and_then(|entries| entries.get(entry).cloned())
+        .filter(|(resolved_at, _)| resolved_at.elapsed() < REGISTRY_ENTRY_ROOT_CACHE_TTL)
+        .map(|(_, root)| root);
+    if let Some(root) = fresh {
+        return root;
+    }
+    let root = agentplug_host::project_root(Path::new(entry));
+    if let Ok(mut entries) = cache.lock() {
+        entries.insert(entry.to_string(), (Instant::now(), root.clone()));
+    }
+    root
+}
+
 pub(crate) fn read_registry() -> Vec<PathBuf> {
     let mut roots: Vec<PathBuf> = Vec::new();
     for entry in fs::read_to_string(registry_path())
@@ -210,7 +226,7 @@ pub(crate) fn read_registry() -> Vec<PathBuf> {
         if entry.is_empty() || !Path::new(entry).exists() {
             continue;
         }
-        let canonical = agentplug_host::canonical_project_root(Path::new(entry));
+        let canonical = cached_project_root(entry);
         if !roots.contains(&canonical) {
             roots.push(canonical);
         }
@@ -255,6 +271,8 @@ struct DaemonConfig {
     project_idle_evict_secs: Option<u64>,
     #[serde(default)]
     shared_plugin_release_idle_secs: Option<u64>,
+    #[serde(default)]
+    require_runner_signature: Option<bool>,
 }
 
 const DAEMON_CONFIG_EXAMPLE: &str = r#"{
@@ -263,7 +281,8 @@ const DAEMON_CONFIG_EXAMPLE: &str = r#"{
   "plugin_update_poll_interval_secs": 600,
   "plugin_update_poll_interval_secs_by_name": {},
   "runner_update_poll_interval_secs": 60,
-  "instruction_source_poll_interval_secs": 600
+  "instruction_source_poll_interval_secs": 600,
+  "require_runner_signature": false
 }
 "#;
 
@@ -309,6 +328,7 @@ impl DaemonConfig {
             shared_store_recycle_dispatches: None,
             project_idle_evict_secs: None,
             shared_plugin_release_idle_secs: None,
+            require_runner_signature: None,
         }
     }
     fn registry_poll_interval(&self) -> Duration {
@@ -384,6 +404,13 @@ impl DaemonConfig {
             .max(MIN_SECS)
             * 1000
     }
+    fn require_runner_signature(&self) -> bool {
+        self.require_runner_signature.unwrap_or(false)
+    }
+}
+
+pub(crate) fn daemon_requires_runner_signature() -> bool {
+    DaemonConfig::load().require_runner_signature()
 }
 
 fn shared_store_recycle_reason_independent_of_daemon_idle_state(
@@ -595,6 +622,151 @@ fn holds_heartbeat_authority() -> bool {
     }
 }
 
+fn intentional_exit_path() -> PathBuf {
+    install_dir().join("daemon-intentional-exit.json")
+}
+
+pub fn mark_intentional_exit(kind: &str) {
+    let path = intentional_exit_path();
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let payload = serde_json::json!({ "ts": now_ms(), "pid": std::process::id(), "kind": kind });
+    let _ = fs::write(&path, payload.to_string());
+}
+
+fn intentional_exit_marker_age_ms() -> Option<u64> {
+    fs::read_to_string(intentional_exit_path())
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .and_then(|v| v.get("ts").and_then(|t| t.as_u64()))
+        .map(|ts| now_ms().saturating_sub(ts))
+}
+
+fn guard_lock_path() -> PathBuf {
+    install_dir().join("daemon-guard.lock")
+}
+
+fn live_guard_pid() -> Option<u64> {
+    let pid = fs::read_to_string(guard_lock_path())
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()?;
+    if pid == std::process::id() as u64 {
+        return None;
+    }
+    if pid_is_alive(pid) {
+        Some(pid)
+    } else {
+        None
+    }
+}
+
+fn claim_guard_lock() -> bool {
+    if live_guard_pid().is_some() {
+        return false;
+    }
+    let path = guard_lock_path();
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let tmp = path.with_extension(format!("lock.tmp.{}", std::process::id()));
+    if fs::write(&tmp, std::process::id().to_string()).is_err() {
+        return false;
+    }
+    if fs::rename(&tmp, &path).is_err() {
+        let _ = fs::remove_file(&tmp);
+        return false;
+    }
+    fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        == Some(std::process::id() as u64)
+}
+
+pub fn ensure_daemon_guard() {
+    if live_guard_pid().is_some() {
+        return;
+    }
+    let exe = match std::env::current_exe() {
+        Ok(exe) => exe,
+        Err(e) => {
+            eprintln!("[agentplug daemon] guard not armed: own exe path unavailable ({e})");
+            return;
+        }
+    };
+    if let Err(e) = spawn_detached(&exe, &["daemon-guard"]) {
+        eprintln!("[agentplug daemon] guard not armed: spawning it failed ({e})");
+        return;
+    }
+    eprintln!(
+        "[agentplug daemon] guard armed: a heartbeat that stops without an intentional-exit marker is restarted automatically"
+    );
+}
+
+const GUARD_POLL_MS: u64 = 2_000;
+const GUARD_START_WAIT_MS: u64 = 45_000;
+const GUARD_MAX_RESTARTS: u32 = 20;
+const INTENTIONAL_EXIT_HONOR_MS: u64 = 10_000;
+
+pub fn run_daemon_guard() -> anyhow::Result<()> {
+    if !claim_guard_lock() {
+        eprintln!("[agentplug daemon-guard] a guard is already live -- exiting");
+        return Ok(());
+    }
+    eprintln!(
+        "[agentplug daemon-guard] pid {} watching the shared daemon heartbeat",
+        std::process::id()
+    );
+    let mut restarts = 0u32;
+    loop {
+        std::thread::sleep(Duration::from_millis(GUARD_POLL_MS));
+        if is_daemon_fresh() {
+            continue;
+        }
+        if let Some(age) = intentional_exit_marker_age_ms() {
+            if age < INTENTIONAL_EXIT_HONOR_MS {
+                eprintln!(
+                    "[agentplug daemon-guard] daemon stopped by design (intentional-exit marker {age}ms old) -- standing down; the next dispatch starts a fresh daemon"
+                );
+                let _ = fs::remove_file(intentional_exit_path());
+                return Ok(());
+            }
+        }
+        if restarts >= GUARD_MAX_RESTARTS {
+            eprintln!(
+                "[agentplug daemon-guard] gave up after {restarts} restart attempt(s) -- exiting so a later daemon boot arms a fresh guard"
+            );
+            return Ok(());
+        }
+        restarts += 1;
+        clear_wasted_daemon_start_backoff();
+        eprintln!(
+            "[agentplug daemon-guard] daemon heartbeat is stale with no intentional-exit marker -- restarting it (attempt {restarts}/{GUARD_MAX_RESTARTS})"
+        );
+        if let Err(e) = spawn_detached_daemon() {
+            eprintln!(
+                "[agentplug daemon-guard] restart attempt {restarts} could not spawn a daemon: {e}"
+            );
+            continue;
+        }
+        let mut became_fresh = false;
+        for _ in 0..(GUARD_START_WAIT_MS / 500) {
+            std::thread::sleep(Duration::from_millis(500));
+            if is_daemon_fresh() {
+                became_fresh = true;
+                break;
+            }
+        }
+        if !became_fresh {
+            eprintln!(
+                "[agentplug daemon-guard] restart attempt {restarts} published no heartbeat within {GUARD_START_WAIT_MS}ms -- retrying"
+            );
+        }
+    }
+}
+
 pub fn ensure_daemon_running() -> anyhow::Result<bool> {
     if is_daemon_fresh() {
         return Ok(true);
@@ -666,18 +838,100 @@ fn is_daemon_fresh() -> bool {
 
 #[cfg(windows)]
 fn pid_is_alive(pid: u64) -> bool {
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    let output = std::process::Command::new("tasklist")
-        .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
-        .creation_flags(CREATE_NO_WINDOW)
-        .output();
-    match output {
-        Ok(o) => {
-            let s = String::from_utf8_lossy(&o.stdout);
-            s.lines().next().map(|l| l.contains(',')).unwrap_or(false)
-        }
-        Err(_) => true,
+    use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ACCESS_DENIED};
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    const STILL_ACTIVE: u32 = 259;
+    let Ok(pid32) = u32::try_from(pid) else {
+        return false;
+    };
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid32) };
+    if handle.is_null() {
+        return unsafe { GetLastError() } == ERROR_ACCESS_DENIED;
     }
+    let mut exit_code = 0u32;
+    let queried = unsafe { GetExitCodeProcess(handle, &mut exit_code) } != 0;
+    unsafe { CloseHandle(handle) };
+    !queried || exit_code == STILL_ACTIVE
+}
+
+const SPOOL_LAUNCHER_HARD_DEADLINE: Duration = Duration::from_secs(90);
+
+pub fn claim_spool_launcher_slot(spool_dir: &Path) -> bool {
+    let slot = spool_dir.join(".spool-launcher.pid");
+    let me = std::process::id() as u64;
+    if let Some(holder) = fs::read_to_string(&slot)
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+    {
+        if holder != me && pid_is_alive(holder) {
+            return false;
+        }
+    }
+    let tmp = slot.with_extension(format!("pid.tmp.{me}"));
+    if fs::write(&tmp, me.to_string()).is_err() {
+        return false;
+    }
+    if fs::rename(&tmp, &slot).is_err() {
+        let _ = fs::remove_file(&tmp);
+        return false;
+    }
+    fs::read_to_string(&slot)
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        == Some(me)
+}
+
+// One standalone watcher per project spool. Without this a second watcher on
+// the same project starts sweeping while the first is still dispatching: each
+// one's orphan sweep then answers `dispatch_orphaned` for the other's running
+// work and deletes the claim under it, which is the rotating-`sweeping_pid`
+// orphan storm. The slot is pid-liveness checked, not just present, so a crash
+// leaves the project reclaimable.
+pub fn claim_standalone_watcher_slot(spool_dir: &Path) -> bool {
+    let slot = spool_dir.join(".standalone-watcher.pid");
+    let me = std::process::id() as u64;
+    if let Some(holder) = fs::read_to_string(&slot)
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+    {
+        if holder != me && pid_is_alive(holder) {
+            return false;
+        }
+    }
+    let tmp = slot.with_extension(format!("pid.tmp.{me}"));
+    if fs::write(&tmp, me.to_string()).is_err() {
+        return false;
+    }
+    if fs::rename(&tmp, &slot).is_err() {
+        let _ = fs::remove_file(&tmp);
+        return false;
+    }
+    fs::read_to_string(&slot)
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        == Some(me)
+}
+
+pub fn release_standalone_watcher_slot(spool_dir: &Path) {
+    let slot = spool_dir.join(".standalone-watcher.pid");
+    let me = std::process::id() as u64;
+    if fs::read_to_string(&slot)
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        == Some(me)
+    {
+        let _ = fs::remove_file(&slot);
+    }
+}
+
+pub fn arm_spool_launcher_deadline() {
+    std::thread::spawn(|| {
+        std::thread::sleep(SPOOL_LAUNCHER_HARD_DEADLINE);
+        eprintln!("[agentplug] spool launcher exceeded {}s without converging -- exiting so a wedged launch never lingers", SPOOL_LAUNCHER_HARD_DEADLINE.as_secs());
+        std::process::exit(2);
+    });
 }
 
 #[cfg(not(windows))]
@@ -792,11 +1046,7 @@ fn run_git_bounded(args: &[&str]) -> anyhow::Result<std::process::Output> {
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
-    #[cfg(windows)]
-    {
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        cmd.creation_flags(CREATE_NO_WINDOW);
-    }
+    agentplug_host::apply_windowless(&mut cmd);
     let mut child = cmd.spawn()?;
     let timeout_ms = agentplug_host::git_subprocess_timeout_ms();
     let stdout_drain_thread = child.stdout.take().map(spawn_pipe_drain_thread);
@@ -883,11 +1133,7 @@ fn sync_instruction_source_if_configured(root: &Path) -> anyhow::Result<()> {
 fn staged_binary_self_check(staged_exe: &Path, expected_version: &str) -> bool {
     let mut cmd = std::process::Command::new(staged_exe);
     cmd.arg("--version");
-    #[cfg(windows)]
-    {
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        cmd.creation_flags(CREATE_NO_WINDOW);
-    }
+    agentplug_host::apply_windowless(&mut cmd);
     let output = cmd.output();
     match output {
         Ok(out) if out.status.success() => {
@@ -920,9 +1166,22 @@ fn staged_binary_self_check(staged_exe: &Path, expected_version: &str) -> bool {
 fn attempt_self_update_handoff(staged_exe: &Path, version: &str) -> bool {
     if !staged_binary_self_check(staged_exe, version) {
         let _ = fs::remove_file(staged_exe);
+        crate::update_trust::remove_stage_record(staged_exe);
         record_handoff_failure(
             version,
             format!("staged_binary_self_check failed for {version}, staged exe removed"),
+        );
+        return false;
+    }
+    if let Err(problem) = crate::update_trust::staged_runner_permitted(staged_exe) {
+        let _ = fs::remove_file(staged_exe);
+        crate::update_trust::remove_stage_record(staged_exe);
+        eprintln!(
+            "[agentplug daemon] refusing to hand off to {version}: {problem} -- staged exe removed and the running version kept"
+        );
+        record_handoff_failure(
+            version,
+            format!("update-signature verification refused staged {version}: {problem}"),
         );
         return false;
     }
@@ -974,7 +1233,7 @@ fn path_is_cargo_build_output(path: &Path) -> bool {
     })
 }
 
-fn promote_staged_exe_to_canonical(version: &str) -> bool {
+fn promote_staged_exe_to_canonical(version: &str, running_before: Option<&str>) -> bool {
     let Some(canonical) = canonical_runner_exe_path() else {
         return false;
     };
@@ -985,10 +1244,24 @@ fn promote_staged_exe_to_canonical(version: &str) -> bool {
         );
         return false;
     }
+    if let Some(reason) = crate::download::installed_runner_blocks_promotion(&canonical) {
+        eprintln!(
+            "[agentplug daemon] takeover: refusing to promote {version} onto {} -- {reason}; this process keeps running from the staged copy instead of overwriting it",
+            canonical.display()
+        );
+        return false;
+    }
     let Ok(staged) = std::env::current_exe() else {
         return false;
     };
     if staged == canonical {
+        return false;
+    }
+    if let Err(problem) = crate::update_trust::staged_runner_permitted(&staged) {
+        eprintln!(
+            "[agentplug daemon] takeover: refusing to promote {version} onto {} -- {problem}; this process keeps running from the staged copy instead of overwriting the canonical exe",
+            canonical.display()
+        );
         return false;
     }
     let prev = canonical.with_extension(
@@ -1018,6 +1291,7 @@ fn promote_staged_exe_to_canonical(version: &str) -> bool {
                 }
             }
             record_completed_runner_swap(version);
+            crate::update_trust::record_unverified_promotion(&staged, version, running_before);
             eprintln!("[agentplug daemon] takeover: promoted {version} onto canonical exe path {} (previous version kept at {})", canonical.display(), prev.display());
             true
         }
@@ -1090,12 +1364,13 @@ pub fn run_takeover(version: &str) -> anyhow::Result<()> {
         serde_json::json!({"version": version, "pid": std::process::id(), "ts": now_ms()})
             .to_string(),
     );
+    let running_before = crate::download::installed_runner_version();
     eprintln!("[agentplug daemon] takeover: readiness marker written, waiting for old daemon to release ownership");
     for _ in 0..480 {
         if read_owner_pid().is_none() && claim_ownership() {
             record_runner_version(version)?;
             crate::download::clear_all_known_bad_version_markers();
-            let promoted = promote_staged_exe_to_canonical(version);
+            let promoted = promote_staged_exe_to_canonical(version, running_before.as_deref());
             if promoted {
                 if let Some(canonical) = canonical_runner_exe_path() {
                     release_ownership_for_handoff();
@@ -1219,6 +1494,9 @@ fn write_daemon_heartbeat(project_count: usize, plugin_module_count: usize) {
             "last_handoff_attempt_ts": handoff_attempt.as_ref().map(|(ts, _)| serde_json::json!(ts)).unwrap_or(serde_json::Value::Null),
             "last_handoff_error": handoff_attempt.as_ref().and_then(|(_, err)| err.clone()),
             "last_completed_runner_swap": read_last_completed_runner_swap().unwrap_or(serde_json::Value::Null),
+            "runner_update_trust_mode": crate::update_trust::runner_mode_str(),
+            "runner_signature_required": crate::update_trust::strict_mode(),
+            "runner_unverified_update": crate::update_trust::unverified_promotion().unwrap_or(serde_json::Value::Null),
         })
         .to_string(),
     );
@@ -1279,6 +1557,9 @@ fn staged_runner_awaiting_handoff() -> Option<(u64, u64)> {
             .map(|e| format!("{}.new", e.to_string_lossy()))
             .unwrap_or_else(|| "new".to_string()),
     );
+    if std::env::current_exe().ok().as_deref() == Some(staged.as_path()) {
+        return None;
+    }
     if staged_matches_running(&canonical, &staged) {
         let _ = fs::remove_file(&staged);
         let _ = fs::remove_file(takeover_ready_path());
@@ -1421,6 +1702,132 @@ fn spawn_project_heartbeat_ticker(interval: Duration) -> std::thread::JoinHandle
     })
 }
 
+static DREAM_RSI_LAST_CYCLE_DISPATCH_TS: OnceLock<Mutex<HashMap<PathBuf, u64>>> = OnceLock::new();
+
+fn dream_rsi_last_cycle_dispatch_ts() -> &'static Mutex<HashMap<PathBuf, u64>> {
+    DREAM_RSI_LAST_CYCLE_DISPATCH_TS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+const DREAM_RSI_MIN_NEW_OBSERVATIONS_PER_CYCLE: u64 = 20;
+const DREAM_RSI_MIN_CYCLE_SPACING_MS: u64 = 15 * 60 * 1000;
+
+fn dream_rsi_count_observations(dream_rsi_dir: &Path) -> u64 {
+    let Ok(entries) = fs::read_dir(dream_rsi_dir) else {
+        return 0;
+    };
+    let mut total: u64 = 0;
+    for entry in entries.flatten() {
+        let obs_path = entry.path().join("observations.json");
+        let Ok(bytes) = fs::read(&obs_path) else {
+            continue;
+        };
+        if let Ok(serde_json::Value::Array(arr)) =
+            serde_json::from_slice::<serde_json::Value>(&bytes)
+        {
+            total += arr.len() as u64;
+        }
+    }
+    total
+}
+
+/// Dream-RSI cycle trigger: observes `.gm/dream-rsi/*/observations.json`
+/// counts already written by ordinary gm session dispatches (see
+/// `.gm/next-step.md`'s "Grounded Dream-RSI replay" section) and, once
+/// `DREAM_RSI_MIN_NEW_OBSERVATIONS_PER_CYCLE` new observations have
+/// accumulated since the last fired cycle (and at least
+/// `DREAM_RSI_MIN_CYCLE_SPACING_MS` has elapsed), writes one real
+/// `dreamrsi-replay` spool dispatch (`rs-plugkit`'s
+/// `orchestrator::dream_rsi::handle_replay`, registered in
+/// `orchestrator/mod.rs`) for the project's own wasm plugin to pick up.
+///
+/// `dreamrsi-replay` is read-only: it scores the incumbent policy against
+/// the live discovery tree and returns the result, writing nothing. This
+/// trigger deliberately never dispatches `dreamrsi-select`, because that
+/// verb's current implementation (`handle_select`) writes
+/// `active-strategy.json` directly -- an unattended call would be exactly
+/// the autonomous redeploy `.gm/next-step.md`'s "Grounded Dream-RSI replay"
+/// section forbids ("deploy an accepted strategy only through the normal
+/// PRD, mutable, phase, authorization, and evidence paths"). Promoting this
+/// trigger to call `dreamrsi-select` (or any future authorization-gated
+/// propose-only verb the sibling `dreamrsi-offline-scoring-and-selection`
+/// PRD row may add) is a future row's decision, not this one's.
+fn dream_rsi_maybe_dispatch_cycle(root: &Path, spool_dir: &Path) {
+    let dream_rsi_dir = root.join(".gm").join("dream-rsi");
+    if !dream_rsi_dir.exists() {
+        return;
+    }
+    let observation_count = dream_rsi_count_observations(&dream_rsi_dir);
+    let now = now_ms();
+
+    let mut last_ts_map = dream_rsi_last_cycle_dispatch_ts()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let last_fired = last_ts_map.get(root).copied();
+    let cursor_path = dream_rsi_dir.join(".last-cycle-observation-count");
+    let baseline_count: u64 = fs::read_to_string(&cursor_path)
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0);
+
+    let spacing_ok = last_fired
+        .map(|ts| now.saturating_sub(ts) >= DREAM_RSI_MIN_CYCLE_SPACING_MS)
+        .unwrap_or(true);
+    let new_observations = observation_count.saturating_sub(baseline_count);
+    let data_threshold_met = new_observations >= DREAM_RSI_MIN_NEW_OBSERVATIONS_PER_CYCLE;
+
+    if !(spacing_ok && data_threshold_met) {
+        return;
+    }
+
+    let in_dir = spool_dir.join("in").join("dreamrsi-replay");
+    if fs::create_dir_all(&in_dir).is_err() {
+        return;
+    }
+    let session_id = format!("daemon-dreamrsi-tick-{now}");
+    let payload = serde_json::json!({
+        "SESSION_ID": session_id,
+        "trigger": "unattended-daemon-tick",
+        "new_observation_count": new_observations,
+        "total_observation_count": observation_count,
+        "authorization_note": "read-only replay/scoring; no unattended redeploy -- see .gm/next-step.md Grounded Dream-RSI replay",
+    })
+    .to_string();
+
+    let tmp_path = in_dir.join(format!(".tmp-{now}"));
+    let final_path = in_dir.join(format!("{session_id}-1.txt"));
+    if fs::write(&tmp_path, &payload).is_err() {
+        return;
+    }
+    if fs::rename(&tmp_path, &final_path).is_err() {
+        let _ = fs::remove_file(&tmp_path);
+        return;
+    }
+
+    last_ts_map.insert(root.to_path_buf(), now);
+    drop(last_ts_map);
+    let _ = fs::write(&cursor_path, observation_count.to_string());
+}
+
+fn spawn_dream_rsi_cycle_ticker(interval: Duration) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || loop {
+        std::thread::sleep(interval);
+        if heartbeat_authority_lost() {
+            return;
+        }
+        let roots = known_project_roots()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        for root in roots {
+            let spool_dir = root.join(".gm").join("exec-spool");
+            if !spool_dir.exists() {
+                continue;
+            }
+            dream_rsi_maybe_dispatch_cycle(&root, &spool_dir);
+        }
+    })
+}
+
 fn read_status_busy_until_if_future(spool_dir: &Path) -> Option<u64> {
     let text = fs::read_to_string(spool_dir.join(".status.json")).ok()?;
     let value: serde_json::Value = serde_json::from_str(&text).ok()?;
@@ -1551,6 +1958,39 @@ fn consecutive_handoff_failures() -> &'static Mutex<(String, u32)> {
 
 const HANDOFF_ESCALATION_THRESHOLD: u32 = 3;
 
+const HANDOFF_RETRY_BACKOFF: Duration = Duration::from_secs(30 * 60);
+
+fn handoff_retry_backoff_slot() -> &'static Mutex<Option<(String, Instant)>> {
+    static SLOT: OnceLock<Mutex<Option<(String, Instant)>>> = OnceLock::new();
+    SLOT.get_or_init(|| Mutex::new(None))
+}
+
+fn handoff_backed_off(version: &str) -> bool {
+    let slot = handoff_retry_backoff_slot()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    match slot.as_ref() {
+        Some((blocked, until)) => blocked == version && Instant::now() < *until,
+        None => false,
+    }
+}
+
+fn record_handoff_backoff(version: &str) {
+    *handoff_retry_backoff_slot()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) =
+        Some((version.to_string(), Instant::now() + HANDOFF_RETRY_BACKOFF));
+}
+
+fn clear_handoff_backoff(version: &str) {
+    let mut slot = handoff_retry_backoff_slot()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if slot.as_ref().map(|(v, _)| v.as_str()) == Some(version) {
+        *slot = None;
+    }
+}
+
 fn runner_update_escalation_path() -> PathBuf {
     install_dir().join("runner-update-escalation.json")
 }
@@ -1587,6 +2027,7 @@ pub(crate) fn patch_update_available_from_escalation(
 
 fn record_handoff_failure(version: &str, reason: String) {
     record_handoff_attempt(Some(reason.clone()));
+    record_handoff_backoff(version);
     let mut slot = consecutive_handoff_failures()
         .lock()
         .unwrap_or_else(|e| e.into_inner());
@@ -1595,7 +2036,9 @@ fn record_handoff_failure(version: &str, reason: String) {
     } else {
         slot.1 += 1;
     }
-    if slot.1 < HANDOFF_ESCALATION_THRESHOLD {
+    // Escalate exactly once per version: rewriting the marker on every later failure would reset
+    // since_ts and re-surface the block on every dispatch until the daemon restarts.
+    if slot.1 != HANDOFF_ESCALATION_THRESHOLD {
         return;
     }
     let command = if cfg!(windows) {
@@ -1623,6 +2066,7 @@ fn clear_handoff_escalation(version: &str) {
     if slot.0 == version {
         *slot = (String::new(), 0);
     }
+    clear_handoff_backoff(version);
     let _ = fs::remove_file(runner_update_escalation_path());
 }
 
@@ -1769,6 +2213,13 @@ struct PluginModules {
     modules: HashMap<String, Module>,
     loaded_content_hash: HashMap<String, String>,
     last_hash_check_stat: HashMap<String, (std::time::SystemTime, u64)>,
+    recompiling: HashMap<
+        String,
+        (
+            String,
+            Mutex<std::sync::mpsc::Receiver<Result<Module, String>>>,
+        ),
+    >,
 }
 
 fn wasm_file_content_hash(wasm_path: &Path) -> anyhow::Result<String> {
@@ -1789,11 +2240,91 @@ impl PluginModules {
             modules: HashMap::new(),
             loaded_content_hash: HashMap::new(),
             last_hash_check_stat: HashMap::new(),
+            recompiling: HashMap::new(),
         })
+    }
+
+    fn install_compiled(
+        &mut self,
+        plugin_name: &str,
+        module: Module,
+        on_disk_hash: String,
+        wasm_path: &Path,
+    ) {
+        if let Some(old_hash) = self.loaded_content_hash.get(plugin_name).cloned() {
+            if old_hash != on_disk_hash {
+                let (evicted_now, deferred) =
+                    agentplug_host::request_shared_store_swap(plugin_name, &old_hash);
+                eprintln!(
+                    "[agentplug daemon] {plugin_name}.wasm recompiled off the claim loop -- swapping it in, draining the shared Stores on the old module ({evicted_now} slot(s) evicted now, {deferred} still in-flight and finishing on the old Store; their slots evict on completion)"
+                );
+            }
+        }
+        if let Some(installed) = installed_plugin_version(plugin_name) {
+            if !is_recognized_release_semver(&installed) {
+                eprintln!(
+                    "[agentplug daemon] BOOT WARNING: {plugin_name}.wasm at {} is served from a NON-RELEASE version marker ({installed:?}) -- this is a local-dev sideload, not a released build, and the auto-updater will never overwrite it. If this was not intentional, replace the sideload with a real release-tagged {plugin_name}.wasm.",
+                    wasm_path.display()
+                );
+            }
+        }
+        self.modules.insert(plugin_name.to_string(), module);
+        self.loaded_content_hash
+            .insert(plugin_name.to_string(), on_disk_hash.clone());
+        loaded_plugin_content_hashes()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(plugin_name.to_string(), on_disk_hash.clone());
+        loaded_plugin_versions()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(
+                plugin_name.to_string(),
+                installed_plugin_version(plugin_name).unwrap_or_else(|| "unversioned".to_string()),
+            );
+        agentplug_host::note_shared_plugin_bytes_current(plugin_name, &on_disk_hash);
+    }
+
+    fn adopt_finished_recompile(
+        &mut self,
+        plugin_name: &str,
+        wasm_path: &Path,
+    ) -> anyhow::Result<()> {
+        let Some((hash, receiver)) = self.recompiling.remove(plugin_name) else {
+            return Ok(());
+        };
+        let received = receiver
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .try_recv();
+        match received {
+            Ok(Ok(module)) => {
+                self.install_compiled(plugin_name, module, hash, wasm_path);
+                Ok(())
+            }
+            Ok(Err(e)) => {
+                self.last_hash_check_stat.remove(plugin_name);
+                Err(anyhow::anyhow!(
+                    "background recompile of {plugin_name} failed: {e}"
+                ))
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                self.recompiling
+                    .insert(plugin_name.to_string(), (hash, receiver));
+                Ok(())
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.last_hash_check_stat.remove(plugin_name);
+                anyhow::bail!(
+                    "background recompile thread for {plugin_name} ended without a result"
+                )
+            }
+        }
     }
 
     fn get_or_compile(&mut self, plugin_name: &str) -> anyhow::Result<()> {
         let wasm_path = ensure_plugin_installed(plugin_name, None)?;
+        self.adopt_finished_recompile(plugin_name, &wasm_path)?;
         let current_stat = wasm_file_stat(&wasm_path);
         let stat_unchanged = current_stat.is_some()
             && current_stat == self.last_hash_check_stat.get(plugin_name).copied();
@@ -1805,47 +2336,60 @@ impl PluginModules {
             self.last_hash_check_stat
                 .insert(plugin_name.to_string(), stat);
         }
-        let old_loaded_hash = self.loaded_content_hash.get(plugin_name).cloned();
-        let stale = old_loaded_hash
-            .as_deref()
-            .is_some_and(|loaded_hash| loaded_hash != on_disk_hash);
+        let stale = self
+            .loaded_content_hash
+            .get(plugin_name)
+            .is_some_and(|loaded_hash| loaded_hash != &on_disk_hash);
+        if self.modules.contains_key(plugin_name) && !stale {
+            self.recompiling.remove(plugin_name);
+            return Ok(());
+        }
         if stale {
-            let old_hash = old_loaded_hash.unwrap_or_default();
-            let (evicted_now, deferred) =
-                agentplug_host::request_shared_store_swap(plugin_name, &old_hash);
-            eprintln!(
-                "[agentplug daemon] {plugin_name}.wasm content hash changed on disk since it was last compiled -- evicting the stale in-process module and draining the shared Stores using it ({evicted_now} slot(s) evicted now, {deferred} still in-flight and finishing on the old Store; their slots evict on completion), forcing a recompile from the current bytes"
-            );
-            self.modules.remove(plugin_name);
-        }
-        if !self.modules.contains_key(plugin_name) {
-            if let Some(installed) = installed_plugin_version(plugin_name) {
-                if !is_recognized_release_semver(&installed) {
-                    eprintln!(
-                        "[agentplug daemon] BOOT WARNING: {plugin_name}.wasm at {} is served from a NON-RELEASE version marker ({installed:?}) -- this is a local-dev sideload, not a released build, and the auto-updater will never overwrite it. If this was not intentional, replace the sideload with a real release-tagged {plugin_name}.wasm.",
-                        wasm_path.display()
-                    );
-                }
+            if self
+                .recompiling
+                .get(plugin_name)
+                .is_some_and(|(pending_hash, _)| pending_hash == &on_disk_hash)
+            {
+                return Ok(());
             }
-            eprintln!("[agentplug daemon] compiling {plugin_name}.wasm (shared across every project that uses it)...");
-            let module = Module::from_file(&self.engine, &wasm_path)?;
-            self.modules.insert(plugin_name.to_string(), module);
-            self.loaded_content_hash
-                .insert(plugin_name.to_string(), on_disk_hash.clone());
-            loaded_plugin_content_hashes()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(plugin_name.to_string(), on_disk_hash.clone());
-            loaded_plugin_versions()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(
-                    plugin_name.to_string(),
-                    installed_plugin_version(plugin_name)
-                        .unwrap_or_else(|| "unversioned".to_string()),
+            eprintln!("[agentplug daemon] {plugin_name}.wasm content hash changed on disk since it was last compiled -- recompiling on a background thread while the loaded module keeps serving");
+            let (tx, rx) = std::sync::mpsc::channel();
+            let engine = self.engine.clone();
+            let path = wasm_path.clone();
+            let thread_plugin_name = plugin_name.to_string();
+            let thread_hash = on_disk_hash.clone();
+            let thread_name = format!("recompile-{plugin_name}");
+            let spawned = std::thread::Builder::new()
+                .name(thread_name)
+                .spawn(move || {
+                    let _ = tx.send(
+                        agentplug_host::load_module_file_backed(
+                            &engine,
+                            &path,
+                            &thread_plugin_name,
+                            &thread_hash,
+                        )
+                        .map_err(|e| format!("{e:#}")),
+                    );
+                });
+            if let Err(e) = spawned {
+                self.last_hash_check_stat.remove(plugin_name);
+                anyhow::bail!(
+                    "could not start the background recompile thread for {plugin_name}: {e}"
                 );
-            agentplug_host::note_shared_plugin_bytes_current(plugin_name, &on_disk_hash);
+            }
+            self.recompiling
+                .insert(plugin_name.to_string(), (on_disk_hash, Mutex::new(rx)));
+            return Ok(());
         }
+        eprintln!("[agentplug daemon] compiling {plugin_name}.wasm (shared across every project that uses it)...");
+        let module = agentplug_host::load_module_file_backed(
+            &self.engine,
+            &wasm_path,
+            plugin_name,
+            &on_disk_hash,
+        )?;
+        self.install_compiled(plugin_name, module, on_disk_hash, &wasm_path);
         Ok(())
     }
 
@@ -1884,10 +2428,8 @@ fn project_in_flight_count(root: &Path) -> usize {
     in_flight_map()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .iter()
-        .filter(|((active_root, _, _), handle)| {
-            active_root == root && !handle.detach.load(std::sync::atomic::Ordering::SeqCst)
-        })
+        .keys()
+        .filter(|(active_root, _, _)| active_root == root)
         .count()
 }
 
@@ -2156,6 +2698,16 @@ pub fn write_spool_out_confirmed(out_dir: &Path, out_name: &str, out_body: &str)
     dest.exists()
 }
 
+fn forget_in_flight_claim(in_dir: &Path, verb: &str, task: &str) {
+    let Some(root) = in_dir.ancestors().nth(3) else {
+        return;
+    };
+    in_flight_map()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&(root.to_path_buf(), verb.to_string(), task.to_string()));
+}
+
 fn write_spool_out_and_release_claim(
     out_dir: &Path,
     in_dir: &Path,
@@ -2163,6 +2715,7 @@ fn write_spool_out_and_release_claim(
     task: &str,
     out_body: &str,
 ) {
+    forget_in_flight_claim(in_dir, verb, task);
     if write_spool_out_confirmed(out_dir, &format!("{verb}-{task}.json"), out_body) {
         let _ = fs::remove_file(inflight_claim_path(in_dir, verb, task));
     } else {
@@ -2344,7 +2897,7 @@ pub fn sweep_orphaned_claims_across_roots(roots: &[PathBuf]) {
     clear_handoff_inherited_claims();
 }
 
-const MIN_ORPHAN_CLAIM_AGE_MS: u64 = 600_000;
+const MIN_ORPHAN_CLAIM_AGE_MS: u64 = 60_000;
 
 fn claim_age_ms(path: &Path) -> Option<u64> {
     let modified = fs::metadata(path).ok()?.modified().ok()?;
@@ -2401,7 +2954,15 @@ fn sweep_orphaned_claims_distinguishing_handoff_from_crash(
                 }
                 eprintln!("[agentplug daemon] could not re-queue handoff-inherited claim {verb}/{task} for {} -- falling through to dispatch_orphaned rather than swallowing it", root.display());
             }
-            if claim_age_ms(&path)
+            if in_flight_map()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key(&(root.to_path_buf(), verb.clone(), task.clone()))
+            {
+                continue;
+            }
+            let claim_age = claim_age_ms(&path);
+            if claim_age
                 .map(|age| age < MIN_ORPHAN_CLAIM_AGE_MS)
                 .unwrap_or(false)
             {
@@ -2414,6 +2975,9 @@ fn sweep_orphaned_claims_distinguishing_handoff_from_crash(
                 let out_body = serde_json::json!({
                     "ok": false,
                     "error_code": "dispatch_orphaned",
+                    "reaped": true,
+                    "reason": "claim file with no live dispatch in this daemon (the claiming daemon exited or was handed off) -- reaped by the periodic orphan sweep so it cannot hold the project busy",
+                    "claim_age_ms": claim_age,
                     "error": format!("verb {verb} (task {task}) was claimed by a daemon that stopped answering -- a wasm trap, an out-of-memory abort, or a shared-Store recycle during the call. A version handoff is NOT a cause of this error: a handoff re-queues its claims for the incoming daemon, which completes them. The outcome is UNVERIFIED, not known to be unperformed: a side-effecting verb (git_commit/git_finalize/git_push/fs_write/memorize-fire) may already have applied some or all of its work, so read the real state (git log, git status, the file, the store) before re-dispatching. Re-dispatch straight away only for a read-only verb."),
                     "verb": verb,
                     "task": task,
@@ -2596,17 +3160,54 @@ fn dir_has_any_verb_subdir_with_claimable_request(base: &Path, language_stems: b
             continue;
         }
         let verb = verb_entry.file_name().to_string_lossy().into_owned();
-        let Ok(files) = fs::read_dir(verb_entry.path()) else {
-            continue;
+        if verb_dir_has_claimable_request(&verb_entry.path(), &verb, language_stems) {
+            return true;
+        }
+    }
+    false
+}
+
+const EMPTY_VERB_DIR_VERDICT_MIN_AGE: Duration = Duration::from_secs(2);
+
+fn empty_verb_dir_verdicts() -> &'static Mutex<HashMap<PathBuf, std::time::SystemTime>> {
+    static SLOT: OnceLock<Mutex<HashMap<PathBuf, std::time::SystemTime>>> = OnceLock::new();
+    SLOT.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn verb_dir_has_claimable_request(verb_dir: &Path, verb: &str, language_stems: bool) -> bool {
+    let modified = fs::metadata(verb_dir)
+        .and_then(|metadata| metadata.modified())
+        .ok();
+    if let Some(modified) = modified {
+        let unchanged_since_empty_verdict = empty_verb_dir_verdicts()
+            .lock()
+            .ok()
+            .is_some_and(|verdicts| verdicts.get(verb_dir) == Some(&modified));
+        if unchanged_since_empty_verdict {
+            return false;
+        }
+    }
+    let Ok(files) = fs::read_dir(verb_dir) else {
+        return false;
+    };
+    for file_entry in files.flatten() {
+        let path = file_entry.path();
+        let claimable = if language_stems {
+            is_spool_request_path(verb, &path)
+        } else {
+            path.extension().and_then(|extension| extension.to_str()) == Some("txt")
         };
-        for file_entry in files.flatten() {
-            let path = file_entry.path();
-            if if language_stems {
-                is_spool_request_path(&verb, &path)
-            } else {
-                path.extension().and_then(|extension| extension.to_str()) == Some("txt")
-            } {
-                return true;
+        if claimable {
+            return true;
+        }
+    }
+    if let Some(modified) = modified {
+        let settled = std::time::SystemTime::now()
+            .duration_since(modified)
+            .is_ok_and(|age| age >= EMPTY_VERB_DIR_VERDICT_MIN_AGE);
+        if settled {
+            if let Ok(mut verdicts) = empty_verb_dir_verdicts().lock() {
+                verdicts.insert(verb_dir.to_path_buf(), modified);
             }
         }
     }
@@ -2646,7 +3247,6 @@ impl IdleInDirWatch {
             .iter()
             .map(|root| root.join(".gm").join("exec-spool").join("in"))
             .filter(|dir| dir.is_dir())
-            .take(64)
             .collect();
         if self.entries.iter().map(|(p, _)| p).eq(wanted.iter()) {
             return;
@@ -2670,31 +3270,53 @@ impl IdleInDirWatch {
         }
     }
 
-    fn wait(&self, cap: Duration) {
+    // WaitForMultipleObjects takes at most MAXIMUM_WAIT_OBJECTS (64) handles,
+    // so a registry with more watched in/ dirs than that is waited on in chunks.
+    // Every chunk gets its own slice of the deadline, so every root stays
+    // covered by a notification and a change in any chunk wakes the wait early.
+    const WAIT_CHUNK_HANDLES: usize = 64;
+
+    // Blocks until one of the watched in/ dirs changes or `cap` elapses.
+    // Returns true when a change woke it and false when the cap ran out, so the
+    // caller can tell "nothing happened" from "something may have appeared".
+    fn wait(&self, cap: Duration) -> bool {
         use windows_sys::Win32::Storage::FileSystem::FindNextChangeNotification;
         use windows_sys::Win32::System::Threading::WaitForMultipleObjects;
         if self.entries.is_empty() {
             std::thread::sleep(cap);
-            return;
+            return false;
         }
-        let handles: Vec<_> = self.entries.iter().map(|(_, h)| *h).collect();
-        let rc = unsafe {
-            WaitForMultipleObjects(
-                handles.len() as u32,
-                handles.as_ptr(),
-                0,
-                cap.as_millis() as u32,
-            )
-        };
         const WAIT_OBJECT_0: u32 = 0;
-        if (WAIT_OBJECT_0..WAIT_OBJECT_0 + handles.len() as u32).contains(&rc) {
-            let idx = (rc - WAIT_OBJECT_0) as usize;
-            if let Some((_, handle)) = self.entries.get(idx) {
-                unsafe {
-                    FindNextChangeNotification(*handle);
+        // Every chunk gets its own slice of the deadline. Waiting each chunk
+        // against the FULL remaining deadline let the first chunk consume all
+        // of it, so a change in a later chunk could never wake the wait early
+        // -- the documented "a change in any chunk wakes the whole wait" only
+        // held for the first chunk, and every other root was seen a whole cap
+        // late.
+        let chunks: Vec<&[(PathBuf, windows_sys::Win32::Foundation::HANDLE)]> =
+            self.entries.chunks(Self::WAIT_CHUNK_HANDLES).collect();
+        let per_chunk_ms = (cap.as_millis() as u64 / chunks.len() as u64).max(1);
+        for chunk in chunks {
+            let handles: Vec<_> = chunk.iter().map(|(_, h)| *h).collect();
+            let rc = unsafe {
+                WaitForMultipleObjects(
+                    handles.len() as u32,
+                    handles.as_ptr(),
+                    0,
+                    per_chunk_ms as u32,
+                )
+            };
+            if (WAIT_OBJECT_0..WAIT_OBJECT_0 + handles.len() as u32).contains(&rc) {
+                let idx = (rc - WAIT_OBJECT_0) as usize;
+                if let Some((_, handle)) = chunk.get(idx) {
+                    unsafe {
+                        FindNextChangeNotification(*handle);
+                    }
                 }
+                return true;
             }
         }
+        false
     }
 }
 
@@ -2705,7 +3327,30 @@ impl Drop for IdleInDirWatch {
     }
 }
 
-fn project_has_pending_dispatch_work(root: &Path) -> bool {
+// Arm the in/ dir watch (a no-op once the watched set already matches `roots`)
+// and block until one of those dirs changes or `cap` elapses. Shared by the
+// busy and the idle cadence of the main loop so neither can fall through with
+// no wait at all. A woken wait invalidates every cached "nothing queued"
+// verdict, since all of them predate the change that woke us.
+#[cfg(windows)]
+fn wait_for_in_dir_change(watch: &mut IdleInDirWatch, roots: &[PathBuf], cap: Duration) {
+    watch.sync(roots);
+    // Arming is itself a pass over the roots. Work that appeared during it must
+    // be served by the next pass now, not slept past.
+    if roots
+        .iter()
+        .any(|root| project_has_pending_dispatch_work(root))
+    {
+        return;
+    }
+    if watch.wait(cap) {
+        if let Ok(mut cache) = spool_work_cache().lock() {
+            cache.clear();
+        }
+    }
+}
+
+fn project_has_queued_spool_work(root: &Path) -> bool {
     let pd_in = root.join(".agentplug").join("plugin-dispatch").join("in");
     if let Ok(plugin_dirs) = fs::read_dir(&pd_in) {
         for plugin_entry in plugin_dirs.flatten() {
@@ -2722,8 +3367,47 @@ fn project_has_pending_dispatch_work(root: &Path) -> bool {
         }
     }
     let gm_in = root.join(".gm").join("exec-spool").join("in");
+    dir_has_any_verb_subdir_with_claimable_request(&gm_in, true)
+}
+
+// The daemon asks this for every known root several times per pass, and each
+// uncached answer is a full recursive enumeration of the spool's verb dirs, so
+// an uncached pass over the whole registry is throttled by directory reads
+// instead of by work. One answer per root per TTL is indistinguishable to a
+// submitter: the file it just wrote is seen within one TTL.
+const SPOOL_WORK_CACHE_TTL: Duration = Duration::from_millis(200);
+
+fn spool_work_cache() -> &'static Mutex<HashMap<PathBuf, (Instant, bool)>> {
+    static SLOT: OnceLock<Mutex<HashMap<PathBuf, (Instant, bool)>>> = OnceLock::new();
+    SLOT.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn project_has_queued_spool_work_cached(root: &Path) -> bool {
+    let now = Instant::now();
+    let fresh = spool_work_cache()
+        .lock()
+        .ok()
+        .and_then(|cache| cache.get(root).copied())
+        .filter(|(at, _)| now.saturating_duration_since(*at) < SPOOL_WORK_CACHE_TTL)
+        .map(|(_, value)| value);
+    if let Some(value) = fresh {
+        return value;
+    }
+    let value = project_has_queued_spool_work(root);
+    if let Ok(mut cache) = spool_work_cache().lock() {
+        cache.insert(root.to_path_buf(), (Instant::now(), value));
+    }
+    value
+}
+
+// Dispatchable now: queued AND this project still has a claim slot. A project
+// sitting at its cap has work the daemon cannot start this instant, which is
+// what the idle wait tests -- but it must never make the project look idle for
+// the purposes of scheduling, or its queued files wait behind every other root
+// in the registry for as long as the cap stays full.
+fn project_has_pending_dispatch_work(root: &Path) -> bool {
     project_in_flight_count(root) < MAX_CLAIMED_DISPATCHES_PER_PROJECT
-        && dir_has_any_verb_subdir_with_claimable_request(&gm_in, true)
+        && project_has_queued_spool_work_cached(root)
 }
 
 fn dispatch_project(
@@ -2747,7 +3431,10 @@ fn dispatch_project(
     let in_dir_scan = fs::read_dir(&in_dir);
     let in_dir_existed = in_dir_scan.is_ok();
     let mut claimable: Vec<(std::time::SystemTime, String, PathBuf)> = Vec::new();
-    if let Ok(entries) = in_dir_scan {
+    // The expensive part of a pass over the registry is enumerating every verb
+    // dir of every root; a root the cache says has nothing queued has nothing to
+    // claim in any of them, and the cache is re-read one TTL later.
+    if let (true, Ok(entries)) = (project_has_queued_spool_work_cached(root), in_dir_scan) {
         for verb_entry in entries.flatten() {
             if !verb_entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
                 continue;
@@ -2791,6 +3478,15 @@ fn dispatch_project(
             let _ = fs::rename(&claim_path, &file_path);
             continue;
         }
+        in_flight_map()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(
+                (root.to_path_buf(), verb.clone(), task.clone()),
+                InFlightHandle {
+                    detach: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                },
+            );
         let submitted_at_ms = queued_since
             .duration_since(std::time::UNIX_EPOCH)
             .ok()
@@ -2815,14 +3511,7 @@ fn dispatch_project(
     write_project_heartbeat(&spool_dir, read_status_busy_until_if_future(&spool_dir));
 
     let requested_plugins = {
-        let mut list = vec![
-            "gm".to_string(),
-            "libsql".to_string(),
-            "bert".to_string(),
-            "treesitter".to_string(),
-            "oxibrowser".to_string(),
-            "crux".to_string(),
-        ];
+        let mut list = vec!["gm".to_string()];
         for extra in read_project_plugin_list(root) {
             if !list.contains(&extra) {
                 list.push(extra);
@@ -3202,10 +3891,11 @@ pub fn try_dispatch_via_daemon(
     body: &str,
 ) -> DaemonDispatchOutcome {
     use DaemonDispatchOutcome::{Answered, ClaimedUnanswered, NeverClaimedRunLocally};
+    let cwd = agentplug_host::project_root(cwd);
     if std::env::var("AGENTPLUG_NO_DAEMON").is_ok() {
         return NeverClaimedRunLocally;
     }
-    if let Err(e) = register_project(cwd) {
+    if let Err(e) = register_project(&cwd) {
         eprintln!("[agentplug] {e}");
         return NeverClaimedRunLocally;
     }
@@ -3361,8 +4051,8 @@ fn configure_github_cli_config_dir() -> bool {
         };
         agentplug_host::set_github_cli_config_dir(Some(directory));
         eprintln!(
-                "[agentplug daemon] configured GitHub CLI credentials from {source} without copying credential data"
-            );
+            "[agentplug daemon] configured GitHub CLI credentials from {source} without copying credential data"
+        );
         return true;
     }
     false
@@ -3372,7 +4062,7 @@ pub fn run_daemon() -> anyhow::Result<()> {
     if let Some(owner_pid) = shared_daemon_owner_that_would_refuse_this_process() {
         record_wasted_daemon_start();
         eprintln!(
-                "[agentplug daemon] shared daemon pid {owner_pid} already owns the ownership lock and its heartbeat is fresh -- exiting before the registry announce and credential-store discovery, nothing shared was touched"
+            "[agentplug daemon] shared daemon pid {owner_pid} already owns the ownership lock and its heartbeat is fresh -- exiting before the registry announce and credential-store discovery, nothing shared was touched"
         );
         return Ok(());
     }
@@ -3401,93 +4091,105 @@ pub fn run_daemon() -> anyhow::Result<()> {
         crate::download::clear_all_known_bad_version_markers();
         let _ = record_runner_version(env!("CARGO_PKG_VERSION"));
     }
+    crate::download::sync_local_build_pin();
     run_daemon_body(plugin_modules)
 }
 
-#[cfg(all(test, unix, not(target_os = "macos")))]
-mod tests {
-    use super::*;
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-    #[test]
-    fn prefers_explicit_then_xdg_then_platform_default_gh_stores() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        let root = std::env::temp_dir().join(format!(
-            "agentplug-gh-config-test-{}-{}",
-            std::process::id(),
-            now_ms()
-        ));
-        let explicit_dir = root.join("explicit");
-        let xdg_config_home = root.join("xdg");
-        let xdg_dir = xdg_config_home.join("gh");
-        let home = root.join("home");
-        let default_dir = home.join(".config/gh");
-        for directory in [&explicit_dir, &xdg_dir, &default_dir] {
-            fs::create_dir_all(directory).unwrap();
-            fs::write(directory.join("hosts.yml"), "github.com:\n").unwrap();
+fn spawn_update_poll_worker(
+    daemon_cfg: DaemonConfig,
+) -> std::sync::mpsc::Receiver<(PathBuf, String)> {
+    let (staged_tx, staged_rx) = std::sync::mpsc::channel::<(PathBuf, String)>();
+    let spawned = std::thread::Builder::new().name("update-poll".to_string()).spawn(move || {
+        let plugin_update_poll_interval = daemon_cfg.plugin_update_poll_interval();
+        let shortest_plugin_poll_interval = daemon_cfg
+            .plugin_update_poll_interval_secs_by_name
+            .values()
+            .copied()
+            .min()
+            .map(Duration::from_secs)
+            .map(|per_plugin| per_plugin.min(plugin_update_poll_interval))
+            .unwrap_or(plugin_update_poll_interval);
+        let mut last_plugin_specific_poll: HashMap<String, Instant> = HashMap::new();
+        let mut last_plugin_update_poll = seed_poll_timer_from_persisted_ts(&persisted_plugin_poll_ts_path());
+        let persisted_plugin_poll_ts_at_boot = read_persisted_poll_ts(&persisted_plugin_poll_ts_path());
+        if persisted_plugin_poll_ts_at_boot > 0 {
+            HEARTBEAT_LAST_PLUGIN_POLL_TS.store(persisted_plugin_poll_ts_at_boot, std::sync::atomic::Ordering::Relaxed);
         }
-
-        let original_gh_config_dir = std::env::var_os("GH_CONFIG_DIR");
-        let original_xdg_config_home = std::env::var_os("XDG_CONFIG_HOME");
-        let original_home = std::env::var_os("HOME");
-        let original_agentplug_gh_config_dir = std::env::var_os("AGENTPLUG_GH_CONFIG_DIR");
-        std::env::remove_var("GH_CONFIG_DIR");
-        std::env::set_var("AGENTPLUG_GH_CONFIG_DIR", &explicit_dir);
-        std::env::set_var("XDG_CONFIG_HOME", &xdg_config_home);
-        std::env::set_var("HOME", &home);
-
-        assert!(configure_github_cli_config_dir());
-        assert_eq!(
-            agentplug_host::github_cli_config_dir(),
-            Some(explicit_dir.canonicalize().unwrap())
-        );
-
-        std::env::remove_var("AGENTPLUG_GH_CONFIG_DIR");
-        assert!(configure_github_cli_config_dir());
-        assert_eq!(
-            agentplug_host::github_cli_config_dir(),
-            Some(xdg_dir.canonicalize().unwrap())
-        );
-
-        std::env::remove_var("XDG_CONFIG_HOME");
-        assert!(configure_github_cli_config_dir());
-        assert_eq!(
-            agentplug_host::github_cli_config_dir(),
-            Some(default_dir.canonicalize().unwrap())
-        );
-
-        match original_gh_config_dir {
-            Some(value) => std::env::set_var("GH_CONFIG_DIR", value),
-            None => std::env::remove_var("GH_CONFIG_DIR"),
+        let runner_update_poll_interval = daemon_cfg.runner_update_poll_interval();
+        let mut last_runner_update_poll = seed_poll_timer_from_persisted_ts(&persisted_runner_poll_ts_path());
+        let mut first_runner_poll_pending = true;
+        let persisted_runner_poll_ts_at_boot = read_persisted_poll_ts(&persisted_runner_poll_ts_path());
+        if persisted_runner_poll_ts_at_boot > 0 {
+            HEARTBEAT_LAST_RUNNER_POLL_TS.store(persisted_runner_poll_ts_at_boot, std::sync::atomic::Ordering::Relaxed);
         }
-        match original_xdg_config_home {
-            Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
-            None => std::env::remove_var("XDG_CONFIG_HOME"),
+        loop {
+            let forced_refresh_request = take_forced_plugin_refresh_request();
+            if last_plugin_update_poll.elapsed() >= shortest_plugin_poll_interval || forced_refresh_request.is_some() {
+                last_plugin_update_poll = Instant::now();
+                let poll_ts = now_ms();
+                HEARTBEAT_LAST_PLUGIN_POLL_TS.store(poll_ts, std::sync::atomic::Ordering::Relaxed);
+                write_persisted_poll_ts(&persisted_plugin_poll_ts_path(), poll_ts);
+                let targets: Vec<String> = match &forced_refresh_request {
+                    Some(Some(name)) => vec![name.clone()],
+                    _ => loaded_plugin_versions().lock().unwrap_or_else(|e| e.into_inner()).keys().cloned().collect(),
+                };
+                let mut cycle_errors: Vec<String> = Vec::new();
+                for plugin_name in targets {
+                    let forced = matches!(&forced_refresh_request, Some(Some(name)) if name == &plugin_name);
+                    if !forced {
+                        let due = last_plugin_specific_poll
+                            .get(&plugin_name)
+                            .map(|t| t.elapsed() >= daemon_cfg.plugin_update_poll_interval_for(&plugin_name))
+                            .unwrap_or(true);
+                        if !due {
+                            continue;
+                        }
+                    }
+                    last_plugin_specific_poll.insert(plugin_name.clone(), Instant::now());
+                    match crate::download::refresh_plugin_if_stale(&plugin_name) {
+                        Ok(Some(new_version)) => {
+                            eprintln!(
+                                "[agentplug daemon] downloaded+verified plugin {plugin_name} update to {new_version} -- the next tick's get_or_compile content-hash check recompiles it off the claim loop and swaps it in when ready"
+                            );
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            let msg = format!("plugin update check for {plugin_name} failed: {e}");
+                            eprintln!("[agentplug daemon] {msg}");
+                            cycle_errors.push(msg);
+                        }
+                    }
+                }
+                record_plugin_poll_error(if cycle_errors.is_empty() { None } else { Some(cycle_errors.join("; ")) });
+            }
+
+            if first_runner_poll_pending || last_runner_update_poll.elapsed() >= runner_update_poll_interval || take_forced_runner_refresh_request() {
+                first_runner_poll_pending = false;
+                last_runner_update_poll = Instant::now();
+                let poll_ts = now_ms();
+                HEARTBEAT_LAST_RUNNER_POLL_TS.store(poll_ts, std::sync::atomic::Ordering::Relaxed);
+                write_persisted_poll_ts(&persisted_runner_poll_ts_path(), poll_ts);
+                match crate::download::stage_runner_self_update() {
+                    Ok(Some(staged_and_version)) => {
+                        if staged_tx.send(staged_and_version).is_err() {
+                            return;
+                        }
+                    }
+                    Ok(None) => record_runner_poll_error(None),
+                    Err(e) => {
+                        let msg = format!("runner self-update check failed: {e}");
+                        eprintln!("[agentplug daemon] {msg}");
+                        record_runner_poll_error(Some(msg));
+                    }
+                }
+            }
+            std::thread::sleep(Duration::from_millis(500));
         }
-        match original_home {
-            Some(value) => std::env::set_var("HOME", value),
-            None => std::env::remove_var("HOME"),
-        }
-        match original_agentplug_gh_config_dir {
-            Some(value) => std::env::set_var("AGENTPLUG_GH_CONFIG_DIR", value),
-            None => std::env::remove_var("AGENTPLUG_GH_CONFIG_DIR"),
-        }
-        agentplug_host::set_github_cli_config_dir(None);
-        fs::remove_dir_all(root).unwrap();
+    });
+    if let Err(e) = spawned {
+        eprintln!("[agentplug daemon] could not start the update-poll thread: {e} -- plugin and runner updates will not be polled until the daemon restarts");
     }
-
-    #[test]
-    fn rejects_a_directory_without_a_github_cli_credential_store() {
-        let root = std::env::temp_dir().join(format!(
-            "agentplug-gh-config-missing-hosts-test-{}-{}",
-            std::process::id(),
-            now_ms()
-        ));
-        fs::create_dir_all(&root).unwrap();
-        assert!(usable_github_cli_config_dir(&root).is_none());
-        fs::remove_dir_all(root).unwrap();
-    }
+    staged_rx
 }
 
 fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
@@ -3499,6 +4201,8 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
         env!("CARGO_PKG_VERSION"),
         now_ms()
     );
+
+    ensure_daemon_guard();
 
     let daemon_cfg = DaemonConfig::load();
     let registry_poll_interval = daemon_cfg.registry_poll_interval();
@@ -3539,47 +4243,31 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
         .checked_sub(COLD_PROJECT_SWEEP_INTERVAL)
         .unwrap_or_else(Instant::now);
     let mut project_round_robin_cursor = 0usize;
+    let mut last_per_root_plugin_scan = Instant::now()
+        .checked_sub(Duration::from_secs(60))
+        .unwrap_or_else(Instant::now);
 
     const SELF_RECYCLE_IDLE_MS: u64 = 60 * 60 * 1000;
     let mut last_any_dispatch = Instant::now();
 
+    // A pass over the registry that finds nothing is pure directory
+    // enumeration, and with a large registry that enumeration IS the daemon's
+    // idle cost -- so such a pass sleeps progressively longer, up to
+    // IDLE_WAIT_MAX_MS. The sleep is a WaitForMultipleObjects over every
+    // watched project's in/ dir, so a dispatch written while it sleeps wakes
+    // it immediately; the cap only bounds how often the periodic polls run.
+    const IDLE_WAIT_MIN_MS: u64 = 25;
+    const IDLE_WAIT_MAX_MS: u64 = 1_000;
+    let mut idle_wait_ms = IDLE_WAIT_MIN_MS;
+
     let shared_plugin_release_idle_ms = daemon_cfg.shared_plugin_release_idle_ms();
     let mut last_shared_release = Instant::now();
 
-    let plugin_update_poll_interval = daemon_cfg.plugin_update_poll_interval();
     let instruction_source_poll_interval = daemon_cfg.instruction_source_poll_interval();
-    let shortest_plugin_poll_interval = daemon_cfg
-        .plugin_update_poll_interval_secs_by_name
-        .values()
-        .copied()
-        .min()
-        .map(Duration::from_secs)
-        .map(|per_plugin| per_plugin.min(plugin_update_poll_interval))
-        .unwrap_or(plugin_update_poll_interval);
-    let mut last_plugin_specific_poll: HashMap<String, Instant> = HashMap::new();
-    let mut last_plugin_update_poll =
-        seed_poll_timer_from_persisted_ts(&persisted_plugin_poll_ts_path());
-    let persisted_plugin_poll_ts_at_boot = read_persisted_poll_ts(&persisted_plugin_poll_ts_path());
-    if persisted_plugin_poll_ts_at_boot > 0 {
-        HEARTBEAT_LAST_PLUGIN_POLL_TS.store(
-            persisted_plugin_poll_ts_at_boot,
-            std::sync::atomic::Ordering::Relaxed,
-        );
-    }
-
-    let runner_update_poll_interval = daemon_cfg.runner_update_poll_interval();
-    let mut last_runner_update_poll =
-        seed_poll_timer_from_persisted_ts(&persisted_runner_poll_ts_path());
-    let mut first_runner_poll_pending = true;
-    let persisted_runner_poll_ts_at_boot = read_persisted_poll_ts(&persisted_runner_poll_ts_path());
-    if persisted_runner_poll_ts_at_boot > 0 {
-        HEARTBEAT_LAST_RUNNER_POLL_TS.store(
-            persisted_runner_poll_ts_at_boot,
-            std::sync::atomic::Ordering::Relaxed,
-        );
-    }
+    let staged_runner_rx = spawn_update_poll_worker(daemon_cfg.clone());
     #[cfg(windows)]
     let mut idle_in_dir_watch = IdleInDirWatch::new();
+    let browser_orphan_sweep_in_flight = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let mut pending_self_update: Option<(PathBuf, String)> = None;
     let mut pending_self_update_staged_at: Option<Instant> = None;
     const SELF_UPDATE_MAX_STARVED_MS: u64 = 10 * 60 * 1000;
@@ -3595,24 +4283,29 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
             let staged_age = now_ms().saturating_sub(staged_at_ms);
             let mut boot_check_cmd = std::process::Command::new(&staged_path);
             boot_check_cmd.arg("--version");
-            #[cfg(windows)]
-            {
-                const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-                boot_check_cmd.creation_flags(CREATE_NO_WINDOW);
-            }
+            agentplug_host::apply_windowless(&mut boot_check_cmd);
             match boot_check_cmd.output() {
                 Ok(out) if out.status.success() => {
                     let version = String::from_utf8_lossy(&out.stdout)
-                        .trim()
+                        .split_whitespace()
+                        .last()
+                        .unwrap_or_default()
                         .trim_start_matches('v')
                         .to_string();
-                    eprintln!(
-                        "[agentplug daemon] found pre-existing staged runner {} (version {version}) at boot, age {}ms -- adopting its on-disk mtime so a daemon restart does not reset the starve clock",
-                        staged_path.display(), staged_age
-                    );
-                    pending_self_update = Some((staged_path, version));
-                    pending_self_update_staged_at =
-                        Instant::now().checked_sub(Duration::from_millis(staged_age));
+                    if version.is_empty() {
+                        eprintln!(
+                            "[agentplug daemon] pre-existing staged runner {} printed an unparseable --version ({:?}) -- ignoring it rather than handing off to an unknown version",
+                            staged_path.display(), String::from_utf8_lossy(&out.stdout).trim()
+                        );
+                    } else {
+                        eprintln!(
+                            "[agentplug daemon] found pre-existing staged runner {} (version {version}) at boot, age {}ms -- adopting its on-disk mtime so a daemon restart does not reset the starve clock",
+                            staged_path.display(), staged_age
+                        );
+                        pending_self_update = Some((staged_path.clone(), version));
+                        pending_self_update_staged_at =
+                            Instant::now().checked_sub(Duration::from_millis(staged_age));
+                    }
                 }
                 Ok(out) => {
                     eprintln!(
@@ -3647,6 +4340,10 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
     const PROJECT_HEARTBEAT_TICK_INTERVAL_MS: u64 = 3_000;
     let _project_heartbeat_ticker =
         spawn_project_heartbeat_ticker(Duration::from_millis(PROJECT_HEARTBEAT_TICK_INTERVAL_MS));
+
+    const DREAM_RSI_CYCLE_TICK_INTERVAL_MS: u64 = 60_000;
+    let _dream_rsi_cycle_ticker =
+        spawn_dream_rsi_cycle_ticker(Duration::from_millis(DREAM_RSI_CYCLE_TICK_INTERVAL_MS));
 
     loop {
         if heartbeat_authority_lost() {
@@ -3686,45 +4383,55 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
         const BROWSER_ORPHAN_SWEEP_INTERVAL_LONGER_THAN_REGISTRY_POLL_MS: u64 = 5 * 60 * 1000;
         if last_browser_orphan_sweep.elapsed()
             >= Duration::from_millis(BROWSER_ORPHAN_SWEEP_INTERVAL_LONGER_THAN_REGISTRY_POLL_MS)
+            && !browser_orphan_sweep_in_flight.load(std::sync::atomic::Ordering::SeqCst)
         {
             last_browser_orphan_sweep = Instant::now();
-            agentplug_host::reap_idle_sessions_and_os_orphans_across_every_known_project_root(
-                &known_roots,
-            );
+            browser_orphan_sweep_in_flight.store(true, std::sync::atomic::Ordering::SeqCst);
+            let finished = browser_orphan_sweep_in_flight.clone();
+            let sweep_roots = known_roots.clone();
+            std::thread::spawn(move || {
+                agentplug_host::reap_idle_sessions_and_os_orphans_across_every_known_project_root(
+                    &sweep_roots,
+                );
+                finished.store(false, std::sync::atomic::Ordering::SeqCst);
+            });
         }
 
         let max_concurrent_projects = daemon_cfg.max_concurrent_projects();
 
-        for root in &known_roots {
-            for plugin_name in read_project_plugin_list(root) {
-                if plugin_compile_in_backoff(&plugin_name) {
-                    continue;
-                }
-                match plugin_modules.get_or_compile(&plugin_name) {
-                    Ok(()) => clear_plugin_compile_failure(&plugin_name),
-                    Err(e) => {
-                        eprintln!("[agentplug daemon] failed to compile/install plugin {plugin_name} for {}: {e:#}", root.display());
-                        record_plugin_compile_failure(&plugin_name, format!("{e:#}"));
+        const PER_ROOT_PLUGIN_SCAN_INTERVAL: Duration = Duration::from_secs(5);
+        if !roots_new_this_registry_poll.is_empty()
+            || last_per_root_plugin_scan.elapsed() >= PER_ROOT_PLUGIN_SCAN_INTERVAL
+        {
+            last_per_root_plugin_scan = Instant::now();
+            for root in &known_roots {
+                for plugin_name in read_project_plugin_list(root) {
+                    if plugin_compile_in_backoff(&plugin_name) {
+                        continue;
+                    }
+                    match plugin_modules.get_or_compile(&plugin_name) {
+                        Ok(()) => clear_plugin_compile_failure(&plugin_name),
+                        Err(e) => {
+                            eprintln!("[agentplug daemon] failed to compile/install plugin {plugin_name} for {}: {e:#}", root.display());
+                            record_plugin_compile_failure(&plugin_name, format!("{e:#}"));
+                        }
                     }
                 }
-            }
-            let due = last_instruction_source_sync
-                .get(root)
-                .map(|t| t.elapsed() >= instruction_source_poll_interval)
-                .unwrap_or(true);
-            if due && instruction_source_syncing.insert(root.clone()) {
-                last_instruction_source_sync.insert(root.clone(), Instant::now());
-                let thread_root = root.clone();
-                let done = instruction_source_sync_done_tx.clone();
-                std::thread::spawn(move || {
-                    if let Err(e) = sync_instruction_source_if_configured(&thread_root) {
-                        eprintln!(
-                            "[agentplug daemon] instruction source-repo sync failed for {}: {e:#}",
-                            thread_root.display()
-                        );
-                    }
-                    let _ = done.send(thread_root);
-                });
+                let due = last_instruction_source_sync
+                    .get(root)
+                    .map(|t| t.elapsed() >= instruction_source_poll_interval)
+                    .unwrap_or(true);
+                if due && instruction_source_syncing.insert(root.clone()) {
+                    last_instruction_source_sync.insert(root.clone(), Instant::now());
+                    let thread_root = root.clone();
+                    let done = instruction_source_sync_done_tx.clone();
+                    std::thread::spawn(move || {
+                        if let Err(e) = sync_instruction_source_if_configured(&thread_root) {
+                            eprintln!("[agentplug daemon] instruction source-repo sync failed for {}: {e:#}", thread_root.display());
+                        }
+                        let _ = done.send(thread_root);
+                    });
+                }
             }
         }
         for plugin_name in ["gm", "libsql", "bert", "treesitter", "oxibrowser", "crux"] {
@@ -3739,10 +4446,18 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
                 }
             }
         }
+        agentplug_host::set_sibling_reload_source((
+            plugin_modules.engine.clone(),
+            plugin_modules.modules_with_hashes(),
+        ));
 
         let sweep_cold_this_tick = last_cold_project_sweep.elapsed() >= COLD_PROJECT_SWEEP_INTERVAL;
         if sweep_cold_this_tick {
             last_cold_project_sweep = Instant::now();
+            let no_inherited_claims = HashSet::new();
+            for root in &known_roots {
+                sweep_orphaned_claims_distinguishing_handoff_from_crash(root, &no_inherited_claims);
+            }
         }
         let mut all_projects: Vec<(PathBuf, ProjectPlugins)> =
             Vec::with_capacity(known_roots.len());
@@ -3752,16 +4467,16 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
             match projects.remove(root) {
                 Some(p) => {
                     all_projects.push((root.clone(), p));
-                    is_genuinely_active.push(project_has_pending_dispatch_work(root));
+                    is_genuinely_active.push(project_has_queued_spool_work_cached(root));
                 }
                 None if sweep_cold_this_tick
                     || roots_new_this_registry_poll.contains(root)
-                    || project_has_pending_dispatch_work(root) =>
+                    || project_has_queued_spool_work_cached(root) =>
                 {
                     all_projects.push((root.clone(), ProjectPlugins::new(root.clone())));
                     is_genuinely_active.push(
                         roots_new_this_registry_poll.contains(root)
-                            || project_has_pending_dispatch_work(root),
+                            || project_has_queued_spool_work_cached(root),
                     );
                 }
                 None => skipped_cold += 1,
@@ -3856,6 +4571,7 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
         if heartbeat_authority_lost() {
             agentplug_host::close_all_sessions();
             eprintln!("[agentplug daemon] heartbeat authority held by another daemon -- exiting after finishing in-flight batch");
+            mark_intentional_exit("heartbeat-authority-lost");
             return Ok(());
         }
         let evict_before = Instant::now()
@@ -3874,82 +4590,24 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
             projects.remove(&root);
         }
 
-        let forced_refresh_request = take_forced_plugin_refresh_request();
-        if last_plugin_update_poll.elapsed() >= shortest_plugin_poll_interval
-            || forced_refresh_request.is_some()
-        {
-            last_plugin_update_poll = Instant::now();
-            let poll_ts = now_ms();
-            HEARTBEAT_LAST_PLUGIN_POLL_TS.store(poll_ts, std::sync::atomic::Ordering::Relaxed);
-            write_persisted_poll_ts(&persisted_plugin_poll_ts_path(), poll_ts);
-            let targets: Vec<String> = match &forced_refresh_request {
-                Some(Some(name)) => vec![name.clone()],
-                _ => plugin_modules.modules.keys().cloned().collect(),
-            };
-            let mut cycle_errors: Vec<String> = Vec::new();
-            for plugin_name in targets {
-                let forced =
-                    matches!(&forced_refresh_request, Some(Some(name)) if name == &plugin_name);
-                if !forced {
-                    let due = last_plugin_specific_poll
-                        .get(&plugin_name)
-                        .map(|t| {
-                            t.elapsed() >= daemon_cfg.plugin_update_poll_interval_for(&plugin_name)
-                        })
-                        .unwrap_or(true);
-                    if !due {
-                        continue;
-                    }
-                }
-                last_plugin_specific_poll.insert(plugin_name.clone(), Instant::now());
-                match crate::download::refresh_plugin_if_stale(&plugin_name) {
-                    Ok(Some(new_version)) => {
-                        eprintln!(
-                            "[agentplug daemon] downloaded+verified plugin {plugin_name} update to {new_version} -- the next tick's get_or_compile content-hash check evicts and recompiles it unconditionally, no idle window required"
-                        );
-                    }
-                    Ok(None) => {}
-                    Err(e) => {
-                        let msg = format!("plugin update check for {plugin_name} failed: {e}");
-                        eprintln!("[agentplug daemon] {msg}");
-                        cycle_errors.push(msg);
-                    }
-                }
-            }
-            record_plugin_poll_error(if cycle_errors.is_empty() {
-                None
+        while let Ok((staged, version)) = staged_runner_rx.try_recv() {
+            if handoff_backed_off(&version) {
+                let _ = fs::remove_file(&staged);
+                crate::update_trust::remove_stage_record(&staged);
+                eprintln!(
+                    "[agentplug daemon] staged self-update to {version} is inside its {}s retry backoff after a failed handoff -- dropping it instead of retrying on every tick",
+                    HANDOFF_RETRY_BACKOFF.as_secs()
+                );
             } else {
-                Some(cycle_errors.join("; "))
-            });
-        }
-
-        if first_runner_poll_pending
-            || last_runner_update_poll.elapsed() >= runner_update_poll_interval
-            || take_forced_runner_refresh_request()
-        {
-            first_runner_poll_pending = false;
-            last_runner_update_poll = Instant::now();
-            let poll_ts = now_ms();
-            HEARTBEAT_LAST_RUNNER_POLL_TS.store(poll_ts, std::sync::atomic::Ordering::Relaxed);
-            write_persisted_poll_ts(&persisted_runner_poll_ts_path(), poll_ts);
-            match crate::download::stage_runner_self_update() {
-                Ok(Some((staged, version))) => {
-                    eprintln!(
-                        "[agentplug daemon] staged self-update to {version} at {}",
-                        staged.display()
-                    );
-                    if pending_self_update.is_none() {
-                        pending_self_update_staged_at = Some(Instant::now());
-                    }
-                    pending_self_update = Some((staged, version));
-                    record_runner_poll_error(None);
+                eprintln!(
+                    "[agentplug daemon] staged self-update to {version} at {}",
+                    staged.display()
+                );
+                if pending_self_update.is_none() {
+                    pending_self_update_staged_at = Some(Instant::now());
                 }
-                Ok(None) => record_runner_poll_error(None),
-                Err(e) => {
-                    let msg = format!("runner self-update check failed: {e}");
-                    eprintln!("[agentplug daemon] {msg}");
-                    record_runner_poll_error(Some(msg));
-                }
+                pending_self_update = Some((staged, version));
+                record_runner_poll_error(None);
             }
         }
 
@@ -3970,9 +4628,17 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
             self_update_starved && detached_still_running && self_update_hard_capped;
         let force_handoff_never_idle =
             self_update_starved && self_update_hard_capped && !detached_still_running && any_work;
-        if (!any_work && !detached_still_running)
-            || force_handoff_despite_in_flight
-            || force_handoff_never_idle
+        let self_update_backed_off = pending_self_update
+            .as_ref()
+            .map(|(_, v)| handoff_backed_off(v))
+            .unwrap_or(false);
+        if self_update_backed_off {
+            pending_self_update_staged_at = None;
+        }
+        if !self_update_backed_off
+            && ((!any_work && !detached_still_running)
+                || force_handoff_despite_in_flight
+                || force_handoff_never_idle)
         {
             if let Some((staged, version)) = pending_self_update.take() {
                 let claims_the_successor_inherits = snapshot_in_flight_claims();
@@ -3998,10 +4664,19 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
                         "[agentplug daemon] handed off to version {version} -- re-queued {requeued} of {} inherited claim(s) for the incoming daemon, exiting",
                         claims_the_successor_inherits.len()
                     );
+                    mark_intentional_exit("runner-handoff");
                     return Ok(());
                 }
                 clear_handoff_inherited_claims();
-                pending_self_update = Some((staged, version));
+                if staged.exists() {
+                    pending_self_update = Some((staged, version));
+                } else {
+                    pending_self_update_staged_at = None;
+                    eprintln!(
+                        "[agentplug daemon] dropping the self-update to {version}: the staged exe {} no longer exists after the failed handoff, so retrying it every tick would only fail faster -- the next scheduled poll re-stages it",
+                        staged.display()
+                    );
+                }
             }
         }
 
@@ -4054,25 +4729,49 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
                 "[agentplug daemon] self-recycling after {}ms fully idle -- reclaims shared-plugin peak wasm memory (monotonic linear memory, no in-place shrink); next real dispatch spawns a fresh process",
                 SELF_RECYCLE_IDLE_MS
             );
+            mark_intentional_exit("self-recycle");
             return Ok(());
         }
 
         let pending_work_exists_before_idle_wait = known_roots
             .iter()
             .any(|root| project_has_pending_dispatch_work(root));
-        if !any_work && !pending_work_exists_before_idle_wait {
+        if any_work || pending_work_exists_before_idle_wait {
+            // Work is running or is waiting on a claim slot: keep the registry
+            // scan at its fastest cadence so a claimable file is seen within
+            // one cache TTL of being written.
+            //
+            // "Fastest cadence" still has to be a cadence. This branch used to
+            // assign `idle_wait_ms` and then fall out of the loop without ever
+            // waiting on it, so any pass that did work -- or any root that
+            // reported pending work it could not actually claim (a stale
+            // .inflight, or a project pinned at
+            // MAX_CLAIMED_DISPATCHES_PER_PROJECT) -- ran the whole registry
+            // scan as an unbounded spin. On a registry of hundreds of roots
+            // that scan is mostly directory enumeration, so it shows up as
+            // near-core CPU with almost all of it in kernel time and no
+            // dispatch in flight. The wait is the same event-driven one the
+            // idle branch uses, so a dispatch written during it still wakes
+            // the next pass immediately.
+            idle_wait_ms = IDLE_WAIT_MIN_MS;
             #[cfg(windows)]
-            {
-                idle_in_dir_watch.sync(&known_roots);
-                let pending_work_appeared_while_arming_idle_watcher = known_roots
-                    .iter()
-                    .any(|root| project_has_pending_dispatch_work(root));
-                if !pending_work_appeared_while_arming_idle_watcher {
-                    idle_in_dir_watch.wait(Duration::from_millis(25));
-                }
-            }
+            wait_for_in_dir_change(
+                &mut idle_in_dir_watch,
+                &known_roots,
+                Duration::from_millis(idle_wait_ms),
+            );
             #[cfg(not(windows))]
-            std::thread::sleep(Duration::from_millis(25));
+            std::thread::sleep(Duration::from_millis(idle_wait_ms));
+        } else {
+            #[cfg(windows)]
+            wait_for_in_dir_change(
+                &mut idle_in_dir_watch,
+                &known_roots,
+                Duration::from_millis(idle_wait_ms),
+            );
+            #[cfg(not(windows))]
+            std::thread::sleep(Duration::from_millis(idle_wait_ms));
+            idle_wait_ms = (idle_wait_ms.saturating_mul(2)).min(IDLE_WAIT_MAX_MS);
         }
     }
 }

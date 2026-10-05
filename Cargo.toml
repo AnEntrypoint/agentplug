@@ -1,11 +1,11 @@
 [workspace]
 resolver = "2"
-members = ["crates/agentplug-host", "crates/agentplug-runner"]
+members = ["crates/agentplug-host", "crates/agentplug-runner", "crates/agentplug-trust"]
 default-members = ["crates/agentplug-runner"]
 
 [workspace.package]
 edition = "2021"
-version = "0.1.158"
+version = "0.1.172"
 
 [profile.release]
 strip = true

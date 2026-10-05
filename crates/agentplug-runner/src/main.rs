@@ -1,5 +1,7 @@
+mod build_info;
 mod daemon;
 mod download;
+mod update_trust;
 
 use std::path::PathBuf;
 
@@ -35,13 +37,14 @@ fn reconcile_plugin_manifest(
             Err(_) => continue,
         };
         let content_hash = download::sha256_hex(&bytes);
-        let module = match Module::from_file(engine, &wasm) {
-            Ok(m) => m,
-            Err(_) => {
-                advance_plugin_fiber(name, false, None);
-                continue;
-            }
-        };
+        let module =
+            match agentplug_host::load_module_file_backed(engine, &wasm, name, &content_hash) {
+                Ok(m) => m,
+                Err(_) => {
+                    advance_plugin_fiber(name, false, None);
+                    continue;
+                }
+            };
         let load_result = project.load_plugin(engine, name, &module, &content_hash);
         advance_plugin_fiber(name, load_result.is_ok(), Some(&content_hash));
         if load_result.is_ok() {
@@ -59,6 +62,7 @@ fn reconcile_plugin_manifest(
 }
 
 fn main() -> anyhow::Result<()> {
+    agentplug_host::ensure_hidden_console();
     suppress_crash_dialogs();
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -93,9 +97,18 @@ fn main() -> anyhow::Result<()> {
             let cwd = std::env::var("CLAUDE_PROJECT_DIR")
                 .map(PathBuf::from)
                 .unwrap_or_else(|_| std::env::current_dir().expect("cwd unavailable"));
+            let cwd = agentplug_host::project_root(&cwd);
             let spool_dir = cwd.join(".gm").join("exec-spool");
             std::fs::create_dir_all(&spool_dir)?;
 
+            if !daemon::claim_spool_launcher_slot(&spool_dir) {
+                eprintln!(
+                    "[agentplug] another spool launcher for {} is already live -- exiting",
+                    cwd.display()
+                );
+                return Ok(());
+            }
+            daemon::arm_spool_launcher_deadline();
             daemon::register_project(&cwd)?;
             if daemon::ensure_daemon_running()? {
                 eprintln!(
@@ -134,6 +147,7 @@ fn main() -> anyhow::Result<()> {
             );
             Ok(())
         }
+        "daemon-guard" => daemon::run_daemon_guard(),
         "daemon" => daemon::run_daemon(),
         "sweep-spool" => {
             let root = args
@@ -168,7 +182,7 @@ fn main() -> anyhow::Result<()> {
             let plugin = args.get(2).cloned().unwrap_or_else(|| "gm".to_string());
             let verb = args.get(3).cloned().unwrap_or_default();
             let body = args.get(4).cloned().unwrap_or_else(|| "{}".to_string());
-            let cwd = std::env::current_dir()?;
+            let cwd = agentplug_host::project_root(&std::env::current_dir()?);
 
             match daemon::try_dispatch_via_daemon(&cwd, &plugin, &verb, &body) {
                 daemon::DaemonDispatchOutcome::Answered(out) => {
@@ -184,7 +198,8 @@ fn main() -> anyhow::Result<()> {
             let wasm = download::ensure_plugin_installed(&plugin, None)?;
             let content_hash = download::sha256_hex(&std::fs::read(&wasm)?);
             let engine = build_engine()?;
-            let module = Module::from_file(&engine, &wasm)?;
+            let module =
+                agentplug_host::load_module_file_backed(&engine, &wasm, &plugin, &content_hash)?;
             let mut project = ProjectPlugins::new(cwd);
             project.load_plugin(&engine, &plugin, &module, &content_hash)?;
             let siblings: Vec<(&str, Option<&str>)> = ["libsql", "bert", "treesitter"]
@@ -198,6 +213,35 @@ fn main() -> anyhow::Result<()> {
             println!("{out}");
             Ok(())
         }
+        "update-runner" => {
+            match download::stage_runner_self_update()? {
+                Some((staged, version)) => {
+                    println!("staged verified runner {version} at {}", staged.display())
+                }
+                None => println!("no runner update to stage"),
+            }
+            Ok(())
+        }
+        "trust-status" => {
+            println!("{}", serde_json::to_string_pretty(&update_trust::status())?);
+            Ok(())
+        }
+        "--build-info" | "build-info" => {
+            println!("{}", serde_json::to_string_pretty(&build_info::document())?);
+            Ok(())
+        }
+        "pin-local-build" => {
+            let sha = download::pin_local_build()?;
+            println!("pinned the installed runner as a locally built binary (sha256 {sha}) -- the auto-updater will not overwrite it");
+            Ok(())
+        }
+        "unpin-local-build" => {
+            download::unpin_local_build()?;
+            println!(
+                "cleared the local-build pin -- the auto-updater may replace this runner again"
+            );
+            Ok(())
+        }
         "--version" | "version" => {
             println!("agentplug-runner {}", env!("CARGO_PKG_VERSION"));
             Ok(())
@@ -208,7 +252,7 @@ fn main() -> anyhow::Result<()> {
         "selfcheck-spool-claim" => selfcheck_spool_claim(),
         other => {
             eprintln!(
-                "agentplug-runner: unknown command '{other}'. Usage: agentplug-runner <plugin <name> [version]|spool|daemon|takeover <version>|dispatch [plugin] <verb> [body]|reap-orphans|sweep-spool [root]|selfcheck-registry|selfcheck-inflight|version>"
+                "agentplug-runner: unknown command '{other}'. Usage: agentplug-runner <plugin <name> [version]|spool|daemon|takeover <version>|dispatch [plugin] <verb> [body]|reap-orphans|sweep-spool [root]|update-runner|trust-status|build-info|pin-local-build|unpin-local-build|selfcheck-registry|selfcheck-inflight|version>"
             );
             std::process::exit(1);
         }
@@ -232,11 +276,9 @@ fn selfcheck_registry() -> anyhow::Result<()> {
     let engine = build_engine()?;
     let module = Module::new(&engine, SELFCHECK_SUCCESS_WAT)?;
     let root = std::env::temp_dir().join(format!(
-        "agentplug-selfcheck-registry-{}-{}",
-        std::process::id(),
-        agentplug_host::now_ms()
+        "agentplug-selfcheck-registry-{}",
+        std::process::id()
     ));
-    std::fs::create_dir_all(&root)?;
     let mut project = ProjectPlugins::new(root.clone());
     project.load_plugin(&engine, "gm", &module, "hash-a")?;
     let out = project.dispatch("gm", "probe", "{}")?;
@@ -246,10 +288,7 @@ fn selfcheck_registry() -> anyhow::Result<()> {
     );
     println!("[selfcheck-registry] fresh gm slot dispatched and returned {out:?}");
 
-    let gm_slot_count = shared_plugin_slot_content_hashes("gm")
-        .iter()
-        .filter(|hash| hash.as_deref() == Some("hash-a"))
-        .count();
+    let gm_slot_count = shared_plugin_slot_content_hashes("gm").len();
     let (evicted_now, deferred) = request_shared_store_swap("gm", "hash-a");
     println!("[selfcheck-registry] swap request against {gm_slot_count} idle slot(s): evicted_now={evicted_now} deferred={deferred}");
     assert_eq!(
@@ -277,7 +316,6 @@ fn selfcheck_registry() -> anyhow::Result<()> {
         shared_plugin_swap_pending_hashes("gm").is_empty(),
         "marking hash-b current must leave no pending swap hashes"
     );
-    std::fs::remove_dir_all(root)?;
     println!(
         "[selfcheck-registry] all invariants witnessed live through real wasmtime dispatch: PASS"
     );
@@ -527,14 +565,6 @@ fn clear_standalone_status(status_path: &std::path::Path) {
         serde_json::json!(agentplug_host::now_ms()),
     );
     let _ = fs::write(status_path, serde_json::Value::Object(map).to_string());
-}
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn selfcheck_registry_witnesses_a_real_slot_swap() {
-        super::selfcheck_registry().unwrap();
-    }
 }
 
 fn run_spool_watcher_single_process(

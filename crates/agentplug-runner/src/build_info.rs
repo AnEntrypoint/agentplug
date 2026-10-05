@@ -1,0 +1,47 @@
+include!(concat!(env!("OUT_DIR"), "/build_info.rs"));
+
+#[derive(Clone)]
+pub struct Reported {
+    pub version: String,
+    pub commit: String,
+    pub build_ts: u64,
+    pub release_build: bool,
+}
+
+pub fn is_release_build() -> bool {
+    RELEASE_BUILD
+}
+
+pub fn document() -> serde_json::Value {
+    serde_json::json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "commit": COMMIT,
+        "build_ts": BUILD_TS,
+        "release_build": RELEASE_BUILD,
+    })
+}
+
+pub fn parse(text: &str) -> Option<Reported> {
+    let value: serde_json::Value = serde_json::from_str(text).ok()?;
+    Some(Reported {
+        version: value.get("version")?.as_str()?.to_string(),
+        commit: value
+            .get("commit")?
+            .as_str()
+            .unwrap_or("unknown")
+            .to_string(),
+        build_ts: value.get("build_ts")?.as_u64().unwrap_or(0),
+        release_build: value.get("release_build")?.as_bool()?,
+    })
+}
+
+pub fn probe(exe: &std::path::Path) -> Option<Reported> {
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("--build-info");
+    agentplug_host::apply_windowless(&mut cmd);
+    let output = cmd.output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse(&String::from_utf8_lossy(&output.stdout))
+}

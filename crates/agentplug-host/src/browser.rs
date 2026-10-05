@@ -15,7 +15,8 @@ pub(crate) const CDP_EVAL_JS: &str = include_str!("cdp_eval.js");
 const EXTENSION_LOAD_JS: &str = include_str!("extension_load.js");
 const DEFAULT_CHROME_IDLE_TTL_SECONDS: u64 = 300;
 const DEFAULT_CHROME_MAX_CONCURRENT: u64 = 2;
-const DEFAULT_SESSION_OWNER_GONE_IDLE_MS: u64 = 60 * 1000;
+const RECENT_END_WINDOW_MS: u64 = 60 * 60 * 1000;
+const RECENT_END_LIMIT: usize = 10;
 const IDLE_REAPER_TICK: Duration = Duration::from_secs(15);
 const GLOBAL_ORPHAN_LAUNCH_GRACE: Duration = Duration::from_secs(15);
 const LRU_EVICTION_IDLE_FLOOR: Duration = Duration::from_secs(60);
@@ -77,25 +78,15 @@ impl BrowserRuntimeConfig {
         self.eval_timeout_grace_ms.unwrap_or(6000)
     }
     fn headless(&self) -> bool {
-        self.headless
-            .unwrap_or_else(|| match std::env::var("GM_BROWSER_HEADLESS").as_deref() {
-                Ok("1") | Ok("true") => true,
-                Ok("0") | Ok("false") => false,
-                _ => {
-                    cfg!(target_os = "linux")
-                        && std::env::var_os("DISPLAY").is_none()
-                        && std::env::var_os("WAYLAND_DISPLAY").is_none()
-                }
-            })
+        self.headless.unwrap_or(false)
     }
     fn session_idle_timeout(&self) -> Duration {
         Duration::from_millis(self.session_idle_timeout_ms.unwrap_or(30 * 60 * 1000))
     }
-    fn session_owner_gone_idle_timeout(&self) -> Duration {
-        Duration::from_millis(
-            self.session_owner_gone_idle_timeout_ms
-                .unwrap_or(DEFAULT_SESSION_OWNER_GONE_IDLE_MS),
-        )
+    fn session_owner_gone_idle_timeout(&self) -> Option<Duration> {
+        self.session_owner_gone_idle_timeout_ms
+            .filter(|ms| *ms > 0)
+            .map(Duration::from_millis)
     }
     pub(crate) fn load_extension(&self) -> Option<&str> {
         self.load_extension.as_deref()
@@ -309,6 +300,20 @@ enum BrowserMode {
     Screenshot,
     Dom,
     Gpu,
+    CdpRaw,
+}
+
+fn names_cdp_event(token: &str) -> bool {
+    token.chars().next().is_some_and(|c| c.is_ascii_uppercase()) && token.contains('.')
+}
+
+fn starts_cdp_raw_body(trimmed: &str) -> bool {
+    let mut words = trimmed.lines().next().unwrap_or("").split_whitespace();
+    match words.next() {
+        Some("cdp") => words.next().is_some(),
+        Some("events") => words.next().is_some_and(names_cdp_event),
+        _ => false,
+    }
 }
 
 fn strip_mode_prefix(body: &str) -> (BrowserMode, String, &str) {
@@ -332,6 +337,10 @@ fn strip_mode_prefix(body: &str) -> (BrowserMode, String, &str) {
             None => (rest.trim().to_string(), ""),
         };
         return (BrowserMode::Screenshot, name, remainder);
+    }
+    if starts_cdp_raw_body(trimmed) {
+        let first_line = trimmed.lines().next().unwrap_or("").trim().to_string();
+        return (BrowserMode::CdpRaw, first_line, trimmed);
     }
     if let Some(rest) = trimmed.strip_prefix("dom=") {
         let (selector, remainder) = match rest.find('\n') {
@@ -626,6 +635,72 @@ fn kill_session(mut session: BrowserSession) {
     let _ = std::fs::remove_file(last_used_sidecar_path(&profile_dir));
 }
 
+fn ended_sidecar_path(profile_dir: &Path) -> PathBuf {
+    profile_dir.join("chrome.ended")
+}
+
+fn kill_session_because(session: BrowserSession, reason: &str, idle_ttl: Option<Duration>) {
+    let profile_dir = browser_chrome_profile_dir(&session.cwd, &session.session_id);
+    if session.owns_process && profile_dir.is_dir() {
+        let record = json!({
+            "session_id": session.session_id,
+            "at_ms": unix_ms() as u64,
+            "reason": reason,
+            "idle_ms": session.last_used.elapsed().as_millis() as u64,
+            "idle_ttl_ms": idle_ttl.map(|ttl| ttl.as_millis() as u64),
+            "pid": session.pid,
+        });
+        let _ = std::fs::write(ended_sidecar_path(&profile_dir), record.to_string());
+    }
+    kill_session(session);
+}
+
+fn take_session_end_record(profile_dir: &Path) -> Option<Value> {
+    let path = ended_sidecar_path(profile_dir);
+    let record = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok());
+    let _ = std::fs::remove_file(&path);
+    record
+}
+
+fn recent_session_end_records(cwd: &Path) -> Vec<Value> {
+    let Ok(entries) = std::fs::read_dir(browser_profiles_root_for_orphan_scan(cwd)) else {
+        return Vec::new();
+    };
+    let mut records: Vec<Value> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            let suffix = path
+                .file_name()?
+                .to_str()?
+                .strip_prefix("browser-chrome-profile-")?
+                .to_string();
+            let mut record: Value =
+                serde_json::from_str(&std::fs::read_to_string(ended_sidecar_path(&path)).ok()?)
+                    .ok()?;
+            if !record.is_object() {
+                return None;
+            }
+            if record.get("session_id").is_none() {
+                record["session_id"] = json!(suffix);
+            }
+            record["ended_ago_ms"] =
+                json!((unix_ms() as u64).saturating_sub(record["at_ms"].as_u64().unwrap_or(0)));
+            Some(record)
+        })
+        .collect();
+    records.retain(|r| {
+        r["ended_ago_ms"]
+            .as_u64()
+            .is_some_and(|ago| ago <= RECENT_END_WINDOW_MS)
+    });
+    records.sort_by_key(|r| r["ended_ago_ms"].as_u64().unwrap_or(u64::MAX));
+    records.truncate(RECENT_END_LIMIT);
+    records
+}
+
 fn kill_chrome_processes_left_on_profile(profile_dir: &Path) -> usize {
     let pids = pids_of_chrome_processes_using_profile_dir(&list_chrome_processes(), profile_dir);
     for pid in &pids {
@@ -805,11 +880,9 @@ fn run_bounded_capturing_stdout(cmd: &mut Command) -> Option<Vec<u8>> {
 
 #[cfg(windows)]
 fn pid_is_alive(pid: u32) -> bool {
-    use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     let mut cmd = Command::new("tasklist");
-    cmd.args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
-        .creation_flags(CREATE_NO_WINDOW);
+    cmd.args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"]);
+    crate::windowless::apply_windowless(&mut cmd);
     match run_bounded_capturing_stdout(&mut cmd) {
         Some(stdout) => {
             let s = String::from_utf8_lossy(&stdout);
@@ -962,9 +1035,7 @@ fn session_liveness_recheck(port: u16, cdp_endpoint: &str, browser_cfg: &Browser
         .stderr(Stdio::null());
     #[cfg(windows)]
     {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        spawn_cmd.creation_flags(CREATE_NO_WINDOW);
+        crate::windowless::apply_windowless(&mut spawn_cmd);
     }
     let spawn = spawn_cmd.spawn();
     let alive = match spawn {
@@ -993,12 +1064,10 @@ fn session_liveness_recheck(port: u16, cdp_endpoint: &str, browser_cfg: &Browser
 
 #[cfg(windows)]
 fn kill_pid(pid: u32) {
-    use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    let _ = Command::new("taskkill")
-        .args(["/PID", &pid.to_string(), "/F", "/T"])
-        .creation_flags(CREATE_NO_WINDOW)
-        .output();
+    let mut cmd = Command::new("taskkill");
+    cmd.args(["/PID", &pid.to_string(), "/F", "/T"]);
+    crate::windowless::apply_windowless(&mut cmd);
+    let _ = cmd.output();
 }
 
 #[cfg(not(windows))]
@@ -1030,8 +1099,6 @@ fn wmi_circuit_breaker_open() -> bool {
 
 #[cfg(windows)]
 fn list_chrome_processes() -> Vec<(u32, String)> {
-    use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     if wmi_circuit_breaker_open() {
         return Vec::new();
     }
@@ -1041,8 +1108,8 @@ fn list_chrome_processes() -> Vec<(u32, String)> {
         "-NonInteractive",
         "-Command",
         "Get-CimInstance Win32_Process -Filter \"Name='chrome.exe'\" | ForEach-Object { \"$($_.ProcessId)|$($_.CommandLine)\" }",
-    ])
-    .creation_flags(CREATE_NO_WINDOW);
+    ]);
+    crate::windowless::apply_windowless(&mut cmd);
     let Some(stdout) = run_bounded_capturing_stdout(&mut cmd) else {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1082,16 +1149,14 @@ fn list_chrome_processes() -> Vec<(u32, String)> {
 
 #[cfg(windows)]
 fn parent_pid_of(pid: u32) -> Option<u32> {
-    use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     let mut cmd = Command::new("powershell.exe");
     cmd.args([
         "-NoProfile",
         "-NonInteractive",
         "-Command",
         &format!("(Get-CimInstance Win32_Process -Filter \"ProcessId={pid}\").ParentProcessId"),
-    ])
-    .creation_flags(CREATE_NO_WINDOW);
+    ]);
+    crate::windowless::apply_windowless(&mut cmd);
     String::from_utf8_lossy(&run_bounded_capturing_stdout(&mut cmd)?)
         .trim()
         .parse()
@@ -1157,6 +1222,21 @@ fn strip_windows_verbatim_prefix(path: &str) -> String {
 pub fn canonical_project_root(path: &Path) -> PathBuf {
     let resolved = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
     PathBuf::from(strip_windows_verbatim_prefix(&resolved.to_string_lossy()))
+}
+
+pub fn project_root(path: &Path) -> PathBuf {
+    let canonical = canonical_project_root(path);
+    if !canonical.is_absolute() {
+        return canonical;
+    }
+    canonical
+        .ancestors()
+        .find(|dir| {
+            let marker = dir.join(".git");
+            marker.is_file() || marker.join("HEAD").exists()
+        })
+        .map(Path::to_path_buf)
+        .unwrap_or(canonical)
 }
 
 fn profile_dir_key(path: &str) -> String {
@@ -1327,7 +1407,7 @@ fn reap_sessions_for_deregistered_roots(roots: &[std::path::PathBuf]) {
     }
     drop(map);
     for session in reaped {
-        kill_session(session);
+        kill_session_because(session, "project_root_deregistered", None);
     }
     evict_session_lifecycle_locks_with_no_active_holder();
 }
@@ -1347,25 +1427,30 @@ fn process_uptime() -> Duration {
     PROCESS_STARTED.get_or_init(Instant::now).elapsed()
 }
 
-fn effective_idle_timeout(session: &BrowserSession, cfg: &BrowserConfig) -> Option<Duration> {
+fn idle_ceiling(session: &BrowserSession, cfg: &BrowserConfig) -> Option<(Duration, &'static str)> {
     match session.idle_reap {
         Some(IdleReap::Never) => return None,
-        Some(IdleReap::After(explicit)) => return Some(explicit),
+        Some(IdleReap::After(explicit)) => {
+            return Some((explicit, "idle_timeout_requested_by_session"))
+        }
         None => {}
     }
-    let long_ceiling = cfg.session_idle_timeout();
-    let short_ceiling = cfg.session_owner_gone_idle_timeout();
-    let session_ceiling =
-        if owner_gm_session_is_stale(session.owner_gm_session.as_deref(), short_ceiling) {
-            short_ceiling.min(long_ceiling)
-        } else {
-            long_ceiling
-        };
-    Some(if session.owns_process {
-        session_ceiling.min(cfg.chrome_idle_ttl())
-    } else {
-        session_ceiling
-    })
+    let mut ceiling = (cfg.session_idle_timeout(), "session_idle_timeout");
+    if let Some(short) = cfg.session_owner_gone_idle_timeout() {
+        if short < ceiling.0
+            && owner_gm_session_is_stale(session.owner_gm_session.as_deref(), short)
+        {
+            ceiling = (short, "idle_ttl_owner_gone");
+        }
+    }
+    if session.owns_process && cfg.chrome_idle_ttl() <= ceiling.0 {
+        ceiling = (cfg.chrome_idle_ttl(), "idle_ttl");
+    }
+    Some(ceiling)
+}
+
+fn effective_idle_timeout(session: &BrowserSession, cfg: &BrowserConfig) -> Option<Duration> {
+    idle_ceiling(session, cfg).map(|(timeout, _)| timeout)
 }
 
 fn dispatch_in_flight(key: &str) -> bool {
@@ -1390,28 +1475,24 @@ fn reap_idle_sessions(cwd: &Path, cfg: &BrowserConfig) {
     let mut reaped = Vec::new();
     for k in dead_keys {
         if let Some(session) = map.remove(&k) {
-            let timeout_ms = effective_idle_timeout(&session, cfg)
-                .map(|t| t.as_millis())
-                .unwrap_or_default();
-            let owner_gone = owner_gm_session_is_stale(
-                session.owner_gm_session.as_deref(),
-                cfg.session_owner_gone_idle_timeout(),
-            );
+            let ceiling = idle_ceiling(&session, cfg);
+            let timeout = ceiling.map(|(t, _)| t);
+            let reason = ceiling.map(|(_, r)| r).unwrap_or("idle_ttl");
             eprintln!(
-                "[agentplug browser] reaping idle session {} (idle {}ms > {}ms, idle_reap={}, owner_gm_session={:?}, owner_gone={})",
+                "[agentplug browser] reaping idle session {} (idle {}ms > {}ms, idle_reap={}, owner_gm_session={:?}, reason={})",
                 session.session_id,
                 session.last_used.elapsed().as_millis(),
-                timeout_ms,
+                timeout.map(|t| t.as_millis()).unwrap_or_default(),
                 IdleReap::report(session.idle_reap),
                 session.owner_gm_session,
-                owner_gone
+                reason
             );
-            reaped.push(session);
+            reaped.push((session, reason, timeout));
         }
     }
     drop(map);
-    for session in reaped {
-        kill_session(session);
+    for (session, reason, timeout) in reaped {
+        kill_session_because(session, reason, timeout);
     }
     evict_session_lifecycle_locks_with_no_active_holder();
 }
@@ -1566,7 +1647,7 @@ fn reserve_chrome_launch_slot(
                 session.cwd.display(),
                 victim_idle.as_secs()
             );
-            kill_session(session);
+            kill_session_because(session, "evicted_at_chrome_cap", None);
         }
         live = owned_chrome_sessions();
     }
@@ -1595,7 +1676,7 @@ fn session_new(
     {
         let mut map = sessions_map().lock().unwrap_or_else(|e| e.into_inner());
         if let Some(existing) = map.remove(&key) {
-            kill_session(existing);
+            kill_session_because(existing, "replaced_by_session_new", None);
         }
     }
     let _launch_slot = match reserve_chrome_launch_slot(cfg, engine, &key) {
@@ -1628,6 +1709,9 @@ fn session_new(
             );
             drop(map);
             record_owner_gm_session(cwd, session_id, owner_gm_session);
+            let _ = std::fs::remove_file(ended_sidecar_path(&browser_chrome_profile_dir(
+                cwd, session_id,
+            )));
             json!({"ok": true, "stdout": "", "exit_code": 0, "stderr": "", "session_id": session_id, "owner_gm_session": owner_gm_session, "port": port, "idle_reap": IdleReap::report(crate::idle_reap::recorded(&browser_chrome_profile_dir(cwd, session_id)))})
         }
         Err(e) => json!({"ok": false, "stdout": "", "exit_code": 1, "stderr": e}),
@@ -1674,6 +1758,7 @@ fn session_list(
                 "idle_seconds": s.last_used.elapsed().as_secs(),
                 "idle_reap": IdleReap::report(s.idle_reap),
                 "idle_timeout_ms": idle_timeout_ms,
+                "reap_in_ms": idle_timeout_ms.map(|ttl| ttl.saturating_sub(s.last_used.elapsed().as_millis() as u64)),
                 "owner_last_dispatch_ms": owner_last_seen_ms,
                 "target_id": s.target_id,
                 "engine": format!("{:?}", s.engine),
@@ -1717,6 +1802,9 @@ fn session_list(
         "chrome_process_count": all_chrome.len(),
         "chrome_max_concurrent": effective_chrome_cap(&cfg),
         "chrome_idle_ttl_seconds": cfg.chrome_idle_ttl().as_secs(),
+        "session_idle_timeout_ms": cfg.session_idle_timeout().as_millis() as u64,
+        "owner_gone_idle_timeout_ms": cfg.session_owner_gone_idle_timeout().map(|t| t.as_millis() as u64),
+        "recently_ended": recent_session_end_records(cwd),
         "chrome_sessions_all_projects": chrome_sessions_all_projects,
         "sessions": out,
     })
@@ -1744,6 +1832,9 @@ fn session_close(cwd: &Path, target_session_id: &str, require_found: bool) -> Va
     });
     crate::gpu::record_uncapped(&browser_chrome_profile_dir(cwd, target_session_id), false);
     crate::idle_reap::record(&browser_chrome_profile_dir(cwd, target_session_id), None);
+    let profile_dir = browser_chrome_profile_dir(cwd, target_session_id);
+    let _ = std::fs::remove_file(ended_sidecar_path(&profile_dir));
+    let _ = std::fs::remove_file(target_id_sidecar_path(&profile_dir));
     match removed {
         Some(session) => {
             kill_session(session);
@@ -1997,9 +2088,7 @@ fn spawn_chrome_once(
     }
     #[cfg(windows)]
     {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        cmd.creation_flags(CREATE_NO_WINDOW);
+        crate::windowless::apply_windowless(&mut cmd);
     }
     let log_path = chrome_launch_log_path(profile_dir);
     let log_file = std::fs::OpenOptions::new()
@@ -2065,11 +2154,13 @@ pub(crate) fn load_extension_after_launch(
         log_line("failed to write extension_load.js helper to temp dir");
         return;
     }
-    let output = Command::new(&node)
+    let mut ext_cmd = Command::new(&node);
+    ext_cmd
         .arg(&script_path)
         .arg(port.to_string())
-        .arg(ext_path)
-        .output();
+        .arg(ext_path);
+    crate::windowless::apply_windowless(&mut ext_cmd);
+    let output = ext_cmd.output();
     let _ = std::fs::remove_file(&script_path);
     match output {
         Ok(out) => {
@@ -2260,7 +2351,7 @@ pub fn run(body: &str, opts: &str, cwd_raw: &Path, session_id: &str) -> Value {
                 .unwrap_or_else(|e| e.into_inner())
                 .remove(&key);
             if let Some(session) = stale {
-                kill_session(session);
+                kill_session_because(session, "launch_mode_changed", None);
             }
         }
     }
@@ -2413,6 +2504,9 @@ pub fn run(body: &str, opts: &str, cwd_raw: &Path, session_id: &str) -> Value {
             mode = m;
             mode_name = name;
             rest = after_mode;
+            if mode == BrowserMode::CdpRaw {
+                break;
+            }
             continue;
         }
         let (v, after_viewport) = strip_viewport_width_height_scale_mobile_prefix(rest);
@@ -2478,7 +2572,7 @@ pub fn run(body: &str, opts: &str, cwd_raw: &Path, session_id: &str) -> Value {
     let script_path = tmp.join(format!("agentplug-cdp-script-{stamp}.js"));
     let result_path = tmp.join(format!("agentplug-cdp-result-{stamp}.json"));
     let artifact_path = match mode {
-        BrowserMode::Default | BrowserMode::Dom | BrowserMode::Gpu => None,
+        BrowserMode::Default | BrowserMode::Dom | BrowserMode::Gpu | BrowserMode::CdpRaw => None,
         BrowserMode::Screenshot => {
             let dir = cwd.join(".gm").join("witness");
             let _ = std::fs::create_dir_all(&dir);
@@ -2531,7 +2625,7 @@ pub fn run(body: &str, opts: &str, cwd_raw: &Path, session_id: &str) -> Value {
             eprintln!(
                 "[agentplug browser] session {key} was created under {prior_engine:?} but this dispatch asked for {engine:?} -- evicting and relaunching rather than answering from the wrong engine"
             );
-            kill_session(session);
+            kill_session_because(session, "engine_changed", None);
         }
     }
     let candidate_port = {
@@ -2575,7 +2669,7 @@ pub fn run(body: &str, opts: &str, cwd_raw: &Path, session_id: &str) -> Value {
                     eprintln!(
                         "[agentplug browser] evicting tracked session {key} -- process alive but CDP endpoint unresponsive, falling back to a fresh spawn"
                     );
-                    kill_session(session);
+                    kill_session_because(session, "cdp_endpoint_unresponsive", None);
                 }
             }
             None
@@ -2663,6 +2757,8 @@ pub fn run(body: &str, opts: &str, cwd_raw: &Path, session_id: &str) -> Value {
         }
     };
 
+    let session_end_record =
+        take_session_end_record(&gpu_profile_dir).filter(|_| launched_fresh_chrome);
     let cfg = json!({
         "port": port,
         "cdpEndpoint": sessions_map().lock().unwrap_or_else(|e| e.into_inner()).get(&key).map(|session| session.cdp_endpoint.clone()).unwrap_or_else(|| format!("http://127.0.0.1:{port}")),
@@ -2697,9 +2793,7 @@ pub fn run(body: &str, opts: &str, cwd_raw: &Path, session_id: &str) -> Value {
         .stderr(Stdio::piped());
     #[cfg(windows)]
     {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        spawn_cmd.creation_flags(CREATE_NO_WINDOW);
+        crate::windowless::apply_windowless(&mut spawn_cmd);
     }
     let spawn = spawn_cmd.spawn();
 
@@ -2743,7 +2837,7 @@ pub fn run(body: &str, opts: &str, cwd_raw: &Path, session_id: &str) -> Value {
             map.remove(&key)
         };
         if let Some(session) = dead {
-            kill_session(session);
+            kill_session_because(session, "wedged_after_eval_timeout", None);
         }
     }
 
@@ -2800,17 +2894,32 @@ pub fn run(body: &str, opts: &str, cwd_raw: &Path, session_id: &str) -> Value {
         out["session_created"] = Value::Bool(true);
     }
     if launched_fresh_chrome
-        && session_had_prior_page
-        && start_url.is_none()
         && !session_created_by_this_dispatch
+        && (session_end_record.is_some() || session_had_prior_page)
     {
         out["session_recycled"] = Value::Bool(true);
-        out["session_note"] = json!("this dispatch launched a fresh browser for the session (the previous one was reaped idle, evicted at the concurrent-Chrome cap, or died), so earlier page state is gone; pass url=<target> on every call that depends on a loaded page");
+        match &session_end_record {
+            Some(record) => {
+                out["recycle_reason"] = record["reason"].clone();
+                out["recycle_idle_ms"] = record["idle_ms"].clone();
+                out["recycle_idle_ttl_ms"] = record["idle_ttl_ms"].clone();
+                out["recycle_ended_ago_ms"] =
+                    json!((unix_ms() as u64).saturating_sub(record["at_ms"].as_u64().unwrap_or(0)));
+            }
+            None => out["recycle_reason"] = json!("chrome_gone_without_a_recorded_reaper_decision"),
+        }
+        out["session_note"] = json!(format!(
+            "this dispatch launched a fresh browser for session '{session_id}' because the previous one ended ({}); window.* state, loaded pages and CDP domain enables are gone. Pass url=<target> on every call that depends on a loaded page, `session new keep_alive` (or idle_timeout_ms=<n>) to opt a session out of the idle TTL, and read idle_timeout_ms in `session list`",
+            out["recycle_reason"].as_str().unwrap_or("unknown")
+        ));
     }
     let mut out = annotate_queue_wait(out, queued_behind_same_page_ms, session_id);
     if cdp_error.is_some() {
         out["result"] = Value::Null;
         out["debug"] = shaped_debug(result_value.get("debug"));
+        if let Some(partial) = result_value.get("partial").filter(|p| !p.is_null()) {
+            out["partial"] = partial.clone();
+        }
         return out;
     }
     let launched_real_page = matches!(mode, BrowserMode::Dom)
@@ -2862,6 +2971,9 @@ pub fn run(body: &str, opts: &str, cwd_raw: &Path, session_id: &str) -> Value {
                 }
                 (None, None) => {}
             }
+        }
+        BrowserMode::CdpRaw => {
+            out["result"] = result_value.get("result").cloned().unwrap_or(Value::Null);
         }
         BrowserMode::Gpu => {
             out["result"] = crate::gpu::with_display_probe(
@@ -2936,6 +3048,7 @@ fn mode_label(mode: BrowserMode) -> &'static str {
         BrowserMode::Screenshot => "screenshot",
         BrowserMode::Dom => "dom",
         BrowserMode::Gpu => "gpu",
+        BrowserMode::CdpRaw => "cdpraw",
     }
 }
 

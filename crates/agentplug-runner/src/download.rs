@@ -6,6 +6,8 @@ use std::time::Duration;
 
 use agentplug_host::install_dir;
 
+use crate::update_trust::{self, AssetIdentity, UpdateRejected};
+
 pub fn sha256_hex(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
@@ -127,8 +129,15 @@ fn try_ensure_plugin_installed_via_direct_release_latest(
         "https://github.com/{}/releases/latest/download/{}.wasm",
         spec.repo, spec.asset_basename
     );
+    let artifact = format!("{}.wasm", spec.asset_basename);
+    let running = installed_plugin_version_from_file(version_file);
+    let identity = AssetIdentity {
+        artifact: &artifact,
+        version: &version,
+        running: running.as_deref(),
+    };
     snapshot_prev_wasm_and_version(dest, version_file);
-    download_and_verify(&wasm_url, dest, &expected_sha)?;
+    download_and_verify(&wasm_url, dest, &expected_sha, &identity)?;
     fs::write(version_file, &version)?;
     eprintln!(
         "[agentplug] {} installed via direct release-asset download {wasm_url} (api.github.com path failed or was blocked)",
@@ -188,7 +197,9 @@ pub fn download_and_verify(
     url: &str,
     dest: &Path,
     expected_sha256_hex: &str,
-) -> anyhow::Result<()> {
+    identity: &AssetIdentity,
+) -> anyhow::Result<update_trust::Finalized> {
+    let preflight = update_trust::preflight(identity, &format!("{url}.sig"))?;
     let resp = agentplug_host::shared_agent().get(url).call()?;
     let mut reader = resp.into_reader();
     let mut bytes = Vec::new();
@@ -206,6 +217,7 @@ pub fn download_and_verify(
             "sha256 mismatch downloading {url}: expected {expected_sha256_hex}, got {actual}"
         );
     }
+    let finalized = update_trust::finalize(identity, &preflight, &bytes)?;
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -228,7 +240,8 @@ pub fn download_and_verify(
         return Err(e);
     }
     fs::rename(&tmp, dest)?;
-    Ok(())
+    update_trust::installed(identity, &finalized);
+    Ok(finalized)
 }
 
 struct PluginAssetSpec {
@@ -334,6 +347,13 @@ fn plugin_version_path(plugin_name: &str) -> PathBuf {
         .join(format!("{plugin_name}.version"))
 }
 
+fn installed_plugin_version_from_file(version_file: &Path) -> Option<String> {
+    fs::read_to_string(version_file)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 fn snapshot_prev_wasm_and_version(dest: &Path, version_file: &Path) {
     if dest.exists() {
         let _ = fs::copy(dest, dest.with_extension("wasm.prev"));
@@ -366,6 +386,221 @@ pub fn installed_runner_version() -> Option<String> {
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
+}
+
+const NO_SELF_UPDATE_ENV: &str = "AGENTPLUG_NO_SELF_UPDATE";
+const ALLOW_UPDATE_OVER_LOCAL_BUILD_ENV: &str = "AGENTPLUG_ALLOW_UPDATE_OVER_LOCAL_BUILD";
+const BLOCKED_REPORT_QUIET_MS: u64 = 60 * 60 * 1000;
+
+static LAST_BLOCKED_REPORT_TS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn no_self_update_file() -> PathBuf {
+    install_dir().join("agentplug-runner.no-self-update")
+}
+
+fn local_build_pin_path() -> PathBuf {
+    install_dir().join("agentplug-runner.local-build.json")
+}
+
+pub(crate) fn env_flag_enabled(name: &str) -> bool {
+    match std::env::var(name) {
+        Ok(value) => matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        ),
+        Err(_) => false,
+    }
+}
+
+pub fn update_over_local_build_allowed() -> bool {
+    env_flag_enabled(ALLOW_UPDATE_OVER_LOCAL_BUILD_ENV)
+}
+
+pub fn canonical_runner_exe() -> Option<PathBuf> {
+    let mut path = std::env::current_exe().ok()?;
+    while path
+        .extension()
+        .map(|e| e.to_string_lossy().to_ascii_lowercase())
+        .map(|e| e == "new" || e == "new2")
+        .unwrap_or(false)
+    {
+        path = path.with_extension("");
+    }
+    Some(path)
+}
+
+fn running_from_staged_copy() -> bool {
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| {
+            exe.extension()
+                .map(|e| e.to_string_lossy().to_ascii_lowercase())
+        })
+        .map(|e| e == "new" || e == "new2")
+        .unwrap_or(false)
+}
+
+fn write_local_build_pin(canonical: &Path) -> anyhow::Result<String> {
+    let bytes = fs::read(canonical)?;
+    let sha = sha256_hex(&bytes);
+    let record = serde_json::json!({
+        "exe": canonical.display().to_string(),
+        "sha256": sha,
+        "version": env!("CARGO_PKG_VERSION"),
+        "commit": crate::build_info::COMMIT,
+        "ts": now_ms_for_marker(),
+    });
+    if let Some(parent) = local_build_pin_path().parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(local_build_pin_path(), record.to_string())?;
+    Ok(sha)
+}
+
+pub fn pin_local_build() -> anyhow::Result<String> {
+    let canonical = canonical_runner_exe()
+        .ok_or_else(|| anyhow::anyhow!("cannot resolve the running runner's canonical path"))?;
+    write_local_build_pin(&canonical)
+}
+
+pub fn unpin_local_build() -> anyhow::Result<()> {
+    match fs::remove_file(local_build_pin_path()) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+pub fn sync_local_build_pin() {
+    if crate::build_info::is_release_build() {
+        if !running_from_staged_copy() {
+            let _ = fs::remove_file(local_build_pin_path());
+        }
+        return;
+    }
+    if let Some(canonical) = canonical_runner_exe() {
+        let _ = write_local_build_pin(&canonical);
+    }
+}
+
+fn pinned_local_build_reason(canonical: &Path) -> Option<String> {
+    let raw = fs::read_to_string(local_build_pin_path()).ok()?;
+    let record: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let pinned_sha = record.get("sha256")?.as_str()?;
+    let bytes = fs::read(canonical).ok()?;
+    if !sha256_hex(&bytes).eq_ignore_ascii_case(pinned_sha) {
+        return None;
+    }
+    let commit = record
+        .get("commit")
+        .and_then(|c| c.as_str())
+        .map(|c| format!(", commit {c}"))
+        .unwrap_or_default();
+    Some(format!(
+        "the installed runner at {} is pinned as a locally built binary (sha256 {pinned_sha}{commit})",
+        canonical.display()
+    ))
+}
+
+pub fn installed_runner_blocks_promotion(canonical: &Path) -> Option<String> {
+    if update_over_local_build_allowed() {
+        return None;
+    }
+    if let Some(reason) = pinned_local_build_reason(canonical) {
+        return Some(reason);
+    }
+    match crate::build_info::probe(canonical) {
+        Some(reported) if !reported.release_build => Some(format!(
+            "it reports itself as a locally built binary (version {}, commit {}, built at unix {})",
+            reported.version, reported.commit, reported.build_ts
+        )),
+        _ => None,
+    }
+}
+
+fn locally_built_installed_reason() -> Option<String> {
+    if update_over_local_build_allowed() {
+        return None;
+    }
+    if !crate::build_info::is_release_build() {
+        return Some(format!(
+            "this runner is a locally built binary (version {}, commit {}, built at unix {}) -- a release is never swapped over a local build",
+            env!("CARGO_PKG_VERSION"),
+            crate::build_info::COMMIT,
+            crate::build_info::BUILD_TS
+        ));
+    }
+    let canonical = canonical_runner_exe()?;
+    let current = std::env::current_exe().ok()?;
+    if canonical == current {
+        return None;
+    }
+    installed_runner_blocks_promotion(&canonical)
+}
+
+fn compare_release_semver(a: &str, b: &str) -> Option<std::cmp::Ordering> {
+    if !is_recognized_release_semver(a) || !is_recognized_release_semver(b) {
+        return None;
+    }
+    let parts = |s: &str| -> Vec<u64> {
+        s.split('.')
+            .map(|p| p.parse::<u64>().unwrap_or(0))
+            .collect()
+    };
+    Some(parts(a).cmp(&parts(b)))
+}
+
+pub fn self_update_blocked_reason(latest: &str) -> Option<String> {
+    if let Ok(value) = std::env::var(NO_SELF_UPDATE_ENV) {
+        let value = value.trim().to_string();
+        if !value.is_empty()
+            && !matches!(
+                value.to_ascii_lowercase().as_str(),
+                "0" | "false" | "no" | "off"
+            )
+        {
+            return Some(format!(
+                "{NO_SELF_UPDATE_ENV}={value} is set -- runner self-update is frozen"
+            ));
+        }
+    }
+    if no_self_update_file().exists() {
+        return Some(format!(
+            "{} exists -- runner self-update is frozen",
+            no_self_update_file().display()
+        ));
+    }
+    if let Some(reason) = locally_built_installed_reason() {
+        return Some(reason);
+    }
+    let running = env!("CARGO_PKG_VERSION");
+    if !is_recognized_release_semver(latest) {
+        return Some(format!(
+            "latest release tag {latest:?} is not X.Y.Z semver -- refusing to compare it against the running {running}"
+        ));
+    }
+    if !is_recognized_release_semver(running) {
+        return None;
+    }
+    match compare_release_semver(latest, running) {
+        Some(std::cmp::Ordering::Greater) => None,
+        Some(_) => Some(format!(
+            "release {latest} is not strictly newer than the running {running}"
+        )),
+        None => Some(format!(
+            "could not order release {latest} against the running {running}"
+        )),
+    }
+}
+
+fn report_self_update_blocked(reason: &str) {
+    let now = now_ms_for_marker();
+    let previous = LAST_BLOCKED_REPORT_TS.load(std::sync::atomic::Ordering::Relaxed);
+    if now.saturating_sub(previous) < BLOCKED_REPORT_QUIET_MS {
+        return;
+    }
+    LAST_BLOCKED_REPORT_TS.store(now, std::sync::atomic::Ordering::Relaxed);
+    eprintln!("[agentplug runner-update] self-update skipped: {reason}");
 }
 
 pub fn fetch_latest_runner_version() -> anyhow::Result<Option<String>> {
@@ -403,6 +638,10 @@ pub fn stage_runner_self_update() -> anyhow::Result<Option<(PathBuf, String)>> {
     let Some(latest) = fetch_latest_runner_version()? else {
         return Ok(None);
     };
+    if let Some(reason) = self_update_blocked_reason(&latest) {
+        report_self_update_blocked(&reason);
+        return Ok(None);
+    }
     if marker_is_trustworthy_and_current(latest.as_str()) {
         return Ok(None);
     }
@@ -439,7 +678,18 @@ pub fn stage_runner_self_update() -> anyhow::Result<Option<(PathBuf, String)>> {
         .next()
         .ok_or_else(|| anyhow::anyhow!("empty sha256 sidecar for {asset} at {base}"))?
         .to_string();
-    download_and_verify(&format!("{base}/{asset}"), &staged, &expected_sha)?;
+    let identity = AssetIdentity {
+        artifact: asset,
+        version: &latest,
+        running: Some(env!("CARGO_PKG_VERSION")),
+    };
+    let finalized = download_and_verify(
+        &format!("{base}/{asset}"),
+        &staged,
+        &expected_sha,
+        &identity,
+    )?;
+    update_trust::record_stage_outcome(&staged, &identity, &finalized);
     #[cfg(not(windows))]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -454,7 +704,7 @@ fn marker_is_trustworthy_and_current(latest: &str) -> bool {
     let Some(marker) = installed_runner_version() else {
         return false;
     };
-    if marker != latest {
+    if marker.trim_start_matches('v') != latest {
         return false;
     }
     let running = env!("CARGO_PKG_VERSION");
@@ -471,6 +721,7 @@ fn marker_is_trustworthy_and_current(latest: &str) -> bool {
 pub fn record_runner_version(version: &str) -> anyhow::Result<()> {
     fs::create_dir_all(install_dir())?;
     fs::write(runner_version_path(), version)?;
+    sync_local_build_pin();
     Ok(())
 }
 
@@ -851,6 +1102,7 @@ pub fn ensure_plugin_installed(
 
     let result = match ensure_plugin_installed_via_github(plugin_name, explicit_version, &spec, &dest, &version_file) {
         Ok(path) => Ok(path),
+        Err(github_api_err) if github_api_err.downcast_ref::<UpdateRejected>().is_some() => Err(github_api_err),
         Err(github_api_err) => match try_ensure_plugin_installed_via_direct_release_latest(&spec, &dest, &version_file) {
             Ok(path) => Ok(path),
             Err(direct_err) => Err(anyhow::anyhow!(
@@ -922,8 +1174,15 @@ fn ensure_plugin_installed_via_github(
         .ok_or_else(|| anyhow::anyhow!("empty sha256 sidecar for {effective_basename} at {base}"))?
         .to_string();
 
+    let artifact = format!("{effective_basename}.wasm");
+    let running = installed_plugin_version_from_file(version_file);
+    let identity = AssetIdentity {
+        artifact: &artifact,
+        version: &version,
+        running: running.as_deref(),
+    };
     snapshot_prev_wasm_and_version(dest, version_file);
-    download_and_verify(&wasm_url, dest, &expected_sha)?;
+    download_and_verify(&wasm_url, dest, &expected_sha, &identity)?;
     fs::write(version_file, &version)?;
     Ok(dest.to_path_buf())
 }
