@@ -227,6 +227,7 @@ pub enum SlotContentSnapshot {
 pub struct SharedPluginPool {
     plugin_name: String,
     slots: Vec<Arc<Mutex<Option<SiblingHandle>>>>,
+    last_observed_slot_hashes: Mutex<Vec<Option<String>>>,
     hashes_to_evict_when_their_in_flight_dispatch_completes: Mutex<std::collections::HashSet<String>>,
     ticket_queue: Mutex<TicketQueue>,
     slot_released: Condvar,
@@ -247,6 +248,7 @@ struct TicketQueue {
     cheap: ClassTicketQueue,
     heavy: ClassTicketQueue,
     heavy_inflight: usize,
+    blocking_inflight: usize,
 }
 
 impl TicketQueue {
@@ -273,16 +275,34 @@ impl Drop for HeavyDispatchAdmission {
     }
 }
 
+pub struct BlockingDispatchAdmission {
+    pool: Option<Arc<SharedPluginPool>>,
+}
+
+impl Drop for BlockingDispatchAdmission {
+    fn drop(&mut self) {
+        let Some(pool) = self.pool.take() else { return };
+        {
+            let mut q = pool.ticket_queue.lock().unwrap_or_else(|e| e.into_inner());
+            q.blocking_inflight = q.blocking_inflight.saturating_sub(1);
+        }
+        pool.slot_released.notify_all();
+    }
+}
+
 impl SharedPluginPool {
     pub fn new(plugin_name: &str, size: usize) -> Self {
+        let size = size.max(1);
         Self {
             plugin_name: plugin_name.to_string(),
-            slots: (0..size.max(1)).map(|_| Arc::new(Mutex::new(None))).collect(),
+            slots: (0..size).map(|_| Arc::new(Mutex::new(None))).collect(),
+            last_observed_slot_hashes: Mutex::new(vec![None; size]),
             hashes_to_evict_when_their_in_flight_dispatch_completes: Mutex::new(std::collections::HashSet::new()),
             ticket_queue: Mutex::new(TicketQueue {
                 cheap: ClassTicketQueue { next_ticket: 0, now_serving: 0 },
                 heavy: ClassTicketQueue { next_ticket: 0, now_serving: 0 },
                 heavy_inflight: 0,
+                blocking_inflight: 0,
             }),
             slot_released: Condvar::new(),
         }
@@ -292,6 +312,29 @@ impl SharedPluginPool {
 
     fn heavy_admission_limit(&self) -> usize {
         self.slots.len().saturating_sub(1).min(MAX_CONCURRENT_HEAVY_DISPATCHES).max(1)
+    }
+
+    fn blocking_admission_limit(&self) -> usize {
+        let reserved_for_short_verbs = (self.slots.len() / 4).max(1);
+        self.slots.len().saturating_sub(reserved_for_short_verbs).max(1)
+    }
+
+    pub fn admit_blocking(pool: &Arc<SharedPluginPool>, verb: &str) -> BlockingDispatchAdmission {
+        if !is_blocking_dispatch_verb(verb) || pool.slots.len() < 2 {
+            return BlockingDispatchAdmission { pool: None };
+        }
+        let limit = pool.blocking_admission_limit();
+        loop {
+            let mut q = pool.ticket_queue.lock().unwrap_or_else(|e| e.into_inner());
+            if q.blocking_inflight < limit {
+                q.blocking_inflight += 1;
+                return BlockingDispatchAdmission { pool: Some(pool.clone()) };
+            }
+            let _ = pool
+                .slot_released
+                .wait_timeout(q, std::time::Duration::from_millis(25))
+                .unwrap_or_else(|e| e.into_inner());
+        }
     }
 
     pub fn admit(pool: &Arc<SharedPluginPool>, class: DispatchCostClass) -> HeavyDispatchAdmission {
@@ -416,10 +459,13 @@ impl SharedPluginPool {
     }
 
     pub fn slot_content_hashes(&self) -> Vec<Option<String>> {
-        self.slots
-            .iter()
-            .map(|s| s.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|h| h.content_hash.clone()))
-            .collect()
+        let mut observed = self.last_observed_slot_hashes.lock().unwrap_or_else(|e| e.into_inner());
+        for (index, slot) in self.slots.iter().enumerate() {
+            if let Ok(guard) = slot.try_lock() {
+                observed[index] = guard.as_ref().map(|h| h.content_hash.clone());
+            }
+        }
+        observed.clone()
     }
 
     pub(crate) fn any_instantiated_within(&self, timeout_ms: u64) -> bool {
@@ -762,6 +808,7 @@ impl ProjectPlugins {
         let pool = pool.ok_or_else(|| PluginDispatchError::NotRegistered { plugin_name: plugin_name.to_string() })?;
         let cost_class = cost_class_for_dispatch(verb, body);
         let _heavy_admission = SharedPluginPool::admit(&pool, cost_class);
+        let _blocking_admission = SharedPluginPool::admit_blocking(&pool, verb);
         let (mut guard, _waited_ms) = pool.acquire_within_for_class(SharedPluginPool::ACQUIRE_TIMEOUT_MS, cost_class);
         dispatch_and_evict_on_error(&mut guard, &pool, verb, body, &self.root, &self.siblings, plugin_name)
     }
@@ -837,6 +884,7 @@ impl DispatchHandle {
         let pool = pool.ok_or_else(|| PluginDispatchError::NotRegistered { plugin_name: plugin_name.to_string() })?;
         let cost_class = cost_class_for_dispatch(verb, body);
         let _heavy_admission = SharedPluginPool::admit(&pool, cost_class);
+        let _blocking_admission = SharedPluginPool::admit_blocking(&pool, verb);
         let (mut guard, _waited_ms) = pool.acquire_within_for_class(SharedPluginPool::ACQUIRE_TIMEOUT_MS, cost_class);
         if guard.is_none() {
             drop(guard);
@@ -945,6 +993,16 @@ const UNSERIALIZED_VERBS: &[&str] = &[
     "git_status", "branch_status", "git_log", "git_diff", "git_show", "ci-status", "git_poll",
     "status", "wait", "close", "phase-status", "prd-list", "prd-status", "mutable-list", "filter",
 ];
+
+const BLOCKING_DISPATCH_VERBS: &[&str] = &[
+    "exec_js", "lang", "nodejs", "javascript", "node", "js", "typescript", "python", "py", "bash", "sh", "shell", "zsh",
+    "powershell", "ps1", "ssh", "go", "rust", "c", "cpp", "java", "deno",
+    "serp", "browser", "cdp", "fetch", "wait",
+];
+
+pub fn is_blocking_dispatch_verb(verb: &str) -> bool {
+    BLOCKING_DISPATCH_VERBS.contains(&verb)
+}
 
 const GIT_LANE_VERBS: &[&str] = &[
     "git_add", "git_commit", "git_finalize", "git_push", "git_pull", "git_fetch", "git_checkout", "git_merge",

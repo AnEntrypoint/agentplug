@@ -95,11 +95,13 @@ publishing a signature is just uploading that one file to the same release:
 gh release upload v0.1.200 ./agentplug-runner-windows-x64.exe.sig --repo AnEntrypoint/agentplug-bin
 ```
 
-CI does not sign: it holds no private key and still publishes unsigned
-releases, which stay installable under the default warn mode. Wiring
-`release-signatures/manifest.json` into `release.yml` (attach a committed `.sig`
-whose artifact name and sha256 match the built asset) is the next step for
-anyone who wants the channel itself signed.
+CI holds no private key, so it cannot produce a signature -- it only attaches
+one. `release.yml` reads a committed `release-signatures/manifest.json`
+(`{"entries": [<doc>, ...]}`) and, for each built asset whose name and sha256
+match an entry there, writes that entry out as `<asset>.sig` before publishing.
+An asset with no matching entry still publishes, unsigned, under a `::notice`.
+Produce the manifest entries offline with `agentplug-sign sign` as above, then
+commit them to `main`.
 
 ## Verifying locally
 

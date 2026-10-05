@@ -11,6 +11,7 @@ mod http_agent;
 mod idle_reap;
 mod memory_pressure;
 mod oxibrowser_driver;
+mod precompiled;
 mod process_tree;
 mod task;
 mod imports;
@@ -28,7 +29,8 @@ pub use host_state::HostState;
 pub use http_agent::{build_agent, shared_agent};
 pub use imports::{git_subprocess_timeout_ms, register_env_imports, register_wasi};
 pub use windowless::{apply_windowless, ensure_hidden_console};
-pub use install::{install_dir, plugins_dir, wasmtime_cache_dir};
+pub use install::{install_dir, plugins_dir, precompiled_dir};
+pub use precompiled::{load_module_file_backed, precompiled_module_path};
 pub use memory_pressure::{process_private_bytes_tracking_retained_wasm_peak_unlike_working_set, reset_shared_dispatch_count, shared_dispatches_since_release};
 pub use registry::{
     advance_plugin_fiber, epoch_ticks_for_seconds, get_active_provider, read_plugin_lifecycle, read_project_plugin_list, release_shared_plugin, set_gm_pool_size, set_side_plugin_pool_size, RELEASABLE_SHARED_PLUGINS,
@@ -37,7 +39,7 @@ pub use registry::{
 };
 
 use std::sync::OnceLock;
-use wasmtime::{Cache, CacheConfig, Config, Engine};
+use wasmtime::{Config, Engine};
 
 static EPOCH_TICKER_STARTED: OnceLock<()> = OnceLock::new();
 
@@ -53,11 +55,6 @@ fn start_epoch_ticker(engine: Engine) {
 
 pub fn build_engine() -> anyhow::Result<Engine> {
     let mut config = Config::new();
-    let mut cache_config = CacheConfig::new();
-    cache_config.with_directory(wasmtime_cache_dir());
-    cache_config.with_files_total_size_soft_limit(256 * 1024 * 1024);
-    cache_config.with_cleanup_interval(std::time::Duration::from_secs(10 * 60));
-    config.cache(Some(Cache::new(cache_config)?));
     config.wasm_backtrace_details(wasmtime::WasmBacktraceDetails::Enable);
     config.epoch_interruption(true);
     let engine = Engine::new(&config).map_err(|e| anyhow::anyhow!(e))?;
