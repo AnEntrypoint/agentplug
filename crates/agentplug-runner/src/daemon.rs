@@ -76,7 +76,7 @@ pub fn register_project(cwd: &Path) -> anyhow::Result<()> {
             dropped += 1;
             continue;
         }
-        let canonical = agentplug_host::project_root(Path::new(entry)).to_string_lossy().to_string();
+        let canonical = cached_project_root(entry).to_string_lossy().to_string();
         respelled |= canonical != entry;
         if live.iter().any(|e| e == &canonical) {
             respelled = true;
@@ -108,13 +108,34 @@ fn describe_dispatch_error_naming_wasm_trap_kind_distinctly_from_a_guest_logic_e
     }
 }
 
+const REGISTRY_ENTRY_ROOT_CACHE_TTL: Duration = Duration::from_secs(600);
+
+fn cached_project_root(entry: &str) -> PathBuf {
+    static SLOT: OnceLock<Mutex<HashMap<String, (Instant, PathBuf)>>> = OnceLock::new();
+    let cache = SLOT.get_or_init(|| Mutex::new(HashMap::new()));
+    let fresh = cache
+        .lock()
+        .ok()
+        .and_then(|entries| entries.get(entry).cloned())
+        .filter(|(resolved_at, _)| resolved_at.elapsed() < REGISTRY_ENTRY_ROOT_CACHE_TTL)
+        .map(|(_, root)| root);
+    if let Some(root) = fresh {
+        return root;
+    }
+    let root = agentplug_host::project_root(Path::new(entry));
+    if let Ok(mut entries) = cache.lock() {
+        entries.insert(entry.to_string(), (Instant::now(), root.clone()));
+    }
+    root
+}
+
 pub(crate) fn read_registry() -> Vec<PathBuf> {
     let mut roots: Vec<PathBuf> = Vec::new();
     for entry in fs::read_to_string(registry_path()).unwrap_or_default().lines().map(str::trim) {
         if entry.is_empty() || !Path::new(entry).exists() {
             continue;
         }
-        let canonical = agentplug_host::project_root(Path::new(entry));
+        let canonical = cached_project_root(entry);
         if !roots.contains(&canonical) {
             roots.push(canonical);
         }
@@ -2266,15 +2287,50 @@ fn dir_has_any_verb_subdir_with_claimable_request(base: &Path, language_stems: b
             continue;
         }
         let verb = verb_entry.file_name().to_string_lossy().into_owned();
-        let Ok(files) = fs::read_dir(verb_entry.path()) else { continue };
-        for file_entry in files.flatten() {
-            let path = file_entry.path();
-            if if language_stems {
-                is_spool_request_path(&verb, &path)
-            } else {
-                path.extension().and_then(|extension| extension.to_str()) == Some("txt")
-            } {
-                return true;
+        if verb_dir_has_claimable_request(&verb_entry.path(), &verb, language_stems) {
+            return true;
+        }
+    }
+    false
+}
+
+const EMPTY_VERB_DIR_VERDICT_MIN_AGE: Duration = Duration::from_secs(2);
+
+fn empty_verb_dir_verdicts() -> &'static Mutex<HashMap<PathBuf, std::time::SystemTime>> {
+    static SLOT: OnceLock<Mutex<HashMap<PathBuf, std::time::SystemTime>>> = OnceLock::new();
+    SLOT.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn verb_dir_has_claimable_request(verb_dir: &Path, verb: &str, language_stems: bool) -> bool {
+    let modified = fs::metadata(verb_dir).and_then(|metadata| metadata.modified()).ok();
+    if let Some(modified) = modified {
+        let unchanged_since_empty_verdict = empty_verb_dir_verdicts()
+            .lock()
+            .ok()
+            .is_some_and(|verdicts| verdicts.get(verb_dir) == Some(&modified));
+        if unchanged_since_empty_verdict {
+            return false;
+        }
+    }
+    let Ok(files) = fs::read_dir(verb_dir) else { return false };
+    for file_entry in files.flatten() {
+        let path = file_entry.path();
+        let claimable = if language_stems {
+            is_spool_request_path(verb, &path)
+        } else {
+            path.extension().and_then(|extension| extension.to_str()) == Some("txt")
+        };
+        if claimable {
+            return true;
+        }
+    }
+    if let Some(modified) = modified {
+        let settled = std::time::SystemTime::now()
+            .duration_since(modified)
+            .is_ok_and(|age| age >= EMPTY_VERB_DIR_VERDICT_MIN_AGE);
+        if settled {
+            if let Ok(mut verdicts) = empty_verb_dir_verdicts().lock() {
+                verdicts.insert(verb_dir.to_path_buf(), modified);
             }
         }
     }
@@ -2310,7 +2366,6 @@ impl IdleInDirWatch {
             .iter()
             .map(|root| root.join(".gm").join("exec-spool").join("in"))
             .filter(|dir| dir.is_dir())
-            .take(64)
             .collect();
         if self.entries.iter().map(|(p, _)| p).eq(wanted.iter()) {
             return;
@@ -2332,24 +2387,42 @@ impl IdleInDirWatch {
         }
     }
 
-    fn wait(&self, cap: Duration) {
+    // WaitForMultipleObjects takes at most MAXIMUM_WAIT_OBJECTS (64) handles,
+    // so a registry with more watched in/ dirs than that is waited on in chunks
+    // against one shared deadline: every root stays covered by a notification,
+    // and a change in any chunk still wakes the whole wait early.
+    const WAIT_CHUNK_HANDLES: usize = 64;
+
+    // Blocks until one of the watched in/ dirs changes or `cap` elapses.
+    // Returns true when a change woke it and false when the cap ran out, so the
+    // caller can tell "nothing happened" from "something may have appeared".
+    fn wait(&self, cap: Duration) -> bool {
         use windows_sys::Win32::Storage::FileSystem::FindNextChangeNotification;
         use windows_sys::Win32::System::Threading::WaitForMultipleObjects;
         if self.entries.is_empty() {
             std::thread::sleep(cap);
-            return;
+            return false;
         }
-        let handles: Vec<_> = self.entries.iter().map(|(_, h)| *h).collect();
-        let rc = unsafe {
-            WaitForMultipleObjects(handles.len() as u32, handles.as_ptr(), 0, cap.as_millis() as u32)
-        };
         const WAIT_OBJECT_0: u32 = 0;
-        if (WAIT_OBJECT_0..WAIT_OBJECT_0 + handles.len() as u32).contains(&rc) {
-            let idx = (rc - WAIT_OBJECT_0) as usize;
-            if let Some((_, handle)) = self.entries.get(idx) {
-                unsafe { FindNextChangeNotification(*handle); }
+        let deadline = Instant::now() + cap;
+        for chunk in self.entries.chunks(Self::WAIT_CHUNK_HANDLES) {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+            let handles: Vec<_> = chunk.iter().map(|(_, h)| *h).collect();
+            let rc = unsafe {
+                WaitForMultipleObjects(handles.len() as u32, handles.as_ptr(), 0, remaining.as_millis() as u32)
+            };
+            if (WAIT_OBJECT_0..WAIT_OBJECT_0 + handles.len() as u32).contains(&rc) {
+                let idx = (rc - WAIT_OBJECT_0) as usize;
+                if let Some((_, handle)) = chunk.get(idx) {
+                    unsafe { FindNextChangeNotification(*handle); }
+                }
+                return true;
             }
         }
+        false
     }
 }
 
@@ -2973,6 +3046,16 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
     const SELF_RECYCLE_IDLE_MS: u64 = 60 * 60 * 1000;
     let mut last_any_dispatch = Instant::now();
 
+    // A pass over the registry that finds nothing is pure directory
+    // enumeration, and with a large registry that enumeration IS the daemon's
+    // idle cost -- so such a pass sleeps progressively longer, up to
+    // IDLE_WAIT_MAX_MS. The sleep is a WaitForMultipleObjects over every
+    // watched project's in/ dir, so a dispatch written while it sleeps wakes
+    // it immediately; the cap only bounds how often the periodic polls run.
+    const IDLE_WAIT_MIN_MS: u64 = 25;
+    const IDLE_WAIT_MAX_MS: u64 = 1_000;
+    let mut idle_wait_ms = IDLE_WAIT_MIN_MS;
+
     let shared_plugin_release_idle_ms = daemon_cfg.shared_plugin_release_idle_ms();
     let mut last_shared_release = Instant::now();
 
@@ -3002,6 +3085,10 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
     }
     #[cfg(windows)]
     let mut idle_in_dir_watch = IdleInDirWatch::new();
+    let browser_orphan_sweep_in_flight = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let plugin_poll_in_flight = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let runner_poll_in_flight = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (runner_poll_staged_tx, runner_poll_staged_rx) = std::sync::mpsc::channel::<(PathBuf, String)>();
     let mut pending_self_update: Option<(PathBuf, String)> = None;
     let mut pending_self_update_staged_at: Option<Instant> = None;
     const SELF_UPDATE_MAX_STARVED_MS: u64 = 10 * 60 * 1000;
@@ -3098,15 +3185,17 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
         }
 
         const BROWSER_ORPHAN_SWEEP_INTERVAL_LONGER_THAN_REGISTRY_POLL_MS: u64 = 5 * 60 * 1000;
-        if last_browser_orphan_sweep.elapsed() >= Duration::from_millis(BROWSER_ORPHAN_SWEEP_INTERVAL_LONGER_THAN_REGISTRY_POLL_MS) {
-            // Housekeeping walks every known root; claiming walks it first. Defer
-            // the walk one tick whenever anything is queued rather than making a
-            // submitted dispatch wait behind it.
-            let dispatch_backlog_before_housekeeping = known_roots.iter().any(|root| project_has_queued_spool_work_cached(root));
-            if !dispatch_backlog_before_housekeeping {
-                last_browser_orphan_sweep = Instant::now();
-                agentplug_host::reap_idle_sessions_and_os_orphans_across_every_known_project_root(&known_roots);
-            }
+        if last_browser_orphan_sweep.elapsed() >= Duration::from_millis(BROWSER_ORPHAN_SWEEP_INTERVAL_LONGER_THAN_REGISTRY_POLL_MS)
+            && !browser_orphan_sweep_in_flight.load(std::sync::atomic::Ordering::SeqCst)
+        {
+            last_browser_orphan_sweep = Instant::now();
+            browser_orphan_sweep_in_flight.store(true, std::sync::atomic::Ordering::SeqCst);
+            let finished = browser_orphan_sweep_in_flight.clone();
+            let sweep_roots = known_roots.clone();
+            std::thread::spawn(move || {
+                agentplug_host::reap_idle_sessions_and_os_orphans_across_every_known_project_root(&sweep_roots);
+                finished.store(false, std::sync::atomic::Ordering::SeqCst);
+            });
         }
 
         let max_concurrent_projects = daemon_cfg.max_concurrent_projects();
@@ -3258,12 +3347,6 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
             projects.remove(&root);
         }
 
-        // The update polls are synchronous network calls on this thread, and this
-        // thread is the only thing that claims spool requests: an unreachable or
-        // slow endpoint stalls every queued dispatch in every project for as long
-        // as it takes to give up. Poll when nothing is queued, and force the poll
-        // through anyway once it is badly overdue so a permanently busy daemon
-        // still updates.
         let dispatch_backlog = known_roots.iter().any(|root| project_has_pending_dispatch_work(root));
         const UPDATE_POLL_MAX_DEFERRAL: Duration = Duration::from_secs(600);
         let plugin_poll_overdue = last_plugin_update_poll.elapsed() >= UPDATE_POLL_MAX_DEFERRAL;
@@ -3271,6 +3354,7 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
 
         let forced_refresh_request = take_forced_plugin_refresh_request();
         if (last_plugin_update_poll.elapsed() >= shortest_plugin_poll_interval || forced_refresh_request.is_some())
+            && !plugin_poll_in_flight.load(std::sync::atomic::Ordering::SeqCst)
             && (!dispatch_backlog || plugin_poll_overdue || forced_refresh_request.is_some())
         {
             last_plugin_update_poll = Instant::now();
@@ -3281,7 +3365,7 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
                 Some(Some(name)) => vec![name.clone()],
                 _ => plugin_modules.modules.keys().cloned().collect(),
             };
-            let mut cycle_errors: Vec<String> = Vec::new();
+            let mut due_plugins: Vec<String> = Vec::new();
             for plugin_name in targets {
                 let forced = matches!(&forced_refresh_request, Some(Some(name)) if name == &plugin_name);
                 if !forced {
@@ -3294,21 +3378,30 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
                     }
                 }
                 last_plugin_specific_poll.insert(plugin_name.clone(), Instant::now());
-                match crate::download::refresh_plugin_if_stale(&plugin_name) {
-                    Ok(Some(new_version)) => {
-                        eprintln!(
-                            "[agentplug daemon] downloaded+verified plugin {plugin_name} update to {new_version} -- the next tick's get_or_compile content-hash check evicts and recompiles it unconditionally, no idle window required"
-                        );
-                    }
-                    Ok(None) => {}
-                    Err(e) => {
-                        let msg = format!("plugin update check for {plugin_name} failed: {e}");
-                        eprintln!("[agentplug daemon] {msg}");
-                        cycle_errors.push(msg);
+                due_plugins.push(plugin_name);
+            }
+            plugin_poll_in_flight.store(true, std::sync::atomic::Ordering::SeqCst);
+            let finished = plugin_poll_in_flight.clone();
+            std::thread::spawn(move || {
+                let mut cycle_errors: Vec<String> = Vec::new();
+                for plugin_name in due_plugins {
+                    match crate::download::refresh_plugin_if_stale(&plugin_name) {
+                        Ok(Some(new_version)) => {
+                            eprintln!(
+                                "[agentplug daemon] downloaded+verified plugin {plugin_name} update to {new_version} -- the next tick's get_or_compile content-hash check evicts and recompiles it unconditionally, no idle window required"
+                            );
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            let msg = format!("plugin update check for {plugin_name} failed: {e}");
+                            eprintln!("[agentplug daemon] {msg}");
+                            cycle_errors.push(msg);
+                        }
                     }
                 }
-            }
-            record_plugin_poll_error(if cycle_errors.is_empty() { None } else { Some(cycle_errors.join("; ")) });
+                record_plugin_poll_error(if cycle_errors.is_empty() { None } else { Some(cycle_errors.join("; ")) });
+                finished.store(false, std::sync::atomic::Ordering::SeqCst);
+            });
         }
 
         let forced_runner_refresh =
@@ -3318,6 +3411,7 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
                 take_forced_runner_refresh_request()
             };
         if (first_runner_poll_pending || last_runner_update_poll.elapsed() >= runner_update_poll_interval || forced_runner_refresh)
+            && !runner_poll_in_flight.load(std::sync::atomic::Ordering::SeqCst)
             && (!dispatch_backlog || runner_poll_overdue || first_runner_poll_pending || forced_runner_refresh)
         {
             first_runner_poll_pending = false;
@@ -3325,30 +3419,39 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
             let poll_ts = now_ms();
             HEARTBEAT_LAST_RUNNER_POLL_TS.store(poll_ts, std::sync::atomic::Ordering::Relaxed);
             write_persisted_poll_ts(&persisted_runner_poll_ts_path(), poll_ts);
-            match crate::download::stage_runner_self_update() {
-                Ok(Some((staged, version))) => {
-                    if handoff_backed_off(&version) {
-                        let _ = fs::remove_file(&staged);
-                        crate::update_trust::remove_stage_record(&staged);
-                        eprintln!(
-                            "[agentplug daemon] staged self-update to {version} is inside its {}s retry backoff after a failed handoff -- dropping it instead of retrying on every tick",
-                            HANDOFF_RETRY_BACKOFF.as_secs()
-                        );
-                    } else {
-                        eprintln!("[agentplug daemon] staged self-update to {version} at {}", staged.display());
-                        if pending_self_update.is_none() {
-                            pending_self_update_staged_at = Some(Instant::now());
-                        }
-                        pending_self_update = Some((staged, version));
-                        record_runner_poll_error(None);
+            runner_poll_in_flight.store(true, std::sync::atomic::Ordering::SeqCst);
+            let finished = runner_poll_in_flight.clone();
+            let staged_tx = runner_poll_staged_tx.clone();
+            std::thread::spawn(move || {
+                match crate::download::stage_runner_self_update() {
+                    Ok(Some(staged)) => {
+                        let _ = staged_tx.send(staged);
+                    }
+                    Ok(None) => record_runner_poll_error(None),
+                    Err(e) => {
+                        let msg = format!("runner self-update check failed: {e}");
+                        eprintln!("[agentplug daemon] {msg}");
+                        record_runner_poll_error(Some(msg));
                     }
                 }
-                Ok(None) => record_runner_poll_error(None),
-                Err(e) => {
-                    let msg = format!("runner self-update check failed: {e}");
-                    eprintln!("[agentplug daemon] {msg}");
-                    record_runner_poll_error(Some(msg));
+                finished.store(false, std::sync::atomic::Ordering::SeqCst);
+            });
+        }
+        while let Ok((staged, version)) = runner_poll_staged_rx.try_recv() {
+            if handoff_backed_off(&version) {
+                let _ = fs::remove_file(&staged);
+                crate::update_trust::remove_stage_record(&staged);
+                eprintln!(
+                    "[agentplug daemon] staged self-update to {version} is inside its {}s retry backoff after a failed handoff -- dropping it instead of retrying on every tick",
+                    HANDOFF_RETRY_BACKOFF.as_secs()
+                );
+            } else {
+                eprintln!("[agentplug daemon] staged self-update to {version} at {}", staged.display());
+                if pending_self_update.is_none() {
+                    pending_self_update_staged_at = Some(Instant::now());
                 }
+                pending_self_update = Some((staged, version));
+                record_runner_poll_error(None);
             }
         }
 
@@ -3456,7 +3559,12 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
         let pending_work_exists_before_idle_wait = known_roots
             .iter()
             .any(|root| project_has_pending_dispatch_work(root));
-        if !any_work && !pending_work_exists_before_idle_wait {
+        if any_work || pending_work_exists_before_idle_wait {
+            // Work is running or is waiting on a claim slot: keep the registry
+            // scan at its fastest cadence so a claimable file is seen within
+            // one cache TTL of being written.
+            idle_wait_ms = IDLE_WAIT_MIN_MS;
+        } else {
             #[cfg(windows)]
             {
                 idle_in_dir_watch.sync(&known_roots);
@@ -3464,11 +3572,21 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
                     .iter()
                     .any(|root| project_has_pending_dispatch_work(root));
                 if !pending_work_appeared_while_arming_idle_watcher {
-                    idle_in_dir_watch.wait(Duration::from_millis(25));
+                    let woken_by_in_dir_change = idle_in_dir_watch.wait(Duration::from_millis(idle_wait_ms));
+                    if woken_by_in_dir_change {
+                        // A watched in/ dir changed while we slept. Every
+                        // cached "nothing queued" verdict predates that change,
+                        // so the next pass must re-enumerate rather than
+                        // trusting them for another TTL.
+                        if let Ok(mut cache) = spool_work_cache().lock() {
+                            cache.clear();
+                        }
+                    }
                 }
             }
-        #[cfg(not(windows))]
-            std::thread::sleep(Duration::from_millis(25));
+            #[cfg(not(windows))]
+            std::thread::sleep(Duration::from_millis(idle_wait_ms));
+            idle_wait_ms = (idle_wait_ms.saturating_mul(2)).min(IDLE_WAIT_MAX_MS);
         }
     }
 }
