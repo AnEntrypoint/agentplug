@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
@@ -241,6 +241,28 @@ fn entry_summary(id: &str, entry: &TaskEntry) -> Value {
     })
 }
 
+fn resolve_cwd(params: &Value, cwd: &Path) -> Result<PathBuf, String> {
+    let requested_cwd = match params.get("cwd") {
+        None | Some(Value::Null) => return Ok(cwd.to_path_buf()),
+        Some(Value::String(requested)) if requested.trim().is_empty() => {
+            return Ok(cwd.to_path_buf())
+        }
+        Some(Value::String(requested)) => Path::new(requested),
+        Some(_) => return Err("cwd must be a string".to_string()),
+    };
+    let target = if requested_cwd.is_absolute() {
+        requested_cwd.to_path_buf()
+    } else {
+        cwd.join(requested_cwd)
+    };
+    let target = std::fs::canonicalize(&target)
+        .map_err(|error| format!("cwd is not an accessible directory: {error}"))?;
+    if !target.is_dir() {
+        return Err("cwd is not a directory".to_string());
+    }
+    Ok(target)
+}
+
 fn spawn(params: &Value, cwd: &Path) -> Value {
     let lang = params.get("lang").and_then(|v| v.as_str()).unwrap_or("");
     let code = params.get("code").and_then(|v| v.as_str()).unwrap_or("");
@@ -254,13 +276,17 @@ fn spawn(params: &Value, cwd: &Path) -> Value {
     if code.is_empty() {
         return json!({"ok": false, "error": "code required"});
     }
+    let cwd = match resolve_cwd(params, cwd) {
+        Ok(cwd) => cwd,
+        Err(error) => return json!({"ok": false, "error": error}),
+    };
     let Some((cmd, args, stdin_payload)) = crate::exec_js::build_command(lang, code) else {
         return json!({"ok": false, "error": format!("unsupported lang: {lang}")});
     };
     let mut command = Command::new(&cmd);
     command
         .args(&args)
-        .current_dir(cwd)
+        .current_dir(&cwd)
         .stdin(if stdin_payload.is_some() {
             Stdio::piped()
         } else {
@@ -320,7 +346,7 @@ fn spawn(params: &Value, cwd: &Path) -> Value {
     reg.insert(id.clone(), entry);
     drop(reg);
     ensure_reaper_running();
-    json!({"ok": true, "id": id, "started_ms": started})
+    json!({"ok": true, "id": id, "started_ms": started, "cwd": cwd})
 }
 
 fn list() -> Value {
