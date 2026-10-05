@@ -114,7 +114,10 @@ fn is_runner_artifact(artifact: &str) -> bool {
 
 fn trust_for(artifact: &str) -> Trust {
     let mut trust = load_trust(&install_dir());
-    if trust.mode != Mode::Enforce && is_runner_artifact(artifact) && strict_mode() {
+    if trust.mode != Mode::Enforce
+        && is_runner_artifact(artifact)
+        && (!trust.configured || strict_mode())
+    {
         trust.mode = Mode::Enforce;
     }
     trust
@@ -355,6 +358,12 @@ pub fn staged_runner_permitted(staged: &Path) -> Result<bool, String> {
     let trust = runner_trust();
     if trust.mode == Mode::Off {
         return Ok(false);
+    }
+    if !trust.configured {
+        return Err(format!(
+            "no trust file at {}; automatic runner promotion requires a verified signature",
+            trust.path.display()
+        ));
     }
     let actual = fs::read(staged)
         .map(|bytes| hexutil::sha256_hex(&bytes))
