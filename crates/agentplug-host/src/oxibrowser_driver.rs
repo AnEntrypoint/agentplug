@@ -192,6 +192,13 @@ fn call_oxibrowser(
         let guard = caller_siblings.lock().unwrap();
         guard.get("oxibrowser").cloned()
     };
+    let sibling_pool = match sibling_pool {
+        Some(pool) => Some(pool),
+        None if crate::registry::ensure_sibling_registered(caller_root, "oxibrowser", &caller_siblings) => {
+            caller_siblings.lock().unwrap().get("oxibrowser").cloned()
+        }
+        None => None,
+    };
     let Some(sibling_pool) = sibling_pool else {
         return Ok(json!({
             "ok": false,

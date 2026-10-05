@@ -714,6 +714,39 @@ pub fn claim_spool_launcher_slot(spool_dir: &Path) -> bool {
     fs::read_to_string(&slot).ok().and_then(|s| s.trim().parse::<u64>().ok()) == Some(me)
 }
 
+// One standalone watcher per project spool. Without this a second watcher on
+// the same project starts sweeping while the first is still dispatching: each
+// one's orphan sweep then answers `dispatch_orphaned` for the other's running
+// work and deletes the claim under it, which is the rotating-`sweeping_pid`
+// orphan storm. The slot is pid-liveness checked, not just present, so a crash
+// leaves the project reclaimable.
+pub fn claim_standalone_watcher_slot(spool_dir: &Path) -> bool {
+    let slot = spool_dir.join(".standalone-watcher.pid");
+    let me = std::process::id() as u64;
+    if let Some(holder) = fs::read_to_string(&slot).ok().and_then(|s| s.trim().parse::<u64>().ok()) {
+        if holder != me && pid_is_alive(holder) {
+            return false;
+        }
+    }
+    let tmp = slot.with_extension(format!("pid.tmp.{me}"));
+    if fs::write(&tmp, me.to_string()).is_err() {
+        return false;
+    }
+    if fs::rename(&tmp, &slot).is_err() {
+        let _ = fs::remove_file(&tmp);
+        return false;
+    }
+    fs::read_to_string(&slot).ok().and_then(|s| s.trim().parse::<u64>().ok()) == Some(me)
+}
+
+pub fn release_standalone_watcher_slot(spool_dir: &Path) {
+    let slot = spool_dir.join(".standalone-watcher.pid");
+    let me = std::process::id() as u64;
+    if fs::read_to_string(&slot).ok().and_then(|s| s.trim().parse::<u64>().ok()) == Some(me) {
+        let _ = fs::remove_file(&slot);
+    }
+}
+
 pub fn arm_spool_launcher_deadline() {
     std::thread::spawn(|| {
         std::thread::sleep(SPOOL_LAUNCHER_HARD_DEADLINE);
@@ -2597,9 +2630,9 @@ impl IdleInDirWatch {
     }
 
     // WaitForMultipleObjects takes at most MAXIMUM_WAIT_OBJECTS (64) handles,
-    // so a registry with more watched in/ dirs than that is waited on in chunks
-    // against one shared deadline: every root stays covered by a notification,
-    // and a change in any chunk still wakes the whole wait early.
+    // so a registry with more watched in/ dirs than that is waited on in chunks.
+    // Every chunk gets its own slice of the deadline, so every root stays
+    // covered by a notification and a change in any chunk wakes the wait early.
     const WAIT_CHUNK_HANDLES: usize = 64;
 
     // Blocks until one of the watched in/ dirs changes or `cap` elapses.
@@ -2613,15 +2646,19 @@ impl IdleInDirWatch {
             return false;
         }
         const WAIT_OBJECT_0: u32 = 0;
-        let deadline = Instant::now() + cap;
-        for chunk in self.entries.chunks(Self::WAIT_CHUNK_HANDLES) {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return false;
-            }
+        // Every chunk gets its own slice of the deadline. Waiting each chunk
+        // against the FULL remaining deadline let the first chunk consume all
+        // of it, so a change in a later chunk could never wake the wait early
+        // -- the documented "a change in any chunk wakes the whole wait" only
+        // held for the first chunk, and every other root was seen a whole cap
+        // late.
+        let chunks: Vec<&[(PathBuf, windows_sys::Win32::Foundation::HANDLE)]> =
+            self.entries.chunks(Self::WAIT_CHUNK_HANDLES).collect();
+        let per_chunk_ms = (cap.as_millis() as u64 / chunks.len() as u64).max(1);
+        for chunk in chunks {
             let handles: Vec<_> = chunk.iter().map(|(_, h)| *h).collect();
             let rc = unsafe {
-                WaitForMultipleObjects(handles.len() as u32, handles.as_ptr(), 0, remaining.as_millis() as u32)
+                WaitForMultipleObjects(handles.len() as u32, handles.as_ptr(), 0, per_chunk_ms as u32)
             };
             if (WAIT_OBJECT_0..WAIT_OBJECT_0 + handles.len() as u32).contains(&rc) {
                 let idx = (rc - WAIT_OBJECT_0) as usize;
@@ -2639,6 +2676,26 @@ impl IdleInDirWatch {
 impl Drop for IdleInDirWatch {
     fn drop(&mut self) {
         self.close_all();
+    }
+}
+
+// Arm the in/ dir watch (a no-op once the watched set already matches `roots`)
+// and block until one of those dirs changes or `cap` elapses. Shared by the
+// busy and the idle cadence of the main loop so neither can fall through with
+// no wait at all. A woken wait invalidates every cached "nothing queued"
+// verdict, since all of them predate the change that woke us.
+#[cfg(windows)]
+fn wait_for_in_dir_change(watch: &mut IdleInDirWatch, roots: &[PathBuf], cap: Duration) {
+    watch.sync(roots);
+    // Arming is itself a pass over the roots. Work that appeared during it must
+    // be served by the next pass now, not slept past.
+    if roots.iter().any(|root| project_has_pending_dispatch_work(root)) {
+        return;
+    }
+    if watch.wait(cap) {
+        if let Ok(mut cache) = spool_work_cache().lock() {
+            cache.clear();
+        }
     }
 }
 
@@ -3525,6 +3582,7 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
                 }
             }
         }
+        agentplug_host::set_sibling_reload_source((plugin_modules.engine.clone(), plugin_modules.modules_with_hashes()));
 
         let sweep_cold_this_tick = last_cold_project_sweep.elapsed() >= COLD_PROJECT_SWEEP_INTERVAL;
         if sweep_cold_this_tick {
@@ -3761,27 +3819,27 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
             // Work is running or is waiting on a claim slot: keep the registry
             // scan at its fastest cadence so a claimable file is seen within
             // one cache TTL of being written.
+            //
+            // "Fastest cadence" still has to be a cadence. This branch used to
+            // assign `idle_wait_ms` and then fall out of the loop without ever
+            // waiting on it, so any pass that did work -- or any root that
+            // reported pending work it could not actually claim (a stale
+            // .inflight, or a project pinned at
+            // MAX_CLAIMED_DISPATCHES_PER_PROJECT) -- ran the whole registry
+            // scan as an unbounded spin. On a registry of hundreds of roots
+            // that scan is mostly directory enumeration, so it shows up as
+            // near-core CPU with almost all of it in kernel time and no
+            // dispatch in flight. The wait is the same event-driven one the
+            // idle branch uses, so a dispatch written during it still wakes
+            // the next pass immediately.
             idle_wait_ms = IDLE_WAIT_MIN_MS;
+            #[cfg(windows)]
+            wait_for_in_dir_change(&mut idle_in_dir_watch, &known_roots, Duration::from_millis(idle_wait_ms));
+            #[cfg(not(windows))]
+            std::thread::sleep(Duration::from_millis(idle_wait_ms));
         } else {
             #[cfg(windows)]
-            {
-                idle_in_dir_watch.sync(&known_roots);
-                let pending_work_appeared_while_arming_idle_watcher = known_roots
-                    .iter()
-                    .any(|root| project_has_pending_dispatch_work(root));
-                if !pending_work_appeared_while_arming_idle_watcher {
-                    let woken_by_in_dir_change = idle_in_dir_watch.wait(Duration::from_millis(idle_wait_ms));
-                    if woken_by_in_dir_change {
-                        // A watched in/ dir changed while we slept. Every
-                        // cached "nothing queued" verdict predates that change,
-                        // so the next pass must re-enumerate rather than
-                        // trusting them for another TTL.
-                        if let Ok(mut cache) = spool_work_cache().lock() {
-                            cache.clear();
-                        }
-                    }
-                }
-            }
+            wait_for_in_dir_change(&mut idle_in_dir_watch, &known_roots, Duration::from_millis(idle_wait_ms));
             #[cfg(not(windows))]
             std::thread::sleep(Duration::from_millis(idle_wait_ms));
             idle_wait_ms = (idle_wait_ms.saturating_mul(2)).min(IDLE_WAIT_MAX_MS);

@@ -766,7 +766,15 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
             }
 
             let caller_siblings = caller.data().siblings();
+            let caller_root = caller.data().cwd();
             let sibling_pool = { caller_siblings.lock().unwrap().get(&plugin).cloned() };
+            let sibling_pool = match sibling_pool {
+                Some(pool) => Some(pool),
+                None if crate::registry::ensure_sibling_registered(&caller_root, &plugin, &caller_siblings) => {
+                    caller_siblings.lock().unwrap().get(&plugin).cloned()
+                }
+                None => None,
+            };
             let Some(sibling_pool) = sibling_pool else {
                 return write_guest_json(
                     &mut caller,
@@ -774,7 +782,6 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
                 );
             };
 
-            let caller_root = caller.data().cwd();
             let acquire_start = std::time::Instant::now();
             let acquire_timeout_ms = crate::registry::SharedPluginPool::ACQUIRE_TIMEOUT_MS;
             let mut guard = sibling_pool.acquire().expect("acquire() always returns Some -- FIFO wait never denies");
@@ -820,14 +827,23 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
             let body = serde_json::json!({"text": text}).to_string();
 
             let caller_siblings = caller.data().siblings();
-            let sibling_pool = { caller_siblings.lock().unwrap_or_else(|e| e.into_inner()).get("bert").cloned() };
             let caller_root = caller.data().cwd();
+            let sibling_pool = { caller_siblings.lock().unwrap_or_else(|e| e.into_inner()).get("bert").cloned() };
+            let sibling_pool = match sibling_pool {
+                Some(pool) => Some(pool),
+                None if crate::registry::ensure_sibling_registered(&caller_root, "bert", &caller_siblings) => {
+                    caller_siblings.lock().unwrap_or_else(|e| e.into_inner()).get("bert").cloned()
+                }
+                None => {
+                    let registered: Vec<String> = caller_siblings.lock().unwrap_or_else(|e| e.into_inner()).keys().cloned().collect();
+                    eprintln!(
+                        "[agentplug:host_vec_embed] no `bert` sibling registered for {} (caller plugin {caller_plugin}); this process has {registered:?} loaded -- the embedder is unreachable, so every embedding-dependent verb will fail until bert is loaded into the SAME siblings map as the caller",
+                        caller_root.display()
+                    );
+                    None
+                }
+            };
             let Some(sibling_pool) = sibling_pool else {
-                let registered: Vec<String> = caller_siblings.lock().unwrap_or_else(|e| e.into_inner()).keys().cloned().collect();
-                eprintln!(
-                    "[agentplug:host_vec_embed] no `bert` sibling registered for {} (caller plugin {caller_plugin}); this process has {registered:?} loaded -- the embedder is unreachable, so every embedding-dependent verb will fail until bert is loaded into the SAME siblings map as the caller",
-                    caller_root.display()
-                );
                 return -1;
             };
             const EMBED_RETRY_ATTEMPTS: u32 = 3;
