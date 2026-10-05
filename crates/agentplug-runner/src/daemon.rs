@@ -1577,6 +1577,7 @@ struct PluginModules {
     modules: HashMap<String, Module>,
     loaded_content_hash: HashMap<String, String>,
     last_hash_check_stat: HashMap<String, (std::time::SystemTime, u64)>,
+    recompiling: HashMap<String, (String, Mutex<std::sync::mpsc::Receiver<Result<Module, String>>>)>,
 }
 
 fn wasm_file_content_hash(wasm_path: &Path) -> anyhow::Result<String> {
@@ -1597,11 +1598,66 @@ impl PluginModules {
             modules: HashMap::new(),
             loaded_content_hash: HashMap::new(),
             last_hash_check_stat: HashMap::new(),
+            recompiling: HashMap::new(),
         })
+    }
+
+    fn install_compiled(&mut self, plugin_name: &str, module: Module, on_disk_hash: String, wasm_path: &Path) {
+        if let Some(old_hash) = self.loaded_content_hash.get(plugin_name).cloned() {
+            if old_hash != on_disk_hash {
+                let (evicted_now, deferred) = agentplug_host::request_shared_store_swap(plugin_name, &old_hash);
+                eprintln!(
+                    "[agentplug daemon] {plugin_name}.wasm recompiled off the claim loop -- swapping it in, draining the shared Stores on the old module ({evicted_now} slot(s) evicted now, {deferred} still in-flight and finishing on the old Store; their slots evict on completion)"
+                );
+            }
+        }
+        if let Some(installed) = installed_plugin_version(plugin_name) {
+            if !is_recognized_release_semver(&installed) {
+                eprintln!(
+                    "[agentplug daemon] BOOT WARNING: {plugin_name}.wasm at {} is served from a NON-RELEASE version marker ({installed:?}) -- this is a local-dev sideload, not a released build, and the auto-updater will never overwrite it. If this was not intentional, replace the sideload with a real release-tagged {plugin_name}.wasm.",
+                    wasm_path.display()
+                );
+            }
+        }
+        self.modules.insert(plugin_name.to_string(), module);
+        self.loaded_content_hash.insert(plugin_name.to_string(), on_disk_hash.clone());
+        loaded_plugin_content_hashes()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(plugin_name.to_string(), on_disk_hash.clone());
+        loaded_plugin_versions()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(plugin_name.to_string(), installed_plugin_version(plugin_name).unwrap_or_else(|| "unversioned".to_string()));
+        agentplug_host::note_shared_plugin_bytes_current(plugin_name, &on_disk_hash);
+    }
+
+    fn adopt_finished_recompile(&mut self, plugin_name: &str, wasm_path: &Path) -> anyhow::Result<()> {
+        let Some((hash, receiver)) = self.recompiling.remove(plugin_name) else { return Ok(()) };
+        let received = receiver.lock().unwrap_or_else(|e| e.into_inner()).try_recv();
+        match received {
+            Ok(Ok(module)) => {
+                self.install_compiled(plugin_name, module, hash, wasm_path);
+                Ok(())
+            }
+            Ok(Err(e)) => {
+                self.last_hash_check_stat.remove(plugin_name);
+                Err(anyhow::anyhow!("background recompile of {plugin_name} failed: {e}"))
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                self.recompiling.insert(plugin_name.to_string(), (hash, receiver));
+                Ok(())
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.last_hash_check_stat.remove(plugin_name);
+                anyhow::bail!("background recompile thread for {plugin_name} ended without a result")
+            }
+        }
     }
 
     fn get_or_compile(&mut self, plugin_name: &str) -> anyhow::Result<()> {
         let wasm_path = ensure_plugin_installed(plugin_name, None)?;
+        self.adopt_finished_recompile(plugin_name, &wasm_path)?;
         let current_stat = wasm_file_stat(&wasm_path);
         let stat_unchanged = current_stat.is_some()
             && current_stat == self.last_hash_check_stat.get(plugin_name).copied();
@@ -1612,39 +1668,35 @@ impl PluginModules {
         if let Some(stat) = current_stat {
             self.last_hash_check_stat.insert(plugin_name.to_string(), stat);
         }
-        let old_loaded_hash = self.loaded_content_hash.get(plugin_name).cloned();
-        let stale = old_loaded_hash.as_deref().is_some_and(|loaded_hash| loaded_hash != on_disk_hash);
+        let stale = self.loaded_content_hash.get(plugin_name).is_some_and(|loaded_hash| loaded_hash != &on_disk_hash);
+        if self.modules.contains_key(plugin_name) && !stale {
+            self.recompiling.remove(plugin_name);
+            return Ok(());
+        }
         if stale {
-            let old_hash = old_loaded_hash.unwrap_or_default();
-            let (evicted_now, deferred) = agentplug_host::request_shared_store_swap(plugin_name, &old_hash);
-            eprintln!(
-                "[agentplug daemon] {plugin_name}.wasm content hash changed on disk since it was last compiled -- evicting the stale in-process module and draining the shared Stores using it ({evicted_now} slot(s) evicted now, {deferred} still in-flight and finishing on the old Store; their slots evict on completion), forcing a recompile from the current bytes"
-            );
-            self.modules.remove(plugin_name);
-        }
-        if !self.modules.contains_key(plugin_name) {
-            if let Some(installed) = installed_plugin_version(plugin_name) {
-                if !is_recognized_release_semver(&installed) {
-                    eprintln!(
-                        "[agentplug daemon] BOOT WARNING: {plugin_name}.wasm at {} is served from a NON-RELEASE version marker ({installed:?}) -- this is a local-dev sideload, not a released build, and the auto-updater will never overwrite it. If this was not intentional, replace the sideload with a real release-tagged {plugin_name}.wasm.",
-                        wasm_path.display()
-                    );
-                }
+            if self.recompiling.get(plugin_name).is_some_and(|(pending_hash, _)| pending_hash == &on_disk_hash) {
+                return Ok(());
             }
-            eprintln!("[agentplug daemon] compiling {plugin_name}.wasm (shared across every project that uses it)...");
-            let module = agentplug_host::load_module_file_backed(&self.engine, &wasm_path, plugin_name, &on_disk_hash)?;
-            self.modules.insert(plugin_name.to_string(), module);
-            self.loaded_content_hash.insert(plugin_name.to_string(), on_disk_hash.clone());
-            loaded_plugin_content_hashes()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(plugin_name.to_string(), on_disk_hash.clone());
-            loaded_plugin_versions()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(plugin_name.to_string(), installed_plugin_version(plugin_name).unwrap_or_else(|| "unversioned".to_string()));
-            agentplug_host::note_shared_plugin_bytes_current(plugin_name, &on_disk_hash);
+            eprintln!("[agentplug daemon] {plugin_name}.wasm content hash changed on disk since it was last compiled -- recompiling on a background thread while the loaded module keeps serving");
+            let (tx, rx) = std::sync::mpsc::channel();
+            let engine = self.engine.clone();
+            let path = wasm_path.clone();
+            let thread_plugin_name = plugin_name.to_string();
+            let thread_hash = on_disk_hash.clone();
+            let thread_name = format!("recompile-{plugin_name}");
+            let spawned = std::thread::Builder::new().name(thread_name).spawn(move || {
+                let _ = tx.send(agentplug_host::load_module_file_backed(&engine, &path, &thread_plugin_name, &thread_hash).map_err(|e| format!("{e:#}")));
+            });
+            if let Err(e) = spawned {
+                self.last_hash_check_stat.remove(plugin_name);
+                anyhow::bail!("could not start the background recompile thread for {plugin_name}: {e}");
+            }
+            self.recompiling.insert(plugin_name.to_string(), (on_disk_hash, Mutex::new(rx)));
+            return Ok(());
         }
+        eprintln!("[agentplug daemon] compiling {plugin_name}.wasm (shared across every project that uses it)...");
+        let module = agentplug_host::load_module_file_backed(&self.engine, &wasm_path, plugin_name, &on_disk_hash)?;
+        self.install_compiled(plugin_name, module, on_disk_hash, &wasm_path);
         Ok(())
     }
 
@@ -1901,7 +1953,13 @@ pub fn write_spool_out_confirmed(out_dir: &Path, out_name: &str, out_body: &str)
     dest.exists()
 }
 
+fn forget_in_flight_claim(in_dir: &Path, verb: &str, task: &str) {
+    let Some(root) = in_dir.ancestors().nth(3) else { return };
+    in_flight_map().lock().unwrap_or_else(|e| e.into_inner()).remove(&(root.to_path_buf(), verb.to_string(), task.to_string()));
+}
+
 fn write_spool_out_and_release_claim(out_dir: &Path, in_dir: &Path, verb: &str, task: &str, out_body: &str) {
+    forget_in_flight_claim(in_dir, verb, task);
     if write_spool_out_confirmed(out_dir, &format!("{verb}-{task}.json"), out_body) {
         let _ = fs::remove_file(inflight_claim_path(in_dir, verb, task));
     } else {
@@ -2042,7 +2100,7 @@ pub fn sweep_orphaned_claims_across_roots(roots: &[PathBuf]) {
     clear_handoff_inherited_claims();
 }
 
-const MIN_ORPHAN_CLAIM_AGE_MS: u64 = 600_000;
+const MIN_ORPHAN_CLAIM_AGE_MS: u64 = 60_000;
 
 fn claim_age_ms(path: &Path) -> Option<u64> {
     let modified = fs::metadata(path).ok()?.modified().ok()?;
@@ -2092,7 +2150,11 @@ fn sweep_orphaned_claims_distinguishing_handoff_from_crash(root: &Path, inherite
                 }
                 eprintln!("[agentplug daemon] could not re-queue handoff-inherited claim {verb}/{task} for {} -- falling through to dispatch_orphaned rather than swallowing it", root.display());
             }
-            if claim_age_ms(&path).map(|age| age < MIN_ORPHAN_CLAIM_AGE_MS).unwrap_or(false) {
+            if in_flight_map().lock().unwrap_or_else(|e| e.into_inner()).contains_key(&(root.to_path_buf(), verb.clone(), task.clone())) {
+                continue;
+            }
+            let claim_age = claim_age_ms(&path);
+            if claim_age.map(|age| age < MIN_ORPHAN_CLAIM_AGE_MS).unwrap_or(false) {
                 continue;
             }
             let out_name = format!("{verb}-{task}.json");
@@ -2102,6 +2164,9 @@ fn sweep_orphaned_claims_distinguishing_handoff_from_crash(root: &Path, inherite
                 let out_body = serde_json::json!({
                     "ok": false,
                     "error_code": "dispatch_orphaned",
+                    "reaped": true,
+                    "reason": "claim file with no live dispatch in this daemon (the claiming daemon exited or was handed off) -- reaped by the periodic orphan sweep so it cannot hold the project busy",
+                    "claim_age_ms": claim_age,
                     "error": format!("verb {verb} (task {task}) was claimed by a daemon that stopped answering -- a wasm trap, an out-of-memory abort, or a shared-Store recycle during the call. A version handoff is NOT a cause of this error: a handoff re-queues its claims for the incoming daemon, which completes them. The outcome is UNVERIFIED, not known to be unperformed: a side-effecting verb (git_commit/git_finalize/git_push/fs_write/memorize-fire) may already have applied some or all of its work, so read the real state (git log, git status, the file, the store) before re-dispatching. Re-dispatch straight away only for a read-only verb."),
                     "verb": verb,
                     "task": task,
@@ -2405,6 +2470,10 @@ fn dispatch_project(root: &Path, project: &mut ProjectPlugins, plugin_modules: &
             let _ = fs::rename(&claim_path, &file_path);
             continue;
         }
+        in_flight_map().lock().unwrap_or_else(|e| e.into_inner()).insert(
+            (root.to_path_buf(), verb.clone(), task.clone()),
+            InFlightHandle { detach: Arc::new(std::sync::atomic::AtomicBool::new(false)) },
+        );
         let submitted_at_ms = queued_since
             .duration_since(std::time::UNIX_EPOCH)
             .ok()
@@ -2859,6 +2928,101 @@ pub fn run_daemon() -> anyhow::Result<()> {
     run_daemon_body(plugin_modules)
 }
 
+fn spawn_update_poll_worker(daemon_cfg: DaemonConfig) -> std::sync::mpsc::Receiver<(PathBuf, String)> {
+    let (staged_tx, staged_rx) = std::sync::mpsc::channel::<(PathBuf, String)>();
+    let spawned = std::thread::Builder::new().name("update-poll".to_string()).spawn(move || {
+        let plugin_update_poll_interval = daemon_cfg.plugin_update_poll_interval();
+        let shortest_plugin_poll_interval = daemon_cfg
+            .plugin_update_poll_interval_secs_by_name
+            .values()
+            .copied()
+            .min()
+            .map(Duration::from_secs)
+            .map(|per_plugin| per_plugin.min(plugin_update_poll_interval))
+            .unwrap_or(plugin_update_poll_interval);
+        let mut last_plugin_specific_poll: HashMap<String, Instant> = HashMap::new();
+        let mut last_plugin_update_poll = seed_poll_timer_from_persisted_ts(&persisted_plugin_poll_ts_path());
+        let persisted_plugin_poll_ts_at_boot = read_persisted_poll_ts(&persisted_plugin_poll_ts_path());
+        if persisted_plugin_poll_ts_at_boot > 0 {
+            HEARTBEAT_LAST_PLUGIN_POLL_TS.store(persisted_plugin_poll_ts_at_boot, std::sync::atomic::Ordering::Relaxed);
+        }
+        let runner_update_poll_interval = daemon_cfg.runner_update_poll_interval();
+        let mut last_runner_update_poll = seed_poll_timer_from_persisted_ts(&persisted_runner_poll_ts_path());
+        let mut first_runner_poll_pending = true;
+        let persisted_runner_poll_ts_at_boot = read_persisted_poll_ts(&persisted_runner_poll_ts_path());
+        if persisted_runner_poll_ts_at_boot > 0 {
+            HEARTBEAT_LAST_RUNNER_POLL_TS.store(persisted_runner_poll_ts_at_boot, std::sync::atomic::Ordering::Relaxed);
+        }
+        loop {
+            let forced_refresh_request = take_forced_plugin_refresh_request();
+            if last_plugin_update_poll.elapsed() >= shortest_plugin_poll_interval || forced_refresh_request.is_some() {
+                last_plugin_update_poll = Instant::now();
+                let poll_ts = now_ms();
+                HEARTBEAT_LAST_PLUGIN_POLL_TS.store(poll_ts, std::sync::atomic::Ordering::Relaxed);
+                write_persisted_poll_ts(&persisted_plugin_poll_ts_path(), poll_ts);
+                let targets: Vec<String> = match &forced_refresh_request {
+                    Some(Some(name)) => vec![name.clone()],
+                    _ => loaded_plugin_versions().lock().unwrap_or_else(|e| e.into_inner()).keys().cloned().collect(),
+                };
+                let mut cycle_errors: Vec<String> = Vec::new();
+                for plugin_name in targets {
+                    let forced = matches!(&forced_refresh_request, Some(Some(name)) if name == &plugin_name);
+                    if !forced {
+                        let due = last_plugin_specific_poll
+                            .get(&plugin_name)
+                            .map(|t| t.elapsed() >= daemon_cfg.plugin_update_poll_interval_for(&plugin_name))
+                            .unwrap_or(true);
+                        if !due {
+                            continue;
+                        }
+                    }
+                    last_plugin_specific_poll.insert(plugin_name.clone(), Instant::now());
+                    match crate::download::refresh_plugin_if_stale(&plugin_name) {
+                        Ok(Some(new_version)) => {
+                            eprintln!(
+                                "[agentplug daemon] downloaded+verified plugin {plugin_name} update to {new_version} -- the next tick's get_or_compile content-hash check recompiles it off the claim loop and swaps it in when ready"
+                            );
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            let msg = format!("plugin update check for {plugin_name} failed: {e}");
+                            eprintln!("[agentplug daemon] {msg}");
+                            cycle_errors.push(msg);
+                        }
+                    }
+                }
+                record_plugin_poll_error(if cycle_errors.is_empty() { None } else { Some(cycle_errors.join("; ")) });
+            }
+
+            if first_runner_poll_pending || last_runner_update_poll.elapsed() >= runner_update_poll_interval || take_forced_runner_refresh_request() {
+                first_runner_poll_pending = false;
+                last_runner_update_poll = Instant::now();
+                let poll_ts = now_ms();
+                HEARTBEAT_LAST_RUNNER_POLL_TS.store(poll_ts, std::sync::atomic::Ordering::Relaxed);
+                write_persisted_poll_ts(&persisted_runner_poll_ts_path(), poll_ts);
+                match crate::download::stage_runner_self_update() {
+                    Ok(Some(staged_and_version)) => {
+                        if staged_tx.send(staged_and_version).is_err() {
+                            return;
+                        }
+                    }
+                    Ok(None) => record_runner_poll_error(None),
+                    Err(e) => {
+                        let msg = format!("runner self-update check failed: {e}");
+                        eprintln!("[agentplug daemon] {msg}");
+                        record_runner_poll_error(Some(msg));
+                    }
+                }
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
+    });
+    if let Err(e) = spawned {
+        eprintln!("[agentplug daemon] could not start the update-poll thread: {e} -- plugin and runner updates will not be polled until the daemon restarts");
+    }
+    staged_rx
+}
+
 fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
     HEARTBEAT_DAEMON_BOOT_TS.store(now_ms(), std::sync::atomic::Ordering::Relaxed);
     write_daemon_heartbeat(0, 0);
@@ -2897,6 +3061,7 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
     let mut roots_new_this_registry_poll: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
     let mut last_cold_project_sweep = Instant::now().checked_sub(COLD_PROJECT_SWEEP_INTERVAL).unwrap_or_else(Instant::now);
     let mut project_round_robin_cursor = 0usize;
+    let mut last_per_root_plugin_scan = Instant::now().checked_sub(Duration::from_secs(60)).unwrap_or_else(Instant::now);
 
     const SELF_RECYCLE_IDLE_MS: u64 = 60 * 60 * 1000;
     let mut last_any_dispatch = Instant::now();
@@ -2904,30 +3069,8 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
     let shared_plugin_release_idle_ms = daemon_cfg.shared_plugin_release_idle_ms();
     let mut last_shared_release = Instant::now();
 
-    let plugin_update_poll_interval = daemon_cfg.plugin_update_poll_interval();
     let instruction_source_poll_interval = daemon_cfg.instruction_source_poll_interval();
-    let shortest_plugin_poll_interval = daemon_cfg
-        .plugin_update_poll_interval_secs_by_name
-        .values()
-        .copied()
-        .min()
-        .map(Duration::from_secs)
-        .map(|per_plugin| per_plugin.min(plugin_update_poll_interval))
-        .unwrap_or(plugin_update_poll_interval);
-    let mut last_plugin_specific_poll: HashMap<String, Instant> = HashMap::new();
-    let mut last_plugin_update_poll = seed_poll_timer_from_persisted_ts(&persisted_plugin_poll_ts_path());
-    let persisted_plugin_poll_ts_at_boot = read_persisted_poll_ts(&persisted_plugin_poll_ts_path());
-    if persisted_plugin_poll_ts_at_boot > 0 {
-        HEARTBEAT_LAST_PLUGIN_POLL_TS.store(persisted_plugin_poll_ts_at_boot, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    let runner_update_poll_interval = daemon_cfg.runner_update_poll_interval();
-    let mut last_runner_update_poll = seed_poll_timer_from_persisted_ts(&persisted_runner_poll_ts_path());
-    let mut first_runner_poll_pending = true;
-    let persisted_runner_poll_ts_at_boot = read_persisted_poll_ts(&persisted_runner_poll_ts_path());
-    if persisted_runner_poll_ts_at_boot > 0 {
-        HEARTBEAT_LAST_RUNNER_POLL_TS.store(persisted_runner_poll_ts_at_boot, std::sync::atomic::Ordering::Relaxed);
-    }
+    let staged_runner_rx = spawn_update_poll_worker(daemon_cfg.clone());
     #[cfg(windows)]
     let mut idle_in_dir_watch = IdleInDirWatch::new();
     let mut pending_self_update: Option<(PathBuf, String)> = None;
@@ -3036,33 +3179,37 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
 
         let max_concurrent_projects = daemon_cfg.max_concurrent_projects();
 
-        for root in &known_roots {
-            for plugin_name in read_project_plugin_list(root) {
-                if plugin_compile_in_backoff(&plugin_name) {
-                    continue;
-                }
-                match plugin_modules.get_or_compile(&plugin_name) {
-                    Ok(()) => clear_plugin_compile_failure(&plugin_name),
-                    Err(e) => {
-                        eprintln!("[agentplug daemon] failed to compile/install plugin {plugin_name} for {}: {e:#}", root.display());
-                        record_plugin_compile_failure(&plugin_name, format!("{e:#}"));
+        const PER_ROOT_PLUGIN_SCAN_INTERVAL: Duration = Duration::from_secs(5);
+        if !roots_new_this_registry_poll.is_empty() || last_per_root_plugin_scan.elapsed() >= PER_ROOT_PLUGIN_SCAN_INTERVAL {
+            last_per_root_plugin_scan = Instant::now();
+            for root in &known_roots {
+                for plugin_name in read_project_plugin_list(root) {
+                    if plugin_compile_in_backoff(&plugin_name) {
+                        continue;
+                    }
+                    match plugin_modules.get_or_compile(&plugin_name) {
+                        Ok(()) => clear_plugin_compile_failure(&plugin_name),
+                        Err(e) => {
+                            eprintln!("[agentplug daemon] failed to compile/install plugin {plugin_name} for {}: {e:#}", root.display());
+                            record_plugin_compile_failure(&plugin_name, format!("{e:#}"));
+                        }
                     }
                 }
-            }
-            let due = last_instruction_source_sync
-                .get(root)
-                .map(|t| t.elapsed() >= instruction_source_poll_interval)
-                .unwrap_or(true);
-            if due && instruction_source_syncing.insert(root.clone()) {
-                last_instruction_source_sync.insert(root.clone(), Instant::now());
-                let thread_root = root.clone();
-                let done = instruction_source_sync_done_tx.clone();
-                std::thread::spawn(move || {
-                    if let Err(e) = sync_instruction_source_if_configured(&thread_root) {
-                        eprintln!("[agentplug daemon] instruction source-repo sync failed for {}: {e:#}", thread_root.display());
-                    }
-                    let _ = done.send(thread_root);
-                });
+                let due = last_instruction_source_sync
+                    .get(root)
+                    .map(|t| t.elapsed() >= instruction_source_poll_interval)
+                    .unwrap_or(true);
+                if due && instruction_source_syncing.insert(root.clone()) {
+                    last_instruction_source_sync.insert(root.clone(), Instant::now());
+                    let thread_root = root.clone();
+                    let done = instruction_source_sync_done_tx.clone();
+                    std::thread::spawn(move || {
+                        if let Err(e) = sync_instruction_source_if_configured(&thread_root) {
+                            eprintln!("[agentplug daemon] instruction source-repo sync failed for {}: {e:#}", thread_root.display());
+                        }
+                        let _ = done.send(thread_root);
+                    });
+                }
             }
         }
         for plugin_name in ["gm", "libsql", "bert", "treesitter", "oxibrowser", "crux"] {
@@ -3081,6 +3228,10 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
         let sweep_cold_this_tick = last_cold_project_sweep.elapsed() >= COLD_PROJECT_SWEEP_INTERVAL;
         if sweep_cold_this_tick {
             last_cold_project_sweep = Instant::now();
+            let no_inherited_claims = HashSet::new();
+            for root in &known_roots {
+                sweep_orphaned_claims_distinguishing_handoff_from_crash(root, &no_inherited_claims);
+            }
         }
         let mut all_projects: Vec<(PathBuf, ProjectPlugins)> = Vec::with_capacity(known_roots.len());
         let mut is_genuinely_active: Vec<bool> = Vec::with_capacity(known_roots.len());
@@ -3182,76 +3333,21 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
             projects.remove(&root);
         }
 
-        let forced_refresh_request = take_forced_plugin_refresh_request();
-        if last_plugin_update_poll.elapsed() >= shortest_plugin_poll_interval || forced_refresh_request.is_some() {
-            last_plugin_update_poll = Instant::now();
-            let poll_ts = now_ms();
-            HEARTBEAT_LAST_PLUGIN_POLL_TS.store(poll_ts, std::sync::atomic::Ordering::Relaxed);
-            write_persisted_poll_ts(&persisted_plugin_poll_ts_path(), poll_ts);
-            let targets: Vec<String> = match &forced_refresh_request {
-                Some(Some(name)) => vec![name.clone()],
-                _ => plugin_modules.modules.keys().cloned().collect(),
-            };
-            let mut cycle_errors: Vec<String> = Vec::new();
-            for plugin_name in targets {
-                let forced = matches!(&forced_refresh_request, Some(Some(name)) if name == &plugin_name);
-                if !forced {
-                    let due = last_plugin_specific_poll
-                        .get(&plugin_name)
-                        .map(|t| t.elapsed() >= daemon_cfg.plugin_update_poll_interval_for(&plugin_name))
-                        .unwrap_or(true);
-                    if !due {
-                        continue;
-                    }
+        while let Ok((staged, version)) = staged_runner_rx.try_recv() {
+            if handoff_backed_off(&version) {
+                let _ = fs::remove_file(&staged);
+                crate::update_trust::remove_stage_record(&staged);
+                eprintln!(
+                    "[agentplug daemon] staged self-update to {version} is inside its {}s retry backoff after a failed handoff -- dropping it instead of retrying on every tick",
+                    HANDOFF_RETRY_BACKOFF.as_secs()
+                );
+            } else {
+                eprintln!("[agentplug daemon] staged self-update to {version} at {}", staged.display());
+                if pending_self_update.is_none() {
+                    pending_self_update_staged_at = Some(Instant::now());
                 }
-                last_plugin_specific_poll.insert(plugin_name.clone(), Instant::now());
-                match crate::download::refresh_plugin_if_stale(&plugin_name) {
-                    Ok(Some(new_version)) => {
-                        eprintln!(
-                            "[agentplug daemon] downloaded+verified plugin {plugin_name} update to {new_version} -- the next tick's get_or_compile content-hash check evicts and recompiles it unconditionally, no idle window required"
-                        );
-                    }
-                    Ok(None) => {}
-                    Err(e) => {
-                        let msg = format!("plugin update check for {plugin_name} failed: {e}");
-                        eprintln!("[agentplug daemon] {msg}");
-                        cycle_errors.push(msg);
-                    }
-                }
-            }
-            record_plugin_poll_error(if cycle_errors.is_empty() { None } else { Some(cycle_errors.join("; ")) });
-        }
-
-        if first_runner_poll_pending || last_runner_update_poll.elapsed() >= runner_update_poll_interval || take_forced_runner_refresh_request() {
-            first_runner_poll_pending = false;
-            last_runner_update_poll = Instant::now();
-            let poll_ts = now_ms();
-            HEARTBEAT_LAST_RUNNER_POLL_TS.store(poll_ts, std::sync::atomic::Ordering::Relaxed);
-            write_persisted_poll_ts(&persisted_runner_poll_ts_path(), poll_ts);
-            match crate::download::stage_runner_self_update() {
-                Ok(Some((staged, version))) => {
-                    if handoff_backed_off(&version) {
-                        let _ = fs::remove_file(&staged);
-                        crate::update_trust::remove_stage_record(&staged);
-                        eprintln!(
-                            "[agentplug daemon] staged self-update to {version} is inside its {}s retry backoff after a failed handoff -- dropping it instead of retrying on every tick",
-                            HANDOFF_RETRY_BACKOFF.as_secs()
-                        );
-                    } else {
-                        eprintln!("[agentplug daemon] staged self-update to {version} at {}", staged.display());
-                        if pending_self_update.is_none() {
-                            pending_self_update_staged_at = Some(Instant::now());
-                        }
-                        pending_self_update = Some((staged, version));
-                        record_runner_poll_error(None);
-                    }
-                }
-                Ok(None) => record_runner_poll_error(None),
-                Err(e) => {
-                    let msg = format!("runner self-update check failed: {e}");
-                    eprintln!("[agentplug daemon] {msg}");
-                    record_runner_poll_error(Some(msg));
-                }
+                pending_self_update = Some((staged, version));
+                record_runner_poll_error(None);
             }
         }
 
