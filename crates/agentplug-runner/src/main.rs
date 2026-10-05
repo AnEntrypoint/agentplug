@@ -135,6 +135,7 @@ fn main() -> anyhow::Result<()> {
             );
             Ok(())
         }
+        "daemon-guard" => daemon::run_daemon_guard(),
         "daemon" => daemon::run_daemon(),
         "sweep-spool" => {
             let root = args.get(2).map(PathBuf::from).unwrap_or_else(|| std::env::current_dir().expect("cwd unavailable"));
