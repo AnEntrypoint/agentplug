@@ -18,6 +18,11 @@ pub fn precompiled_dir() -> PathBuf {
     install_dir().join("precompiled")
 }
 
+pub fn system_precompiled_dir() -> PathBuf {
+    let base = directories::BaseDirs::new().expect("no home directory resolvable on this platform");
+    base.home_dir().join(".agentplug").join("precompiled")
+}
+
 pub fn plugins_dir() -> PathBuf {
     install_dir().join("plugins")
 }
