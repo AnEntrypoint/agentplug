@@ -97,6 +97,11 @@ fn main() -> anyhow::Result<()> {
             let spool_dir = cwd.join(".gm").join("exec-spool");
             std::fs::create_dir_all(&spool_dir)?;
 
+            if !daemon::claim_spool_launcher_slot(&spool_dir) {
+                eprintln!("[agentplug] another spool launcher for {} is already live -- exiting", cwd.display());
+                return Ok(());
+            }
+            daemon::arm_spool_launcher_deadline();
             daemon::register_project(&cwd)?;
             if daemon::ensure_daemon_running()? {
                 eprintln!(
