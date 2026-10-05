@@ -4,6 +4,9 @@ on:
   push:
     branches: [main]
 
+permissions:
+  contents: read
+
 concurrency:
   group: agentplug-release
   cancel-in-progress: false
@@ -13,11 +16,12 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.bump.outputs.version }}
+      commit: ${{ steps.bump.outputs.commit }}
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
-        with:
-          token: ${{ secrets.PUBLISHER_TOKEN }}
-          fetch-depth: 0
+        - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+          with:
+            fetch-depth: 0
+            persist-credentials: false
 
       - name: Auto-bump patch version BEFORE build
         id: bump
@@ -25,7 +29,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.PUBLISHER_TOKEN }}
         run: |
-          set -e
+          set -euo pipefail
           git config user.name "agentplug-bot"
           git config user.email "noreply@github.com"
           git config url."https://${GH_TOKEN}:x-oauth-basic@github.com/".insteadOf "https://github.com/"
@@ -37,11 +41,12 @@ jobs:
           git add Cargo.toml
           if git diff --cached --quiet; then
             echo "version=$CURRENT" >> "$GITHUB_OUTPUT"
-          else
-            git commit -m "chore: auto-bump version to $NEW_VERSION [skip ci]"
-            git push origin HEAD:main
-            echo "version=$NEW_VERSION" >> "$GITHUB_OUTPUT"
-          fi
+              else
+                git commit -m "chore: auto-bump version to $NEW_VERSION [skip ci]"
+                git push origin HEAD:main
+                echo "version=$NEW_VERSION" >> "$GITHUB_OUTPUT"
+              fi
+              echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
   build:
     needs: bump
@@ -66,9 +71,10 @@ jobs:
             asset: agentplug-runner-windows-arm64.exe
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
-        with:
-          ref: main
+          - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+            with:
+              ref: ${{ needs.bump.outputs.commit }}
+              persist-credentials: false
 
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
         with:
@@ -106,9 +112,10 @@ jobs:
     needs: bump
     runs-on: ubuntu-24.04-arm
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
-        with:
-          ref: main
+          - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+            with:
+              ref: ${{ needs.bump.outputs.commit }}
+              persist-credentials: false
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
         with:
           toolchain: stable
@@ -137,7 +144,8 @@ jobs:
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
         with:
-          ref: main
+          ref: ${{ needs.bump.outputs.commit }}
+          persist-credentials: false
 
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
         with:
@@ -177,17 +185,23 @@ jobs:
           GH_TOKEN: ${{ secrets.PUBLISHER_TOKEN }}
           VER: ${{ needs.bump.outputs.version }}
           REPO: AnEntrypoint/agentplug-bin
-          SHA: ${{ github.sha }}
+          SHA: ${{ needs.bump.outputs.commit }}
         run: |
-          set -e
+          set -euo pipefail
           ls -la release-assets
-          if ! gh release view "v$VER" --repo "$REPO" >/dev/null 2>&1; then
-            gh release create "v$VER" \
-              --repo "$REPO" \
-              --title "agentplug-runner v$VER" \
-              --notes "Auto-published from agentplug CI at $SHA"
+          gh release create "v$VER" \
+            --repo "$REPO" \
+            --title "agentplug-runner v$VER" \
+            --notes "Auto-published from agentplug CI at $SHA" \
+            --draft
+          gh release upload "v$VER" --repo "$REPO" release-assets/*
+          expected=$(for f in release-assets/*; do basename "$f"; done | sort)
+          uploaded=$(gh release view "v$VER" --repo "$REPO" --json assets --jq '.assets[].name' | sort)
+          if [ "$expected" != "$uploaded" ]; then
+            echo "::error::draft release v$VER does not contain exactly the signed asset set" >&2
+            exit 1
           fi
-          gh release upload "v$VER" --repo "$REPO" --clobber release-assets/*
+          gh release edit "v$VER" --repo "$REPO" --draft=false
 
       - name: Verify every uploaded asset is actually fetchable
         env:
