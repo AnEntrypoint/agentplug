@@ -35,6 +35,8 @@ trap 'rm -rf "$work"' EXIT
 umask 077
 key_file="$work/$key_id.secret"
 printf '%s\n' "$key" > "$key_file"
+unset AGENTPLUG_RELEASE_SIGNING_KEY
+export AGENTPLUG_RELEASE_SIGNING_CI_AUTHORIZED=true
 public_key=$(cargo run --quiet --locked --manifest-path "$source_dir/Cargo.toml" -p agentplug-trust --bin agentplug-sign -- pubkey --key "$key_file")
 jq -n --arg id "$key_id" --arg public_key "$public_key" '{mode:"enforce",threshold:1,keys:[{id:$id,public_key:$public_key}]}' > "$work/trusted-keys.json"
 

@@ -23,7 +23,9 @@ const USAGE: &str = "agentplug-sign <command>
 
   verify --artifact <file> --sig <file.sig> --trust-dir <dir> --version <x.y.z> [--name <asset name>] [--record]
       Run the runner's exact acceptance logic against <dir>/trusted-keys.json.
-      Exit 0 verified, 2 accepted without verification (off/warn), 1 rejected.";
+          Exit 0 verified, 2 accepted without verification (off/warn), 1 rejected.";
+
+const CI_SIGNING_AUTHORIZATION_ENV: &str = "AGENTPLUG_RELEASE_SIGNING_CI_AUTHORIZED";
 
 struct Args {
     flags: BTreeMap<String, Vec<String>>,
@@ -87,15 +89,15 @@ fn refuse_signing_in_ci(args: &Args) -> Result<(), String> {
     let protected_release = std::env::var("GITHUB_ACTIONS")
         .map(|value| value == "true")
         .unwrap_or(false)
-        && std::env::var("AGENTPLUG_RELEASE_SIGNING_KEY")
-            .map(|value| !value.is_empty())
+        && std::env::var(CI_SIGNING_AUTHORIZATION_ENV)
+            .map(|value| value == "true")
             .unwrap_or(false);
     if args.has("allow-ci") && protected_release {
         return Ok(());
     }
     if args.has("allow-ci") {
         return Err(
-            "--allow-ci requires GitHub Actions and AGENTPLUG_RELEASE_SIGNING_KEY from the protected release-signing environment".to_string(),
+            "--allow-ci requires GitHub Actions and the protected release-signing authorization marker".to_string(),
         );
     }
     refuse_in_ci()

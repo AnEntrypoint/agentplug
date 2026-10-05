@@ -109,8 +109,11 @@ the non-secret `AGENTPLUG_RELEASE_SIGNING_KEY_ID` Environment variable. That job
 downloads every built runner, signs it, and verifies the generated document under
 an ephemeral enforce-mode trust file before it passes the artifacts to the
 publisher. The publisher has the repository publishing token but never the signing
-key. A missing or malformed signing configuration, invalid signature, or failed
-verification fails before any asset is published.
+key. The signing script copies the seed into a temporary owner-only file, removes
+the secret from Cargo's child environment, and supplies only a non-secret release
+authorization marker to the signing command. A missing or malformed signing
+configuration, invalid signature, or failed verification fails before any asset is
+published.
 
 The public key must be pinned into each strict updater's `trusted-keys.json`
 through the normal offline key-distribution process before releases signed by that
