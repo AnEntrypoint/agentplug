@@ -9,11 +9,22 @@ newer one under the same version tag. A detached ed25519 signature over the
 artifact adds a second, independent check against public keys pinned locally and
 never written by the updater.
 
-## Default: warn
+## Default: protect the runner
 
-With no trust file, updates install as they always did, and every unverified
-install is logged once per version and recorded under the install dir. Nothing
-is refused and nothing is frozen for anyone who has not opted in.
+With no trust file, the installed runner remains bootable, but automatic runner
+updates are refused before an artifact is downloaded, staged, or executed. This
+prevents a release channel from promoting an unsigned runner merely because it
+supplies a matching sha256 sidecar. Plugin updates retain the trust file behavior
+below.
+
+A configured `warn` or `off` trust file is an explicit operator choice and can
+still install an unverified runner. Configure `enforce` with a pinned public key
+for the normal secure update path.
+
+There is no cryptographically safe automatic migration from a legacy updater
+that trusted unsigned releases: it has no independent trust anchor. Bootstrap a
+signed runner through a trusted out-of-band delivery path, then pin the release
+public key before enabling automatic runner updates.
 
 ## Opting a machine into strict mode
 
@@ -60,8 +71,8 @@ Never created or modified by the runner.
 
 - `mode`: `off` (no verification at all), `warn` (verify, log loudly, install
   anyway), `enforce` (refuse and keep the running version). A missing file
-  behaves as `warn` with a one-time notice; a file with `mode` omitted behaves
-  as `enforce`.
+  protects runner updates by refusing them while leaving the current runner
+  bootable; a file with `mode` omitted behaves as `enforce`.
 - `threshold`: how many distinct pinned keys must sign an artifact. Use 2 during
   key rotation so the old key alone and the new key alone are each insufficient
   while both remain valid signers of a transition release.

@@ -1130,15 +1130,6 @@ fn staged_binary_self_check(staged_exe: &Path, expected_version: &str) -> bool {
 }
 
 fn attempt_self_update_handoff(staged_exe: &Path, version: &str) -> bool {
-    if !staged_binary_self_check(staged_exe, version) {
-        let _ = fs::remove_file(staged_exe);
-        crate::update_trust::remove_stage_record(staged_exe);
-        record_handoff_failure(
-            version,
-            format!("staged_binary_self_check failed for {version}, staged exe removed"),
-        );
-        return false;
-    }
     if let Err(problem) = crate::update_trust::staged_runner_permitted(staged_exe) {
         let _ = fs::remove_file(staged_exe);
         crate::update_trust::remove_stage_record(staged_exe);
@@ -1148,6 +1139,15 @@ fn attempt_self_update_handoff(staged_exe: &Path, version: &str) -> bool {
         record_handoff_failure(
             version,
             format!("update-signature verification refused staged {version}: {problem}"),
+        );
+        return false;
+    }
+    if !staged_binary_self_check(staged_exe, version) {
+        let _ = fs::remove_file(staged_exe);
+        crate::update_trust::remove_stage_record(staged_exe);
+        record_handoff_failure(
+            version,
+            format!("staged_binary_self_check failed for {version}, staged exe removed"),
         );
         return false;
     }
