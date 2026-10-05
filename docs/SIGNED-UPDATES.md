@@ -104,11 +104,15 @@ gh release upload v0.1.200 ./agentplug-runner-windows-x64.exe.sig --repo AnEntry
 
 CI holds no private key, so it cannot produce a signature -- it only attaches
 one. `release.yml` reads a committed `release-signatures/manifest.json`
-(`{"entries": [<doc>, ...]}`) and, for each built asset whose name and sha256
-match an entry there, writes that entry out as `<asset>.sig` before publishing.
-An asset with no matching entry still publishes, unsigned, under a `::notice`.
-Produce the manifest entries offline with `agentplug-sign sign` as above, then
-commit them to `main`.
+(`{"entries": [<doc>, ...]}`) and requires exactly one well-formed document for
+every built runner asset. The document must name that asset, the release version,
+and its exact sha256, have schema version 1, a non-negative integer sequence, and
+at least one complete ed25519 signature. CI verifies every document against
+`release-signatures/trusted-keys.json` with the same acceptance logic used by the
+runner. A missing, duplicate, malformed, mismatched, or untrusted entry fails the
+release before any asset is published. Produce the manifest entries offline with
+`agentplug-sign sign` as above, add the offline signer's public key to that trust
+file, then commit the manifest and trust file to `main`.
 
 ## Verifying locally
 
