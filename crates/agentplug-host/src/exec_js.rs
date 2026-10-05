@@ -42,6 +42,13 @@ fn exec_path_dirs() -> Vec<PathBuf> {
     if let Some(login) = login_shell_path() {
         dirs.extend(std::env::split_paths(&login).filter(|dir| !dir.as_os_str().is_empty()));
     }
+    let cargo_bin = std::env::var_os("CARGO_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cargo")))
+        .map(|home| home.join("bin"));
+    if let Some(cargo_bin) = cargo_bin.filter(|dir| dir.is_dir()) {
+        dirs.push(cargo_bin);
+    }
     dirs.extend(
         [
             "/config/tools",
@@ -157,9 +164,7 @@ pub fn run(code: &str, opts: &Value, cwd: &Path) -> Value {
     }
     #[cfg(windows)]
     {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        command.creation_flags(CREATE_NO_WINDOW);
+        crate::windowless::apply_windowless(&mut command);
     }
     let spawn = command.spawn();
 
