@@ -466,6 +466,141 @@ fn holds_heartbeat_authority() -> bool {
     }
 }
 
+fn intentional_exit_path() -> PathBuf {
+    install_dir().join("daemon-intentional-exit.json")
+}
+
+pub fn mark_intentional_exit(kind: &str) {
+    let path = intentional_exit_path();
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let payload = serde_json::json!({ "ts": now_ms(), "pid": std::process::id(), "kind": kind });
+    let _ = fs::write(&path, payload.to_string());
+}
+
+fn intentional_exit_marker_age_ms() -> Option<u64> {
+    fs::read_to_string(intentional_exit_path())
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .and_then(|v| v.get("ts").and_then(|t| t.as_u64()))
+        .map(|ts| now_ms().saturating_sub(ts))
+}
+
+fn guard_lock_path() -> PathBuf {
+    install_dir().join("daemon-guard.lock")
+}
+
+fn live_guard_pid() -> Option<u64> {
+    let pid = fs::read_to_string(guard_lock_path()).ok()?.trim().parse::<u64>().ok()?;
+    if pid == std::process::id() as u64 {
+        return None;
+    }
+    if pid_is_alive(pid) { Some(pid) } else { None }
+}
+
+fn claim_guard_lock() -> bool {
+    if live_guard_pid().is_some() {
+        return false;
+    }
+    let path = guard_lock_path();
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let tmp = path.with_extension(format!("lock.tmp.{}", std::process::id()));
+    if fs::write(&tmp, std::process::id().to_string()).is_err() {
+        return false;
+    }
+    if fs::rename(&tmp, &path).is_err() {
+        let _ = fs::remove_file(&tmp);
+        return false;
+    }
+    fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        == Some(std::process::id() as u64)
+}
+
+pub fn ensure_daemon_guard() {
+    if live_guard_pid().is_some() {
+        return;
+    }
+    let exe = match std::env::current_exe() {
+        Ok(exe) => exe,
+        Err(e) => {
+            eprintln!("[agentplug daemon] guard not armed: own exe path unavailable ({e})");
+            return;
+        }
+    };
+    if let Err(e) = spawn_detached(&exe, &["daemon-guard"]) {
+        eprintln!("[agentplug daemon] guard not armed: spawning it failed ({e})");
+        return;
+    }
+    eprintln!(
+        "[agentplug daemon] guard armed: a heartbeat that stops without an intentional-exit marker is restarted automatically"
+    );
+}
+
+const GUARD_POLL_MS: u64 = 2_000;
+const GUARD_START_WAIT_MS: u64 = 45_000;
+const GUARD_MAX_RESTARTS: u32 = 20;
+const INTENTIONAL_EXIT_HONOR_MS: u64 = 10_000;
+
+pub fn run_daemon_guard() -> anyhow::Result<()> {
+    if !claim_guard_lock() {
+        eprintln!("[agentplug daemon-guard] a guard is already live -- exiting");
+        return Ok(());
+    }
+    eprintln!(
+        "[agentplug daemon-guard] pid {} watching the shared daemon heartbeat",
+        std::process::id()
+    );
+    let mut restarts = 0u32;
+    loop {
+        std::thread::sleep(Duration::from_millis(GUARD_POLL_MS));
+        if is_daemon_fresh() {
+            continue;
+        }
+        if let Some(age) = intentional_exit_marker_age_ms() {
+            if age < INTENTIONAL_EXIT_HONOR_MS {
+                eprintln!(
+                    "[agentplug daemon-guard] daemon stopped by design (intentional-exit marker {age}ms old) -- standing down; the next dispatch starts a fresh daemon"
+                );
+                let _ = fs::remove_file(intentional_exit_path());
+                return Ok(());
+            }
+        }
+        if restarts >= GUARD_MAX_RESTARTS {
+            eprintln!(
+                "[agentplug daemon-guard] gave up after {restarts} restart attempt(s) -- exiting so a later daemon boot arms a fresh guard"
+            );
+            return Ok(());
+        }
+        restarts += 1;
+        clear_wasted_daemon_start_backoff();
+        eprintln!(
+            "[agentplug daemon-guard] daemon heartbeat is stale with no intentional-exit marker -- restarting it (attempt {restarts}/{GUARD_MAX_RESTARTS})"
+        );
+        if let Err(e) = spawn_detached_daemon() {
+            eprintln!("[agentplug daemon-guard] restart attempt {restarts} could not spawn a daemon: {e}");
+            continue;
+        }
+        let mut became_fresh = false;
+        for _ in 0..(GUARD_START_WAIT_MS / 500) {
+            std::thread::sleep(Duration::from_millis(500));
+            if is_daemon_fresh() {
+                became_fresh = true;
+                break;
+            }
+        }
+        if !became_fresh {
+            eprintln!(
+                "[agentplug daemon-guard] restart attempt {restarts} published no heartbeat within {GUARD_START_WAIT_MS}ms -- retrying"
+            );
+        }
+    }
+}
+
 pub fn ensure_daemon_running() -> anyhow::Result<bool> {
     if is_daemon_fresh() {
         return Ok(true);
@@ -2225,7 +2360,7 @@ impl Drop for IdleInDirWatch {
     }
 }
 
-fn project_has_pending_dispatch_work(root: &Path) -> bool {
+fn project_has_queued_spool_work(root: &Path) -> bool {
     let pd_in = root.join(".agentplug").join("plugin-dispatch").join("in");
     if let Ok(plugin_dirs) = fs::read_dir(&pd_in) {
         for plugin_entry in plugin_dirs.flatten() {
@@ -2238,7 +2373,46 @@ fn project_has_pending_dispatch_work(root: &Path) -> bool {
         }
     }
     let gm_in = root.join(".gm").join("exec-spool").join("in");
-    project_in_flight_count(root) < MAX_CLAIMED_DISPATCHES_PER_PROJECT && dir_has_any_verb_subdir_with_claimable_request(&gm_in, true)
+    dir_has_any_verb_subdir_with_claimable_request(&gm_in, true)
+}
+
+// The daemon asks this for every known root several times per pass, and each
+// uncached answer is a full recursive enumeration of the spool's verb dirs, so
+// an uncached pass over the whole registry is throttled by directory reads
+// instead of by work. One answer per root per TTL is indistinguishable to a
+// submitter: the file it just wrote is seen within one TTL.
+const SPOOL_WORK_CACHE_TTL: Duration = Duration::from_millis(200);
+
+fn spool_work_cache() -> &'static Mutex<HashMap<PathBuf, (Instant, bool)>> {
+    static SLOT: OnceLock<Mutex<HashMap<PathBuf, (Instant, bool)>>> = OnceLock::new();
+    SLOT.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn project_has_queued_spool_work_cached(root: &Path) -> bool {
+    let now = Instant::now();
+    let fresh = spool_work_cache()
+        .lock()
+        .ok()
+        .and_then(|cache| cache.get(root).copied())
+        .filter(|(at, _)| now.saturating_duration_since(*at) < SPOOL_WORK_CACHE_TTL)
+        .map(|(_, value)| value);
+    if let Some(value) = fresh {
+        return value;
+    }
+    let value = project_has_queued_spool_work(root);
+    if let Ok(mut cache) = spool_work_cache().lock() {
+        cache.insert(root.to_path_buf(), (Instant::now(), value));
+    }
+    value
+}
+
+// Dispatchable now: queued AND this project still has a claim slot. A project
+// sitting at its cap has work the daemon cannot start this instant, which is
+// what the idle wait tests -- but it must never make the project look idle for
+// the purposes of scheduling, or its queued files wait behind every other root
+// in the registry for as long as the cap stays full.
+fn project_has_pending_dispatch_work(root: &Path) -> bool {
+    project_in_flight_count(root) < MAX_CLAIMED_DISPATCHES_PER_PROJECT && project_has_queued_spool_work_cached(root)
 }
 
 fn dispatch_project(root: &Path, project: &mut ProjectPlugins, plugin_modules: &PluginModules) -> bool {
@@ -2258,7 +2432,10 @@ fn dispatch_project(root: &Path, project: &mut ProjectPlugins, plugin_modules: &
     let in_dir_scan = fs::read_dir(&in_dir);
     let in_dir_existed = in_dir_scan.is_ok();
     let mut claimable: Vec<(std::time::SystemTime, String, PathBuf)> = Vec::new();
-    if let Ok(entries) = in_dir_scan {
+    // The expensive part of a pass over the registry is enumerating every verb
+    // dir of every root; a root the cache says has nothing queued has nothing to
+    // claim in any of them, and the cache is re-read one TTL later.
+    if let (true, Ok(entries)) = (project_has_queued_spool_work_cached(root), in_dir_scan) {
         for verb_entry in entries.flatten() {
             if !verb_entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
                 continue;
@@ -2762,6 +2939,8 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
         now_ms()
     );
 
+    ensure_daemon_guard();
+
     let daemon_cfg = DaemonConfig::load();
     let registry_poll_interval = daemon_cfg.registry_poll_interval();
     let heartbeat_interval = daemon_cfg.heartbeat_interval();
@@ -2920,8 +3099,14 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
 
         const BROWSER_ORPHAN_SWEEP_INTERVAL_LONGER_THAN_REGISTRY_POLL_MS: u64 = 5 * 60 * 1000;
         if last_browser_orphan_sweep.elapsed() >= Duration::from_millis(BROWSER_ORPHAN_SWEEP_INTERVAL_LONGER_THAN_REGISTRY_POLL_MS) {
-            last_browser_orphan_sweep = Instant::now();
-            agentplug_host::reap_idle_sessions_and_os_orphans_across_every_known_project_root(&known_roots);
+            // Housekeeping walks every known root; claiming walks it first. Defer
+            // the walk one tick whenever anything is queued rather than making a
+            // submitted dispatch wait behind it.
+            let dispatch_backlog_before_housekeeping = known_roots.iter().any(|root| project_has_queued_spool_work_cached(root));
+            if !dispatch_backlog_before_housekeeping {
+                last_browser_orphan_sweep = Instant::now();
+                agentplug_host::reap_idle_sessions_and_os_orphans_across_every_known_project_root(&known_roots);
+            }
         }
 
         let max_concurrent_projects = daemon_cfg.max_concurrent_projects();
@@ -2979,15 +3164,15 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
             match projects.remove(root) {
                 Some(p) => {
                     all_projects.push((root.clone(), p));
-                    is_genuinely_active.push(project_has_pending_dispatch_work(root));
+                    is_genuinely_active.push(project_has_queued_spool_work_cached(root));
                 }
                 None if sweep_cold_this_tick
                     || roots_new_this_registry_poll.contains(root)
-                    || project_has_pending_dispatch_work(root) =>
+                    || project_has_queued_spool_work_cached(root) =>
                 {
                     all_projects.push((root.clone(), ProjectPlugins::new(root.clone())));
                     is_genuinely_active.push(
-                        roots_new_this_registry_poll.contains(root) || project_has_pending_dispatch_work(root),
+                        roots_new_this_registry_poll.contains(root) || project_has_queued_spool_work_cached(root),
                     );
                 }
                 None => skipped_cold += 1,
@@ -3063,6 +3248,7 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
         if heartbeat_authority_lost() {
             agentplug_host::close_all_sessions();
             eprintln!("[agentplug daemon] heartbeat authority held by another daemon -- exiting after finishing in-flight batch");
+            mark_intentional_exit("heartbeat-authority-lost");
             return Ok(());
         }
         let evict_before = Instant::now().checked_sub(Duration::from_millis(daemon_cfg.project_idle_evict_ms())).unwrap_or_else(Instant::now);
@@ -3072,8 +3258,21 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
             projects.remove(&root);
         }
 
+        // The update polls are synchronous network calls on this thread, and this
+        // thread is the only thing that claims spool requests: an unreachable or
+        // slow endpoint stalls every queued dispatch in every project for as long
+        // as it takes to give up. Poll when nothing is queued, and force the poll
+        // through anyway once it is badly overdue so a permanently busy daemon
+        // still updates.
+        let dispatch_backlog = known_roots.iter().any(|root| project_has_pending_dispatch_work(root));
+        const UPDATE_POLL_MAX_DEFERRAL: Duration = Duration::from_secs(600);
+        let plugin_poll_overdue = last_plugin_update_poll.elapsed() >= UPDATE_POLL_MAX_DEFERRAL;
+        let runner_poll_overdue = last_runner_update_poll.elapsed() >= UPDATE_POLL_MAX_DEFERRAL;
+
         let forced_refresh_request = take_forced_plugin_refresh_request();
-        if last_plugin_update_poll.elapsed() >= shortest_plugin_poll_interval || forced_refresh_request.is_some() {
+        if (last_plugin_update_poll.elapsed() >= shortest_plugin_poll_interval || forced_refresh_request.is_some())
+            && (!dispatch_backlog || plugin_poll_overdue || forced_refresh_request.is_some())
+        {
             last_plugin_update_poll = Instant::now();
             let poll_ts = now_ms();
             HEARTBEAT_LAST_PLUGIN_POLL_TS.store(poll_ts, std::sync::atomic::Ordering::Relaxed);
@@ -3112,7 +3311,15 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
             record_plugin_poll_error(if cycle_errors.is_empty() { None } else { Some(cycle_errors.join("; ")) });
         }
 
-        if first_runner_poll_pending || last_runner_update_poll.elapsed() >= runner_update_poll_interval || take_forced_runner_refresh_request() {
+        let forced_runner_refresh =
+            if first_runner_poll_pending || last_runner_update_poll.elapsed() >= runner_update_poll_interval {
+                false
+            } else {
+                take_forced_runner_refresh_request()
+            };
+        if (first_runner_poll_pending || last_runner_update_poll.elapsed() >= runner_update_poll_interval || forced_runner_refresh)
+            && (!dispatch_backlog || runner_poll_overdue || first_runner_poll_pending || forced_runner_refresh)
+        {
             first_runner_poll_pending = false;
             last_runner_update_poll = Instant::now();
             let poll_ts = now_ms();
@@ -3183,6 +3390,7 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
                         "[agentplug daemon] handed off to version {version} -- re-queued {requeued} of {} inherited claim(s) for the incoming daemon, exiting",
                         claims_the_successor_inherits.len()
                     );
+                    mark_intentional_exit("runner-handoff");
                     return Ok(());
                 }
                 clear_handoff_inherited_claims();
@@ -3241,6 +3449,7 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
                 "[agentplug daemon] self-recycling after {}ms fully idle -- reclaims shared-plugin peak wasm memory (monotonic linear memory, no in-place shrink); next real dispatch spawns a fresh process",
                 SELF_RECYCLE_IDLE_MS
             );
+            mark_intentional_exit("self-recycle");
             return Ok(());
         }
 
