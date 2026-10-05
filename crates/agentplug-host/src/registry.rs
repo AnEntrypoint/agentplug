@@ -227,6 +227,7 @@ pub enum SlotContentSnapshot {
 pub struct SharedPluginPool {
     plugin_name: String,
     slots: Vec<Arc<Mutex<Option<SiblingHandle>>>>,
+    last_observed_slot_hashes: Mutex<Vec<Option<String>>>,
     hashes_to_evict_when_their_in_flight_dispatch_completes: Mutex<std::collections::HashSet<String>>,
     ticket_queue: Mutex<TicketQueue>,
     slot_released: Condvar,
