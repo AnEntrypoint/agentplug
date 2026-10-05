@@ -696,6 +696,20 @@ async function main() {
       sess.close();
       process.exit(0);
     }
+    if (mode === 'cdpraw') {
+      const results = [];
+      for (const block of script.split(/\r?\n(?=cdp )/)) {
+        const text = block.replace(/^cdp /, '');
+        const newline = text.indexOf('\n');
+        const method = (newline < 0 ? text : text.slice(0, newline)).trim();
+        const rawParams = newline < 0 ? '' : text.slice(newline + 1).trim();
+        const params = rawParams ? JSON.parse(rawParams) : {};
+        results.push(await sess.send(method, params));
+      }
+      writeResult({ result: results.length === 1 ? results[0] : results });
+      sess.close();
+      process.exit(0);
+    }
     const instrumented = mode === 'capture' || mode === 'profile' || mode === 'trace';
     if (instrumented) await sess.send('Runtime.enable', {});
     await sess.send('Page.enable', {});
