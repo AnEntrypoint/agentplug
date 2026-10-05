@@ -1163,23 +1163,38 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
                             timed_out = true;
                             break;
                         }
-                    }
-                    let (stdout, out_trunc_read) = out_handle.and_then(|h| h.join().ok()).unwrap_or_default();
-                    let (stderr, _err_trunc) = err_handle.and_then(|h| h.join().ok()).unwrap_or_default();
-                    if timed_out {
-                        serde_json::json!({
-                            "stdout": String::from_utf8_lossy(&stdout),
-                            "stderr": format!("git {argv:?} timed out after {timeout_ms}ms, killed"),
-                            "exit_code": -1,
-                        })
-                    } else {
-                        serde_json::json!({
-                            "stdout": String::from_utf8_lossy(&stdout),
-                            "stderr": String::from_utf8_lossy(&stderr),
-                            "exit_code": if cap_stopped { 0 } else { exit_code },
-                            "stdout_truncated": out_trunc_read || cap_stopped,
-                        })
-                    }
+                        }
+                        let (stdout, out_trunc_read) =
+                            out_handle.and_then(|h| h.join().ok()).unwrap_or_default();
+                        let (stderr, err_trunc_read) =
+                            err_handle.and_then(|h| h.join().ok()).unwrap_or_default();
+                        let output_truncated = out_trunc_read || err_trunc_read || cap_stopped;
+                        let stderr = String::from_utf8_lossy(&stderr);
+                        let output_limit_error =
+                            format!("git {argv:?} output exceeded the host capture limit");
+                        if timed_out {
+                            serde_json::json!({
+                                "stdout": String::from_utf8_lossy(&stdout),
+                                "stderr": format!("git {argv:?} timed out after {timeout_ms}ms, killed"),
+                                "exit_code": -1,
+                            })
+                        } else {
+                            serde_json::json!({
+                                "stdout": String::from_utf8_lossy(&stdout),
+                                "stderr": if output_truncated {
+                                    if stderr.is_empty() {
+                                        output_limit_error
+                                    } else {
+                                        format!("{stderr}\n{output_limit_error}")
+                                    }
+                                } else {
+                                    stderr.into_owned()
+                                },
+                                "exit_code": if output_truncated { -1 } else { exit_code },
+                                "stdout_truncated": out_trunc_read,
+                                "stderr_truncated": err_trunc_read,
+                            })
+                        }
                 }
                 Err(e) => serde_json::json!({"stdout": "", "stderr": e.to_string(), "exit_code": 1}),
             };
