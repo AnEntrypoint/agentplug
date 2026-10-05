@@ -1,11 +1,13 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io::Write;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+use fs2::FileExt;
 use wasmtime::{Engine, Module, Trap};
 
 use agentplug_host::{
@@ -859,71 +861,35 @@ fn pid_is_alive(pid: u64) -> bool {
 const SPOOL_LAUNCHER_HARD_DEADLINE: Duration = Duration::from_secs(90);
 
 pub fn claim_spool_launcher_slot(spool_dir: &Path) -> bool {
+    static SLOT: OnceLock<Mutex<Option<fs::File>>> = OnceLock::new();
+    let Ok(mut held) = SLOT.get_or_init(|| Mutex::new(None)).lock() else {
+        return false;
+    };
+    if held.is_some() {
+        return true;
+    }
     let slot = spool_dir.join(".spool-launcher.pid");
-    let me = std::process::id() as u64;
-    if let Some(holder) = fs::read_to_string(&slot)
-        .ok()
-        .and_then(|s| s.trim().parse::<u64>().ok())
+    let Ok(mut file) = fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(slot)
+    else {
+        return false;
+    };
+    if file.try_lock_exclusive().is_err() {
+        return false;
+    }
+    if file.set_len(0).is_err()
+        || file
+            .write_all(std::process::id().to_string().as_bytes())
+            .is_err()
     {
-        if holder != me && pid_is_alive(holder) {
-            return false;
-        }
-    }
-    let tmp = slot.with_extension(format!("pid.tmp.{me}"));
-    if fs::write(&tmp, me.to_string()).is_err() {
+        let _ = file.unlock();
         return false;
     }
-    if fs::rename(&tmp, &slot).is_err() {
-        let _ = fs::remove_file(&tmp);
-        return false;
-    }
-    fs::read_to_string(&slot)
-        .ok()
-        .and_then(|s| s.trim().parse::<u64>().ok())
-        == Some(me)
-}
-
-// One standalone watcher per project spool. Without this a second watcher on
-// the same project starts sweeping while the first is still dispatching: each
-// one's orphan sweep then answers `dispatch_orphaned` for the other's running
-// work and deletes the claim under it, which is the rotating-`sweeping_pid`
-// orphan storm. The slot is pid-liveness checked, not just present, so a crash
-// leaves the project reclaimable.
-pub fn claim_standalone_watcher_slot(spool_dir: &Path) -> bool {
-    let slot = spool_dir.join(".standalone-watcher.pid");
-    let me = std::process::id() as u64;
-    if let Some(holder) = fs::read_to_string(&slot)
-        .ok()
-        .and_then(|s| s.trim().parse::<u64>().ok())
-    {
-        if holder != me && pid_is_alive(holder) {
-            return false;
-        }
-    }
-    let tmp = slot.with_extension(format!("pid.tmp.{me}"));
-    if fs::write(&tmp, me.to_string()).is_err() {
-        return false;
-    }
-    if fs::rename(&tmp, &slot).is_err() {
-        let _ = fs::remove_file(&tmp);
-        return false;
-    }
-    fs::read_to_string(&slot)
-        .ok()
-        .and_then(|s| s.trim().parse::<u64>().ok())
-        == Some(me)
-}
-
-pub fn release_standalone_watcher_slot(spool_dir: &Path) {
-    let slot = spool_dir.join(".standalone-watcher.pid");
-    let me = std::process::id() as u64;
-    if fs::read_to_string(&slot)
-        .ok()
-        .and_then(|s| s.trim().parse::<u64>().ok())
-        == Some(me)
-    {
-        let _ = fs::remove_file(&slot);
-    }
+    *held = Some(file);
+    true
 }
 
 pub fn arm_spool_launcher_deadline() {
@@ -1730,27 +1696,6 @@ fn dream_rsi_count_observations(dream_rsi_dir: &Path) -> u64 {
     total
 }
 
-/// Dream-RSI cycle trigger: observes `.gm/dream-rsi/*/observations.json`
-/// counts already written by ordinary gm session dispatches (see
-/// `.gm/next-step.md`'s "Grounded Dream-RSI replay" section) and, once
-/// `DREAM_RSI_MIN_NEW_OBSERVATIONS_PER_CYCLE` new observations have
-/// accumulated since the last fired cycle (and at least
-/// `DREAM_RSI_MIN_CYCLE_SPACING_MS` has elapsed), writes one real
-/// `dreamrsi-replay` spool dispatch (`rs-plugkit`'s
-/// `orchestrator::dream_rsi::handle_replay`, registered in
-/// `orchestrator/mod.rs`) for the project's own wasm plugin to pick up.
-///
-/// `dreamrsi-replay` is read-only: it scores the incumbent policy against
-/// the live discovery tree and returns the result, writing nothing. This
-/// trigger deliberately never dispatches `dreamrsi-select`, because that
-/// verb's current implementation (`handle_select`) writes
-/// `active-strategy.json` directly -- an unattended call would be exactly
-/// the autonomous redeploy `.gm/next-step.md`'s "Grounded Dream-RSI replay"
-/// section forbids ("deploy an accepted strategy only through the normal
-/// PRD, mutable, phase, authorization, and evidence paths"). Promoting this
-/// trigger to call `dreamrsi-select` (or any future authorization-gated
-/// propose-only verb the sibling `dreamrsi-offline-scoring-and-selection`
-/// PRD row may add) is a future row's decision, not this one's.
 fn dream_rsi_maybe_dispatch_cycle(root: &Path, spool_dir: &Path) {
     let dream_rsi_dir = root.join(".gm").join("dream-rsi");
     if !dream_rsi_dir.exists() {
@@ -2036,8 +1981,6 @@ fn record_handoff_failure(version: &str, reason: String) {
     } else {
         slot.1 += 1;
     }
-    // Escalate exactly once per version: rewriting the marker on every later failure would reset
-    // since_ts and re-surface the block on every dispatch until the daemon restarts.
     if slot.1 != HANDOFF_ESCALATION_THRESHOLD {
         return;
     }
@@ -2543,10 +2486,6 @@ fn take_forced_runner_refresh_request() -> bool {
     } else {
         false
     }
-}
-
-pub fn shared_daemon_is_serving() -> bool {
-    is_daemon_fresh()
 }
 
 const FOREIGN_SWEEPER_STALE_MS: u64 = 120_000;
@@ -3270,15 +3209,8 @@ impl IdleInDirWatch {
         }
     }
 
-    // WaitForMultipleObjects takes at most MAXIMUM_WAIT_OBJECTS (64) handles,
-    // so a registry with more watched in/ dirs than that is waited on in chunks.
-    // Every chunk gets its own slice of the deadline, so every root stays
-    // covered by a notification and a change in any chunk wakes the wait early.
     const WAIT_CHUNK_HANDLES: usize = 64;
 
-    // Blocks until one of the watched in/ dirs changes or `cap` elapses.
-    // Returns true when a change woke it and false when the cap ran out, so the
-    // caller can tell "nothing happened" from "something may have appeared".
     fn wait(&self, cap: Duration) -> bool {
         use windows_sys::Win32::Storage::FileSystem::FindNextChangeNotification;
         use windows_sys::Win32::System::Threading::WaitForMultipleObjects;
@@ -3287,12 +3219,6 @@ impl IdleInDirWatch {
             return false;
         }
         const WAIT_OBJECT_0: u32 = 0;
-        // Every chunk gets its own slice of the deadline. Waiting each chunk
-        // against the FULL remaining deadline let the first chunk consume all
-        // of it, so a change in a later chunk could never wake the wait early
-        // -- the documented "a change in any chunk wakes the whole wait" only
-        // held for the first chunk, and every other root was seen a whole cap
-        // late.
         let chunks: Vec<&[(PathBuf, windows_sys::Win32::Foundation::HANDLE)]> =
             self.entries.chunks(Self::WAIT_CHUNK_HANDLES).collect();
         let per_chunk_ms = (cap.as_millis() as u64 / chunks.len() as u64).max(1);
@@ -3327,16 +3253,9 @@ impl Drop for IdleInDirWatch {
     }
 }
 
-// Arm the in/ dir watch (a no-op once the watched set already matches `roots`)
-// and block until one of those dirs changes or `cap` elapses. Shared by the
-// busy and the idle cadence of the main loop so neither can fall through with
-// no wait at all. A woken wait invalidates every cached "nothing queued"
-// verdict, since all of them predate the change that woke us.
 #[cfg(windows)]
 fn wait_for_in_dir_change(watch: &mut IdleInDirWatch, roots: &[PathBuf], cap: Duration) {
     watch.sync(roots);
-    // Arming is itself a pass over the roots. Work that appeared during it must
-    // be served by the next pass now, not slept past.
     if roots
         .iter()
         .any(|root| project_has_pending_dispatch_work(root))
@@ -3370,11 +3289,6 @@ fn project_has_queued_spool_work(root: &Path) -> bool {
     dir_has_any_verb_subdir_with_claimable_request(&gm_in, true)
 }
 
-// The daemon asks this for every known root several times per pass, and each
-// uncached answer is a full recursive enumeration of the spool's verb dirs, so
-// an uncached pass over the whole registry is throttled by directory reads
-// instead of by work. One answer per root per TTL is indistinguishable to a
-// submitter: the file it just wrote is seen within one TTL.
 const SPOOL_WORK_CACHE_TTL: Duration = Duration::from_millis(200);
 
 fn spool_work_cache() -> &'static Mutex<HashMap<PathBuf, (Instant, bool)>> {
@@ -3400,11 +3314,6 @@ fn project_has_queued_spool_work_cached(root: &Path) -> bool {
     value
 }
 
-// Dispatchable now: queued AND this project still has a claim slot. A project
-// sitting at its cap has work the daemon cannot start this instant, which is
-// what the idle wait tests -- but it must never make the project look idle for
-// the purposes of scheduling, or its queued files wait behind every other root
-// in the registry for as long as the cap stays full.
 fn project_has_pending_dispatch_work(root: &Path) -> bool {
     project_in_flight_count(root) < MAX_CLAIMED_DISPATCHES_PER_PROJECT
         && project_has_queued_spool_work_cached(root)
@@ -3431,9 +3340,6 @@ fn dispatch_project(
     let in_dir_scan = fs::read_dir(&in_dir);
     let in_dir_existed = in_dir_scan.is_ok();
     let mut claimable: Vec<(std::time::SystemTime, String, PathBuf)> = Vec::new();
-    // The expensive part of a pass over the registry is enumerating every verb
-    // dir of every root; a root the cache says has nothing queued has nothing to
-    // claim in any of them, and the cache is re-read one TTL later.
     if let (true, Ok(entries)) = (project_has_queued_spool_work_cached(root), in_dir_scan) {
         for verb_entry in entries.flatten() {
             if !verb_entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
@@ -4250,12 +4156,6 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
     const SELF_RECYCLE_IDLE_MS: u64 = 60 * 60 * 1000;
     let mut last_any_dispatch = Instant::now();
 
-    // A pass over the registry that finds nothing is pure directory
-    // enumeration, and with a large registry that enumeration IS the daemon's
-    // idle cost -- so such a pass sleeps progressively longer, up to
-    // IDLE_WAIT_MAX_MS. The sleep is a WaitForMultipleObjects over every
-    // watched project's in/ dir, so a dispatch written while it sleeps wakes
-    // it immediately; the cap only bounds how often the periodic polls run.
     const IDLE_WAIT_MIN_MS: u64 = 25;
     const IDLE_WAIT_MAX_MS: u64 = 1_000;
     let mut idle_wait_ms = IDLE_WAIT_MIN_MS;
@@ -4737,22 +4637,6 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
             .iter()
             .any(|root| project_has_pending_dispatch_work(root));
         if any_work || pending_work_exists_before_idle_wait {
-            // Work is running or is waiting on a claim slot: keep the registry
-            // scan at its fastest cadence so a claimable file is seen within
-            // one cache TTL of being written.
-            //
-            // "Fastest cadence" still has to be a cadence. This branch used to
-            // assign `idle_wait_ms` and then fall out of the loop without ever
-            // waiting on it, so any pass that did work -- or any root that
-            // reported pending work it could not actually claim (a stale
-            // .inflight, or a project pinned at
-            // MAX_CLAIMED_DISPATCHES_PER_PROJECT) -- ran the whole registry
-            // scan as an unbounded spin. On a registry of hundreds of roots
-            // that scan is mostly directory enumeration, so it shows up as
-            // near-core CPU with almost all of it in kernel time and no
-            // dispatch in flight. The wait is the same event-driven one the
-            // idle branch uses, so a dispatch written during it still wakes
-            // the next pass immediately.
             idle_wait_ms = IDLE_WAIT_MIN_MS;
             #[cfg(windows)]
             wait_for_in_dir_change(
