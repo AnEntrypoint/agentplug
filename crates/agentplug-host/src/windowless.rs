@@ -22,6 +22,7 @@ const STD_OUTPUT_HANDLE: u32 = 0xFFFF_FFF5;
 #[cfg(windows)]
 const STD_ERROR_HANDLE: u32 = 0xFFFF_FFF4;
 
+#[cfg(windows)]
 pub fn has_console() -> bool {
     #[cfg(windows)]
     {
