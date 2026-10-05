@@ -1366,6 +1366,8 @@ fn pending_store_swaps_by_plugin() -> serde_json::Map<String, serde_json::Value>
 }
 
 fn write_daemon_heartbeat(project_count: usize, plugin_module_count: usize) {
+    static NEXT_HEARTBEAT_WRITE: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
     let last_plugin_poll_ts =
         HEARTBEAT_LAST_PLUGIN_POLL_TS.load(std::sync::atomic::Ordering::Relaxed);
     let last_runner_poll_ts =
@@ -1437,9 +1439,8 @@ fn write_daemon_heartbeat(project_count: usize, plugin_module_count: usize) {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .clone();
-    let _ = fs::write(
-        daemon_status_path(),
-        serde_json::json!({
+    let status_path = daemon_status_path();
+    let payload = serde_json::json!({
             "pid": std::process::id(),
             "ts": now_ms(),
             "daemon_boot_ts": if boot_ts == 0 { serde_json::Value::Null } else { serde_json::json!(boot_ts) },
@@ -1463,9 +1464,17 @@ fn write_daemon_heartbeat(project_count: usize, plugin_module_count: usize) {
             "runner_update_trust_mode": crate::update_trust::runner_mode_str(),
             "runner_signature_required": crate::update_trust::strict_mode(),
             "runner_unverified_update": crate::update_trust::unverified_promotion().unwrap_or(serde_json::Value::Null),
-        })
-        .to_string(),
-    );
+    })
+    .to_string();
+    let temp_path = status_path.with_extension(format!(
+        "json.tmp.{}.{}",
+        std::process::id(),
+        NEXT_HEARTBEAT_WRITE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    if fs::write(&temp_path, payload).is_ok() && fs::rename(&temp_path, &status_path).is_ok() {
+        return;
+    }
+    let _ = fs::remove_file(temp_path);
 }
 
 fn last_completed_runner_swap_path() -> PathBuf {
