@@ -3,6 +3,9 @@ include!(concat!(env!("OUT_DIR"), "/build_info.rs"));
 pub const RELEASE_RUNNER_ROOT_KEY_ID: &str = "release-20261006-2";
 pub const RELEASE_RUNNER_ROOT_PUBLIC_KEY: &str =
     "7e1e7cb128556b9e56810dd485f41d3015c65e17fbea6a8c4ad4e1d0275d64eb";
+pub const RELEASE_PLUGIN_ROOT_KEY_ID: &str = "plugin-release-20261006-1";
+pub const RELEASE_PLUGIN_ROOT_PUBLIC_KEY: &str =
+    "d05db5fea83309b98cb00d7532c05bf622050016a38321ddd917600f7baa97fe";
 
 #[derive(Clone)]
 pub struct Reported {
@@ -20,16 +23,24 @@ pub fn embedded_runner_root() -> (&'static str, &'static str) {
     (RELEASE_RUNNER_ROOT_KEY_ID, RELEASE_RUNNER_ROOT_PUBLIC_KEY)
 }
 
+pub fn embedded_plugin_root() -> (&'static str, &'static str) {
+    (RELEASE_PLUGIN_ROOT_KEY_ID, RELEASE_PLUGIN_ROOT_PUBLIC_KEY)
+}
+
 pub fn document() -> serde_json::Value {
     serde_json::json!({
         "version": env!("CARGO_PKG_VERSION"),
         "commit": COMMIT,
         "build_ts": BUILD_TS,
         "release_build": RELEASE_BUILD,
-        "embedded_runner_root": {
-            "id": RELEASE_RUNNER_ROOT_KEY_ID,
-            "public_key": RELEASE_RUNNER_ROOT_PUBLIC_KEY,
-        },
+            "embedded_runner_root": {
+                "id": RELEASE_RUNNER_ROOT_KEY_ID,
+                "public_key": RELEASE_RUNNER_ROOT_PUBLIC_KEY,
+            },
+            "embedded_plugin_root": {
+                "id": RELEASE_PLUGIN_ROOT_KEY_ID,
+                "public_key": RELEASE_PLUGIN_ROOT_PUBLIC_KEY,
+            },
     })
 }
 
