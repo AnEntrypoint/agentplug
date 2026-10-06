@@ -18,6 +18,10 @@ the `agentplug-host` imports, and `agentplug-trust`. Work on `main` as GitHub us
 - Keep signing material only in the protected CI environment. Bind each signature to the immutable
   source revision that built its artifact, and publish a release only after every expected asset and
   signature is present.
+- Canonical runner promotion atomically persists the staging receipt beside the promoted binary
+  and rechecks its artifact, version, bytes and signature before re-exec. Receipt or verification
+  failure keeps the permitted staged daemon serving. Preserve the authoritative checker’s explicit
+  `warn`/`off` policies; only `off` allows an absent receipt, never enforced signature mode.
 - A discovered same-user GitHub CLI credential directory is shared with Git and execution child
   processes through `GH_CONFIG_DIR`; an explicit inherited directory takes precedence. Git uses
   the transient `gh auth git-credential` helper. Never export, copy, print, or persist its token.
@@ -64,6 +68,9 @@ the `agentplug-host` imports, and `agentplug-trust`. Work on `main` as GitHub us
 - Every subprocess has a bounded wall-clock deadline and tree cleanup. Keep stdout/stderr draining
   concurrent with child execution, and keep oversized dispatch results in a spill file rather than
   an unbounded JSON reply.
+- Foreground execution waits at most 50 ms for both output drains after child exit, capped by the
+  remaining execution deadline. Unfinished readers transfer to task ownership; they do not prove a
+  descendant holds a pipe.
 - Default JavaScript results use the last sentinel candidate followed by a complete JSON line;
   remove only that validated frame. Sentinel text inside returned strings or ordinary stdout
   must remain data, including when stdout has no preceding newline.
