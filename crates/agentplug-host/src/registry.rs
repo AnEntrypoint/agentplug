@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use wasmtime::{Engine, Linker, Module, Store};
 
@@ -108,6 +108,7 @@ pub fn read_plugin_lifecycle(plugin_name: &str) -> PluginFiberLifecycle {
 pub enum PluginDispatchError {
     NotRegistered { plugin_name: String },
     EvictedOrPoisoned { plugin_name: String },
+    AdmissionStarved { kind: &'static str, waited_ms: u64, limit: usize, in_flight: usize, slots: usize },
 }
 
 impl std::fmt::Display for PluginDispatchError {
@@ -119,11 +120,24 @@ impl std::fmt::Display for PluginDispatchError {
             PluginDispatchError::EvictedOrPoisoned { plugin_name } => {
                 write!(f, "plugin {plugin_name} slot was evicted after a prior dispatch error (poisoned Store) and could not be reinstantiated -- retry will attempt to reload it")
             }
+            PluginDispatchError::AdmissionStarved { kind, waited_ms, limit, in_flight, slots } => {
+                write!(f, "the {kind} admission gate was not entered within {waited_ms}ms -- {in_flight} dispatches already hold the {limit} admitted slots of {slots}; this dispatch was NOT executed and re-dispatching is safe")
+            }
         }
     }
 }
 
 impl std::error::Error for PluginDispatchError {}
+
+fn admission_starved_error(report: AdmissionWaitReport) -> PluginDispatchError {
+    PluginDispatchError::AdmissionStarved {
+        kind: report.kind,
+        waited_ms: report.waited_ms,
+        limit: report.limit,
+        in_flight: report.in_flight,
+        slots: report.slots,
+    }
+}
 
 fn log_poisoned_store_eviction_event(root: &Path, plugin_name: &str, verb: &str, reinstantiation_succeeded: bool, prior_dispatch_error: &str) {
     let log_path = root.join(".gm").join("exec-spool").join(".watcher.log");
@@ -290,6 +304,63 @@ impl Drop for BlockingDispatchAdmission {
     }
 }
 
+const ADMISSION_WAIT_MAX_MS_DEFAULT: u64 = 120_000;
+
+fn env_u64_or(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
+}
+
+pub fn admission_wait_max() -> Duration {
+    Duration::from_millis(env_u64_or("AGENTPLUG_ADMISSION_WAIT_MAX_MS", ADMISSION_WAIT_MAX_MS_DEFAULT))
+}
+
+pub struct AdmissionWaitReport {
+    pub kind: &'static str,
+    pub waited_ms: u64,
+    pub limit: usize,
+    pub in_flight: usize,
+    pub slots: usize,
+}
+
+#[derive(Clone, Copy)]
+pub struct AdmissionWaitState {
+    pub kind: &'static str,
+    pub since_ms: u64,
+    pub limit: usize,
+    pub in_flight: usize,
+}
+
+fn admission_waits_by_thread() -> &'static Mutex<HashMap<std::thread::ThreadId, AdmissionWaitState>> {
+    static WAITS: OnceLock<Mutex<HashMap<std::thread::ThreadId, AdmissionWaitState>>> = OnceLock::new();
+    WAITS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub fn admission_wait_state_for_thread(thread: std::thread::ThreadId) -> Option<AdmissionWaitState> {
+    admission_waits_by_thread()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&thread)
+        .copied()
+}
+
+fn mark_admission_wait(kind: &'static str, limit: usize, in_flight: usize) {
+    let mut waits = admission_waits_by_thread().lock().unwrap_or_else(|e| e.into_inner());
+    let thread = std::thread::current().id();
+    let since_ms = waits.get(&thread).map(|state| state.since_ms).unwrap_or_else(crate::now_ms);
+    waits.insert(thread, AdmissionWaitState { kind, since_ms, limit, in_flight });
+}
+
+fn clear_admission_wait() {
+    admission_waits_by_thread()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&std::thread::current().id());
+}
+
 impl SharedPluginPool {
     pub fn new(plugin_name: &str, size: usize) -> Self {
         let size = size.max(1);
@@ -320,50 +391,79 @@ impl SharedPluginPool {
     }
 
     pub fn admit_blocking(pool: &Arc<SharedPluginPool>, verb: &str) -> BlockingDispatchAdmission {
+        Self::admit_blocking_within(pool, verb, Duration::from_secs(86_400)).unwrap_or(BlockingDispatchAdmission { pool: None })
+    }
+
+    pub fn admit_blocking_within(pool: &Arc<SharedPluginPool>, verb: &str, max_wait: Duration) -> Result<BlockingDispatchAdmission, AdmissionWaitReport> {
         if !is_blocking_dispatch_verb(verb) || pool.slots.len() < 2 {
-            return BlockingDispatchAdmission { pool: None };
+            return Ok(BlockingDispatchAdmission { pool: None });
         }
         let limit = pool.blocking_admission_limit();
+        let start = Instant::now();
         loop {
-            let mut q = pool.ticket_queue.lock().unwrap_or_else(|e| e.into_inner());
-            if q.blocking_inflight < limit {
-                q.blocking_inflight += 1;
-                return BlockingDispatchAdmission { pool: Some(pool.clone()) };
+            {
+                let mut q = pool.ticket_queue.lock().unwrap_or_else(|e| e.into_inner());
+                if q.blocking_inflight < limit {
+                    q.blocking_inflight += 1;
+                    clear_admission_wait();
+                    return Ok(BlockingDispatchAdmission { pool: Some(pool.clone()) });
+                }
             }
+            let waited_ms = start.elapsed().as_millis() as u64;
+            let in_flight = pool.ticket_queue.lock().unwrap_or_else(|e| e.into_inner()).blocking_inflight;
+            if start.elapsed() >= max_wait {
+                clear_admission_wait();
+                return Err(AdmissionWaitReport { kind: "blocking", waited_ms, limit, in_flight, slots: pool.slots.len() });
+            }
+            mark_admission_wait("blocking", limit, in_flight);
+            let guard = pool.ticket_queue.lock().unwrap_or_else(|e| e.into_inner());
             let _ = pool
                 .slot_released
-                .wait_timeout(q, std::time::Duration::from_millis(25))
+                .wait_timeout(guard, std::time::Duration::from_millis(25))
                 .unwrap_or_else(|e| e.into_inner());
         }
     }
 
     pub fn admit(pool: &Arc<SharedPluginPool>, class: DispatchCostClass) -> HeavyDispatchAdmission {
+        Self::admit_within(pool, class, Duration::from_secs(86_400)).unwrap_or(HeavyDispatchAdmission { pool: None })
+    }
+
+    pub fn admit_within(pool: &Arc<SharedPluginPool>, class: DispatchCostClass, max_wait: Duration) -> Result<HeavyDispatchAdmission, AdmissionWaitReport> {
         if class != DispatchCostClass::Heavy || pool.slots.len() < 2 {
-            return HeavyDispatchAdmission { pool: None };
+            return Ok(HeavyDispatchAdmission { pool: None });
         }
         let limit = pool.heavy_admission_limit();
-        let start = std::time::Instant::now();
+        let start = Instant::now();
+        let mut logged_at_ms = 0u64;
         loop {
             {
                 let mut q = pool.ticket_queue.lock().unwrap_or_else(|e| e.into_inner());
                 if q.heavy_inflight < limit {
                     q.heavy_inflight += 1;
-                    return HeavyDispatchAdmission { pool: Some(pool.clone()) };
+                    clear_admission_wait();
+                    return Ok(HeavyDispatchAdmission { pool: Some(pool.clone()) });
                 }
+            }
+            let waited_ms = start.elapsed().as_millis() as u64;
+            let in_flight = pool.ticket_queue.lock().unwrap_or_else(|e| e.into_inner()).heavy_inflight;
+            if start.elapsed() >= max_wait {
+                clear_admission_wait();
+                return Err(AdmissionWaitReport { kind: "heavy", waited_ms, limit, in_flight, slots: pool.slots.len() });
+            }
+            mark_admission_wait("heavy", limit, in_flight);
+            if waited_ms > Self::ACQUIRE_TIMEOUT_MS && waited_ms.saturating_sub(logged_at_ms) >= 5_000 {
+                logged_at_ms = waited_ms;
+                eprintln!(
+                    "[agentplug registry] {} heavy-dispatch admission waiting {waited_ms}ms -- {limit} of {} slots already hold heavy work, one slot stays reserved for cheap verbs",
+                    pool.plugin_name,
+                    pool.slots.len()
+                );
             }
             let guard = pool.ticket_queue.lock().unwrap_or_else(|e| e.into_inner());
             let _ = pool
                 .slot_released
                 .wait_timeout(guard, std::time::Duration::from_millis(25))
                 .unwrap_or_else(|e| e.into_inner());
-            let waited = start.elapsed().as_millis() as u64;
-            if waited > Self::ACQUIRE_TIMEOUT_MS && waited % 5_000 < 30 {
-                eprintln!(
-                    "[agentplug registry] {} heavy-dispatch admission waiting {waited}ms -- {limit} of {} slots already hold heavy work, one slot stays reserved for cheap verbs",
-                    pool.plugin_name,
-                    pool.slots.len()
-                );
-            }
         }
     }
 
@@ -836,8 +936,8 @@ impl ProjectPlugins {
         }
         let pool = pool.ok_or_else(|| PluginDispatchError::NotRegistered { plugin_name: plugin_name.to_string() })?;
         let cost_class = cost_class_for_dispatch(verb, body);
-        let _heavy_admission = SharedPluginPool::admit(&pool, cost_class);
-        let _blocking_admission = SharedPluginPool::admit_blocking(&pool, verb);
+        let _heavy_admission = SharedPluginPool::admit_within(&pool, cost_class, admission_wait_max()).map_err(admission_starved_error)?;
+        let _blocking_admission = SharedPluginPool::admit_blocking_within(&pool, verb, admission_wait_max()).map_err(admission_starved_error)?;
         let (mut guard, _waited_ms) = pool.acquire_within_for_class(SharedPluginPool::ACQUIRE_TIMEOUT_MS, cost_class);
         dispatch_and_evict_on_error(&mut guard, &pool, verb, body, &self.root, &self.siblings, plugin_name)
     }
@@ -912,8 +1012,8 @@ impl DispatchHandle {
         }
         let pool = pool.ok_or_else(|| PluginDispatchError::NotRegistered { plugin_name: plugin_name.to_string() })?;
         let cost_class = cost_class_for_dispatch(verb, body);
-        let _heavy_admission = SharedPluginPool::admit(&pool, cost_class);
-        let _blocking_admission = SharedPluginPool::admit_blocking(&pool, verb);
+        let _heavy_admission = SharedPluginPool::admit_within(&pool, cost_class, admission_wait_max()).map_err(admission_starved_error)?;
+        let _blocking_admission = SharedPluginPool::admit_blocking_within(&pool, verb, admission_wait_max()).map_err(admission_starved_error)?;
         let (mut guard, _waited_ms) = pool.acquire_within_for_class(SharedPluginPool::ACQUIRE_TIMEOUT_MS, cost_class);
         if guard.is_none() {
             drop(guard);
@@ -1067,6 +1167,39 @@ fn serial_lane_for_dispatch(verb: &str, body: &str) -> Option<&'static str> {
     }
 }
 
+pub fn dispatch_serial_lane(verb: &str, body: &str) -> Option<&'static str> {
+    serial_lane_for_dispatch(verb, body)
+}
+
+fn gm_lane_waiters() -> &'static Mutex<HashMap<(PathBuf, &'static str), usize>> {
+    static WAITERS: OnceLock<Mutex<HashMap<(PathBuf, &'static str), usize>>> = OnceLock::new();
+    WAITERS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn gm_lane_holders() -> &'static Mutex<HashMap<(PathBuf, &'static str), String>> {
+    static HOLDERS: OnceLock<Mutex<HashMap<(PathBuf, &'static str), String>>> = OnceLock::new();
+    HOLDERS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn tool_queue_holders() -> &'static Mutex<HashMap<String, String>> {
+    static HOLDERS: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+    HOLDERS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub struct LaneWaitReport {
+    pub lane: &'static str,
+    pub waited_ms: u64,
+    pub waiters: usize,
+    pub lane_holder_task: Option<String>,
+}
+
+pub struct ToolQueueWaitReport {
+    pub queue_key: String,
+    pub waited_ms: u64,
+    pub position: u64,
+    pub holder_task: Option<String>,
+}
+
 pub struct GmFairnessGuard {
     root: PathBuf,
     lane: Option<&'static str>,
@@ -1088,6 +1221,68 @@ impl GmFairnessGuard {
             map = gm_project_step_released().wait(map).unwrap_or_else(|e| e.into_inner());
         }
     }
+
+    pub fn acquire_within(root: &Path, verb: &str, body: &str, task: &str, max_wait: Duration) -> Result<Self, LaneWaitReport> {
+        let owned_root = root.to_path_buf();
+        let Some(lane) = serial_lane_for_dispatch(verb, body) else {
+            return Ok(Self { root: owned_root, lane: None });
+        };
+        let started = Instant::now();
+        {
+            let mut waiters = gm_lane_waiters().lock().unwrap_or_else(|e| e.into_inner());
+            *waiters.entry((owned_root.clone(), lane)).or_insert(0) += 1;
+        }
+        let mut map = gm_inflight_map().lock().unwrap_or_else(|e| e.into_inner());
+        let acquired = loop {
+            let count = map.entry((owned_root.clone(), lane)).or_insert(0);
+            if *count == 0 {
+                *count = 1;
+                break true;
+            }
+            let remaining = max_wait.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                break false;
+            }
+            let (next, timed_out) = gm_project_step_released()
+                .wait_timeout(map, remaining)
+                .unwrap_or_else(|e| e.into_inner());
+            map = next;
+            if timed_out.timed_out() {
+                break false;
+            }
+        };
+        drop(map);
+        let waiters = {
+            let mut waiters = gm_lane_waiters().lock().unwrap_or_else(|e| e.into_inner());
+            let key = (owned_root.clone(), lane);
+            let remaining = waiters.get(&key).copied().unwrap_or(0).saturating_sub(1);
+            if remaining == 0 {
+                waiters.remove(&key);
+            } else {
+                waiters.insert(key, remaining);
+            }
+            remaining
+        };
+        if !acquired {
+            let lane_holder_task = gm_lane_holders()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&(owned_root.clone(), lane))
+                .cloned();
+            gm_project_step_released().notify_all();
+            return Err(LaneWaitReport {
+                lane,
+                waited_ms: started.elapsed().as_millis() as u64,
+                waiters,
+                lane_holder_task,
+            });
+        }
+        gm_lane_holders()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert((owned_root.clone(), lane), task.to_string());
+        Ok(Self { root: owned_root, lane: Some(lane) })
+    }
 }
 
 impl Drop for GmFairnessGuard {
@@ -1095,8 +1290,9 @@ impl Drop for GmFairnessGuard {
         let Some(lane) = self.lane else {
             return;
         };
-        let mut map = gm_inflight_map().lock().unwrap_or_else(|e| e.into_inner());
         let key = (self.root.clone(), lane);
+        gm_lane_holders().lock().unwrap_or_else(|e| e.into_inner()).remove(&key);
+        let mut map = gm_inflight_map().lock().unwrap_or_else(|e| e.into_inner());
         if let Some(count) = map.get_mut(&key) {
             *count = count.saturating_sub(1);
             if *count == 0 {
@@ -1139,6 +1335,67 @@ impl ToolDispatchGuard {
             active = tool_step_released().wait(active).unwrap_or_else(|e| e.into_inner());
         }
     }
+
+    pub fn acquire_within(plugin: &str, verb: &str, body: &str, task: &str, max_wait: Duration) -> Result<Self, ToolQueueWaitReport> {
+        if is_unserialized_dispatch(verb, body) {
+            return Ok(Self { key: None });
+        }
+        let key = format!("{plugin}\u{0}{verb}");
+        let started = Instant::now();
+        let mut active = tool_inflight().lock().unwrap_or_else(|e| e.into_inner());
+        let ticket = {
+            let queue = active.entry(key.clone()).or_insert(ToolQueue {
+                next_ticket: 0,
+                now_serving: 0,
+                active: false,
+            });
+            let ticket = queue.next_ticket;
+            queue.next_ticket += 1;
+            ticket
+        };
+        let acquired = loop {
+            let queue = active.get_mut(&key).expect("tool queue exists for its assigned ticket");
+            if queue.now_serving == ticket && !queue.active {
+                queue.now_serving += 1;
+                queue.active = true;
+                break true;
+            }
+            let remaining = max_wait.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                break false;
+            }
+            let (next, timed_out) = tool_step_released()
+                .wait_timeout(active, remaining)
+                .unwrap_or_else(|e| e.into_inner());
+            active = next;
+            if timed_out.timed_out() {
+                break false;
+            }
+        };
+        if !acquired {
+            let queue = active.get_mut(&key).expect("tool queue exists for its assigned ticket");
+            let position = ticket.saturating_sub(queue.now_serving);
+            queue.now_serving = queue.now_serving.max(ticket + 1);
+            let queue_drained = queue.next_ticket == queue.now_serving;
+            if queue_drained {
+                active.remove(&key);
+            }
+            drop(active);
+            let holder_task = tool_queue_holders().lock().unwrap_or_else(|e| e.into_inner()).get(&key).cloned();
+            tool_step_released().notify_all();
+            return Err(ToolQueueWaitReport {
+                queue_key: key,
+                waited_ms: started.elapsed().as_millis() as u64,
+                position,
+                holder_task,
+            });
+        }
+        tool_queue_holders()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key.clone(), task.to_string());
+        Ok(Self { key: Some(key) })
+    }
 }
 
 impl Drop for ToolDispatchGuard {
@@ -1151,6 +1408,10 @@ impl Drop for ToolDispatchGuard {
             queue.active = false;
             if queue.next_ticket == queue.now_serving {
                 active.remove(key);
+                drop(active);
+                tool_queue_holders().lock().unwrap_or_else(|e| e.into_inner()).remove(key);
+                tool_step_released().notify_all();
+                return;
             }
         }
         drop(active);
