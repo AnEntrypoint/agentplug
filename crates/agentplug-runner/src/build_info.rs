@@ -3,9 +3,9 @@ include!(concat!(env!("OUT_DIR"), "/build_info.rs"));
 pub const RELEASE_RUNNER_ROOT_KEY_ID: &str = "release-20261006-2";
 pub const RELEASE_RUNNER_ROOT_PUBLIC_KEY: &str =
     "7e1e7cb128556b9e56810dd485f41d3015c65e17fbea6a8c4ad4e1d0275d64eb";
-pub const RELEASE_PLUGIN_ROOT_KEY_ID: &str = "plugin-release-20261006-1";
+pub const RELEASE_PLUGIN_ROOT_KEY_ID: &str = "plugin-release-20261006-2";
 pub const RELEASE_PLUGIN_ROOT_PUBLIC_KEY: &str =
-    "d05db5fea83309b98cb00d7532c05bf622050016a38321ddd917600f7baa97fe";
+    "022fa8098b8fcbc63a63b5ff5d49d4246a5c89d8cabc14925087fcab728bf6f0";
 
 #[derive(Clone)]
 pub struct Reported {
