@@ -1,12 +1,15 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+#[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 fn git_head(manifest_dir: &Path) -> Option<String> {
     let mut cmd = Command::new("git");
     cmd.arg("-C").arg(manifest_dir).args(["rev-parse", "HEAD"]);
-    cmd.stdout(Stdio::piped()).stderr(Stdio::null()).stdin(Stdio::null());
+    cmd.stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .stdin(Stdio::null());
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -25,7 +28,10 @@ fn git_head(manifest_dir: &Path) -> Option<String> {
 
 fn release_build_requested() -> bool {
     match std::env::var("AGENTPLUG_RELEASE_BUILD") {
-        Ok(value) => matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"),
+        Ok(value) => matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        ),
         Err(_) => false,
     }
 }
@@ -42,7 +48,8 @@ fn main() {
         "pub const COMMIT: &str = {commit:?};\npub const BUILD_TS: u64 = {build_ts};\npub const RELEASE_BUILD: bool = {release_build};\n"
     );
 
-    let out_dir = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR not set for the build script"));
+    let out_dir =
+        PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR not set for the build script"));
     let dest = out_dir.join("build_info.rs");
     let unchanged = std::fs::read_to_string(&dest)
         .map(|existing| existing == generated)

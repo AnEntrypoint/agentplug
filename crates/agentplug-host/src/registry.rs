@@ -78,11 +78,21 @@ fn read_plugin_fiber_state(plugin_name: &str) -> PluginFiberState {
     std::fs::read_to_string(plugin_fiber_state_path(plugin_name))
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or(PluginFiberState { state: PluginFiberLifecycle::Inactive, content_hash: None })
+        .unwrap_or(PluginFiberState {
+            state: PluginFiberLifecycle::Inactive,
+            content_hash: None,
+        })
 }
 
-fn write_plugin_fiber_state(plugin_name: &str, state: PluginFiberLifecycle, content_hash: Option<String>) {
-    let body = PluginFiberState { state, content_hash };
+fn write_plugin_fiber_state(
+    plugin_name: &str,
+    state: PluginFiberLifecycle,
+    content_hash: Option<String>,
+) {
+    let body = PluginFiberState {
+        state,
+        content_hash,
+    };
     if let Ok(text) = serde_json::to_string(&body) {
         let _ = std::fs::write(plugin_fiber_state_path(plugin_name), text);
     }
@@ -139,11 +149,25 @@ fn admission_starved_error(report: AdmissionWaitReport) -> PluginDispatchError {
     }
 }
 
-fn log_poisoned_store_eviction_event(root: &Path, plugin_name: &str, verb: &str, reinstantiation_succeeded: bool, prior_dispatch_error: &str) {
+fn log_poisoned_store_eviction_event(
+    root: &Path,
+    plugin_name: &str,
+    verb: &str,
+    reinstantiation_succeeded: bool,
+    prior_dispatch_error: &str,
+) {
     let log_path = root.join(".gm").join("exec-spool").join(".watcher.log");
-    let Some(parent) = log_path.parent() else { return };
+    let Some(parent) = log_path.parent() else {
+        return;
+    };
     let _ = std::fs::create_dir_all(parent);
-    let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&log_path) else { return };
+    let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+    else {
+        return;
+    };
     use std::io::Write;
     let line = serde_json::json!({
         "event": "plugin_poisoned_store_evicted",
@@ -223,7 +247,9 @@ pub fn cost_class_for_dispatch(verb: &str, body: &str) -> DispatchCostClass {
     }
 }
 
-fn try_lock_slot_recovering_from_poison(slot: &Mutex<Option<SiblingHandle>>) -> Option<std::sync::MutexGuard<'_, Option<SiblingHandle>>> {
+fn try_lock_slot_recovering_from_poison(
+    slot: &Mutex<Option<SiblingHandle>>,
+) -> Option<std::sync::MutexGuard<'_, Option<SiblingHandle>>> {
     match slot.try_lock() {
         Ok(guard) => Some(guard),
         Err(std::sync::TryLockError::Poisoned(poisoned)) => Some(poisoned.into_inner()),
@@ -242,7 +268,8 @@ pub struct SharedPluginPool {
     plugin_name: String,
     slots: Vec<Arc<Mutex<Option<SiblingHandle>>>>,
     last_observed_slot_hashes: Mutex<Vec<Option<String>>>,
-    hashes_to_evict_when_their_in_flight_dispatch_completes: Mutex<std::collections::HashSet<String>>,
+    hashes_to_evict_when_their_in_flight_dispatch_completes:
+        Mutex<std::collections::HashSet<String>>,
     ticket_queue: Mutex<TicketQueue>,
     slot_released: Condvar,
 }
@@ -368,10 +395,18 @@ impl SharedPluginPool {
             plugin_name: plugin_name.to_string(),
             slots: (0..size).map(|_| Arc::new(Mutex::new(None))).collect(),
             last_observed_slot_hashes: Mutex::new(vec![None; size]),
-            hashes_to_evict_when_their_in_flight_dispatch_completes: Mutex::new(std::collections::HashSet::new()),
+            hashes_to_evict_when_their_in_flight_dispatch_completes: Mutex::new(
+                std::collections::HashSet::new(),
+            ),
             ticket_queue: Mutex::new(TicketQueue {
-                cheap: ClassTicketQueue { next_ticket: 0, now_serving: 0 },
-                heavy: ClassTicketQueue { next_ticket: 0, now_serving: 0 },
+                cheap: ClassTicketQueue {
+                    next_ticket: 0,
+                    now_serving: 0,
+                },
+                heavy: ClassTicketQueue {
+                    next_ticket: 0,
+                    now_serving: 0,
+                },
                 heavy_inflight: 0,
                 blocking_inflight: 0,
             }),
@@ -382,12 +417,19 @@ impl SharedPluginPool {
     pub const ACQUIRE_TIMEOUT_MS: u64 = 60_000;
 
     fn heavy_admission_limit(&self) -> usize {
-        self.slots.len().saturating_sub(1).min(MAX_CONCURRENT_HEAVY_DISPATCHES).max(1)
+        self.slots
+            .len()
+            .saturating_sub(1)
+            .min(MAX_CONCURRENT_HEAVY_DISPATCHES)
+            .max(1)
     }
 
     fn blocking_admission_limit(&self) -> usize {
         let reserved_for_short_verbs = (self.slots.len() / 4).max(1);
-        self.slots.len().saturating_sub(reserved_for_short_verbs).max(1)
+        self.slots
+            .len()
+            .saturating_sub(reserved_for_short_verbs)
+            .max(1)
     }
 
     pub fn admit_blocking(pool: &Arc<SharedPluginPool>, verb: &str) -> BlockingDispatchAdmission {
@@ -406,7 +448,9 @@ impl SharedPluginPool {
                 if q.blocking_inflight < limit {
                     q.blocking_inflight += 1;
                     clear_admission_wait();
-                    return Ok(BlockingDispatchAdmission { pool: Some(pool.clone()) });
+                    return Ok(BlockingDispatchAdmission {
+                        pool: Some(pool.clone()),
+                    });
                 }
             }
             let waited_ms = start.elapsed().as_millis() as u64;
@@ -441,7 +485,9 @@ impl SharedPluginPool {
                 if q.heavy_inflight < limit {
                     q.heavy_inflight += 1;
                     clear_admission_wait();
-                    return Ok(HeavyDispatchAdmission { pool: Some(pool.clone()) });
+                    return Ok(HeavyDispatchAdmission {
+                        pool: Some(pool.clone()),
+                    });
                 }
             }
             let waited_ms = start.elapsed().as_millis() as u64;
@@ -471,7 +517,10 @@ impl SharedPluginPool {
         Some(self.acquire_within(Self::ACQUIRE_TIMEOUT_MS).0)
     }
 
-    pub fn acquire_within(&self, timeout_ms: u64) -> (std::sync::MutexGuard<'_, Option<SiblingHandle>>, u64) {
+    pub fn acquire_within(
+        &self,
+        timeout_ms: u64,
+    ) -> (std::sync::MutexGuard<'_, Option<SiblingHandle>>, u64) {
         self.acquire_within_for_class(timeout_ms, DispatchCostClass::Cheap)
     }
 
@@ -527,10 +576,12 @@ impl SharedPluginPool {
     }
 
     fn all_instantiated(&self) -> bool {
-        self.slots.iter().all(|s| match try_lock_slot_recovering_from_poison(s) {
-            Some(g) => g.is_some(),
-            None => true,
-        })
+        self.slots
+            .iter()
+            .all(|s| match try_lock_slot_recovering_from_poison(s) {
+                Some(g) => g.is_some(),
+                None => true,
+            })
     }
 
     fn any_instantiated_without_blocking(&self) -> bool {
@@ -550,7 +601,9 @@ impl SharedPluginPool {
             .iter()
             .map(|s| match try_lock_slot_recovering_from_poison(s) {
                 Some(guard) => match guard.as_ref() {
-                    Some(handle) => SlotContentSnapshot::Loaded { content_hash: handle.content_hash.clone() },
+                    Some(handle) => SlotContentSnapshot::Loaded {
+                        content_hash: handle.content_hash.clone(),
+                    },
                     None => SlotContentSnapshot::Empty,
                 },
                 None => SlotContentSnapshot::BusyWithDispatchInFlight,
@@ -559,7 +612,10 @@ impl SharedPluginPool {
     }
 
     pub fn slot_content_hashes(&self) -> Vec<Option<String>> {
-        let mut observed = self.last_observed_slot_hashes.lock().unwrap_or_else(|e| e.into_inner());
+        let mut observed = self
+            .last_observed_slot_hashes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         for (index, slot) in self.slots.iter().enumerate() {
             if let Ok(guard) = slot.try_lock() {
                 observed[index] = guard.as_ref().map(|h| h.content_hash.clone());
@@ -580,7 +636,10 @@ impl SharedPluginPool {
                 }
             }
             if std::time::Instant::now() >= deadline {
-                return self.slots.iter().any(|s| s.lock().unwrap_or_else(|e| e.into_inner()).is_some());
+                return self
+                    .slots
+                    .iter()
+                    .any(|s| s.lock().unwrap_or_else(|e| e.into_inner()).is_some());
             }
             std::thread::sleep(std::time::Duration::from_millis(POLL_INTERVAL_MS));
         }
@@ -614,14 +673,23 @@ impl SharedPluginPool {
             }
         }
         if deferred > 0 {
-            self.hashes_to_evict_when_their_in_flight_dispatch_completes.lock().unwrap_or_else(|e| e.into_inner()).insert(old_hash.to_string());
+            self.hashes_to_evict_when_their_in_flight_dispatch_completes
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(old_hash.to_string());
         }
         (evicted, deferred)
     }
 
-    pub fn evict_if_swap_pending(&self, guard: &mut std::sync::MutexGuard<'_, Option<SiblingHandle>>) {
+    pub fn evict_if_swap_pending(
+        &self,
+        guard: &mut std::sync::MutexGuard<'_, Option<SiblingHandle>>,
+    ) {
         let Some(handle) = guard.as_ref() else { return };
-        let pending = self.hashes_to_evict_when_their_in_flight_dispatch_completes.lock().unwrap_or_else(|e| e.into_inner());
+        let pending = self
+            .hashes_to_evict_when_their_in_flight_dispatch_completes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if pending.contains(&handle.content_hash) {
             drop(pending);
             **guard = None;
@@ -629,11 +697,19 @@ impl SharedPluginPool {
     }
 
     pub fn note_bytes_current(&self, hash: &str) {
-        self.hashes_to_evict_when_their_in_flight_dispatch_completes.lock().unwrap_or_else(|e| e.into_inner()).remove(hash);
+        self.hashes_to_evict_when_their_in_flight_dispatch_completes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(hash);
     }
 
     pub fn swap_pending_hashes(&self) -> Vec<String> {
-        self.hashes_to_evict_when_their_in_flight_dispatch_completes.lock().unwrap_or_else(|e| e.into_inner()).iter().cloned().collect()
+        self.hashes_to_evict_when_their_in_flight_dispatch_completes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .cloned()
+            .collect()
     }
 }
 
@@ -641,7 +717,11 @@ type SharedPluginMap = Mutex<HashMap<String, Arc<SharedPluginPool>>>;
 static SHARED_PLUGINS: OnceLock<SharedPluginMap> = OnceLock::new();
 
 fn shared_plugin_pool(plugin_name: &str) -> Arc<SharedPluginPool> {
-    let pool_size = if plugin_name == "gm" { gm_pool_size() } else { side_plugin_pool_size() };
+    let pool_size = if plugin_name == "gm" {
+        gm_pool_size()
+    } else {
+        side_plugin_pool_size()
+    };
     SHARED_PLUGINS
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
@@ -721,7 +801,11 @@ pub fn set_sibling_reload_source(source: SiblingReloadSource) {
 }
 
 pub fn ensure_sibling_registered(root: &Path, plugin_name: &str, siblings: &SiblingPools) -> bool {
-    if siblings.lock().unwrap_or_else(|e| e.into_inner()).contains_key(plugin_name) {
+    if siblings
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains_key(plugin_name)
+    {
         return true;
     }
     let source = {
@@ -735,7 +819,10 @@ pub fn ensure_sibling_registered(root: &Path, plugin_name: &str, siblings: &Sibl
         reload_source: Some(source.as_ref().clone()),
     };
     let _ = handle.reinstantiate_plugin_into_pool_slot_if_reload_source_available(plugin_name);
-    siblings.lock().unwrap_or_else(|e| e.into_inner()).contains_key(plugin_name)
+    siblings
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains_key(plugin_name)
 }
 
 fn resolve_routed_plugin_name(plugin_name: &str) -> (String, Option<crate::broker::RouteLease>) {
@@ -770,13 +857,17 @@ pub fn dispatch_on(
     store.data().set_call_deadline_secs(call_deadline_secs);
     store.set_epoch_deadline(epoch_ticks_for_seconds(call_deadline_secs));
     let alloc = instance.get_typed_func::<u32, u32>(&mut *store, "plugkit_alloc")?;
-    let memory = instance.get_memory(&mut *store, "memory").ok_or_else(|| anyhow::anyhow!("plugin {plugin_name} has no exported memory"))?;
+    let memory = instance
+        .get_memory(&mut *store, "memory")
+        .ok_or_else(|| anyhow::anyhow!("plugin {plugin_name} has no exported memory"))?;
 
     let verb_ptr = alloc.call(&mut *store, verb.len() as u32)?;
     memory.write(&mut *store, verb_ptr as usize, verb.as_bytes())?;
     let body_ptr = alloc.call(&mut *store, body.len() as u32)?;
     memory.write(&mut *store, body_ptr as usize, body.as_bytes())?;
-    let free = instance.get_typed_func::<(u32, u32), ()>(&mut *store, "plugkit_free").ok();
+    let free = instance
+        .get_typed_func::<(u32, u32), ()>(&mut *store, "plugkit_free")
+        .ok();
     let free_call_args = |store: &mut Store<HostState>| {
         if let Some(free) = &free {
             let _ = free.call(&mut *store, (verb_ptr, verb.len() as u32));
@@ -786,15 +877,23 @@ pub fn dispatch_on(
 
     let dispatch_fn = instance
         .get_typed_func::<(u32, u32, u32, u32), u64>(&mut *store, "plugin_call")
-        .or_else(|_| instance.get_typed_func::<(u32, u32, u32, u32), u64>(&mut *store, "dispatch_verb"))?;
-    let call_result = dispatch_fn.call(&mut *store, (verb_ptr, verb.len() as u32, body_ptr, body.len() as u32));
+        .or_else(|_| {
+            instance.get_typed_func::<(u32, u32, u32, u32), u64>(&mut *store, "dispatch_verb")
+        })?;
+    let call_result = dispatch_fn.call(
+        &mut *store,
+        (verb_ptr, verb.len() as u32, body_ptr, body.len() as u32),
+    );
     let packed = match call_result {
         Ok(p) => {
             free_call_args(store);
             p
         }
         Err(e) => {
-            if matches!(e.downcast_ref::<wasmtime::Trap>(), Some(wasmtime::Trap::Interrupt)) {
+            if matches!(
+                e.downcast_ref::<wasmtime::Trap>(),
+                Some(wasmtime::Trap::Interrupt)
+            ) {
                 return Err(anyhow::anyhow!("plugin_call_deadline_exceeded: {plugin_name} exceeded {call_deadline_secs}s executing verb {verb}"));
             }
             return Err(e.into());
@@ -826,7 +925,11 @@ fn host_fs_root() -> PathBuf {
     #[cfg(windows)]
     {
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("C:\\"));
-        let mut root = cwd.components().next().map(|c| PathBuf::from(c.as_os_str())).unwrap_or_else(|| PathBuf::from("C:\\"));
+        let mut root = cwd
+            .components()
+            .next()
+            .map(|c| PathBuf::from(c.as_os_str()))
+            .unwrap_or_else(|| PathBuf::from("C:\\"));
         if !root.to_string_lossy().ends_with('\\') {
             root = PathBuf::from(format!("{}\\", root.to_string_lossy()));
         }
@@ -838,7 +941,13 @@ fn host_fs_root() -> PathBuf {
     }
 }
 
-fn instantiate_plugin(engine: &Engine, root: PathBuf, plugin_name: &str, module: &Module, content_hash: &str) -> anyhow::Result<SiblingHandle> {
+fn instantiate_plugin(
+    engine: &Engine,
+    root: PathBuf,
+    plugin_name: &str,
+    module: &Module,
+    content_hash: &str,
+) -> anyhow::Result<SiblingHandle> {
     let mut linker: Linker<HostState> = Linker::new(engine);
     register_wasi(&mut linker)?;
     register_env_imports(&mut linker)?;
@@ -853,7 +962,11 @@ fn instantiate_plugin(engine: &Engine, root: PathBuf, plugin_name: &str, module:
     store.set_epoch_deadline(epoch_ticks_for_seconds(DISPATCH_CALL_DEADLINE_SECS));
     let instance = linker.instantiate(&mut store, module)?;
     *self_instance_cell.lock().unwrap() = Some(instance);
-    Ok(SiblingHandle { store, instance, content_hash: content_hash.to_string() })
+    Ok(SiblingHandle {
+        store,
+        instance,
+        content_hash: content_hash.to_string(),
+    })
 }
 
 pub struct ProjectPlugins {
@@ -864,17 +977,26 @@ pub struct ProjectPlugins {
 
 impl ProjectPlugins {
     pub fn new(root: PathBuf) -> Self {
-        Self { root, siblings: Arc::new(Mutex::new(HashMap::new())), last_active: Instant::now() }
+        Self {
+            root,
+            siblings: Arc::new(Mutex::new(HashMap::new())),
+            last_active: Instant::now(),
+        }
     }
 
     pub fn is_loaded(&self, plugin_name: &str) -> bool {
-        self.siblings.lock().unwrap().get(plugin_name).map(|pool| {
-            if is_stateless_shared_plugin(plugin_name) {
-                pool.any_instantiated_without_blocking()
-            } else {
-                pool.all_instantiated()
-            }
-        }).unwrap_or(false)
+        self.siblings
+            .lock()
+            .unwrap()
+            .get(plugin_name)
+            .map(|pool| {
+                if is_stateless_shared_plugin(plugin_name) {
+                    pool.any_instantiated_without_blocking()
+                } else {
+                    pool.all_instantiated()
+                }
+            })
+            .unwrap_or(false)
     }
 
     pub fn is_loaded_current(&self, plugin_name: &str, content_hash: &str) -> bool {
@@ -885,32 +1007,58 @@ impl ProjectPlugins {
             .lock()
             .unwrap()
             .get(plugin_name)
-            .map(|p| p.slot_content_hashes().iter().any(|h| h.as_deref() == Some(content_hash)))
+            .map(|p| {
+                p.slot_content_hashes()
+                    .iter()
+                    .any(|h| h.as_deref() == Some(content_hash))
+            })
             .unwrap_or(false)
     }
 
-    pub fn load_plugin(&mut self, engine: &Engine, plugin_name: &str, module: &Module, content_hash: &str) -> anyhow::Result<()> {
+    pub fn load_plugin(
+        &mut self,
+        engine: &Engine,
+        plugin_name: &str,
+        module: &Module,
+        content_hash: &str,
+    ) -> anyhow::Result<()> {
         if is_stateless_shared_plugin(plugin_name) {
             let pool = shared_plugin_pool(plugin_name);
             let has_current = pool.slots_for_fill().iter().any(|slot| {
                 try_lock_slot_recovering_from_poison(slot)
-                    .map(|guard| guard.as_ref().is_some_and(|handle| handle.content_hash == content_hash))
+                    .map(|guard| {
+                        guard
+                            .as_ref()
+                            .is_some_and(|handle| handle.content_hash == content_hash)
+                    })
                     .unwrap_or(true)
             });
             if !has_current {
                 for slot in pool.slots_for_fill() {
-                    let Some(mut guard) = try_lock_slot_recovering_from_poison(slot) else { continue };
+                    let Some(mut guard) = try_lock_slot_recovering_from_poison(slot) else {
+                        continue;
+                    };
                     if guard.is_none() {
-                        *guard = Some(instantiate_plugin(engine, self.root.clone(), plugin_name, module, content_hash)?);
+                        *guard = Some(instantiate_plugin(
+                            engine,
+                            self.root.clone(),
+                            plugin_name,
+                            module,
+                            content_hash,
+                        )?);
                         break;
                     }
                 }
             }
-            self.siblings.lock().unwrap().insert(plugin_name.to_string(), pool);
+            self.siblings
+                .lock()
+                .unwrap()
+                .insert(plugin_name.to_string(), pool);
             return Ok(());
         }
 
-        let instantiated = instantiate_plugin(engine, self.root.clone(), plugin_name, module, content_hash)?;
+        let instantiated =
+            instantiate_plugin(engine, self.root.clone(), plugin_name, module, content_hash)?;
         let pool = self
             .siblings
             .lock()
@@ -918,11 +1066,18 @@ impl ProjectPlugins {
             .entry(plugin_name.to_string())
             .or_insert_with(|| Arc::new(SharedPluginPool::new(plugin_name, 1)))
             .clone();
-        *pool.acquire().expect("acquire() always returns Some -- FIFO wait never denies") = Some(instantiated);
+        *pool
+            .acquire()
+            .expect("acquire() always returns Some -- FIFO wait never denies") = Some(instantiated);
         Ok(())
     }
 
-    pub fn dispatch(&mut self, plugin_name: &str, verb: &str, body: &str) -> anyhow::Result<String> {
+    pub fn dispatch(
+        &mut self,
+        plugin_name: &str,
+        verb: &str,
+        body: &str,
+    ) -> anyhow::Result<String> {
         self.last_active = Instant::now();
         let (routed_name, _route_lease) = resolve_routed_plugin_name(plugin_name);
         let plugin_name = routed_name.as_str();
@@ -931,23 +1086,53 @@ impl ProjectPlugins {
         let mut pool = None;
         for attempt in 0..DISPATCH_LOOKUP_RETRY_ATTEMPTS {
             pool = self.siblings.lock().unwrap().get(plugin_name).cloned();
-            if pool.is_some() || attempt + 1 == DISPATCH_LOOKUP_RETRY_ATTEMPTS { break; }
-            std::thread::sleep(std::time::Duration::from_millis(DISPATCH_LOOKUP_RETRY_BACKOFF_MS));
+            if pool.is_some() || attempt + 1 == DISPATCH_LOOKUP_RETRY_ATTEMPTS {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(
+                DISPATCH_LOOKUP_RETRY_BACKOFF_MS,
+            ));
         }
-        let pool = pool.ok_or_else(|| PluginDispatchError::NotRegistered { plugin_name: plugin_name.to_string() })?;
+        let pool = pool.ok_or_else(|| PluginDispatchError::NotRegistered {
+            plugin_name: plugin_name.to_string(),
+        })?;
         let cost_class = cost_class_for_dispatch(verb, body);
-        let _heavy_admission = SharedPluginPool::admit_within(&pool, cost_class, admission_wait_max()).map_err(admission_starved_error)?;
-        let _blocking_admission = SharedPluginPool::admit_blocking_within(&pool, verb, admission_wait_max()).map_err(admission_starved_error)?;
-        let (mut guard, _waited_ms) = pool.acquire_within_for_class(SharedPluginPool::ACQUIRE_TIMEOUT_MS, cost_class);
-        dispatch_and_evict_on_error(&mut guard, &pool, verb, body, &self.root, &self.siblings, plugin_name)
+        let _heavy_admission =
+            SharedPluginPool::admit_within(&pool, cost_class, admission_wait_max())
+                .map_err(admission_starved_error)?;
+        let _blocking_admission =
+            SharedPluginPool::admit_blocking_within(&pool, verb, admission_wait_max())
+                .map_err(admission_starved_error)?;
+        let (mut guard, _waited_ms) =
+            pool.acquire_within_for_class(SharedPluginPool::ACQUIRE_TIMEOUT_MS, cost_class);
+        dispatch_and_evict_on_error(
+            &mut guard,
+            &pool,
+            verb,
+            body,
+            &self.root,
+            &self.siblings,
+            plugin_name,
+        )
     }
 
-    pub fn dispatch_handle_with_reload(&self, reload_source: Option<(Engine, HashMap<String, (Module, String)>)>) -> DispatchHandle {
-        DispatchHandle { root: self.root.clone(), siblings: self.siblings.clone(), reload_source }
+    pub fn dispatch_handle_with_reload(
+        &self,
+        reload_source: Option<(Engine, HashMap<String, (Module, String)>)>,
+    ) -> DispatchHandle {
+        DispatchHandle {
+            root: self.root.clone(),
+            siblings: self.siblings.clone(),
+            reload_source,
+        }
     }
 
     pub fn dispatch_handle(&self) -> DispatchHandle {
-        DispatchHandle { root: self.root.clone(), siblings: self.siblings.clone(), reload_source: None }
+        DispatchHandle {
+            root: self.root.clone(),
+            siblings: self.siblings.clone(),
+            reload_source: None,
+        }
     }
 }
 
@@ -959,7 +1144,10 @@ pub struct DispatchHandle {
 }
 
 impl DispatchHandle {
-    fn reinstantiate_plugin_into_pool_slot_if_reload_source_available(&self, plugin_name: &str) -> anyhow::Result<()> {
+    fn reinstantiate_plugin_into_pool_slot_if_reload_source_available(
+        &self,
+        plugin_name: &str,
+    ) -> anyhow::Result<()> {
         let Some((engine, modules)) = self.reload_source.as_ref() else {
             eprintln!("[agentplug registry] reinstantiate skipped for {plugin_name}: this DispatchHandle has no reload_source attached at all (dispatch_handle() no-reload constructor)");
             return Ok(());
@@ -971,19 +1159,31 @@ impl DispatchHandle {
         if is_stateless_shared_plugin(plugin_name) {
             let pool = shared_plugin_pool(plugin_name);
             {
-                let mut guard = pool.acquire().expect("acquire() always returns Some -- FIFO wait never denies");
+                let mut guard = pool
+                    .acquire()
+                    .expect("acquire() always returns Some -- FIFO wait never denies");
                 let needs_fill = match guard.as_ref() {
                     None => true,
                     Some(existing) => &existing.content_hash != content_hash,
                 };
                 if needs_fill {
-                    *guard = Some(instantiate_plugin(engine, self.root.clone(), plugin_name, module, content_hash)?);
+                    *guard = Some(instantiate_plugin(
+                        engine,
+                        self.root.clone(),
+                        plugin_name,
+                        module,
+                        content_hash,
+                    )?);
                 }
             }
-            self.siblings.lock().unwrap().insert(plugin_name.to_string(), pool);
+            self.siblings
+                .lock()
+                .unwrap()
+                .insert(plugin_name.to_string(), pool);
             return Ok(());
         }
-        let instantiated = instantiate_plugin(engine, self.root.clone(), plugin_name, module, content_hash)?;
+        let instantiated =
+            instantiate_plugin(engine, self.root.clone(), plugin_name, module, content_hash)?;
         let pool = self
             .siblings
             .lock()
@@ -991,7 +1191,9 @@ impl DispatchHandle {
             .entry(plugin_name.to_string())
             .or_insert_with(|| Arc::new(SharedPluginPool::new(plugin_name, 1)))
             .clone();
-        *pool.acquire().expect("acquire() always returns Some -- FIFO wait never denies") = Some(instantiated);
+        *pool
+            .acquire()
+            .expect("acquire() always returns Some -- FIFO wait never denies") = Some(instantiated);
         Ok(())
     }
 
@@ -1003,18 +1205,30 @@ impl DispatchHandle {
         let mut pool = None;
         for attempt in 0..REGISTRATION_LOOKUP_RETRY_ATTEMPTS {
             pool = self.siblings.lock().unwrap().get(plugin_name).cloned();
-            if pool.is_some() || attempt + 1 == REGISTRATION_LOOKUP_RETRY_ATTEMPTS { break; }
-            std::thread::sleep(std::time::Duration::from_millis(REGISTRATION_LOOKUP_RETRY_BACKOFF_MS));
+            if pool.is_some() || attempt + 1 == REGISTRATION_LOOKUP_RETRY_ATTEMPTS {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(
+                REGISTRATION_LOOKUP_RETRY_BACKOFF_MS,
+            ));
         }
         if pool.is_none() {
-            let _ = self.reinstantiate_plugin_into_pool_slot_if_reload_source_available(plugin_name);
+            let _ =
+                self.reinstantiate_plugin_into_pool_slot_if_reload_source_available(plugin_name);
             pool = self.siblings.lock().unwrap().get(plugin_name).cloned();
         }
-        let pool = pool.ok_or_else(|| PluginDispatchError::NotRegistered { plugin_name: plugin_name.to_string() })?;
+        let pool = pool.ok_or_else(|| PluginDispatchError::NotRegistered {
+            plugin_name: plugin_name.to_string(),
+        })?;
         let cost_class = cost_class_for_dispatch(verb, body);
-        let _heavy_admission = SharedPluginPool::admit_within(&pool, cost_class, admission_wait_max()).map_err(admission_starved_error)?;
-        let _blocking_admission = SharedPluginPool::admit_blocking_within(&pool, verb, admission_wait_max()).map_err(admission_starved_error)?;
-        let (mut guard, _waited_ms) = pool.acquire_within_for_class(SharedPluginPool::ACQUIRE_TIMEOUT_MS, cost_class);
+        let _heavy_admission =
+            SharedPluginPool::admit_within(&pool, cost_class, admission_wait_max())
+                .map_err(admission_starved_error)?;
+        let _blocking_admission =
+            SharedPluginPool::admit_blocking_within(&pool, verb, admission_wait_max())
+                .map_err(admission_starved_error)?;
+        let (mut guard, _waited_ms) =
+            pool.acquire_within_for_class(SharedPluginPool::ACQUIRE_TIMEOUT_MS, cost_class);
         if guard.is_none() {
             drop(guard);
             const REINSTANTIATION_RETRY_ATTEMPTS: u32 = 3;
@@ -1022,7 +1236,9 @@ impl DispatchHandle {
             let mut last_reload_error: Option<String> = None;
             let mut refilled_pool: Option<Arc<SharedPluginPool>> = None;
             for attempt in 0..REINSTANTIATION_RETRY_ATTEMPTS {
-                if let Err(e) = self.reinstantiate_plugin_into_pool_slot_if_reload_source_available(plugin_name) {
+                if let Err(e) =
+                    self.reinstantiate_plugin_into_pool_slot_if_reload_source_available(plugin_name)
+                {
                     last_reload_error = Some(format!("{e:#}"));
                 }
                 let candidate_pool = self
@@ -1031,9 +1247,12 @@ impl DispatchHandle {
                     .unwrap()
                     .get(plugin_name)
                     .cloned()
-                    .ok_or_else(|| PluginDispatchError::NotRegistered { plugin_name: plugin_name.to_string() })?;
+                    .ok_or_else(|| PluginDispatchError::NotRegistered {
+                        plugin_name: plugin_name.to_string(),
+                    })?;
                 let is_refilled = {
-                    let (retry_guard, _retry_waited_ms) = candidate_pool.acquire_within(SharedPluginPool::ACQUIRE_TIMEOUT_MS);
+                    let (retry_guard, _retry_waited_ms) =
+                        candidate_pool.acquire_within(SharedPluginPool::ACQUIRE_TIMEOUT_MS);
                     retry_guard.is_some()
                 };
                 if is_refilled {
@@ -1041,19 +1260,43 @@ impl DispatchHandle {
                     break;
                 }
                 if attempt + 1 < REINSTANTIATION_RETRY_ATTEMPTS {
-                    std::thread::sleep(std::time::Duration::from_millis(REINSTANTIATION_RETRY_BACKOFF_MS));
+                    std::thread::sleep(std::time::Duration::from_millis(
+                        REINSTANTIATION_RETRY_BACKOFF_MS,
+                    ));
                 }
             }
             let Some(refilled_pool) = refilled_pool else {
-                let detail = last_reload_error.unwrap_or_else(|| "reload produced no error but no slot was repopulated".to_string());
+                let detail = last_reload_error.unwrap_or_else(|| {
+                    "reload produced no error but no slot was repopulated".to_string()
+                });
                 eprintln!("[agentplug registry] plugin {plugin_name} could not be reinstantiated after a poisoned-Store eviction (verb {verb}) -- {detail}");
                 log_poisoned_store_eviction_event(&self.root, plugin_name, verb, false, &format!("reinstantiation failed after {REINSTANTIATION_RETRY_ATTEMPTS} attempts: {detail}"));
-                return Err(PluginDispatchError::EvictedOrPoisoned { plugin_name: plugin_name.to_string() }.into());
+                return Err(PluginDispatchError::EvictedOrPoisoned {
+                    plugin_name: plugin_name.to_string(),
+                }
+                .into());
             };
-            let (mut final_guard, _final_waited_ms) = refilled_pool.acquire_within_for_class(SharedPluginPool::ACQUIRE_TIMEOUT_MS, cost_class);
-            return dispatch_and_evict_on_error(&mut final_guard, &refilled_pool, verb, body, &self.root, &self.siblings, plugin_name);
+            let (mut final_guard, _final_waited_ms) = refilled_pool
+                .acquire_within_for_class(SharedPluginPool::ACQUIRE_TIMEOUT_MS, cost_class);
+            return dispatch_and_evict_on_error(
+                &mut final_guard,
+                &refilled_pool,
+                verb,
+                body,
+                &self.root,
+                &self.siblings,
+                plugin_name,
+            );
         }
-        dispatch_and_evict_on_error(&mut guard, &pool, verb, body, &self.root, &self.siblings, plugin_name)
+        dispatch_and_evict_on_error(
+            &mut guard,
+            &pool,
+            verb,
+            body,
+            &self.root,
+            &self.siblings,
+            plugin_name,
+        )
     }
 }
 
@@ -1071,10 +1314,23 @@ fn dispatch_and_evict_on_error(
         log_poisoned_store_eviction_event(root, plugin_name, verb, false, "slot already empty from a prior eviction, reload did not repopulate it");
         PluginDispatchError::EvictedOrPoisoned { plugin_name: plugin_name.to_string() }
     })?;
-    let result = dispatch_on(&mut handle.store, handle.instance, verb, body, root, siblings.clone());
+    let result = dispatch_on(
+        &mut handle.store,
+        handle.instance,
+        verb,
+        body,
+        root,
+        siblings.clone(),
+    );
     if let Err(poisoning_error) = &result {
         eprintln!("[agentplug registry] evicting plugin {plugin_name} slot -- verb {verb} poisoned its Store: {poisoning_error}");
-        log_poisoned_store_eviction_event(root, plugin_name, verb, true, &poisoning_error.to_string());
+        log_poisoned_store_eviction_event(
+            root,
+            plugin_name,
+            verb,
+            true,
+            &poisoning_error.to_string(),
+        );
         **guard = None;
     } else {
         pool.evict_if_swap_pending(guard);
@@ -1082,7 +1338,8 @@ fn dispatch_and_evict_on_error(
     result
 }
 
-static GM_INFLIGHT_BY_PROJECT: OnceLock<Mutex<HashMap<(PathBuf, &'static str), usize>>> = OnceLock::new();
+static GM_INFLIGHT_BY_PROJECT: OnceLock<Mutex<HashMap<(PathBuf, &'static str), usize>>> =
+    OnceLock::new();
 
 static GM_PROJECT_STEP_RELEASED: OnceLock<Condvar> = OnceLock::new();
 
@@ -1115,18 +1372,86 @@ fn tool_step_released() -> &'static Condvar {
 const MAX_CONCURRENT_HEAVY_DISPATCHES: usize = 3;
 
 const UNSERIALIZED_VERBS: &[&str] = &[
-    "exec_js", "lang", "nodejs", "javascript", "node", "js", "typescript", "python", "py", "bash", "sh", "shell", "zsh",
-    "powershell", "ps1", "ssh", "go", "rust", "c", "cpp", "java", "deno",
-    "serp", "browser", "cdp", "fetch", "callers", "callees", "impact",
-    "fs_read", "fs_readdir", "fs_stat", "env_get", "kv_get", "config_resolve",
-    "git_status", "branch_status", "git_log", "git_diff", "git_show", "ci-status", "git_poll",
-    "status", "wait", "close", "phase-status", "prd-list", "prd-status", "mutable-list", "filter",
+    "exec_js",
+    "lang",
+    "nodejs",
+    "javascript",
+    "node",
+    "js",
+    "typescript",
+    "python",
+    "py",
+    "bash",
+    "sh",
+    "shell",
+    "zsh",
+    "powershell",
+    "ps1",
+    "ssh",
+    "go",
+    "rust",
+    "c",
+    "cpp",
+    "java",
+    "deno",
+    "serp",
+    "browser",
+    "cdp",
+    "fetch",
+    "callers",
+    "callees",
+    "impact",
+    "fs_read",
+    "fs_readdir",
+    "fs_stat",
+    "env_get",
+    "kv_get",
+    "config_resolve",
+    "git_status",
+    "branch_status",
+    "git_log",
+    "git_diff",
+    "git_show",
+    "ci-status",
+    "git_poll",
+    "status",
+    "wait",
+    "close",
+    "phase-status",
+    "prd-list",
+    "prd-status",
+    "mutable-list",
+    "filter",
 ];
 
 const BLOCKING_DISPATCH_VERBS: &[&str] = &[
-    "exec_js", "lang", "nodejs", "javascript", "node", "js", "typescript", "python", "py", "bash", "sh", "shell", "zsh",
-    "powershell", "ps1", "ssh", "go", "rust", "c", "cpp", "java", "deno",
-    "serp", "browser", "cdp", "fetch", "wait",
+    "exec_js",
+    "lang",
+    "nodejs",
+    "javascript",
+    "node",
+    "js",
+    "typescript",
+    "python",
+    "py",
+    "bash",
+    "sh",
+    "shell",
+    "zsh",
+    "powershell",
+    "ps1",
+    "ssh",
+    "go",
+    "rust",
+    "c",
+    "cpp",
+    "java",
+    "deno",
+    "serp",
+    "browser",
+    "cdp",
+    "fetch",
+    "wait",
 ];
 
 pub fn is_blocking_dispatch_verb(verb: &str) -> bool {
@@ -1134,17 +1459,60 @@ pub fn is_blocking_dispatch_verb(verb: &str) -> bool {
 }
 
 const GIT_LANE_VERBS: &[&str] = &[
-    "git_add", "git_commit", "git_finalize", "git_push", "git_pull", "git_fetch", "git_checkout", "git_merge",
-    "git_merge_abort", "git_branch", "git_branch_delete", "git_rm", "git_revert", "git_reset", "git_stash",
-    "git_stash_pop", "git_stash_drop", "git_stash_list",
+    "git_add",
+    "git_commit",
+    "git_finalize",
+    "git_push",
+    "git_pull",
+    "git_fetch",
+    "git_checkout",
+    "git_merge",
+    "git_merge_abort",
+    "git_branch",
+    "git_branch_delete",
+    "git_rm",
+    "git_revert",
+    "git_reset",
+    "git_stash",
+    "git_stash_pop",
+    "git_stash_drop",
+    "git_stash_list",
 ];
 
 const STORE_LANE_VERBS: &[&str] = &[
-    "scan_deps", "health", "memorize", "memorize-fire", "memorize-prune", "memorize-vacuum", "memorize-retention",
-    "recall", "forget", "codeinsight_index", "code_index", "embed", "index", "libsql", "bert",
-    "tencentdb-compat-probe", "tencentdb-memory-import", "config-sync-now", "dataflow_resolve",
-    "sql_open", "sql_close", "sql_list_dbs", "sql_exec", "sql_query", "sql_smoke", "sql_serialize", "sql_deserialize",
-    "cache_get", "cache_put", "cache_invalidate", "cache_stats", "kv_put", "kv_query",
+    "scan_deps",
+    "health",
+    "memorize",
+    "memorize-fire",
+    "memorize-prune",
+    "memorize-vacuum",
+    "memorize-retention",
+    "recall",
+    "forget",
+    "codeinsight_index",
+    "code_index",
+    "embed",
+    "index",
+    "libsql",
+    "bert",
+    "tencentdb-compat-probe",
+    "tencentdb-memory-import",
+    "config-sync-now",
+    "dataflow_resolve",
+    "sql_open",
+    "sql_close",
+    "sql_list_dbs",
+    "sql_exec",
+    "sql_query",
+    "sql_smoke",
+    "sql_serialize",
+    "sql_deserialize",
+    "cache_get",
+    "cache_put",
+    "cache_invalidate",
+    "cache_stats",
+    "kv_put",
+    "kv_query",
 ];
 
 const TREE_SCAN_VERBS: &[&str] = &["grep", "codesearch"];
@@ -1218,9 +1586,14 @@ impl GmFairnessGuard {
             let count = map.entry((root.clone(), lane)).or_insert(0);
             if *count == 0 {
                 *count = 1;
-                return Self { root, lane: Some(lane) };
+                return Self {
+                    root,
+                    lane: Some(lane),
+                };
             }
-            map = gm_project_step_released().wait(map).unwrap_or_else(|e| e.into_inner());
+            map = gm_project_step_released()
+                .wait(map)
+                .unwrap_or_else(|e| e.into_inner());
         }
     }
 
@@ -1328,13 +1701,17 @@ impl ToolDispatchGuard {
             ticket
         };
         loop {
-            let queue = active.get_mut(&key).expect("tool queue exists for its assigned ticket");
+            let queue = active
+                .get_mut(&key)
+                .expect("tool queue exists for its assigned ticket");
             if queue.now_serving == ticket && !queue.active {
                 queue.now_serving += 1;
                 queue.active = true;
                 return Self { key: Some(key) };
             }
-            active = tool_step_released().wait(active).unwrap_or_else(|e| e.into_inner());
+            active = tool_step_released()
+                .wait(active)
+                .unwrap_or_else(|e| e.into_inner());
         }
     }
 

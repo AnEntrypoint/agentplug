@@ -27,10 +27,20 @@ pub fn accepted(dir: &Path, artifact: &str) -> Option<Accepted> {
 
 pub fn record(dir: &Path, artifact: &str, sequence: u64, sha256: &str) -> std::io::Result<()> {
     let mut all = read_all(dir);
-    if all.get(artifact).map(|a| a.sequence > sequence).unwrap_or(false) {
+    if all
+        .get(artifact)
+        .map(|a| a.sequence > sequence)
+        .unwrap_or(false)
+    {
         return Ok(());
     }
-    all.insert(artifact.to_string(), Accepted { sequence, sha256: sha256.to_ascii_lowercase() });
+    all.insert(
+        artifact.to_string(),
+        Accepted {
+            sequence,
+            sha256: sha256.to_ascii_lowercase(),
+        },
+    );
     std::fs::create_dir_all(dir)?;
     let target = path(dir);
     let tmp = target.with_extension(format!("tmp.{}", std::process::id()));

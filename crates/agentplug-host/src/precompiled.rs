@@ -37,11 +37,17 @@ fn precompiled_file_name(plugin_name: &str, content_hash: &str, compat_key: &str
 }
 
 pub fn precompiled_module_path(engine: &Engine, plugin_name: &str, content_hash: &str) -> PathBuf {
-    precompiled_dir().join(precompiled_file_name(plugin_name, content_hash, &engine_compatibility_key(engine)))
+    precompiled_dir().join(precompiled_file_name(
+        plugin_name,
+        content_hash,
+        &engine_compatibility_key(engine),
+    ))
 }
 
 fn remove_superseded_artifacts_for(plugin_name: &str, keep: &Path) {
-    let Ok(entries) = std::fs::read_dir(precompiled_dir()) else { return };
+    let Ok(entries) = std::fs::read_dir(precompiled_dir()) else {
+        return;
+    };
     let prefix = format!("{plugin_name}-");
     for entry in entries.flatten() {
         let path = entry.path();
@@ -49,21 +55,31 @@ fn remove_superseded_artifacts_for(plugin_name: &str, keep: &Path) {
             continue;
         }
         let name = entry.file_name().to_string_lossy().into_owned();
-        let is_this_plugins_artifact = name.starts_with(&prefix) && name.ends_with(PRECOMPILED_EXTENSION);
+        let is_this_plugins_artifact =
+            name.starts_with(&prefix) && name.ends_with(PRECOMPILED_EXTENSION);
         if is_this_plugins_artifact {
             let _ = std::fs::remove_file(&path);
         }
     }
 }
 
-fn write_precompiled_artifact(engine: &Engine, wasm_path: &Path, artifact_path: &Path) -> anyhow::Result<()> {
+fn write_precompiled_artifact(
+    engine: &Engine,
+    wasm_path: &Path,
+    artifact_path: &Path,
+) -> anyhow::Result<()> {
     let wasm_bytes = std::fs::read(wasm_path)?;
-    let serialized = engine.precompile_module(&wasm_bytes).map_err(|e| anyhow::anyhow!("{e:#}"))?;
+    let serialized = engine
+        .precompile_module(&wasm_bytes)
+        .map_err(|e| anyhow::anyhow!("{e:#}"))?;
     drop(wasm_bytes);
     if let Some(parent) = artifact_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let tmp = artifact_path.with_extension(format!("{PRECOMPILED_EXTENSION}.tmp.{}", std::process::id()));
+    let tmp = artifact_path.with_extension(format!(
+        "{PRECOMPILED_EXTENSION}.tmp.{}",
+        std::process::id()
+    ));
     std::fs::write(&tmp, &serialized)?;
     drop(serialized);
     std::fs::rename(&tmp, artifact_path)?;
@@ -85,7 +101,12 @@ fn deserialize_file_backed(engine: &Engine, artifact_path: &Path) -> anyhow::Res
     unsafe { Module::deserialize_file(engine, artifact_path) }.map_err(|e| anyhow::anyhow!("{e:#}"))
 }
 
-pub fn load_module_file_backed(engine: &Engine, wasm_path: &Path, plugin_name: &str, content_hash: &str) -> anyhow::Result<Module> {
+pub fn load_module_file_backed(
+    engine: &Engine,
+    wasm_path: &Path,
+    plugin_name: &str,
+    content_hash: &str,
+) -> anyhow::Result<Module> {
     remove_legacy_wasmtime_cache_once();
     let artifact_path = precompiled_module_path(engine, plugin_name, content_hash);
     if artifact_path.exists() {
@@ -104,7 +125,9 @@ pub fn load_module_file_backed(engine: &Engine, wasm_path: &Path, plugin_name: &
     let started = std::time::Instant::now();
     write_precompiled_artifact(engine, wasm_path, &artifact_path)?;
     remove_superseded_artifacts_for(plugin_name, &artifact_path);
-    let artifact_len = std::fs::metadata(&artifact_path).map(|m| m.len()).unwrap_or(0);
+    let artifact_len = std::fs::metadata(&artifact_path)
+        .map(|m| m.len())
+        .unwrap_or(0);
     eprintln!(
         "[agentplug precompiled] {plugin_name} compiled to {} ({} MB, {}ms) -- later loads map this file instead of copying the artifact into anonymous memory",
         artifact_path.display(),
