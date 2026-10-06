@@ -18,10 +18,10 @@ jobs:
       version: ${{ steps.bump.outputs.version }}
       commit: ${{ steps.bump.outputs.commit }}
     steps:
-        - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
-          with:
-            fetch-depth: 0
-            persist-credentials: false
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          fetch-depth: 0
+          persist-credentials: false
 
       - name: Auto-bump patch version BEFORE build
         id: bump
@@ -41,12 +41,12 @@ jobs:
           git add Cargo.toml
           if git diff --cached --quiet; then
             echo "version=$CURRENT" >> "$GITHUB_OUTPUT"
-              else
-                git commit -m "chore: auto-bump version to $NEW_VERSION [skip ci]"
-                git push origin HEAD:main
-                echo "version=$NEW_VERSION" >> "$GITHUB_OUTPUT"
-              fi
-              echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          else
+            git commit -m "chore: auto-bump version to $NEW_VERSION [skip ci]"
+            git push origin HEAD:main
+            echo "version=$NEW_VERSION" >> "$GITHUB_OUTPUT"
+          fi
+          echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
   build:
     needs: bump
@@ -71,10 +71,10 @@ jobs:
             asset: agentplug-runner-windows-arm64.exe
     runs-on: ${{ matrix.os }}
     steps:
-          - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
-            with:
-              ref: ${{ needs.bump.outputs.commit }}
-              persist-credentials: false
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          ref: ${{ needs.bump.outputs.commit }}
+          persist-credentials: false
 
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
         with:
@@ -112,18 +112,21 @@ jobs:
     needs: bump
     runs-on: ubuntu-24.04-arm
     steps:
-          - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
-            with:
-              ref: ${{ needs.bump.outputs.commit }}
-              persist-credentials: false
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          ref: ${{ needs.bump.outputs.commit }}
+          persist-credentials: false
+
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
         with:
           toolchain: stable
           targets: aarch64-unknown-linux-gnu
+
       - name: Build host runner
         env:
           AGENTPLUG_RELEASE_BUILD: "1"
         run: cargo build -p agentplug-runner --bin agentplug-runner --release --target aarch64-unknown-linux-gnu
+
       - name: Stage host release asset with checksum
         run: |
           set -e
@@ -131,6 +134,7 @@ jobs:
           cp target/aarch64-unknown-linux-gnu/release/agentplug-runner release-assets/agentplug-runner-linux-arm64
           cd release-assets
           sha256sum agentplug-runner-linux-arm64 | sed 's/ \*/  /' > agentplug-runner-linux-arm64.sha256
+
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: agentplug-runner-linux-arm64
@@ -162,8 +166,7 @@ jobs:
           AGENTPLUG_RELEASE_SIGNING_KEY: ${{ secrets.AGENTPLUG_RELEASE_SIGNING_KEY }}
           AGENTPLUG_RELEASE_SIGNING_KEY_ID: ${{ vars.AGENTPLUG_RELEASE_SIGNING_KEY_ID }}
           CI: "true"
-        run: |
-          scripts/sign-release-assets.sh release-assets "${{ needs.bump.outputs.version }}" .
+        run: scripts/sign-release-assets.sh release-assets "${{ needs.bump.outputs.version }}" .
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
@@ -214,7 +217,7 @@ jobs:
             name=$(basename "$f")
             code=$(curl -sL -o /dev/null -w '%{http_code}' "$base/$name")
             if [ "$code" != "200" ]; then
-              echo "::error::published release v$VER's $name is not fetchable (HTTP $code)"
+              echo "::error::published release v$VER's $name is not fetchable (HTTP $code)" >&2
               exit 1
             fi
           done
