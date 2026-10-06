@@ -463,13 +463,17 @@ pub fn run(code: &str, opts: &Value, cwd: &Path) -> Value {
             let mut stdout = stdout_raw;
             let mut result_field: Option<Value> = None;
             if is_js_lang {
-                if let Some(idx) = stdout.rfind(RESULT_SENTINEL) {
+                if let Some((idx, line_end, parsed)) =
+                    stdout.rmatch_indices(RESULT_SENTINEL).find_map(|(idx, _)| {
+                        let tail = &stdout[idx + RESULT_SENTINEL.len()..];
+                        let line_end = tail.find('\n').unwrap_or(tail.len());
+                        serde_json::from_str::<Value>(&tail[..line_end])
+                            .ok()
+                            .map(|parsed| (idx, line_end, parsed))
+                    })
+                {
+                    result_field = Some(parsed);
                     let tail = &stdout[idx + RESULT_SENTINEL.len()..];
-                    let line_end = tail.find('\n').unwrap_or(tail.len());
-                    let json_str = &tail[..line_end];
-                    if let Ok(parsed) = serde_json::from_str::<Value>(json_str) {
-                        result_field = Some(parsed);
-                    }
                     let mut cleaned = String::new();
                     cleaned.push_str(&stdout[..idx]);
                     if let Some(rest_start) = tail.get(line_end + 1..) {
