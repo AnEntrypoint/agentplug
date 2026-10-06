@@ -354,7 +354,11 @@ pub fn remove_stage_record(staged: &Path) {
     let _ = fs::remove_file(sidecar_path(staged));
 }
 
-pub fn staged_runner_permitted(staged: &Path) -> Result<bool, String> {
+pub fn staged_runner_permitted(
+    staged: &Path,
+    expected_artifact: &str,
+    expected_version: &str,
+) -> Result<bool, String> {
     let trust = runner_trust();
     if trust.mode == Mode::Off {
         return Ok(false);
@@ -374,6 +378,14 @@ pub fn staged_runner_permitted(staged: &Path) -> Result<bool, String> {
         .and_then(|v| v.get("sha256"))
         .and_then(|v| v.as_str())
         .map(str::to_string);
+    let recorded_artifact = record
+        .as_ref()
+        .and_then(|v| v.get("artifact"))
+        .and_then(|v| v.as_str());
+    let recorded_version = record
+        .as_ref()
+        .and_then(|v| v.get("version"))
+        .and_then(|v| v.as_str());
     let verified = record
         .as_ref()
         .and_then(|v| v.get("verified"))
@@ -387,6 +399,18 @@ pub fn staged_runner_permitted(staged: &Path) -> Result<bool, String> {
         .unwrap_or_else(|| {
             "the staged runner carries no signature-verification record".to_string()
         });
+    if recorded_artifact != Some(expected_artifact) {
+        return Err(format!(
+            "the staged runner verification record is for artifact {:?}, not {expected_artifact:?}",
+            recorded_artifact
+        ));
+    }
+    if recorded_version != Some(expected_version) {
+        return Err(format!(
+            "the staged runner verification record is for version {:?}, not {expected_version:?}",
+            recorded_version
+        ));
+    }
     match recorded_sha {
         Some(sha) if sha.eq_ignore_ascii_case(&actual) => {
             if verified {

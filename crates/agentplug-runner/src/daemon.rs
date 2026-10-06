@@ -1175,7 +1175,10 @@ fn staged_binary_self_check(staged_exe: &Path, expected_version: &str) -> bool {
 }
 
 fn attempt_self_update_handoff(staged_exe: &Path, version: &str) -> bool {
-    if let Err(problem) = crate::update_trust::staged_runner_permitted(staged_exe) {
+    let Some(asset) = crate::download::runner_asset_name() else {
+        return false;
+    };
+    if let Err(problem) = crate::update_trust::staged_runner_permitted(staged_exe, asset, version) {
         let _ = fs::remove_file(staged_exe);
         crate::update_trust::remove_stage_record(staged_exe);
         eprintln!(
@@ -1277,7 +1280,10 @@ fn promote_staged_exe_to_canonical(version: &str, running_before: Option<&str>) 
     if staged == canonical {
         return false;
     }
-    if let Err(problem) = crate::update_trust::staged_runner_permitted(&staged) {
+    let Some(asset) = crate::download::runner_asset_name() else {
+        return false;
+    };
+    if let Err(problem) = crate::update_trust::staged_runner_permitted(&staged, asset, version) {
         eprintln!(
             "[agentplug daemon] takeover: refusing to promote {version} onto {} -- {problem}; this process keeps running from the staged copy instead of overwriting the canonical exe",
             canonical.display()

@@ -459,7 +459,7 @@ fn record_plugin_install(
 
 const RUNNER_BIN_REPO: &str = "AnEntrypoint/agentplug-bin";
 
-fn runner_asset_name() -> Option<&'static str> {
+pub(crate) fn runner_asset_name() -> Option<&'static str> {
     match (std::env::consts::OS, std::env::consts::ARCH) {
         ("windows", "x86_64") => Some("agentplug-runner-windows-x64.exe"),
         ("windows", "aarch64") => Some("agentplug-runner-windows-arm64.exe"),
