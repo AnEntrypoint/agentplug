@@ -1435,11 +1435,12 @@ fn cached_staged_runner() -> Option<(u64, u64)> {
     *staged_runner_cache().lock().unwrap_or_else(|e| e.into_inner())
 }
 
-fn write_project_heartbeat(spool_dir: &Path, busy_until: Option<u64>) {
-    write_project_heartbeat_with_queue_info(spool_dir, busy_until, None);
+fn write_project_heartbeat(root: &Path, busy_until: Option<u64>) {
+    write_project_heartbeat_with_queue_info(root, busy_until, None);
 }
 
-fn write_project_heartbeat_with_queue_info(spool_dir: &Path, busy_until: Option<u64>, queue_info: Option<(usize, usize)>) {
+fn write_project_heartbeat_with_queue_info(root: &Path, busy_until: Option<u64>, queue_info: Option<(usize, usize)>) {
+    let spool_dir = spool_dir_of(root);
     let status_path = spool_dir.join(".status.json");
     let mut payload = match fs::read_to_string(&status_path).ok().and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok()) {
         Some(serde_json::Value::Object(map)) => serde_json::Value::Object(map),
@@ -1459,7 +1460,7 @@ fn write_project_heartbeat_with_queue_info(spool_dir: &Path, busy_until: Option<
         payload["queue_position"] = serde_json::json!(position);
         payload["queue_depth"] = serde_json::json!(total);
     }
-    let (queued_steps, claimed_steps) = spool_step_counts(spool_dir);
+    let (queued_steps, claimed_steps) = spool_step_counts(root);
     payload["queued_step_count"] = serde_json::json!(queued_steps);
     payload["claimed_step_count"] = serde_json::json!(claimed_steps);
     payload["gm_processor_capacity"] = serde_json::json!(GM_PROCESSOR_CAPACITY.load(std::sync::atomic::Ordering::Relaxed));
@@ -1498,6 +1499,27 @@ pub fn read_known_project_roots() -> Vec<PathBuf> {
     known_project_roots().lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
+const IDLE_PROJECT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
+
+fn project_heartbeat_last_write() -> &'static Mutex<HashMap<PathBuf, Instant>> {
+    static SLOT: OnceLock<Mutex<HashMap<PathBuf, Instant>>> = OnceLock::new();
+    SLOT.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn project_heartbeat_due(root: &Path, has_queued_work: bool) -> bool {
+    let now = Instant::now();
+    let mut last_writes = project_heartbeat_last_write().lock().unwrap_or_else(|e| e.into_inner());
+    let due = has_queued_work
+        || match last_writes.get(root) {
+            Some(at) => now.saturating_duration_since(*at) >= IDLE_PROJECT_HEARTBEAT_INTERVAL,
+            None => true,
+        };
+    if due {
+        last_writes.insert(root.to_path_buf(), now);
+    }
+    due
+}
+
 fn spawn_project_heartbeat_ticker(interval: Duration) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || loop {
         std::thread::sleep(interval);
@@ -1506,11 +1528,15 @@ fn spawn_project_heartbeat_ticker(interval: Duration) -> std::thread::JoinHandle
         }
         let roots = known_project_roots().lock().unwrap_or_else(|e| e.into_inner()).clone();
         for root in roots {
-            let spool_dir = root.join(".gm").join("exec-spool");
+            let spool_dir = spool_dir_of(&root);
             if !spool_dir.exists() {
                 continue;
             }
-            write_project_heartbeat(&spool_dir, busy_until_for_project_ticker(&root, &spool_dir));
+            let (queued, claimed) = spool_step_counts(&root);
+            if !project_heartbeat_due(&root, queued + claimed > 0) {
+                continue;
+            }
+            write_project_heartbeat(&root, busy_until_for_project_ticker(&root));
         }
     })
 }
@@ -1629,8 +1655,12 @@ fn spawn_dream_rsi_cycle_ticker(interval: Duration) -> std::thread::JoinHandle<(
     })
 }
 
-fn read_status_busy_until_if_future(spool_dir: &Path) -> Option<u64> {
-    let text = fs::read_to_string(spool_dir.join(".status.json")).ok()?;
+fn spool_dir_of(root: &Path) -> PathBuf {
+    root.join(".gm").join("exec-spool")
+}
+
+fn read_status_busy_until_if_future(root: &Path) -> Option<u64> {
+    let text = fs::read_to_string(spool_dir_of(root).join(".status.json")).ok()?;
     let value: serde_json::Value = serde_json::from_str(&text).ok()?;
     let busy_until = value.get("busy_until")?.as_u64()?;
     (busy_until > now_ms()).then_some(busy_until)
@@ -1638,38 +1668,45 @@ fn read_status_busy_until_if_future(spool_dir: &Path) -> Option<u64> {
 
 const TICKER_BUSY_UNTIL_EXTEND_MS: u64 = 60_000;
 
-fn busy_until_for_project_ticker(root: &Path, spool_dir: &Path) -> Option<u64> {
-    if project_in_flight_count(root) > 0 || spool_has_queued_work(spool_dir) {
+fn busy_until_for_project_ticker(root: &Path) -> Option<u64> {
+    if project_in_flight_count(root) > 0 || spool_has_queued_work(root) {
         return Some(now_ms() + TICKER_BUSY_UNTIL_EXTEND_MS);
     }
-    read_status_busy_until_if_future(spool_dir)
+    read_status_busy_until_if_future(root)
 }
 
-fn spool_has_queued_work(spool_dir: &Path) -> bool {
-    let in_dir = spool_dir.join("in");
-    let Ok(verbs) = fs::read_dir(&in_dir) else { return false };
-    for verb_entry in verbs.flatten() {
-        if !verb_entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-            continue;
-        }
-        let verb = verb_entry.file_name().to_string_lossy().into_owned();
-        let Ok(files) = fs::read_dir(verb_entry.path()) else { continue };
-        for file_entry in files.flatten() {
-            let name = file_entry.file_name();
-            let name = name.to_string_lossy();
-            if name.ends_with(".inflight") || is_spool_request_path(&verb, &file_entry.path()) {
-                return true;
-            }
-        }
+const SPOOL_SCAN_BACKSTOP_TTL: Duration = Duration::from_secs(30);
+
+struct RootScan {
+    at: Instant,
+    claimable: bool,
+    has_queued_work: bool,
+    queued_steps: usize,
+    claimed_steps: usize,
+}
+
+fn spool_dirty_roots() -> &'static Mutex<HashSet<PathBuf>> {
+    static SLOT: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+    SLOT.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn mark_spool_dirty(root: &Path) {
+    if let Ok(mut dirty) = spool_dirty_roots().lock() {
+        dirty.insert(root.to_path_buf());
     }
-    false
 }
 
-fn spool_step_counts(spool_dir: &Path) -> (usize, usize) {
+fn root_scan_cache() -> &'static Mutex<HashMap<PathBuf, RootScan>> {
+    static SLOT: OnceLock<Mutex<HashMap<PathBuf, RootScan>>> = OnceLock::new();
+    SLOT.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn count_spool_steps(root: &Path) -> (bool, usize, usize) {
     let mut queued = 0usize;
     let mut claimed = 0usize;
-    let in_dir = spool_dir.join("in");
-    let Ok(verbs) = fs::read_dir(in_dir) else { return (queued, claimed) };
+    let mut has_queued_work = false;
+    let in_dir = spool_dir_of(root).join("in");
+    let Ok(verbs) = fs::read_dir(&in_dir) else { return (has_queued_work, queued, claimed) };
     for verb_entry in verbs.flatten() {
         if !verb_entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
             continue;
@@ -1677,15 +1714,58 @@ fn spool_step_counts(spool_dir: &Path) -> (usize, usize) {
         let verb = verb_entry.file_name().to_string_lossy().into_owned();
         let Ok(files) = fs::read_dir(verb_entry.path()) else { continue };
         for file_entry in files.flatten() {
-            let name = file_entry.file_name();
-            let name = name.to_string_lossy();
+            let name = file_entry.file_name().to_string_lossy().into_owned();
             if is_spool_request_path(&verb, &file_entry.path()) {
                 queued += 1;
+                has_queued_work = true;
             } else if name.ends_with(".inflight") {
                 claimed += 1;
+                has_queued_work = true;
             }
         }
     }
+    (has_queued_work, queued, claimed)
+}
+
+fn cached_root_scan(root: &Path) -> (bool, bool, usize, usize) {
+    let now = Instant::now();
+    let dirty = spool_dirty_roots().lock().map(|d| d.contains(root)).unwrap_or(true);
+    if !dirty {
+        let cached = root_scan_cache()
+            .lock()
+            .ok()
+            .and_then(|cache| cache.get(root).map(|s| (s.at, s.claimable, s.has_queued_work, s.queued_steps, s.claimed_steps)));
+        if let Some((at, claimable, has_queued_work, queued_steps, claimed_steps)) = cached {
+            if now.saturating_duration_since(at) < SPOOL_SCAN_BACKSTOP_TTL {
+                return (claimable, has_queued_work, queued_steps, claimed_steps);
+            }
+        }
+    }
+    let queued_work = project_has_queued_spool_work(root);
+    let counted = count_spool_steps(root);
+    let scan = RootScan {
+        at: Instant::now(),
+        claimable: queued_work,
+        has_queued_work: counted.0,
+        queued_steps: counted.1,
+        claimed_steps: counted.2,
+    };
+    let result = (scan.claimable, scan.has_queued_work, scan.queued_steps, scan.claimed_steps);
+    if let Ok(mut cache) = root_scan_cache().lock() {
+        cache.insert(root.to_path_buf(), scan);
+    }
+    if let Ok(mut dirty) = spool_dirty_roots().lock() {
+        dirty.remove(root);
+    }
+    result
+}
+
+fn spool_has_queued_work(root: &Path) -> bool {
+    cached_root_scan(root).1
+}
+
+fn spool_step_counts(root: &Path) -> (usize, usize) {
+    let (_, _, queued, claimed) = cached_root_scan(root);
     (queued, claimed)
 }
 
@@ -2726,7 +2806,7 @@ fn verb_dir_has_claimable_request(verb_dir: &Path, verb: &str, language_stems: b
 
 #[cfg(windows)]
 struct IdleInDirWatch {
-    entries: Vec<(PathBuf, windows_sys::Win32::Foundation::HANDLE)>,
+    entries: Vec<(PathBuf, PathBuf, windows_sys::Win32::Foundation::HANDLE)>,
 }
 
 #[cfg(windows)]
@@ -2737,7 +2817,7 @@ impl IdleInDirWatch {
 
     fn close_all(&mut self) {
         use windows_sys::Win32::Storage::FileSystem::FindCloseChangeNotification;
-        for (_, handle) in self.entries.drain(..) {
+        for (_, _, handle) in self.entries.drain(..) {
             unsafe { FindCloseChangeNotification(handle); }
         }
     }
@@ -2749,16 +2829,16 @@ impl IdleInDirWatch {
             FindFirstChangeNotificationW, FILE_NOTIFY_CHANGE_DIR_NAME, FILE_NOTIFY_CHANGE_FILE_NAME,
             FILE_NOTIFY_CHANGE_SIZE,
         };
-        let wanted: Vec<PathBuf> = roots
+        let wanted: Vec<(PathBuf, PathBuf)> = roots
             .iter()
-            .map(|root| root.join(".gm").join("exec-spool").join("in"))
-            .filter(|dir| dir.is_dir())
+            .map(|root| (root.clone(), spool_dir_of(root).join("in")))
+            .filter(|(_, dir)| dir.is_dir())
             .collect();
-        if self.entries.iter().map(|(p, _)| p).eq(wanted.iter()) {
+        if self.entries.iter().map(|(_, dir, _)| dir).eq(wanted.iter().map(|(_, dir)| dir)) {
             return;
         }
         self.close_all();
-        for dir in wanted {
+        for (root, dir) in wanted {
             let mut wide: Vec<u16> = dir.as_os_str().encode_wide().collect();
             wide.push(0);
             let handle = unsafe {
@@ -2769,7 +2849,8 @@ impl IdleInDirWatch {
                 )
             };
             if handle != INVALID_HANDLE_VALUE {
-                self.entries.push((dir, handle));
+                mark_spool_dirty(&root);
+                self.entries.push((root, dir, handle));
             }
         }
     }
@@ -2783,12 +2864,12 @@ impl IdleInDirWatch {
     // Blocks until one of the watched in/ dirs changes or `cap` elapses.
     // Returns true when a change woke it and false when the cap ran out, so the
     // caller can tell "nothing happened" from "something may have appeared".
-    fn wait(&self, cap: Duration) -> bool {
+    fn wait(&self, cap: Duration) -> Option<PathBuf> {
         use windows_sys::Win32::Storage::FileSystem::FindNextChangeNotification;
         use windows_sys::Win32::System::Threading::WaitForMultipleObjects;
         if self.entries.is_empty() {
             std::thread::sleep(cap);
-            return false;
+            return None;
         }
         const WAIT_OBJECT_0: u32 = 0;
         // Every chunk gets its own slice of the deadline. Waiting each chunk
@@ -2797,23 +2878,23 @@ impl IdleInDirWatch {
         // -- the documented "a change in any chunk wakes the whole wait" only
         // held for the first chunk, and every other root was seen a whole cap
         // late.
-        let chunks: Vec<&[(PathBuf, windows_sys::Win32::Foundation::HANDLE)]> =
+        let chunks: Vec<&[(PathBuf, PathBuf, windows_sys::Win32::Foundation::HANDLE)]> =
             self.entries.chunks(Self::WAIT_CHUNK_HANDLES).collect();
         let per_chunk_ms = (cap.as_millis() as u64 / chunks.len() as u64).max(1);
         for chunk in chunks {
-            let handles: Vec<_> = chunk.iter().map(|(_, h)| *h).collect();
+            let handles: Vec<_> = chunk.iter().map(|(_, _, h)| *h).collect();
             let rc = unsafe {
                 WaitForMultipleObjects(handles.len() as u32, handles.as_ptr(), 0, per_chunk_ms as u32)
             };
             if (WAIT_OBJECT_0..WAIT_OBJECT_0 + handles.len() as u32).contains(&rc) {
                 let idx = (rc - WAIT_OBJECT_0) as usize;
-                if let Some((_, handle)) = chunk.get(idx) {
+                if let Some((_, _, handle)) = chunk.get(idx) {
                     unsafe { FindNextChangeNotification(*handle); }
                 }
-                return true;
+                return chunk.get(idx).map(|(root, _, _)| root.clone());
             }
         }
-        false
+        None
     }
 }
 
@@ -2837,10 +2918,8 @@ fn wait_for_in_dir_change(watch: &mut IdleInDirWatch, roots: &[PathBuf], cap: Du
     if roots.iter().any(|root| project_has_pending_dispatch_work(root)) {
         return;
     }
-    if watch.wait(cap) {
-        if let Ok(mut cache) = spool_work_cache().lock() {
-            cache.clear();
-        }
+    if let Some(changed_root) = watch.wait(cap) {
+        mark_spool_dirty(&changed_root);
     }
 }
 
@@ -2865,29 +2944,8 @@ fn project_has_queued_spool_work(root: &Path) -> bool {
 // an uncached pass over the whole registry is throttled by directory reads
 // instead of by work. One answer per root per TTL is indistinguishable to a
 // submitter: the file it just wrote is seen within one TTL.
-const SPOOL_WORK_CACHE_TTL: Duration = Duration::from_millis(200);
-
-fn spool_work_cache() -> &'static Mutex<HashMap<PathBuf, (Instant, bool)>> {
-    static SLOT: OnceLock<Mutex<HashMap<PathBuf, (Instant, bool)>>> = OnceLock::new();
-    SLOT.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
 fn project_has_queued_spool_work_cached(root: &Path) -> bool {
-    let now = Instant::now();
-    let fresh = spool_work_cache()
-        .lock()
-        .ok()
-        .and_then(|cache| cache.get(root).copied())
-        .filter(|(at, _)| now.saturating_duration_since(*at) < SPOOL_WORK_CACHE_TTL)
-        .map(|(_, value)| value);
-    if let Some(value) = fresh {
-        return value;
-    }
-    let value = project_has_queued_spool_work(root);
-    if let Ok(mut cache) = spool_work_cache().lock() {
-        cache.insert(root.to_path_buf(), (Instant::now(), value));
-    }
-    value
+    cached_root_scan(root).0
 }
 
 // Dispatchable now: queued AND this project still has a claim slot. A project
@@ -2901,6 +2959,7 @@ fn project_has_pending_dispatch_work(root: &Path) -> bool {
 
 fn dispatch_project(root: &Path, project: &mut ProjectPlugins, plugin_modules: &PluginModules) -> bool {
     let mut did_work = false;
+    mark_spool_dirty(root);
 
     let spool_dir = root.join(".gm").join("exec-spool");
     let in_dir = spool_dir.join("in");
@@ -2972,7 +3031,7 @@ fn dispatch_project(root: &Path, project: &mut ProjectPlugins, plugin_modules: &
     if fs::create_dir_all(&in_dir).is_err() || fs::create_dir_all(&out_dir).is_err() {
         return did_work;
     }
-    write_project_heartbeat(&spool_dir, read_status_busy_until_if_future(&spool_dir));
+    write_project_heartbeat(root, read_status_busy_until_if_future(root));
 
     let requested_plugins = {
         let mut list = vec!["gm".to_string()];
@@ -3090,7 +3149,7 @@ fn dispatch_project(root: &Path, project: &mut ProjectPlugins, plugin_modules: &
             }
 
             answer_bg_converts(bg_convert_requests);
-            write_project_heartbeat(&spool_dir, Some(now_ms() + TICKER_BUSY_UNTIL_EXTEND_MS));
+            write_project_heartbeat(root, Some(now_ms() + TICKER_BUSY_UNTIL_EXTEND_MS));
         }
     }
 
@@ -3660,6 +3719,9 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
             let previous_roots: std::collections::HashSet<PathBuf> = known_roots.iter().cloned().collect();
             known_roots = read_registry();
             roots_new_this_registry_poll = known_roots.iter().filter(|r| !previous_roots.contains(*r)).cloned().collect();
+            for root in &roots_new_this_registry_poll {
+                mark_spool_dirty(root);
+            }
             set_known_project_roots(&known_roots);
             if sweep_orphans_left_by_whatever_daemon_died_before_answering {
                 sweep_orphaned_claims_across_roots(&known_roots);
@@ -3781,7 +3843,7 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
             for (position, (_, root)) in active_roots.iter().enumerate() {
                 let spool_dir = root.join(".gm").join("exec-spool");
                 if fs::create_dir_all(&spool_dir).is_ok() {
-                    write_project_heartbeat_with_queue_info(&spool_dir, read_status_busy_until_if_future(&spool_dir), Some((position, reported_queue_total)));
+                    write_project_heartbeat_with_queue_info(root, read_status_busy_until_if_future(root), Some((position, reported_queue_total)));
                 }
             }
         }
@@ -3825,7 +3887,7 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
             if reported_queue_total > worker_count {
                 let spool_dir = root.join(".gm").join("exec-spool");
                 if fs::create_dir_all(&spool_dir).is_ok() {
-                    write_project_heartbeat_with_queue_info(&spool_dir, read_status_busy_until_if_future(&spool_dir), Some((0, 0)));
+                    write_project_heartbeat_with_queue_info(root.as_path(), read_status_busy_until_if_future(root.as_path()), Some((0, 0)));
                 }
             }
             projects.insert(root, project);
