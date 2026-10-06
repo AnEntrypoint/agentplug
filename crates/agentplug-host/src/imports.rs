@@ -551,13 +551,12 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
             else {
                 return 0;
             };
-            let entries: Vec<String> = fs::read_dir(&full)
-                .map(|rd| {
-                    rd.filter_map(|e| e.ok())
-                        .map(|e| e.file_name().to_string_lossy().into_owned())
-                        .collect()
-                })
-                .unwrap_or_default();
+            let Ok(entries) = fs::read_dir(&full).and_then(|rd| {
+                rd.map(|entry| entry.map(|entry| entry.file_name().to_string_lossy().into_owned()))
+                    .collect::<std::io::Result<Vec<String>>>()
+            }) else {
+                return 0;
+            };
             write_guest_json(&mut caller, serde_json::json!(entries))
         },
     )?;

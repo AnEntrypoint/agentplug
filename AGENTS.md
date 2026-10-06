@@ -29,6 +29,12 @@ the `agentplug-host` imports, and `agentplug-trust`. Work on `main` as GitHub us
 
 ## Runtime invariants
 
+- `host_fs_readdir` returns zero on directory or entry-read failure, never a successful empty
+  or partial array. Structural indexing propagates that failure and refuses pruning or graph
+  evidence; legacy guest wrappers may explicitly retain their empty-list fallback.
+- Task handles are process-local. Spawn and JavaScript adoption share checked monotonic IDs
+  and never overwrite occupied entries. Registry-instance mismatch identifies lost host ownership,
+  including restart; failed registration cleans up only the newly owned child and process group.
 - The spool daemon is a singleton per project. Requests are written atomically, claimed by rename,
   and identified by `(verb, session-id-task-number)`; preserve those properties when changing
   dispatch or recovery.
