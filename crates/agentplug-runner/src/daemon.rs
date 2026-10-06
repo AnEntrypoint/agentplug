@@ -1348,7 +1348,9 @@ pub fn run_takeover(version: &str) -> anyhow::Result<()> {
                     reexec_from_canonical_and_exit(&canonical);
                 }
             }
-            eprintln!("[agentplug daemon] takeover: ownership claimed, version recorded, entering normal daemon loop");
+            eprintln!(
+                "[agentplug daemon] takeover: ownership claimed, entering normal daemon loop"
+            );
             return run_daemon_body(plugin_modules);
         }
         std::thread::sleep(Duration::from_millis(250));
