@@ -2300,10 +2300,6 @@ pub fn run(body: &str, opts: &str, cwd_raw: &Path, session_id: &str) -> Value {
     reap_idle_sessions(cwd, &browser_cfg);
     reap_os_orphans(cwd);
 
-    // A body authored with CRLF line endings (or a directive line with trailing spaces) used to
-    // miss every `"<directive>\n"` prefix, so `capture` silently fell through to the default mode
-    // and reported `instrumented: false` with no visible cause. Normalize once, before any
-    // directive is parsed, so mode/quiet/timeout/sessionId/viewport/url all behave identically.
     let inner_body = if body.contains('\r') {
         body.replace("\r\n", "\n")
     } else {
@@ -2572,9 +2568,6 @@ pub fn run(body: &str, opts: &str, cwd_raw: &Path, session_id: &str) -> Value {
         Err(std::sync::TryLockError::Poisoned(poisoned)) => (Some(poisoned.into_inner()), None),
         Err(std::sync::TryLockError::WouldBlock) => {
             let queued_at = Instant::now();
-            // Bounded: an unbounded `lock()` here let a wedged holder keep every later dispatch
-            // on the same page waiting past the caller's own deadline, which is how the verb
-            // "hung" with no response at all. Give up and say so instead.
             let budget = Duration::from_millis(timeout_ms.max(1_000));
             let mut acquired = None;
             while acquired.is_none() && queued_at.elapsed() < budget {
@@ -2806,7 +2799,7 @@ pub fn run(body: &str, opts: &str, cwd_raw: &Path, session_id: &str) -> Value {
         "cdpEndpoint": sessions_map().lock().unwrap_or_else(|e| e.into_inner()).get(&key).map(|session| session.cdp_endpoint.clone()).unwrap_or_else(|| format!("http://127.0.0.1:{port}")),
         "startUrl": start_url,
         "targetId": known_target_id,
-        "claimFreshTarget": engine == crate::browser_engine::Engine::Steel,
+        "claimFreshTarget": true,
         "glCapture": mode == BrowserMode::Capture && mode_name == "gl",
         "uncapped": uncapped,
         "gpuProbeFile": gpu_probe_path.as_ref().map(|p| p.to_string_lossy().into_owned()),
@@ -2831,8 +2824,6 @@ pub fn run(body: &str, opts: &str, cwd_raw: &Path, session_id: &str) -> Value {
         .arg(&helper_path)
         .arg(&cfg)
         .stdin(Stdio::null())
-        // Nothing ever reads the helper's stdout (results go to resultFile, diagnostics to
-        // stderr), so a piped stdout is only a 64KB write buffer the child can block on.
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
     #[cfg(windows)]
@@ -2853,10 +2844,6 @@ pub fn run(body: &str, opts: &str, cwd_raw: &Path, session_id: &str) -> Value {
         }
     };
 
-    // Kill inside the caller's own deadline, not after it: waiting `timeout_ms + grace` meant the
-    // response could only ever land once the caller had already given up, which reads as a wedged
-    // verb. The lead is always larger than the helper's pre-kill watchdog margin, so the helper's
-    // honest "did not settle" result is already on disk when we get here.
     let kill_lead = std::cmp::max(
         HOST_KILL_LEAD_MS,
         std::cmp::max(timeout_ms / 40, browser_cfg.eval_timeout_grace()),
@@ -2929,9 +2916,6 @@ pub fn run(body: &str, opts: &str, cwd_raw: &Path, session_id: &str) -> Value {
     );
     let shaped_debug = |raw: Option<&Value>| -> Value {
         let mut debug = raw.cloned().unwrap_or_else(default_debug);
-        // Authoritative and always present, so `capture` either clearly engaged or clearly did
-        // not: previously only the negative case carried a flag, which is what made the
-        // "instrumented: false" reports look like they had no pattern.
         if let Some(obj) = debug.as_object_mut() {
             obj.insert("instrumented".to_string(), json!(instrumented));
         }
@@ -2953,8 +2937,6 @@ pub fn run(body: &str, opts: &str, cwd_raw: &Path, session_id: &str) -> Value {
         "gm_session": owner_gm_session,
         "port": port,
     });
-    // The document the script actually ran in, plus how it got there. Without this a stale or
-    // blank document is indistinguishable from a rendered one in the caller's own output.
     if let Some(doc) = result_value.get("__document").filter(|d| !d.is_null()) {
         out["document"] = doc.clone();
     }
