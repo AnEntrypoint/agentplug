@@ -958,7 +958,8 @@ pub fn ensure_sibling_registered(root: &Path, plugin_name: &str, siblings: &Sibl
     if siblings
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .contains_key(plugin_name)
+        .get(plugin_name)
+        .is_some_and(|pool| pool.any_instantiated_without_blocking())
     {
         return true;
     }
@@ -976,7 +977,8 @@ pub fn ensure_sibling_registered(root: &Path, plugin_name: &str, siblings: &Sibl
     siblings
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .contains_key(plugin_name)
+        .get(plugin_name)
+        .is_some_and(|pool| pool.any_instantiated_without_blocking())
 }
 
 fn resolve_routed_plugin_name(plugin_name: &str) -> (String, Option<crate::broker::RouteLease>) {

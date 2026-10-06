@@ -997,6 +997,7 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
             let mut guard = sibling_pool.acquire().expect("acquire() always returns Some -- FIFO wait never denies");
             if guard.is_none() {
                 drop(guard);
+                crate::registry::ensure_sibling_registered(&caller_root, &plugin, &caller_siblings);
                 let remaining_ms = acquire_timeout_ms.saturating_sub(acquire_start.elapsed().as_millis() as u64);
                 sibling_pool.any_instantiated_within(remaining_ms);
                 let remaining_ms = acquire_timeout_ms.saturating_sub(acquire_start.elapsed().as_millis() as u64);
