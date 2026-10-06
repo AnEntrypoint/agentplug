@@ -320,6 +320,10 @@ fn starts_cdp_raw_body(trimmed: &str) -> bool {
 fn strip_mode_prefix(body: &str) -> (BrowserMode, String, &str) {
     let trimmed = body.trim_start();
     let Some(nl) = trimmed.find('\n') else {
+        if starts_cdp_raw_body(trimmed) {
+            let first_line = trimmed.trim().to_string();
+            return (BrowserMode::CdpRaw, first_line, trimmed);
+        }
         if let Some(rest) = trimmed.strip_prefix("screenshot=") {
             return (BrowserMode::Screenshot, rest.trim().to_string(), "");
         }
