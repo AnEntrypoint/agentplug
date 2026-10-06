@@ -454,6 +454,48 @@ fn daemon_owner_path() -> PathBuf {
     install_dir().join("daemon-owner.lock")
 }
 
+fn handoff_reservation_path() -> PathBuf {
+    install_dir().join("daemon-handoff-reservation.json")
+}
+
+const HANDOFF_RESERVATION_MAX_AGE_MS: u64 = 30_000;
+
+fn handoff_reservation_blocks(pid: u64) -> bool {
+    let reservation = fs::read_to_string(handoff_reservation_path())
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok());
+    let Some(reservation) = reservation else {
+        return false;
+    };
+    let Some(reserved_pid) = reservation.get("pid").and_then(|value| value.as_u64()) else {
+        return false;
+    };
+    let ts = reservation
+        .get("ts")
+        .and_then(|value| value.as_u64())
+        .unwrap_or(0);
+    reserved_pid != pid
+        && now_ms().saturating_sub(ts) < HANDOFF_RESERVATION_MAX_AGE_MS
+        && pid_is_alive(reserved_pid)
+}
+
+fn reserve_ownership_for_handoff(pid: u64, version: &str) -> anyhow::Result<()> {
+    if pid == 0 || !pid_is_alive(pid) {
+        anyhow::bail!("successor pid {pid} is not alive");
+    }
+    let path = handoff_reservation_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let temp = path.with_extension(format!("json.tmp.{}", std::process::id()));
+    fs::write(
+        &temp,
+        serde_json::json!({ "pid": pid, "version": version, "ts": now_ms() }).to_string(),
+    )?;
+    fs::rename(&temp, path)?;
+    Ok(())
+}
+
 fn read_owner_pid() -> Option<u64> {
     fs::read_to_string(daemon_owner_path())
         .ok()
@@ -466,6 +508,9 @@ pub fn claim_ownership() -> bool {
         let _ = fs::create_dir_all(parent);
     }
     let my_pid = std::process::id() as u64;
+    if handoff_reservation_blocks(my_pid) {
+        return false;
+    }
 
     if fs::OpenOptions::new()
         .write(true)
@@ -1165,6 +1210,15 @@ fn attempt_self_update_handoff(staged_exe: &Path, version: &str) -> bool {
         if let Ok(raw) = fs::read_to_string(&ready_path) {
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
                 if v.get("version").and_then(|x| x.as_str()) == Some(version) {
+                    let Some(successor_pid) = v.get("pid").and_then(|x| x.as_u64()) else {
+                        continue;
+                    };
+                    if let Err(error) = reserve_ownership_for_handoff(successor_pid, version) {
+                        eprintln!(
+                            "[agentplug daemon] self-update successor for {version} cannot reserve the ownership handoff: {error}"
+                        );
+                        continue;
+                    }
                     eprintln!("[agentplug daemon] new version {version} confirmed ready -- releasing ownership for handoff");
                     record_handoff_attempt(None);
                     clear_handoff_escalation(version);
@@ -1245,25 +1299,36 @@ fn promote_staged_exe_to_canonical(version: &str, running_before: Option<&str>) 
             return false;
         }
     }
-    match fs::copy(&staged, &canonical) {
-        Ok(_) => {
-            #[cfg(not(windows))]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                if let Ok(meta) = fs::metadata(&canonical) {
-                    let mut perms = meta.permissions();
-                    perms.set_mode(0o755);
-                    let _ = fs::set_permissions(&canonical, perms);
-                }
-            }
+    let replacement = canonical.with_extension(format!(
+        "{}.replace.{}",
+        canonical
+            .extension()
+            .map(|extension| extension.to_string_lossy())
+            .unwrap_or_default(),
+        std::process::id()
+    ));
+    let promotion = (|| -> std::io::Result<()> {
+        fs::copy(&staged, &replacement)?;
+        #[cfg(not(windows))]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&replacement)?.permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&replacement, perms)?;
+        }
+        fs::rename(&replacement, &canonical)
+    })();
+    match promotion {
+        Ok(()) => {
             record_completed_runner_swap(version);
             crate::update_trust::record_unverified_promotion(&staged, version, running_before);
             eprintln!("[agentplug daemon] takeover: promoted {version} onto canonical exe path {} (previous version kept at {})", canonical.display(), prev.display());
             true
         }
         Err(e) => {
+            let _ = fs::remove_file(&replacement);
             eprintln!(
-                "[agentplug daemon] takeover: failed to copy staged exe onto canonical path {}: {e} -- restoring previous version at canonical path",
+                "[agentplug daemon] takeover: failed to atomically promote staged exe onto canonical path {}: {e} -- restoring previous version at canonical path",
                 canonical.display()
             );
             if prev.exists() {
