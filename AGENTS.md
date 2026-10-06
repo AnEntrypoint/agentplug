@@ -21,6 +21,11 @@ the `agentplug-host` imports, and `agentplug-trust`. Work on `main` as GitHub us
 - A discovered same-user GitHub CLI credential directory is shared with Git and execution child
   processes through `GH_CONFIG_DIR`; an explicit inherited directory takes precedence. Git uses
   the transient `gh auth git-credential` helper. Never export, copy, print, or persist its token.
+- Execution children inherit explicit `SHELL` and `XDG_RUNTIME_DIR`. On Unix, an absent `SHELL`
+  selects the effective user’s account shell only when it is absolute, executable, root/user-owned,
+  and not group/other-writable. One cached login probe captures only `PATH` and `XDG_RUNTIME_DIR`,
+  bounded to five seconds and 64 KiB; an absent runtime directory is filled only from that probe.
+  Never guess a runtime directory or forward the login shell’s wider environment.
 
 ## Runtime invariants
 

@@ -65,30 +65,171 @@ fn exec_path_dirs() -> Vec<PathBuf> {
     dirs
 }
 
+#[derive(Default)]
+struct LoginEnvironment {
+    path: Option<OsString>,
+    runtime_directory: Option<OsString>,
+}
+
+fn login_environment() -> &'static LoginEnvironment {
+    static LOGIN_ENVIRONMENT: OnceLock<LoginEnvironment> = OnceLock::new();
+    LOGIN_ENVIRONMENT.get_or_init(|| {
+        #[cfg(unix)]
+        {
+            probe_login_environment().unwrap_or_default()
+        }
+        #[cfg(not(unix))]
+        {
+            LoginEnvironment::default()
+        }
+    })
+}
+
 fn login_shell_path() -> Option<OsString> {
-    if cfg!(windows) {
-        return None;
+    login_environment().path.clone()
+}
+
+#[cfg(unix)]
+fn current_user_login_shell() -> Option<OsString> {
+    use std::ffi::CStr;
+    use std::os::unix::ffi::OsStringExt;
+    use std::os::unix::fs::MetadataExt;
+
+    let mut buffer = vec![0u8; 4096];
+    loop {
+        // SAFETY: passwd and its backing buffer remain live until the shell bytes are copied; only the current effective UID is queried.
+        let (uid, status, shell) = unsafe {
+            let uid = libc::geteuid();
+            let mut account: libc::passwd = std::mem::zeroed();
+            let mut result = std::ptr::null_mut();
+            let status = libc::getpwuid_r(
+                uid,
+                &mut account,
+                buffer.as_mut_ptr().cast(),
+                buffer.len(),
+                &mut result,
+            );
+            let shell = if status == 0
+                && !result.is_null()
+                && account.pw_uid == uid
+                && !account.pw_shell.is_null()
+            {
+                Some(OsString::from_vec(
+                    CStr::from_ptr(account.pw_shell).to_bytes().to_vec(),
+                ))
+            } else {
+                None
+            };
+            (uid, status, shell)
+        };
+        if status == libc::ERANGE && buffer.len() < 65_536 {
+            buffer.resize(buffer.len() * 2, 0);
+            continue;
+        }
+        let shell = shell?;
+        let path = Path::new(&shell);
+        let metadata = std::fs::metadata(path).ok()?;
+        return (path.is_absolute()
+            && metadata.is_file()
+            && (metadata.uid() == 0 || metadata.uid() == uid)
+            && metadata.mode() & 0o022 == 0
+            && metadata.mode() & 0o111 != 0)
+            .then_some(shell);
     }
-    let shell = std::env::var_os("SHELL").unwrap_or_else(|| OsString::from("/bin/sh"));
-    let output = Command::new(shell)
-        .args(["-lc", "printf %s \"$PATH\""])
+}
+
+#[cfg(unix)]
+fn probe_login_environment() -> Option<LoginEnvironment> {
+    use std::io::Read;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::ffi::OsStringExt;
+    use std::os::unix::process::CommandExt;
+
+    let shell = std::env::var_os("SHELL")
+        .or_else(current_user_login_shell)
+        .unwrap_or_else(|| OsString::from("/bin/sh"));
+    let mut child = Command::new(shell)
+        .args([
+            "-lc",
+            "printf '\\0GM_PATH=%s\\0GM_XDG_RUNTIME_DIR=%s\\0' \"$PATH\" \"$XDG_RUNTIME_DIR\"",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .output()
+        .process_group(0)
+        .spawn()
         .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let text = String::from_utf8(output.stdout).ok()?;
-    let value = text
-        .lines()
-        .rev()
-        .find(|line| !line.trim().is_empty())?
-        .trim();
-    if value.is_empty() {
-        None
-    } else {
-        Some(OsString::from(value))
-    }
+    let containment = match crate::process_tree::establish_containment(&child) {
+        Ok(containment) => containment,
+        Err(_) => {
+            crate::process_tree::kill_tree(child.id());
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+    };
+    let result = (|| {
+        let mut pipe = child.stdout.take().expect("login probe stdout is piped");
+        let fd = pipe.as_raw_fd();
+        // SAFETY: the pipe owns this live descriptor, and fcntl changes only its read-side status flags.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        // SAFETY: the descriptor remains owned by pipe and O_NONBLOCK is a valid status flag.
+        if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+            return None;
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut output = Vec::new();
+        let mut chunk = [0u8; 4096];
+        let mut status = None;
+        loop {
+            loop {
+                if Instant::now() >= deadline {
+                    return None;
+                }
+                match pipe.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(count) => {
+                        if output.len() + count > 65_536 {
+                            return None;
+                        }
+                        output.extend_from_slice(&chunk[..count]);
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(_) => return None,
+                }
+            }
+            if status.is_some() {
+                break;
+            }
+            status = child.try_wait().ok()?;
+            if Instant::now() >= deadline {
+                return None;
+            }
+            if status.is_none() {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        if !status?.success() {
+            return None;
+        }
+        let value = |prefix: &[u8]| {
+            output
+                .split(|byte| *byte == 0)
+                .rev()
+                .find_map(|field| field.strip_prefix(prefix))
+                .filter(|value| !value.is_empty())
+                .map(|value| OsString::from_vec(value.to_vec()))
+        };
+        Some(LoginEnvironment {
+            path: value(b"GM_PATH="),
+            runtime_directory: value(b"GM_XDG_RUNTIME_DIR="),
+        })
+    })();
+    crate::process_tree::terminate_containment(&containment, child.id());
+    let _ = child.kill();
+    let _ = child.wait();
+    result
 }
 
 fn exec_path() -> &'static OsString {
@@ -156,7 +297,7 @@ pub fn run(code: &str, opts: &Value, cwd: &Path) -> Value {
         })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    configure_toolchain_path(&mut command);
+    configure_execution_environment(&mut command);
     if std::env::var_os("GH_CONFIG_DIR").is_none() {
         if let Some(directory) = crate::github_cli_config_dir() {
             command.env("GH_CONFIG_DIR", directory);
@@ -360,7 +501,12 @@ pub fn run(code: &str, opts: &Value, cwd: &Path) -> Value {
     }
 }
 
-pub(crate) fn configure_toolchain_path(command: &mut Command) {
+pub(crate) fn configure_execution_environment(command: &mut Command) {
+    if std::env::var_os("XDG_RUNTIME_DIR").is_none() {
+        if let Some(directory) = &login_environment().runtime_directory {
+            command.env("XDG_RUNTIME_DIR", directory);
+        }
+    }
     let Some(cargo_bin) = cargo_bin_dir() else {
         return;
     };
