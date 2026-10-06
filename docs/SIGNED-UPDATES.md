@@ -7,7 +7,10 @@ channel says they are: whoever can publish the release controls both sides of
 the check, which is how a release carrying an older build can be promoted over a
 newer one under the same version tag. A detached ed25519 signature over the
 artifact adds a second, independent check against public keys pinned locally and
-never written by the updater.
+never written by the updater. Runner artifacts also carry the repository's committed release root,
+so a machine with no local trust file verifies normal runner releases without a machine-specific
+setup. Local trust files remain the authority for plugin trust, multiple signatures, custom roots,
+and rotation policy.
 
 ## Default: protect the runner
 
@@ -126,10 +129,10 @@ authorization marker to the signing command. A missing or malformed signing
 configuration, invalid signature, or failed verification fails before any asset is
 published.
 
-The public key must be pinned into each strict updater's `trusted-keys.json`
-through the normal offline key-distribution process before releases signed by that
-key can install there. The signing secret is not committed, printed, uploaded, or
-written outside the signing job's temporary directory.
+The signing script derives the public key from the protected seed and refuses publication unless it
+equals the runner's committed release root. This gives no-local-configuration runner updates a
+cryptographic root independent of the release channel. The signing secret is not committed,
+printed, uploaded, or written outside the signing job's temporary directory.
 
 ## Verifying locally
 
