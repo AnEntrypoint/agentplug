@@ -84,6 +84,9 @@ the `agentplug-host` imports, and `agentplug-trust`. Work on `main` as GitHub us
   produce an out-file or be released for recovery.
 - `DispatchOrigin::page_session` is the only browser session resolver. Browser pages are keyed by
   project root and GM session; serialize work per page before writing its temporary files.
+  Chrome and Steel reuse only their remembered target; a missing target creates a fresh owned page,
+  never adopts another session's tab. Explicit `url=` reloads an identical URL; hash-only changes
+  retain the document. Preserve document telemetry and captured diagnostics on evaluation failure.
 - Acquire the browser page guard before global plugin admission. Waiting for the same page must
   not consume execution slots needed by unrelated commands; distinct page sessions stay parallel.
 - Kill only processes and browser profiles owned by this host. An adopted or externally supplied
