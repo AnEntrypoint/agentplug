@@ -26,7 +26,8 @@ the `agentplug-host` imports, and `agentplug-trust`. Work on `main` as GitHub us
   failure keeps the permitted staged daemon serving. Preserve the authoritative checker’s explicit
   `warn`/`off` policies; only `off` allows an absent receipt, never enforced signature mode.
 - A discovered same-user GitHub CLI credential directory is shared with Git, execution children,
-  and updater API calls; inherited `GH_CONFIG_DIR` takes precedence. Git uses transient
+  and updater API calls; fresh boot, takeover and canonical re-exec discover it before workers start.
+  Inherited `GH_CONFIG_DIR` takes precedence. Git uses transient
   `gh auth git-credential`. The updater preserves the `GITHUB_TOKEN.or_else(GH_TOKEN)` selector:
   an empty selected value falls back to system `gh auth token`, not the other environment name.
   CLI retrieval is noninteractive with a 5s lookup/drain deadline and 8KiB output cap. Its

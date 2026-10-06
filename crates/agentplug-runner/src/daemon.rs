@@ -5124,7 +5124,6 @@ pub fn run_daemon() -> anyhow::Result<()> {
     }
 
     clear_wasted_daemon_start_backoff();
-    configure_github_cli_config_dir();
     runner_version_parity();
 
     let plugin_modules = PluginModules::new()?;
@@ -5235,6 +5234,7 @@ fn spawn_update_poll_worker(
 }
 
 fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
+    configure_github_cli_config_dir();
     HEARTBEAT_DAEMON_BOOT_TS.store(now_ms(), std::sync::atomic::Ordering::Relaxed);
     write_daemon_heartbeat(0, 0);
     let parity = runner_version_parity();
