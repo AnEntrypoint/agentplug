@@ -1141,6 +1141,35 @@ fn sync_instruction_source_if_configured(root: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn staged_version_output_matches(text: &str, expected_version: &str) -> bool {
+    text.trim() == format!("agentplug-runner {expected_version}")
+}
+
+#[cfg(test)]
+mod staged_binary_self_check_tests {
+    use super::staged_version_output_matches;
+
+    #[test]
+    fn version_output_requires_the_exact_runner_identity_and_version() {
+        assert!(staged_version_output_matches(
+            "agentplug-runner 1.2.3\n",
+            "1.2.3"
+        ));
+        assert!(!staged_version_output_matches(
+            "other-runner 1.2.3",
+            "1.2.3"
+        ));
+        assert!(!staged_version_output_matches(
+            "agentplug-runner 1.2.3-dev",
+            "1.2.3"
+        ));
+        assert!(!staged_version_output_matches(
+            "agentplug-runner 1.2.30",
+            "1.2.3"
+        ));
+    }
+}
+
 fn staged_binary_self_check(staged_exe: &Path, expected_version: &str) -> bool {
     let mut cmd = std::process::Command::new(staged_exe);
     cmd.arg("--version");
@@ -1149,7 +1178,7 @@ fn staged_binary_self_check(staged_exe: &Path, expected_version: &str) -> bool {
     match output {
         Ok(out) if out.status.success() => {
             let text = String::from_utf8_lossy(&out.stdout);
-            if text.contains(expected_version) {
+            if staged_version_output_matches(&text, expected_version) {
                 true
             } else {
                 eprintln!(
