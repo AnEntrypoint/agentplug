@@ -5043,6 +5043,12 @@ fn github_cli_config_candidates() -> Vec<(PathBuf, &'static str)> {
     if let Some(path) = std::env::var_os("XDG_CONFIG_HOME") {
         candidates.push((PathBuf::from(path).join("gh"), "XDG_CONFIG_HOME"));
     }
+    if let Some(home) = std::env::var_os("HOME") {
+        candidates.push((
+            PathBuf::from(&home).join(".gmweb/cache/.config/gh"),
+            "GM web credential cache",
+        ));
+    }
     #[cfg(target_os = "macos")]
     if let Some(home) = std::env::var_os("HOME") {
         candidates.push((
