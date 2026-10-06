@@ -62,6 +62,9 @@ the `agentplug-host` imports, and `agentplug-trust`. Work on `main` as GitHub us
 - `host_fs_readdir` returns zero on directory or entry-read failure, never a successful empty
   or partial array. Structural indexing propagates that failure and refuses pruning or graph
   evidence; legacy guest wrappers may explicitly retain their empty-list fallback.
+- `host_fs_read` reserves packed value `1` for a successful empty UTF-8 read, without allocation.
+  Actual path, I/O and UTF-8 failures remain `0`; nonempty reads retain their pointer/length ABI.
+  Guests must recognize the empty marker before decoding a pointer; older guests still refuse it.
 - Spawn and JavaScript adoption share process-instance checked monotonic IDs and never overwrite
   occupied entries. Failed registration cleans up only the newly owned child and process group.
   Task output first checks the live registry, then its private durable result store; missing handles
