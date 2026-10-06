@@ -938,6 +938,10 @@ fn reap_os_orphans(cwd: &Path) {
         );
         return;
     }
+    if chrome_scan_is_blind() {
+        eprintln!("[agentplug browser] {}", blind_reap_note("skipping OS-orphan reap"));
+        return;
+    }
     let dir = browser_profiles_root_for_orphan_scan(cwd);
     let Ok(entries) = std::fs::read_dir(&dir) else {
         return;
@@ -1086,22 +1090,57 @@ fn kill_pid(pid: u32) {
 }
 
 #[cfg(windows)]
-const WMI_CIRCUIT_BREAKER_COOLDOWN_MS: u64 = 300_000;
+const WMI_CIRCUIT_BREAKER_COOLDOWN_MS: u64 = 45_000;
 
 #[cfg(windows)]
 static WMI_LAST_TIMEOUT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 #[cfg(windows)]
 fn wmi_circuit_breaker_open() -> bool {
+    wmi_circuit_breaker_remaining_ms() > 0
+}
+
+#[cfg(windows)]
+fn wmi_circuit_breaker_remaining_ms() -> u64 {
     let last = WMI_LAST_TIMEOUT_MS.load(std::sync::atomic::Ordering::Relaxed);
     if last == 0 {
-        return false;
+        return 0;
     }
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
-    now.saturating_sub(last) < WMI_CIRCUIT_BREAKER_COOLDOWN_MS
+    WMI_CIRCUIT_BREAKER_COOLDOWN_MS.saturating_sub(now.saturating_sub(last))
+}
+
+/// True when the chrome process scan cannot answer at all right now, so a reap
+/// pass that depends on it would silently match nothing. Callers must say so
+/// instead of reporting a clean sweep: an orphan that is never matched is
+/// indistinguishable from an orphan that does not exist, which is how they
+/// accumulate unnoticed.
+fn chrome_scan_is_blind() -> bool {
+    #[cfg(windows)]
+    {
+        wmi_circuit_breaker_open()
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+fn blind_reap_note(scope: &str) -> String {
+    #[cfg(windows)]
+    {
+        format!(
+            "{scope}: the chrome process scan is BLIND (WMI circuit breaker open, {}ms left), so this pass can match no orphan and reaps nothing -- orphans accumulate for as long as this persists, and each one left behind makes the next scan slower. Recovery: close the sessions you opened (`browser` with `session close-all`), then let the next pass run.",
+            wmi_circuit_breaker_remaining_ms()
+        )
+    }
+    #[cfg(not(windows))]
+    {
+        format!("{scope}: chrome process scan unavailable")
+    }
 }
 
 #[cfg(windows)]
@@ -1310,6 +1349,10 @@ fn reap_globally_orphaned_gm_chromes(served_roots: &[PathBuf]) {
         eprintln!(
             "[agentplug browser] skipping global gm-chrome orphan reap -- a different process is the fresh registered daemon, this process cannot safely judge liveness of sessions it does not own"
         );
+        return;
+    }
+    if chrome_scan_is_blind() {
+        eprintln!("[agentplug browser] {}", blind_reap_note("skipping global gm-chrome orphan reap"));
         return;
     }
     let claimed_profile_dirs: std::collections::HashSet<String> = {
