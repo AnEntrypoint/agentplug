@@ -2,8 +2,8 @@ use std::collections::HashMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard, TryLockError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -119,6 +119,94 @@ fn registry() -> &'static Registry {
     REG.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+fn execution_admission() -> &'static RwLock<()> {
+    static ADMISSION: OnceLock<RwLock<()>> = OnceLock::new();
+    ADMISSION.get_or_init(|| RwLock::new(()))
+}
+
+static EXECUTION_CLOSED: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn admit_execution() -> Result<RwLockReadGuard<'static, ()>, String> {
+    let guard = execution_admission()
+        .read()
+        .unwrap_or_else(|error| error.into_inner());
+    if EXECUTION_CLOSED.load(Ordering::Acquire) {
+        return Err("host ownership was handed off before execution began".to_string());
+    }
+    Ok(guard)
+}
+
+pub struct TaskHandoff {
+    _admission: RwLockWriteGuard<'static, ()>,
+}
+
+impl TaskHandoff {
+    pub fn commit(self) {
+        EXECUTION_CLOSED.store(true, Ordering::Release);
+    }
+}
+
+pub fn prepare_task_handoff() -> Result<Option<TaskHandoff>, String> {
+    let admission = match execution_admission().try_write() {
+        Ok(guard) => guard,
+        Err(TryLockError::WouldBlock) => return Ok(None),
+        Err(TryLockError::Poisoned(error)) => error.into_inner(),
+    };
+    let mut reg = registry().lock().unwrap_or_else(|error| error.into_inner());
+    for entry in reg.values_mut() {
+        poll_entry(entry);
+    }
+    expire_completed(&mut reg);
+    if reg
+        .values()
+        .any(|entry| entry.finished_ms.is_none() || drains_pending(entry))
+    {
+        return Ok(None);
+    }
+    if reg.len() > crate::task_results::MAX_RECORDS {
+        return Err("completed task registry exceeds durable result capacity".to_string());
+    }
+    let records = reg
+        .iter()
+        .map(|(id, entry)| {
+            let stdout_start = entry
+                .stdout
+                .len()
+                .saturating_sub(crate::task_results::TAIL_BYTES);
+            let stderr_start = entry
+                .stderr
+                .len()
+                .saturating_sub(crate::task_results::TAIL_BYTES);
+            crate::task_results::CompletedTask {
+                schema: 1,
+                id: id.clone(),
+                lang: entry.lang.clone(),
+                started_ms: entry.started_ms,
+                finished_ms: entry.finished_ms.expect("completed task checked"),
+                exit_code: entry.exit_code,
+                stdout: entry.stdout[stdout_start..].to_vec(),
+                stderr: entry.stderr[stderr_start..].to_vec(),
+                stdout_omitted_bytes: stdout_start as u64,
+                stderr_omitted_bytes: stderr_start as u64,
+            }
+        })
+        .collect();
+    crate::task_results::save(records, now_ms())?;
+    Ok(Some(TaskHandoff {
+        _admission: admission,
+    }))
+}
+
+fn expire_completed(reg: &mut HashMap<String, TaskEntry>) {
+    let now = now_ms();
+    reg.retain(|_, entry| {
+        !entry.finished_ms.is_some_and(|finished| {
+            !drains_pending(entry)
+                && now.saturating_sub(finished) >= crate::task_results::RETENTION_MS
+        })
+    });
+}
+
 #[cfg(test)]
 pub(crate) fn test_registry_guard() -> std::sync::MutexGuard<'static, ()> {
     static GUARD: OnceLock<Mutex<()>> = OnceLock::new();
@@ -137,6 +225,7 @@ fn ensure_reaper_running() {
             for entry in reg.values_mut() {
                 poll_entry(entry);
             }
+            expire_completed(&mut reg);
         });
     });
 }
@@ -198,9 +287,9 @@ fn missing_task(id: &str) -> Value {
     json!({
         "ok": false,
         "error": if same_registry {
-            format!("no such task {id}; it was stopped or was never registered in this host")
+            format!("no such task {id}; it was stopped, expired or was never registered in this host")
         } else {
-            format!("task {id} does not belong to this host registry; task handles are process-local and cannot survive a host restart")
+            format!("task {id} belongs to another host registry and has no retained result; it was stopped, expired, or its previous host did not preserve it")
         },
         "error_code": if same_registry { "task_not_found" } else { "task_registry_mismatch" },
         "task_registry": instance,
@@ -334,6 +423,12 @@ fn spawn(params: &Value, cwd: &Path) -> Value {
     let Some((cmd, args, stdin_payload)) = crate::exec_js::build_command(lang, code) else {
         return json!({"ok": false, "error": format!("unsupported lang: {lang}")});
     };
+    let _admission = match admit_execution() {
+        Ok(guard) => guard,
+        Err(error) => {
+            return json!({"ok": false, "error": error, "error_code": "task_handoff_pending", "execution_started": false})
+        }
+    };
     let mut command = Command::new(&cmd);
     command
         .args(&args)
@@ -401,7 +496,7 @@ fn spawn(params: &Value, cwd: &Path) -> Value {
     json!({"ok": true, "id": id, "started_ms": started, "cwd": cwd})
 }
 
-fn list() -> Value {
+fn list(params: &Value) -> Value {
     let mut reg = registry().lock().unwrap();
     let ids: Vec<String> = reg.keys().cloned().collect();
     let mut tasks = Vec::new();
@@ -411,7 +506,18 @@ fn list() -> Value {
             tasks.push(entry_summary(&id, entry));
         }
     }
-    json!({"ok": true, "tasks": tasks})
+    drop(reg);
+    let mut result = json!({"ok": true, "tasks": tasks});
+    if params.get("prepare_handoff").and_then(Value::as_bool) == Some(true) {
+        result["handoff_status"] = match prepare_task_handoff() {
+            Ok(Some(_guard)) => json!({"ready": true, "completed_results_persisted": true}),
+            Ok(None) => json!({"ready": false, "reason": "execution_or_child_drains_pending"}),
+            Err(error) => {
+                json!({"ready": false, "reason": "task_result_store_error", "error": error})
+            }
+        };
+    }
+    result
 }
 
 fn output(params: &Value) -> Value {
@@ -425,7 +531,14 @@ fn output(params: &Value) -> Value {
     }
     let mut reg = registry().lock().unwrap();
     let Some(entry) = reg.get_mut(id) else {
-        return missing_task(id);
+        drop(reg);
+        return match crate::task_results::output(id, max_bytes, now_ms()) {
+            Ok(Some(result)) => result,
+            Ok(None) => missing_task(id),
+            Err(error) => {
+                json!({"ok": false, "error": error, "error_code": "task_result_store_error"})
+            }
+        };
     };
     poll_entry(entry);
     let tail = |buf: &[u8]| -> String {
@@ -447,6 +560,8 @@ fn output(params: &Value) -> Value {
         "id": id,
         "stdout": tail(&stdout),
         "stderr": tail(&stderr),
+        "stdout_omitted_bytes": stdout.len().saturating_sub(max_bytes),
+        "stderr_omitted_bytes": stderr.len().saturating_sub(max_bytes),
         "running": entry.finished_ms.is_none(),
         "exit_code": entry.exit_code,
     })
@@ -460,7 +575,14 @@ fn stop(params: &Value) -> Value {
     let mut entry = {
         let mut reg = registry().lock().unwrap_or_else(|e| e.into_inner());
         let Some(entry) = reg.remove(id) else {
-            return missing_task(id);
+            drop(reg);
+            return match crate::task_results::remove(id) {
+                Ok(true) => json!({"ok": true, "id": id, "stopped": true}),
+                Ok(false) => missing_task(id),
+                Err(error) => {
+                    json!({"ok": false, "error": error, "error_code": "task_result_store_error"})
+                }
+            };
         };
         entry
     };
@@ -474,13 +596,16 @@ fn stop(params: &Value) -> Value {
     if let Some(pipe) = entry.stderr_pipe.take() {
         entry.stderr = pipe.collect_with_grace(drain_deadline);
     }
+    if let Err(error) = crate::task_results::remove(id) {
+        return json!({"ok": false, "id": id, "stopped": true, "error": error, "error_code": "task_result_store_error"});
+    }
     json!({"ok": true, "id": id, "stopped": true})
 }
 
 pub fn handle(action: &str, params: &Value, cwd: &Path) -> Value {
     match action {
         "spawn" => spawn(params, cwd),
-        "list" => list(),
+        "list" => list(params),
         "output" => output(params),
         "stop" => stop(params),
         other => json!({"ok": false, "error": format!("unknown task action: {other}")}),
