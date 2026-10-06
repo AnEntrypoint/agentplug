@@ -14,6 +14,7 @@ const PROFILE_SENTINEL: &str = "__GM_PROFILE__";
 const DEFAULT_LIMIT_MS: u64 = 300_000;
 const HARD_CEILING_MS: u64 = 900_000;
 const MIN_LIMIT_MS: i64 = 100;
+const DRAIN_GRACE_MS: u64 = 50;
 
 struct BuiltCommand {
     cmd: String,
@@ -382,14 +383,25 @@ pub fn run(code: &str, opts: &Value, cwd: &Path) -> Value {
         });
     }
     let exit_code = child.wait().ok().and_then(|s| s.code()).unwrap_or(-1);
-    let duration_ms = t0.elapsed().as_millis() as u64;
-    let drains_finished = stdout_pipe
-        .as_ref()
-        .map_or(true, crate::task::DrainedPipe::is_finished)
-        && stderr_pipe
+    let drain_deadline = (Instant::now() + Duration::from_millis(DRAIN_GRACE_MS))
+        .min(t0 + Duration::from_millis(limit_ms));
+    let drains_finished = || {
+        stdout_pipe
             .as_ref()
-            .map_or(true, crate::task::DrainedPipe::is_finished);
-    if !drains_finished {
+            .map_or(true, crate::task::DrainedPipe::is_finished)
+            && stderr_pipe
+                .as_ref()
+                .map_or(true, crate::task::DrainedPipe::is_finished)
+    };
+    while !drains_finished() {
+        let remaining = drain_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        std::thread::sleep(remaining.min(Duration::from_millis(1)));
+    }
+    let duration_ms = t0.elapsed().as_millis() as u64;
+    if !drains_finished() {
         let task_id = match crate::task::adopt_running(
             child,
             containment,
@@ -417,7 +429,7 @@ pub fn run(code: &str, opts: &Value, cwd: &Path) -> Value {
             "exit_code": exit_code,
             "duration_ms": duration_ms,
             "task_timeout_ms": 30 * 60 * 1000,
-            "decision_required": "the direct process exited but a descendant still owns its output pipes; task-output with {\"id\":\"<task_id>\"} will retain output until every pipe closes. Call task-stop with that id to terminate the process group."
+            "decision_required": "the direct process exited but its output drains remain unfinished after the bounded grace; a descendant may still hold the pipes. task-output with {\"id\":\"<task_id>\"} retains output until every pipe closes. Call task-stop with that id to terminate the process group."
         });
     }
     let stdout_buf = stdout_pipe.map(|p| p.collect()).unwrap_or_default();
