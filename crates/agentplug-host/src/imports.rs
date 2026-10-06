@@ -25,29 +25,46 @@ struct CapabilityAllowlistConfig {
 
 fn compiled_default_capability_allowlist(caller_plugin: &str, callee_plugin: &str) -> bool {
     match caller_plugin {
-        "gm" => matches!(callee_plugin, "bert" | "libsql" | "treesitter" | "liqology" | "crux"),
+        "gm" => matches!(
+            callee_plugin,
+            "bert" | "libsql" | "treesitter" | "liqology" | "crux"
+        ),
         _ => false,
     }
 }
 
 fn load_capability_allowlist_config(cwd: &Path) -> Option<CapabilityAllowlistConfig> {
     let path = cwd.join(".agentplug").join("capability-allowlist.json");
-    fs::read_to_string(&path).ok().and_then(|s| serde_json::from_str::<CapabilityAllowlistConfig>(&s).ok())
+    fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<CapabilityAllowlistConfig>(&s).ok())
 }
 
 fn plugin_call_capability_allowed(cwd: &Path, caller_plugin: &str, callee_plugin: &str) -> bool {
     match load_capability_allowlist_config(cwd) {
-        Some(cfg) => cfg.allow.get(caller_plugin).map(|allowed| allowed.iter().any(|p| p == callee_plugin)).unwrap_or(false),
+        Some(cfg) => cfg
+            .allow
+            .get(caller_plugin)
+            .map(|allowed| allowed.iter().any(|p| p == callee_plugin))
+            .unwrap_or(false),
         None => compiled_default_capability_allowlist(caller_plugin, callee_plugin),
     }
 }
 
 fn is_well_formed_plugin_name(name: &str) -> bool {
-    !name.is_empty() && name.len() <= 64 && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
 fn is_well_formed_verb(verb: &str) -> bool {
-    !verb.is_empty() && verb.len() <= 128 && verb.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+    !verb.is_empty()
+        && verb.len() <= 128
+        && verb
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
 }
 
 fn validate_plugin_call_body(body: &str) -> Result<(), String> {
@@ -57,7 +74,9 @@ fn validate_plugin_call_body(body: &str) -> Result<(), String> {
     if body.len() > 64 * 1024 * 1024 {
         return Err("body_exceeds_max_size".to_string());
     }
-    serde_json::from_str::<serde_json::Value>(body).map(|_| ()).map_err(|e| format!("body_not_valid_json: {e}"))
+    serde_json::from_str::<serde_json::Value>(body)
+        .map(|_| ())
+        .map_err(|e| format!("body_not_valid_json: {e}"))
 }
 
 pub fn git_subprocess_timeout_ms() -> u64 {
@@ -119,11 +138,52 @@ fn normalize_lexically(path: &std::path::Path) -> Option<PathBuf> {
             other => out.push(other.as_os_str()),
         }
     }
+
     Some(out)
 }
 
+fn github_cli_config_dir_slot() -> &'static Mutex<Option<PathBuf>> {
+    static SLOT: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
+    SLOT.get_or_init(|| Mutex::new(None))
+}
+
+pub fn set_github_cli_config_dir(directory: Option<PathBuf>) {
+    *github_cli_config_dir_slot()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = directory;
+}
+
+pub fn github_cli_config_dir() -> Option<PathBuf> {
+    github_cli_config_dir_slot()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
+fn configure_github_git_credentials(command: &mut std::process::Command) {
+    if let Some(directory) = github_cli_config_dir() {
+        command.env("GH_CONFIG_DIR", directory);
+    }
+    let config_count = std::env::var("GIT_CONFIG_COUNT")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(0);
+    command
+        .env("GIT_CONFIG_COUNT", (config_count + 1).to_string())
+        .env(
+            format!("GIT_CONFIG_KEY_{config_count}"),
+            "credential.https://github.com.helper",
+        )
+        .env(
+            format!("GIT_CONFIG_VALUE_{config_count}"),
+            "!gh auth git-credential",
+        );
+}
+
 fn user_gm_root() -> Option<PathBuf> {
-    let home = std::env::var("HOME").ok().or_else(|| std::env::var("USERPROFILE").ok())?;
+    let home = std::env::var("HOME")
+        .ok()
+        .or_else(|| std::env::var("USERPROFILE").ok())?;
     let home = home.trim();
     if home.is_empty() {
         return None;
@@ -131,13 +191,17 @@ fn user_gm_root() -> Option<PathBuf> {
     normalize_lexically(&std::path::Path::new(home).join(".gm"))
 }
 
-static FS_WRITE_LOCKS: OnceLock<Mutex<HashMap<PathBuf, std::sync::Arc<Mutex<()>>>>> = OnceLock::new();
+static FS_WRITE_LOCKS: OnceLock<Mutex<HashMap<PathBuf, std::sync::Arc<Mutex<()>>>>> =
+    OnceLock::new();
 
 fn fs_write_lock_for(path: &Path) -> std::sync::Arc<Mutex<()>> {
     let key = canonicalize_path_separators_for_stable_keying(path);
     let registry = FS_WRITE_LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
     let mut guard = registry.lock().unwrap_or_else(|e| e.into_inner());
-    guard.entry(key).or_insert_with(|| std::sync::Arc::new(Mutex::new(()))).clone()
+    guard
+        .entry(key)
+        .or_insert_with(|| std::sync::Arc::new(Mutex::new(())))
+        .clone()
 }
 
 fn atomic_write_locked(full: &Path, data: &str) -> std::io::Result<()> {
@@ -175,12 +239,21 @@ fn atomic_cas_write_locked(full: &Path, expected: &str, data: &str) -> std::io::
 
 fn has_project_marker(dir: &std::path::Path) -> bool {
     const MARKERS: &[&str] = &[
-        ".git", ".gm", "package.json", "Cargo.toml", "go.mod", "pyproject.toml",
+        ".git",
+        ".gm",
+        "package.json",
+        "Cargo.toml",
+        "go.mod",
+        "pyproject.toml",
     ];
     MARKERS.iter().any(|m| dir.join(m).exists())
 }
 
-fn sandboxed_guest_path_with_extra_roots(cwd: &std::path::Path, path: &str, extra_roots: &[PathBuf]) -> Option<PathBuf> {
+fn sandboxed_guest_path_with_extra_roots(
+    cwd: &std::path::Path,
+    path: &str,
+    extra_roots: &[PathBuf],
+) -> Option<PathBuf> {
     let requested = std::path::Path::new(path);
     let joined = if requested.is_absolute() || requested.has_root() {
         requested.to_path_buf()
@@ -197,7 +270,9 @@ fn sandboxed_guest_path_with_extra_roots(cwd: &std::path::Path, path: &str, extr
         return Some(normalized);
     }
     for extra in extra_roots {
-        let Some(extra_normalized) = normalize_lexically(extra) else { continue };
+        let Some(extra_normalized) = normalize_lexically(extra) else {
+            continue;
+        };
         if normalized == extra_normalized || normalized.starts_with(&extra_normalized) {
             return Some(normalized);
         }
@@ -267,7 +342,11 @@ fn write_guest_bytes(caller: &mut Caller<'_, HostState>, bytes: &[u8]) -> u64 {
         .expect("plugkit_alloc export missing on wasm module");
     const RESPONSE_HANDOFF_GRACE_SECS: u64 = 5;
     let real_deadline_secs = caller.data().call_deadline_secs();
-    caller.as_context_mut().set_epoch_deadline(crate::registry::epoch_ticks_for_seconds(RESPONSE_HANDOFF_GRACE_SECS));
+    caller
+        .as_context_mut()
+        .set_epoch_deadline(crate::registry::epoch_ticks_for_seconds(
+            RESPONSE_HANDOFF_GRACE_SECS,
+        ));
     match alloc.call(&mut *caller, bytes.len() as u32) {
         Ok(ptr) => {
             let memory = guest_memory(caller);
@@ -278,14 +357,21 @@ fn write_guest_bytes(caller: &mut Caller<'_, HostState>, bytes: &[u8]) -> u64 {
                 );
                 eprintln!("[agentplug host] write_guest_bytes: {reason} -- returning 0, which the guest reads as a null response");
                 caller.data().note_lost_response(reason);
-                caller.as_context_mut().set_epoch_deadline(crate::registry::epoch_ticks_for_seconds(real_deadline_secs));
+                caller.as_context_mut().set_epoch_deadline(
+                    crate::registry::epoch_ticks_for_seconds(real_deadline_secs),
+                );
                 return 0;
             }
-            caller.as_context_mut().set_epoch_deadline(crate::registry::epoch_ticks_for_seconds(real_deadline_secs));
+            caller
+                .as_context_mut()
+                .set_epoch_deadline(crate::registry::epoch_ticks_for_seconds(real_deadline_secs));
             pack_guest_ptr_len(ptr, bytes.len())
         }
         Err(e) => {
-            let interrupted = matches!(e.downcast_ref::<wasmtime::Trap>(), Some(wasmtime::Trap::Interrupt));
+            let interrupted = matches!(
+                e.downcast_ref::<wasmtime::Trap>(),
+                Some(wasmtime::Trap::Interrupt)
+            );
             let reason = if interrupted {
                 format!("plugkit_alloc({}) hit the epoch deadline while handing the host response back to the guest", bytes.len())
             } else {
@@ -293,7 +379,9 @@ fn write_guest_bytes(caller: &mut Caller<'_, HostState>, bytes: &[u8]) -> u64 {
             };
             eprintln!("[agentplug host] write_guest_bytes: {reason} -- returning 0, which the guest reads as a null response");
             caller.data().note_lost_response(reason);
-            caller.as_context_mut().set_epoch_deadline(crate::registry::epoch_ticks_for_seconds(real_deadline_secs));
+            caller
+                .as_context_mut()
+                .set_epoch_deadline(crate::registry::epoch_ticks_for_seconds(real_deadline_secs));
             0
         }
     }
@@ -322,7 +410,9 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
         "host_fs_allow_root",
         |mut caller: Caller<'_, HostState>, path_ptr: u32, path_len: u32| -> u32 {
             let path = read_guest_string(&mut caller, path_ptr, path_len);
-            let Some(normalized) = normalize_lexically(std::path::Path::new(&path)) else { return 0 };
+            let Some(normalized) = normalize_lexically(std::path::Path::new(&path)) else {
+                return 0;
+            };
             match fs::metadata(&normalized) {
                 Ok(md) if md.is_dir() && has_project_marker(&normalized) => {
                     caller.data().allow_extra_root(normalized);
@@ -338,7 +428,11 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
         |mut caller: Caller<'_, HostState>, path_ptr: u32, path_len: u32| -> u64 {
             let path = read_guest_string(&mut caller, path_ptr, path_len);
             let extra_roots = caller.data().extra_readable_roots();
-            let Some(full) = sandboxed_guest_path_with_extra_roots(&caller.data().cwd(), &path, &extra_roots) else { return 0 };
+            let Some(full) =
+                sandboxed_guest_path_with_extra_roots(&caller.data().cwd(), &path, &extra_roots)
+            else {
+                return 0;
+            };
             match fs::read_to_string(&full) {
                 Ok(content) => write_guest_bytes(&mut caller, content.as_bytes()),
                 Err(_) => 0,
@@ -349,11 +443,20 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
     linker.func_wrap(
         "env",
         "host_fs_write",
-        |mut caller: Caller<'_, HostState>, path_ptr: u32, path_len: u32, data_ptr: u32, data_len: u32| -> u32 {
+        |mut caller: Caller<'_, HostState>,
+         path_ptr: u32,
+         path_len: u32,
+         data_ptr: u32,
+         data_len: u32|
+         -> u32 {
             let path = read_guest_string(&mut caller, path_ptr, path_len);
             let data = read_guest_string(&mut caller, data_ptr, data_len);
             let extra_roots = caller.data().extra_readable_roots();
-            let Some(full) = sandboxed_guest_path_with_extra_roots(&caller.data().cwd(), &path, &extra_roots) else { return 0 };
+            let Some(full) =
+                sandboxed_guest_path_with_extra_roots(&caller.data().cwd(), &path, &extra_roots)
+            else {
+                return 0;
+            };
             if let Some(parent) = full.parent() {
                 let _ = fs::create_dir_all(parent);
             }
@@ -367,12 +470,23 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
     linker.func_wrap(
         "env",
         "host_fs_cas_write",
-        |mut caller: Caller<'_, HostState>, path_ptr: u32, path_len: u32, expected_ptr: u32, expected_len: u32, data_ptr: u32, data_len: u32| -> u32 {
+        |mut caller: Caller<'_, HostState>,
+         path_ptr: u32,
+         path_len: u32,
+         expected_ptr: u32,
+         expected_len: u32,
+         data_ptr: u32,
+         data_len: u32|
+         -> u32 {
             let path = read_guest_string(&mut caller, path_ptr, path_len);
             let expected = read_guest_string(&mut caller, expected_ptr, expected_len);
             let data = read_guest_string(&mut caller, data_ptr, data_len);
             let extra_roots = caller.data().extra_readable_roots();
-            let Some(full) = sandboxed_guest_path_with_extra_roots(&caller.data().cwd(), &path, &extra_roots) else { return 0 };
+            let Some(full) =
+                sandboxed_guest_path_with_extra_roots(&caller.data().cwd(), &path, &extra_roots)
+            else {
+                return 0;
+            };
             if let Some(parent) = full.parent() {
                 let _ = fs::create_dir_all(parent);
             }
@@ -390,7 +504,11 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
         |mut caller: Caller<'_, HostState>, path_ptr: u32, path_len: u32| -> u32 {
             let path = read_guest_string(&mut caller, path_ptr, path_len);
             let extra_roots = caller.data().extra_readable_roots();
-            let Some(full) = sandboxed_guest_path_with_extra_roots(&caller.data().cwd(), &path, &extra_roots) else { return 0 };
+            let Some(full) =
+                sandboxed_guest_path_with_extra_roots(&caller.data().cwd(), &path, &extra_roots)
+            else {
+                return 0;
+            };
             match fs::metadata(&full) {
                 Ok(md) if md.is_dir() => 0,
                 Ok(_) => match fs::remove_file(&full) {
@@ -408,9 +526,17 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
         |mut caller: Caller<'_, HostState>, path_ptr: u32, path_len: u32| -> u64 {
             let path = read_guest_string(&mut caller, path_ptr, path_len);
             let extra_roots = caller.data().extra_readable_roots();
-            let Some(full) = sandboxed_guest_path_with_extra_roots(&caller.data().cwd(), &path, &extra_roots) else { return 0 };
+            let Some(full) =
+                sandboxed_guest_path_with_extra_roots(&caller.data().cwd(), &path, &extra_roots)
+            else {
+                return 0;
+            };
             let entries: Vec<String> = fs::read_dir(&full)
-                .map(|rd| rd.filter_map(|e| e.ok()).map(|e| e.file_name().to_string_lossy().into_owned()).collect())
+                .map(|rd| {
+                    rd.filter_map(|e| e.ok())
+                        .map(|e| e.file_name().to_string_lossy().into_owned())
+                        .collect()
+                })
                 .unwrap_or_default();
             write_guest_json(&mut caller, serde_json::json!(entries))
         },
@@ -442,10 +568,17 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
         },
     )?;
 
-    linker.func_wrap("env", "host_now_ms", |_caller: Caller<'_, HostState>| -> u64 {
-        use std::time::{SystemTime, UNIX_EPOCH};
-        SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
-    })?;
+    linker.func_wrap(
+        "env",
+        "host_now_ms",
+        |_caller: Caller<'_, HostState>| -> u64 {
+            use std::time::{SystemTime, UNIX_EPOCH};
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0)
+        },
+    )?;
 
     linker.func_wrap(
         "env",
@@ -459,7 +592,11 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
                 if let Some(parent) = log_path.parent() {
                     let _ = fs::create_dir_all(parent);
                 }
-                if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(&log_path) {
+                if let Ok(mut f) = fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&log_path)
+                {
                     use std::io::Write;
                     let _ = writeln!(f, "evt: {evt_line}");
                 }
@@ -516,12 +653,24 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
     linker.func_wrap(
         "env",
         "host_fetch",
-        |mut caller: Caller<'_, HostState>, url_ptr: u32, url_len: u32, opts_ptr: u32, opts_len: u32| -> u64 {
+        |mut caller: Caller<'_, HostState>,
+         url_ptr: u32,
+         url_len: u32,
+         opts_ptr: u32,
+         opts_len: u32|
+         -> u64 {
             let url = read_guest_string(&mut caller, url_ptr, url_len);
             let opts_str = read_guest_string(&mut caller, opts_ptr, opts_len);
-            let opts: serde_json::Value =
-                if opts_str.is_empty() { serde_json::json!({}) } else { serde_json::from_str(&opts_str).unwrap_or(serde_json::json!({})) };
-            let method = opts.get("method").and_then(|v| v.as_str()).unwrap_or("GET").to_uppercase();
+            let opts: serde_json::Value = if opts_str.is_empty() {
+                serde_json::json!({})
+            } else {
+                serde_json::from_str(&opts_str).unwrap_or(serde_json::json!({}))
+            };
+            let method = opts
+                .get("method")
+                .and_then(|v| v.as_str())
+                .unwrap_or("GET")
+                .to_uppercase();
             let body = opts.get("body").and_then(|v| v.as_str());
             let timeout = opts
                 .get("timeoutMs")
@@ -561,7 +710,12 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
     linker.func_wrap(
         "env",
         "host_kv_get",
-        |mut caller: Caller<'_, HostState>, ns_ptr: u32, ns_len: u32, key_ptr: u32, key_len: u32| -> u64 {
+        |mut caller: Caller<'_, HostState>,
+         ns_ptr: u32,
+         ns_len: u32,
+         key_ptr: u32,
+         key_len: u32|
+         -> u64 {
             let ns = read_guest_string(&mut caller, ns_ptr, ns_len);
             let key = read_guest_string(&mut caller, key_ptr, key_len);
             if ns.is_empty() || key.is_empty() {
@@ -577,7 +731,14 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
     linker.func_wrap(
         "env",
         "host_kv_put",
-        |mut caller: Caller<'_, HostState>, ns_ptr: u32, ns_len: u32, key_ptr: u32, key_len: u32, val_ptr: u32, val_len: u32| -> u32 {
+        |mut caller: Caller<'_, HostState>,
+         ns_ptr: u32,
+         ns_len: u32,
+         key_ptr: u32,
+         key_len: u32,
+         val_ptr: u32,
+         val_len: u32|
+         -> u32 {
             let ns = read_guest_string(&mut caller, ns_ptr, ns_len);
             let key = read_guest_string(&mut caller, key_ptr, key_len);
             let val = read_guest_string(&mut caller, val_ptr, val_len);
@@ -597,7 +758,12 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
     linker.func_wrap(
         "env",
         "host_kv_delete",
-        |mut caller: Caller<'_, HostState>, ns_ptr: u32, ns_len: u32, key_ptr: u32, key_len: u32| -> u32 {
+        |mut caller: Caller<'_, HostState>,
+         ns_ptr: u32,
+         ns_len: u32,
+         key_ptr: u32,
+         key_len: u32|
+         -> u32 {
             let ns = read_guest_string(&mut caller, ns_ptr, ns_len);
             let key = read_guest_string(&mut caller, key_ptr, key_len);
             if ns.is_empty() || key.is_empty() {
@@ -613,7 +779,12 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
     linker.func_wrap(
         "env",
         "host_kv_query",
-        |mut caller: Caller<'_, HostState>, ns_ptr: u32, ns_len: u32, q_ptr: u32, q_len: u32| -> u64 {
+        |mut caller: Caller<'_, HostState>,
+         ns_ptr: u32,
+         ns_len: u32,
+         q_ptr: u32,
+         q_len: u32|
+         -> u64 {
             let ns = read_guest_string(&mut caller, ns_ptr, ns_len);
             let q = read_guest_string(&mut caller, q_ptr, q_len).to_lowercase();
             if ns.is_empty() {
@@ -629,7 +800,11 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
                     }
                     if let Ok(content) = fs::read_to_string(&path) {
                         if q.is_empty() || content.to_lowercase().contains(&q) {
-                            let key = path.file_stem().and_then(|s| s.to_str()).unwrap_or_default().to_string();
+                            let key = path
+                                .file_stem()
+                                .and_then(|s| s.to_str())
+                                .unwrap_or_default()
+                                .to_string();
                             results.push(serde_json::json!({"key": key, "value": content}));
                         }
                     }
@@ -642,7 +817,12 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
     linker.func_wrap(
         "env",
         "host_exec_js",
-        |mut caller: Caller<'_, HostState>, code_ptr: u32, code_len: u32, opts_ptr: u32, opts_len: u32| -> u64 {
+        |mut caller: Caller<'_, HostState>,
+         code_ptr: u32,
+         code_len: u32,
+         opts_ptr: u32,
+         opts_len: u32|
+         -> u64 {
             let code = read_guest_string(&mut caller, code_ptr, code_len);
             let opts_str = read_guest_string(&mut caller, opts_ptr, opts_len);
             let opts: serde_json::Value = if opts_str.is_empty() {
@@ -667,7 +847,12 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
     linker.func_wrap(
         "env",
         "host_task_proc",
-        |mut caller: Caller<'_, HostState>, a_ptr: u32, a_len: u32, p_ptr: u32, p_len: u32| -> u64 {
+        |mut caller: Caller<'_, HostState>,
+         a_ptr: u32,
+         a_len: u32,
+         p_ptr: u32,
+         p_len: u32|
+         -> u64 {
             let action = read_guest_string(&mut caller, a_ptr, a_len);
             let params_str = read_guest_string(&mut caller, p_ptr, p_len);
             let params: serde_json::Value = if params_str.is_empty() {
@@ -678,7 +863,9 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
             let cwd = caller.data().cwd();
             let result = if action == crate::fs_prewarm::ACTION {
                 let extra_roots = caller.data().extra_readable_roots();
-                crate::fs_prewarm::run(&params, |p| sandboxed_guest_path_with_extra_roots(&cwd, p, &extra_roots))
+                crate::fs_prewarm::run(&params, |p| {
+                    sandboxed_guest_path_with_extra_roots(&cwd, p, &extra_roots)
+                })
             } else {
                 crate::task::handle(&action, &params, &cwd)
             };
@@ -688,7 +875,16 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
     linker.func_wrap(
         "env",
         "host_browser_exec",
-        |mut caller: Caller<'_, HostState>, body_ptr: u32, body_len: u32, cwd_ptr: u32, cwd_len: u32, sid_ptr: u32, sid_len: u32, opts_ptr: u32, opts_len: u32| -> u64 {
+        |mut caller: Caller<'_, HostState>,
+         body_ptr: u32,
+         body_len: u32,
+         cwd_ptr: u32,
+         cwd_len: u32,
+         sid_ptr: u32,
+         sid_len: u32,
+         opts_ptr: u32,
+         opts_len: u32|
+         -> u64 {
             let body = read_guest_string(&mut caller, body_ptr, body_len);
             let cwd_str = read_guest_string(&mut caller, cwd_ptr, cwd_len);
             let sid = read_guest_string(&mut caller, sid_ptr, sid_len);
@@ -707,7 +903,16 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
     linker.func_wrap(
         "env",
         "host_oxi_exec",
-        |mut caller: Caller<'_, HostState>, body_ptr: u32, body_len: u32, cwd_ptr: u32, cwd_len: u32, sid_ptr: u32, sid_len: u32, opts_ptr: u32, opts_len: u32| -> u64 {
+        |mut caller: Caller<'_, HostState>,
+         body_ptr: u32,
+         body_len: u32,
+         cwd_ptr: u32,
+         cwd_len: u32,
+         sid_ptr: u32,
+         sid_len: u32,
+         opts_ptr: u32,
+         opts_len: u32|
+         -> u64 {
             let body = read_guest_string(&mut caller, body_ptr, body_len);
             let cwd_str = read_guest_string(&mut caller, cwd_ptr, cwd_len);
             let sid = read_guest_string(&mut caller, sid_ptr, sid_len);
@@ -922,9 +1127,10 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
                     "exit_code": -1,
                 });
                 return write_guest_json(&mut caller, v);
-            }
-            let mut git_cmd = std::process::Command::new("git");
-            git_cmd.args(&argv).current_dir(&cwd).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+                }
+                let mut git_cmd = std::process::Command::new("git");
+                git_cmd.args(&argv).current_dir(&cwd).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+                configure_github_git_credentials(&mut git_cmd);
             #[cfg(windows)]
             {
                 crate::windowless::apply_windowless(&mut git_cmd);
@@ -993,5 +1199,43 @@ fn kv_file_path(cwd: &std::path::Path, ns: &str, key: &str) -> PathBuf {
 }
 
 fn safe_name(s: &str) -> String {
-    s.chars().map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-' { c } else { '_' }).collect()
+    s.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    static CREDENTIAL_CONFIG_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn scopes_the_github_cli_store_and_helper_to_git_children() {
+        let _guard = CREDENTIAL_CONFIG_LOCK.lock().unwrap();
+        let credential_dir = PathBuf::from("/tmp/agentplug-gh-config");
+        set_github_cli_config_dir(Some(credential_dir.clone()));
+        let mut command = std::process::Command::new("git");
+        configure_github_git_credentials(&mut command);
+        let envs: HashMap<_, _> = command.get_envs().collect();
+        assert_eq!(
+            envs.get(std::ffi::OsStr::new("GH_CONFIG_DIR"))
+                .and_then(|value| *value),
+            Some(credential_dir.as_os_str())
+        );
+        let helper_present = envs.iter().any(|(key, value)| {
+            key.to_string_lossy().starts_with("GIT_CONFIG_KEY_")
+                && value.is_some_and(|value| {
+                    value == std::ffi::OsStr::new("credential.https://github.com.helper")
+                })
+        });
+        assert!(helper_present);
+        set_github_cli_config_dir(None);
+    }
 }

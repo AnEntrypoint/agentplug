@@ -32,7 +32,11 @@ impl IdleReap {
     fn decode(raw: &str) -> Option<IdleReap> {
         match raw.trim() {
             "never" => Some(IdleReap::Never),
-            ms => ms.parse::<u64>().ok().filter(|ms| *ms > 0).map(|ms| IdleReap::After(Duration::from_millis(ms))),
+            ms => ms
+                .parse::<u64>()
+                .ok()
+                .filter(|ms| *ms > 0)
+                .map(|ms| IdleReap::After(Duration::from_millis(ms))),
         }
     }
 
@@ -63,5 +67,7 @@ pub(crate) fn record(profile_dir: &Path, reap: Option<IdleReap>) {
 }
 
 pub(crate) fn recorded(profile_dir: &Path) -> Option<IdleReap> {
-    std::fs::read_to_string(sidecar_path(profile_dir)).ok().and_then(|raw| IdleReap::decode(&raw))
+    std::fs::read_to_string(sidecar_path(profile_dir))
+        .ok()
+        .and_then(|raw| IdleReap::decode(&raw))
 }

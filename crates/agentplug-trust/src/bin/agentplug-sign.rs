@@ -54,11 +54,18 @@ impl Args {
     }
 
     fn opt(&self, name: &str) -> Option<&str> {
-        self.flags.get(name).and_then(|v| v.first()).map(String::as_str).filter(|v| !v.is_empty())
+        self.flags
+            .get(name)
+            .and_then(|v| v.first())
+            .map(String::as_str)
+            .filter(|v| !v.is_empty())
     }
 
     fn many(&self, name: &str) -> Vec<&str> {
-        self.flags.get(name).map(|v| v.iter().map(String::as_str).collect()).unwrap_or_default()
+        self.flags
+            .get(name)
+            .map(|v| v.iter().map(String::as_str).collect())
+            .unwrap_or_default()
     }
 
     fn has(&self, name: &str) -> bool {
@@ -85,7 +92,10 @@ fn inside_git_worktree(path: &Path) -> bool {
 
 fn refuse_inside_repo(path: &Path, what: &str) -> Result<(), String> {
     if inside_git_worktree(path) {
-        return Err(format!("{what} {} is inside a git work tree; a private key must never live in a repository", path.display()));
+        return Err(format!(
+            "{what} {} is inside a git work tree; a private key must never live in a repository",
+            path.display()
+        ));
     }
     Ok(())
 }
@@ -98,14 +108,18 @@ fn write_new_private(path: &Path, contents: &str) -> Result<(), String> {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    let mut file = options.open(path).map_err(|e| format!("cannot create {}: {e}", path.display()))?;
-    file.write_all(contents.as_bytes()).map_err(|e| format!("cannot write {}: {e}", path.display()))
+    let mut file = options
+        .open(path)
+        .map_err(|e| format!("cannot create {}: {e}", path.display()))?;
+    file.write_all(contents.as_bytes())
+        .map_err(|e| format!("cannot write {}: {e}", path.display()))
 }
 
 fn read_secret(path: &str) -> Result<([u8; 32], String), String> {
     refuse_inside_repo(Path::new(path), "secret key file")?;
     let text = std::fs::read_to_string(path).map_err(|e| format!("cannot read {path}: {e}"))?;
-    let seed = hexutil::decode_fixed::<32>(&text).ok_or_else(|| format!("{path} is not a 64-hex-digit ed25519 seed"))?;
+    let seed = hexutil::decode_fixed::<32>(&text)
+        .ok_or_else(|| format!("{path} is not a 64-hex-digit ed25519 seed"))?;
     let id = Path::new(path)
         .file_name()
         .and_then(|n| n.to_str())
@@ -117,7 +131,11 @@ fn read_secret(path: &str) -> Result<([u8; 32], String), String> {
 fn keygen(args: &Args) -> Result<i32, String> {
     refuse_in_ci()?;
     let id = args.one("id")?;
-    if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.') {
+    if id.is_empty()
+        || !id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+    {
         return Err("--id may contain only letters, digits, - _ .".to_string());
     }
     let out = PathBuf::from(args.one("out")?);
@@ -126,9 +144,16 @@ fn keygen(args: &Args) -> Result<i32, String> {
     let mut seed = [0u8; 32];
     getrandom::getrandom(&mut seed).map_err(|e| format!("no OS randomness: {e}"))?;
     let public = hexutil::encode(&signature::public_key_of(&seed));
-    write_new_private(&out.join(format!("{id}.secret")), &format!("{}\n", hexutil::encode(&seed)))?;
-    std::fs::write(out.join(format!("{id}.pub")), format!("{public}\n")).map_err(|e| format!("cannot write public key: {e}"))?;
-    println!("{}", serde_json::json!({"id": id, "public_key": public, "secret_file": out.join(format!("{id}.secret")).display().to_string()}));
+    write_new_private(
+        &out.join(format!("{id}.secret")),
+        &format!("{}\n", hexutil::encode(&seed)),
+    )?;
+    std::fs::write(out.join(format!("{id}.pub")), format!("{public}\n"))
+        .map_err(|e| format!("cannot write public key: {e}"))?;
+    println!(
+        "{}",
+        serde_json::json!({"id": id, "public_key": public, "secret_file": out.join(format!("{id}.secret")).display().to_string()})
+    );
     eprintln!("keep {id}.secret offline (hardware token / encrypted offline media); put only the public key in trusted-keys.json");
     Ok(0)
 }
@@ -143,18 +168,40 @@ fn sign(args: &Args) -> Result<i32, String> {
     refuse_in_ci()?;
     let artifact_path = PathBuf::from(args.one("artifact")?);
     let version = args.one("version")?.to_string();
-    let sequence: u64 = args.one("sequence")?.parse().map_err(|_| "--sequence must be a non-negative integer".to_string())?;
+    let sequence: u64 = args
+        .one("sequence")?
+        .parse()
+        .map_err(|_| "--sequence must be a non-negative integer".to_string())?;
     let name = match args.opt("name") {
         Some(name) => name.to_string(),
-        None => artifact_path.file_name().and_then(|n| n.to_str()).ok_or("cannot derive an asset name; pass --name")?.to_string(),
+        None => artifact_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or("cannot derive an asset name; pass --name")?
+            .to_string(),
     };
-    let bytes = std::fs::read(&artifact_path).map_err(|e| format!("cannot read {}: {e}", artifact_path.display()))?;
+    let bytes = std::fs::read(&artifact_path)
+        .map_err(|e| format!("cannot read {}: {e}", artifact_path.display()))?;
     let sha256 = hexutil::sha256_hex(&bytes);
     let statement = signature::statement(&name, &version, sequence, &sha256)?;
-    let mut doc = SignatureDoc { v: DOCUMENT_VERSION, artifact: name.clone(), version, sequence, sha256, signatures: Vec::new() };
+    let mut doc = SignatureDoc {
+        v: DOCUMENT_VERSION,
+        artifact: name.clone(),
+        version,
+        sequence,
+        sha256,
+        signatures: Vec::new(),
+    };
     if let Some(existing_path) = args.opt("merge") {
-        let existing = SignatureDoc::parse(&std::fs::read_to_string(existing_path).map_err(|e| format!("cannot read {existing_path}: {e}"))?)?;
-        if existing.artifact != doc.artifact || existing.version != doc.version || existing.sequence != doc.sequence || existing.sha256 != doc.sha256 {
+        let existing = SignatureDoc::parse(
+            &std::fs::read_to_string(existing_path)
+                .map_err(|e| format!("cannot read {existing_path}: {e}"))?,
+        )?;
+        if existing.artifact != doc.artifact
+            || existing.version != doc.version
+            || existing.sequence != doc.sequence
+            || existing.sha256 != doc.sha256
+        {
             return Err("--merge file signs a different statement (artifact/version/sequence/digest differ)".to_string());
         }
         doc.signatures = existing.signatures;
@@ -169,14 +216,34 @@ fn sign(args: &Args) -> Result<i32, String> {
             continue;
         }
         let sig = signature::sign(&seed, &statement);
-        if !signature::verify(&signature::public_key_of(&seed), &statement, &hexutil::encode(&sig)) {
+        if !signature::verify(
+            &signature::public_key_of(&seed),
+            &statement,
+            &hexutil::encode(&sig),
+        ) {
             return Err("self-verification of the fresh signature failed".to_string());
         }
-        doc.signatures.push(SignatureEntry { key_id: id, sig: hexutil::encode(&sig) });
+        doc.signatures.push(SignatureEntry {
+            key_id: id,
+            sig: hexutil::encode(&sig),
+        });
     }
-    let out = args.opt("out").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(format!("{}.sig", artifact_path.display())));
-    std::fs::write(&out, format!("{}\n", serde_json::to_string(&doc).map_err(|e| e.to_string())?)).map_err(|e| format!("cannot write {}: {e}", out.display()))?;
-    println!("{}", serde_json::json!({"signed": name, "sha256": doc.sha256, "sequence": sequence, "signers": doc.signatures.iter().map(|s| &s.key_id).collect::<Vec<_>>(), "out": out.display().to_string()}));
+    let out = args
+        .opt("out")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(format!("{}.sig", artifact_path.display())));
+    std::fs::write(
+        &out,
+        format!(
+            "{}\n",
+            serde_json::to_string(&doc).map_err(|e| e.to_string())?
+        ),
+    )
+    .map_err(|e| format!("cannot write {}: {e}", out.display()))?;
+    println!(
+        "{}",
+        serde_json::json!({"signed": name, "sha256": doc.sha256, "sequence": sequence, "signers": doc.signatures.iter().map(|s| &s.key_id).collect::<Vec<_>>(), "out": out.display().to_string()})
+    );
     Ok(0)
 }
 
@@ -186,11 +253,18 @@ fn verify(args: &Args) -> Result<i32, String> {
     let dir = PathBuf::from(args.one("trust-dir")?);
     let name = match args.opt("name") {
         Some(name) => name.to_string(),
-        None => artifact_path.file_name().and_then(|n| n.to_str()).ok_or("cannot derive an asset name; pass --name")?.to_string(),
+        None => artifact_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or("cannot derive an asset name; pass --name")?
+            .to_string(),
     };
-    let bytes = std::fs::read(&artifact_path).map_err(|e| format!("cannot read {}: {e}", artifact_path.display()))?;
+    let bytes = std::fs::read(&artifact_path)
+        .map_err(|e| format!("cannot read {}: {e}", artifact_path.display()))?;
     let sha256 = hexutil::sha256_hex(&bytes);
-    let sig_text = args.opt("sig").map(|p| std::fs::read_to_string(p).map_err(|e| format!("cannot read {p}: {e}")));
+    let sig_text = args
+        .opt("sig")
+        .map(|p| std::fs::read_to_string(p).map_err(|e| format!("cannot read {p}: {e}")));
     let trust = load_trust(&dir);
     let sig_arg = match &sig_text {
         Some(Ok(text)) => Ok(text.as_str()),
@@ -201,17 +275,26 @@ fn verify(args: &Args) -> Result<i32, String> {
         Ok(authorized) => {
             let (label, code) = match &authorized.verdict {
                 agentplug_trust::Verdict::Verified { .. } => ("verified", 0),
-                agentplug_trust::Verdict::Unverified { .. } => ("unverified-installed-under-warn", 2),
+                agentplug_trust::Verdict::Unverified { .. } => {
+                    ("unverified-installed-under-warn", 2)
+                }
                 agentplug_trust::Verdict::Off => ("off", 2),
             };
             if args.has("record") {
-                commit(&dir, &name, &sha256, &authorized).map_err(|e| format!("cannot record sequence: {e}"))?;
+                commit(&dir, &name, &sha256, &authorized)
+                    .map_err(|e| format!("cannot record sequence: {e}"))?;
             }
-            println!("{}", serde_json::json!({"verdict": label, "mode": authorized.mode.as_str(), "trust_configured": authorized.configured, "detail": format!("{:?}", authorized.verdict), "sha256": sha256}));
+            println!(
+                "{}",
+                serde_json::json!({"verdict": label, "mode": authorized.mode.as_str(), "trust_configured": authorized.configured, "detail": format!("{:?}", authorized.verdict), "sha256": sha256})
+            );
             Ok(code)
         }
         Err(rejected) => {
-            println!("{}", serde_json::json!({"verdict": "rejected", "mode": rejected.mode.as_str(), "reason": rejected.reason, "sha256": sha256}));
+            println!(
+                "{}",
+                serde_json::json!({"verdict": "rejected", "mode": rejected.mode.as_str(), "reason": rejected.reason, "sha256": sha256})
+            );
             Ok(1)
         }
     }

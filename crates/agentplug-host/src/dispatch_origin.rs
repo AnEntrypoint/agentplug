@@ -27,7 +27,11 @@ impl DispatchOrigin {
             .unwrap_or_else(|| UNATTRIBUTED_DISPATCH_SESSION.to_string())
     }
 
-    pub(crate) fn page_session(&self, explicit_session_line: Option<String>, guest_resolved_session: &str) -> String {
+    pub(crate) fn page_session(
+        &self,
+        explicit_session_line: Option<String>,
+        guest_resolved_session: &str,
+    ) -> String {
         explicit_session_line
             .or_else(|| self.named_page_session.clone())
             .unwrap_or_else(|| self.implicit_page_session(guest_resolved_session))
@@ -49,7 +53,11 @@ impl Drop for DispatchOriginScope {
     }
 }
 
-pub fn enter_dispatch_origin_scope(spool_task: &str, body: &str, submitted_at_ms: Option<u64>) -> DispatchOriginScope {
+pub fn enter_dispatch_origin_scope(
+    spool_task: &str,
+    body: &str,
+    submitted_at_ms: Option<u64>,
+) -> DispatchOriginScope {
     let mut origin = dispatch_origin_of(spool_task, body);
     origin.spool_task = Some(spool_task.to_string()).filter(|task| !task.is_empty());
     origin.submitted_at_ms = submitted_at_ms;
@@ -69,10 +77,13 @@ fn session_last_seen_map() -> &'static Mutex<HashMap<String, Instant>> {
 }
 
 pub(crate) fn note_session_activity(session_id: &str) {
-    let mut map = session_last_seen_map().lock().unwrap_or_else(|e| e.into_inner());
+    let mut map = session_last_seen_map()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     map.insert(session_id.to_string(), Instant::now());
     if map.len() > SESSION_ACTIVITY_MAX_ENTRIES {
-        let mut entries: Vec<(String, Instant)> = map.iter().map(|(k, v)| (k.clone(), *v)).collect();
+        let mut entries: Vec<(String, Instant)> =
+            map.iter().map(|(k, v)| (k.clone(), *v)).collect();
         entries.sort_by_key(|(_, t)| *t);
         let evict_count = entries.len() - SESSION_ACTIVITY_MAX_ENTRIES / 2;
         for (k, _) in entries.into_iter().take(evict_count) {
@@ -82,7 +93,9 @@ pub(crate) fn note_session_activity(session_id: &str) {
 }
 
 pub(crate) fn session_activity_elapsed(session_id: &str) -> Option<Duration> {
-    let map = session_last_seen_map().lock().unwrap_or_else(|e| e.into_inner());
+    let map = session_last_seen_map()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     map.get(session_id).map(|t| t.elapsed())
 }
 
@@ -99,11 +112,15 @@ pub(crate) fn dispatch_env_value(key: &str) -> Option<Option<String>> {
 }
 
 pub(crate) fn current_dispatch_origin() -> DispatchOrigin {
-    CURRENT_DISPATCH_ORIGIN.with(|cell| cell.borrow().clone()).unwrap_or_default()
+    CURRENT_DISPATCH_ORIGIN
+        .with(|cell| cell.borrow().clone())
+        .unwrap_or_default()
 }
 
 fn dispatch_origin_of(spool_task: &str, body: &str) -> DispatchOrigin {
-    let envelope = serde_json::from_str::<Value>(body).ok().filter(Value::is_object);
+    let envelope = serde_json::from_str::<Value>(body)
+        .ok()
+        .filter(Value::is_object);
     let envelope_field = |name: &str| {
         envelope
             .as_ref()
@@ -114,7 +131,9 @@ fn dispatch_origin_of(spool_task: &str, body: &str) -> DispatchOrigin {
             .map(str::to_string)
     };
     DispatchOrigin {
-        gm_session: envelope_field("session_id").or_else(|| envelope_field("SESSION_ID")).or_else(|| gm_session_from_spool_task(spool_task)),
+        gm_session: envelope_field("session_id")
+            .or_else(|| envelope_field("SESSION_ID"))
+            .or_else(|| gm_session_from_spool_task(spool_task)),
         named_page_session: envelope_field("sessionId"),
         spool_task: None,
         submitted_at_ms: None,

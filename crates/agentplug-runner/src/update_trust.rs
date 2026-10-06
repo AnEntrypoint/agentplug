@@ -28,7 +28,11 @@ pub struct UpdateRejected {
 
 impl std::fmt::Display for UpdateRejected {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "update rejected: {} {} -- {}", self.artifact, self.version, self.reason)
+        write!(
+            f,
+            "update rejected: {} {} -- {}",
+            self.artifact, self.version, self.reason
+        )
     }
 }
 
@@ -61,7 +65,10 @@ struct Events {
 }
 
 fn now_ms() -> u64 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 fn events_path() -> PathBuf {
@@ -69,12 +76,18 @@ fn events_path() -> PathBuf {
 }
 
 fn read_events() -> Events {
-    fs::read_to_string(events_path()).ok().and_then(|text| serde_json::from_str(&text).ok()).unwrap_or_default()
+    fs::read_to_string(events_path())
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default()
 }
 
 fn write_events(events: &Events) {
     let _ = fs::create_dir_all(install_dir());
-    let _ = fs::write(events_path(), serde_json::to_string_pretty(events).unwrap_or_default());
+    let _ = fs::write(
+        events_path(),
+        serde_json::to_string_pretty(events).unwrap_or_default(),
+    );
 }
 
 pub fn unverified_promotion_path() -> PathBuf {
@@ -130,7 +143,10 @@ fn announce_missing_trust_file_once(trust: &Trust) {
     if marker.exists() {
         return;
     }
-    eprintln!("[agentplug UPDATE-TRUST NOTICE] {}", trust_notice_text(trust));
+    eprintln!(
+        "[agentplug UPDATE-TRUST NOTICE] {}",
+        trust_notice_text(trust)
+    );
     let _ = fs::create_dir_all(install_dir());
     let _ = fs::write(marker, now_ms().to_string());
 }
@@ -140,10 +156,15 @@ fn fetch_signature_text(url: &str) -> Result<String, String> {
         Ok(resp) => {
             let limit = agentplug_trust::signature::MAX_DOCUMENT_BYTES as u64;
             let mut text = String::new();
-            resp.into_reader().take(limit + 1).read_to_string(&mut text).map_err(|e| format!("reading {url}: {e}"))?;
+            resp.into_reader()
+                .take(limit + 1)
+                .read_to_string(&mut text)
+                .map_err(|e| format!("reading {url}: {e}"))?;
             Ok(text)
         }
-        Err(ureq::Error::Status(404, _)) => Err(format!("no signature published at {url} (HTTP 404)")),
+        Err(ureq::Error::Status(404, _)) => {
+            Err(format!("no signature published at {url} (HTTP 404)"))
+        }
         Err(ureq::Error::Status(code, _)) => Err(format!("HTTP {code} fetching {url}")),
         Err(e) => Err(format!("fetching {url}: {e}")),
     }
@@ -151,7 +172,9 @@ fn fetch_signature_text(url: &str) -> Result<String, String> {
 
 fn rejection(asset: &AssetIdentity, mode: Mode, reason: String) -> anyhow::Error {
     let reason = match strict_mode_source() {
-        Some(source) if is_runner_artifact(asset.artifact) => format!("{reason} (strict mode demanded a signature: {source})"),
+        Some(source) if is_runner_artifact(asset.artifact) => {
+            format!("{reason} (strict mode demanded a signature: {source})")
+        }
         _ => reason,
     };
     let mut events = read_events();
@@ -170,26 +193,52 @@ fn rejection(asset: &AssetIdentity, mode: Mode, reason: String) -> anyhow::Error
         );
         events.rejected.insert(
             asset.artifact.to_string(),
-            Event { version: asset.version.to_string(), reason: reason.clone(), ts: now_ms(), running: asset.running.map(str::to_string) },
+            Event {
+                version: asset.version.to_string(),
+                reason: reason.clone(),
+                ts: now_ms(),
+                running: asset.running.map(str::to_string),
+            },
         );
         write_events(&events);
     }
-    anyhow::Error::new(UpdateRejected { artifact: asset.artifact.to_string(), version: asset.version.to_string(), reason })
+    anyhow::Error::new(UpdateRejected {
+        artifact: asset.artifact.to_string(),
+        version: asset.version.to_string(),
+        reason,
+    })
 }
 
 pub fn preflight(asset: &AssetIdentity, signature_url: &str) -> anyhow::Result<Preflight> {
     let trust = trust_for(asset.artifact);
     if trust.mode == Mode::Off {
-        return Ok(Preflight { trust, signature: Err("trust mode is off".to_string()) });
+        return Ok(Preflight {
+            trust,
+            signature: Err("trust mode is off".to_string()),
+        });
     }
     announce_missing_trust_file_once(&trust);
     let signature = fetch_signature_text(signature_url);
     let provisional = match &signature {
         Ok(text) => match agentplug_trust::SignatureDoc::parse(text) {
-            Ok(doc) => Some(authorize(&trust, &install_dir(), asset.artifact, asset.version, &doc.sha256, Ok(text))),
+            Ok(doc) => Some(authorize(
+                &trust,
+                &install_dir(),
+                asset.artifact,
+                asset.version,
+                &doc.sha256,
+                Ok(text),
+            )),
             Err(_) => None,
         },
-        Err(detail) => Some(authorize(&trust, &install_dir(), asset.artifact, asset.version, "", Err(detail))),
+        Err(detail) => Some(authorize(
+            &trust,
+            &install_dir(),
+            asset.artifact,
+            asset.version,
+            "",
+            Err(detail),
+        )),
     };
     if let Some(Err(rejected)) = provisional {
         return Err(rejection(asset, rejected.mode, rejected.reason));
@@ -199,8 +248,19 @@ pub fn preflight(asset: &AssetIdentity, signature_url: &str) -> anyhow::Result<P
 
 pub fn finalize(asset: &AssetIdentity, pre: &Preflight, bytes: &[u8]) -> anyhow::Result<Finalized> {
     let sha256 = hexutil::sha256_hex(bytes);
-    let signature = pre.signature.as_ref().map(String::as_str).map_err(String::as_str);
-    match authorize(&pre.trust, &install_dir(), asset.artifact, asset.version, &sha256, signature) {
+    let signature = pre
+        .signature
+        .as_ref()
+        .map(String::as_str)
+        .map_err(String::as_str);
+    match authorize(
+        &pre.trust,
+        &install_dir(),
+        asset.artifact,
+        asset.version,
+        &sha256,
+        signature,
+    ) {
         Ok(authorized) => {
             if let Verdict::Unverified { reason } = &authorized.verdict {
                 let mut events = read_events();
@@ -220,7 +280,12 @@ pub fn finalize(asset: &AssetIdentity, pre: &Preflight, bytes: &[u8]) -> anyhow:
                     );
                     events.unverified.insert(
                         asset.artifact.to_string(),
-                        Event { version: asset.version.to_string(), reason: reason.clone(), ts: now_ms(), running: asset.running.map(str::to_string) },
+                        Event {
+                            version: asset.version.to_string(),
+                            reason: reason.clone(),
+                            ts: now_ms(),
+                            running: asset.running.map(str::to_string),
+                        },
                     );
                     write_events(&events);
                 }
@@ -232,12 +297,21 @@ pub fn finalize(asset: &AssetIdentity, pre: &Preflight, bytes: &[u8]) -> anyhow:
 }
 
 pub fn installed(asset: &AssetIdentity, finalized: &Finalized) {
-    if let Err(e) = commit(&install_dir(), asset.artifact, &finalized.sha256, &finalized.authorized) {
-        eprintln!("[agentplug UPDATE-TRUST WARN] could not record accepted sequence for {}: {e}", asset.artifact);
+    if let Err(e) = commit(
+        &install_dir(),
+        asset.artifact,
+        &finalized.sha256,
+        &finalized.authorized,
+    ) {
+        eprintln!(
+            "[agentplug UPDATE-TRUST WARN] could not record accepted sequence for {}: {e}",
+            asset.artifact
+        );
     }
     if finalized.authorized.verified() {
         let mut events = read_events();
-        let changed = events.rejected.remove(asset.artifact).is_some() | events.unverified.remove(asset.artifact).is_some();
+        let changed = events.rejected.remove(asset.artifact).is_some()
+            | events.unverified.remove(asset.artifact).is_some();
         if changed {
             write_events(&events);
         }
@@ -268,7 +342,9 @@ pub fn record_stage_outcome(staged: &Path, asset: &AssetIdentity, finalized: &Fi
 }
 
 fn read_stage_record(staged: &Path) -> Option<serde_json::Value> {
-    fs::read_to_string(sidecar_path(staged)).ok().and_then(|text| serde_json::from_str(&text).ok())
+    fs::read_to_string(sidecar_path(staged))
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
 }
 
 pub fn remove_stage_record(staged: &Path) {
@@ -280,16 +356,28 @@ pub fn staged_runner_permitted(staged: &Path) -> Result<bool, String> {
     if trust.mode == Mode::Off {
         return Ok(false);
     }
-    let actual = fs::read(staged).map(|bytes| hexutil::sha256_hex(&bytes)).map_err(|e| format!("cannot read staged runner {}: {e}", staged.display()))?;
+    let actual = fs::read(staged)
+        .map(|bytes| hexutil::sha256_hex(&bytes))
+        .map_err(|e| format!("cannot read staged runner {}: {e}", staged.display()))?;
     let record = read_stage_record(staged);
-    let recorded_sha = record.as_ref().and_then(|v| v.get("sha256")).and_then(|v| v.as_str()).map(str::to_string);
-    let verified = record.as_ref().and_then(|v| v.get("verified")).and_then(|v| v.as_bool()).unwrap_or(false);
+    let recorded_sha = record
+        .as_ref()
+        .and_then(|v| v.get("sha256"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let verified = record
+        .as_ref()
+        .and_then(|v| v.get("verified"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let reason = record
         .as_ref()
         .and_then(|v| v.get("reason"))
         .and_then(|v| v.as_str())
         .map(str::to_string)
-        .unwrap_or_else(|| "the staged runner carries no signature-verification record".to_string());
+        .unwrap_or_else(|| {
+            "the staged runner carries no signature-verification record".to_string()
+        });
     match recorded_sha {
         Some(sha) if sha.eq_ignore_ascii_case(&actual) => {
             if verified {
@@ -318,7 +406,11 @@ pub fn staged_runner_permitted(staged: &Path) -> Result<bool, String> {
 pub fn record_unverified_promotion(staged: &Path, version: &str, running: Option<&str>) {
     let path = unverified_promotion_path();
     let record = read_stage_record(staged);
-    let verified = record.as_ref().and_then(|v| v.get("verified")).and_then(|v| v.as_bool()).unwrap_or(false);
+    let verified = record
+        .as_ref()
+        .and_then(|v| v.get("verified"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     if verified || runner_trust().mode == Mode::Off {
         if path.exists() {
             let _ = fs::remove_file(&path);
@@ -330,9 +422,21 @@ pub fn record_unverified_promotion(staged: &Path, version: &str, running: Option
         .and_then(|v| v.get("reason"))
         .and_then(|v| v.as_str())
         .map(str::to_string)
-        .unwrap_or_else(|| "the promoted runner carried no signature-verification record".to_string());
-    let sha256 = record.as_ref().and_then(|v| v.get("sha256")).and_then(|v| v.as_str()).unwrap_or_default().to_string();
-    let artifact = record.as_ref().and_then(|v| v.get("artifact")).and_then(|v| v.as_str()).unwrap_or_default().to_string();
+        .unwrap_or_else(|| {
+            "the promoted runner carried no signature-verification record".to_string()
+        });
+    let sha256 = record
+        .as_ref()
+        .and_then(|v| v.get("sha256"))
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let artifact = record
+        .as_ref()
+        .and_then(|v| v.get("artifact"))
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
     let marker = serde_json::json!({
         "artifact": artifact,
         "version": version,
@@ -342,10 +446,15 @@ pub fn record_unverified_promotion(staged: &Path, version: &str, running: Option
         "promoted_at_ts": now_ms(),
         "running_before": running,
     });
-    let already = fs::read_to_string(&path).ok().and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok());
+    let already = fs::read_to_string(&path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok());
     let unchanged = already
         .as_ref()
-        .map(|old| old.get("version").and_then(|v| v.as_str()) == Some(version) && old.get("reason").and_then(|v| v.as_str()) == Some(reason.as_str()))
+        .map(|old| {
+            old.get("version").and_then(|v| v.as_str()) == Some(version)
+                && old.get("reason").and_then(|v| v.as_str()) == Some(reason.as_str())
+        })
         .unwrap_or(false);
     let _ = fs::create_dir_all(install_dir());
     let _ = fs::write(&path, marker.to_string());
@@ -359,7 +468,9 @@ pub fn record_unverified_promotion(staged: &Path, version: &str, running: Option
 }
 
 pub fn unverified_promotion() -> Option<serde_json::Value> {
-    fs::read_to_string(unverified_promotion_path()).ok().and_then(|text| serde_json::from_str(&text).ok())
+    fs::read_to_string(unverified_promotion_path())
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
 }
 
 pub fn status() -> serde_json::Value {

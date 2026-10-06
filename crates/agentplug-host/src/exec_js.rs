@@ -1,9 +1,8 @@
 use std::ffi::OsString;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{Arc, Mutex, OnceLock};
-use std::thread::JoinHandle;
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
@@ -15,42 +14,11 @@ const PROFILE_SENTINEL: &str = "__GM_PROFILE__";
 const DEFAULT_LIMIT_MS: u64 = 300_000;
 const HARD_CEILING_MS: u64 = 900_000;
 const MIN_LIMIT_MS: i64 = 100;
-const PIPE_DRAIN_GRACE: Duration = Duration::from_millis(1500);
 
 struct BuiltCommand {
     cmd: String,
     args: Vec<String>,
     stdin_payload: Option<String>,
-}
-
-struct DrainedPipe {
-    buffer: Arc<Mutex<Vec<u8>>>,
-    reader: JoinHandle<()>,
-}
-
-fn drain_in_background(mut pipe: impl Read + Send + 'static) -> DrainedPipe {
-    let buffer = Arc::new(Mutex::new(Vec::new()));
-    let sink = Arc::clone(&buffer);
-    let reader = std::thread::spawn(move || {
-        let mut chunk = [0u8; 16384];
-        loop {
-            match pipe.read(&mut chunk) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => sink.lock().unwrap_or_else(|e| e.into_inner()).extend_from_slice(&chunk[..n]),
-            }
-        }
-    });
-    DrainedPipe { buffer, reader }
-}
-
-impl DrainedPipe {
-    fn collect(self, deadline: Instant) -> Vec<u8> {
-        while !self.reader.is_finished() && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        let bytes = self.buffer.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        bytes
-    }
 }
 
 fn resolve_limit(opts: &Value) -> Result<(u64, Option<u64>), Value> {
@@ -64,29 +32,6 @@ fn resolve_limit(opts: &Value) -> Result<(u64, Option<u64>), Value> {
     }
 }
 
-fn timeout_failure(lang: &str, limit_ms: u64, clamped_from: Option<u64>, killed: usize, duration_ms: u64, stdout: String, stderr: String) -> Value {
-    let mut v = json!({
-        "ok": false,
-        "timed_out": true,
-        "killed": true,
-        "error_code": "exec_timeout",
-        "error": format!(
-            "{lang} body exceeded its {limit_ms} ms wall-clock limit and its process tree was killed ({killed} process(es)); the limit is timeoutMs from the body prefix, default {DEFAULT_LIMIT_MS} ms, hard ceiling {HARD_CEILING_MS} ms. For work that legitimately runs longer, use the task-spawn verb (its own cap is 30 minutes), or start it detached with stdio ignored and poll it in later calls"
-        ),
-        "limit_ms": limit_ms,
-        "default_limit_ms": DEFAULT_LIMIT_MS,
-        "ceiling_ms": HARD_CEILING_MS,
-        "stdout": stdout,
-        "stderr": stderr,
-        "exit_code": -1,
-        "duration_ms": duration_ms,
-    });
-    if let Some(requested) = clamped_from {
-        v["limit_clamped_from_ms"] = json!(requested);
-    }
-    v
-}
-
 fn exec_path_dirs() -> Vec<PathBuf> {
     let mut dirs: Vec<PathBuf> = std::env::var_os("PATH")
         .map(|value| std::env::split_paths(&value).collect())
@@ -97,11 +42,23 @@ fn exec_path_dirs() -> Vec<PathBuf> {
     if let Some(login) = login_shell_path() {
         dirs.extend(std::env::split_paths(&login).filter(|dir| !dir.as_os_str().is_empty()));
     }
+    let cargo_bin = std::env::var_os("CARGO_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cargo")))
+        .map(|home| home.join("bin"));
+    if let Some(cargo_bin) = cargo_bin.filter(|dir| dir.is_dir()) {
+        dirs.push(cargo_bin);
+    }
     dirs.extend(
-        ["/config/tools", "/config/workspace/google-cloud-sdk/bin", "/config/go-install", "/config/.gm-tools"]
-            .into_iter()
-            .map(PathBuf::from)
-            .filter(|dir| dir.is_dir()),
+        [
+            "/config/tools",
+            "/config/workspace/google-cloud-sdk/bin",
+            "/config/go-install",
+            "/config/.gm-tools",
+        ]
+        .into_iter()
+        .map(PathBuf::from)
+        .filter(|dir| dir.is_dir()),
     );
     let mut seen = std::collections::HashSet::new();
     dirs.retain(|dir| seen.insert(dir.clone()));
@@ -113,13 +70,25 @@ fn login_shell_path() -> Option<OsString> {
         return None;
     }
     let shell = std::env::var_os("SHELL").unwrap_or_else(|| OsString::from("/bin/sh"));
-    let output = Command::new(shell).args(["-lc", "printf %s \"$PATH\""]).stderr(Stdio::null()).output().ok()?;
+    let output = Command::new(shell)
+        .args(["-lc", "printf %s \"$PATH\""])
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
     if !output.status.success() {
         return None;
     }
     let text = String::from_utf8(output.stdout).ok()?;
-    let value = text.lines().rev().find(|line| !line.trim().is_empty())?.trim();
-    if value.is_empty() { None } else { Some(OsString::from(value)) }
+    let value = text
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())?
+        .trim();
+    if value.is_empty() {
+        None
+    } else {
+        Some(OsString::from(value))
+    }
 }
 
 fn exec_path() -> &'static OsString {
@@ -131,15 +100,27 @@ fn exec_path() -> &'static OsString {
 }
 
 pub fn run(code: &str, opts: &Value, cwd: &Path) -> Value {
-    let lang = opts.get("lang").and_then(|v| v.as_str()).unwrap_or("nodejs");
-    let (limit_ms, clamped_from) = match resolve_limit(opts) {
+    let lang = opts
+        .get("lang")
+        .and_then(|v| v.as_str())
+        .unwrap_or("nodejs");
+    let (limit_ms, _clamped_from) = match resolve_limit(opts) {
         Ok(v) => v,
         Err(rejection) => return rejection,
     };
 
     let is_js_lang = lang == "nodejs" || lang == "js";
-    let want_profile = opts.get("profile").and_then(|v| v.as_bool()).unwrap_or(false) && is_js_lang;
-    let profile_skipped = if opts.get("profile").and_then(|v| v.as_bool()).unwrap_or(false) && !is_js_lang {
+    let want_profile = opts
+        .get("profile")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+        && is_js_lang;
+    let profile_skipped = if opts
+        .get("profile")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+        && !is_js_lang
+    {
         Some(json!({
             "reason": format!("profile requested but lang={lang} is not js/nodejs; CPU profiling only supported on the node surface"),
             "lang": lang,
@@ -147,7 +128,8 @@ pub fn run(code: &str, opts: &Value, cwd: &Path) -> Value {
     } else {
         None
     };
-    let want_mem = opts.get("mem").and_then(|v| v.as_bool()).unwrap_or(false) && is_js_lang && !want_profile;
+    let want_mem =
+        opts.get("mem").and_then(|v| v.as_bool()).unwrap_or(false) && is_js_lang && !want_profile;
     let mode = if want_profile {
         ExecMode::Profile
     } else if want_mem {
@@ -167,9 +149,19 @@ pub fn run(code: &str, opts: &Value, cwd: &Path) -> Value {
         .args(&built.args)
         .env("PATH", exec_path())
         .current_dir(cwd)
-        .stdin(if built.stdin_payload.is_some() { Stdio::piped() } else { Stdio::null() })
+        .stdin(if built.stdin_payload.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    configure_toolchain_path(&mut command);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
     #[cfg(windows)]
     {
         crate::windowless::apply_windowless(&mut command);
@@ -185,39 +177,80 @@ pub fn run(code: &str, opts: &Value, cwd: &Path) -> Value {
             });
         }
     };
+    let containment = match crate::process_tree::establish_containment(&child) {
+        Ok(containment) => containment,
+        Err(error) => {
+            crate::process_tree::kill_tree(child.id());
+            let _ = child.kill();
+            let _ = child.wait();
+            return json!({
+                "ok": false,
+                "stdout": "",
+                "stderr": error,
+                "exit_code": -1,
+                "containment_error": true,
+            });
+        }
+    };
 
     if let (Some(payload), Some(mut stdin)) = (built.stdin_payload, child.stdin.take()) {
         std::thread::spawn(move || {
             let _ = stdin.write_all(payload.as_bytes());
         });
     }
-    let stdout_pipe = child.stdout.take().map(drain_in_background);
-    let stderr_pipe = child.stderr.take().map(drain_in_background);
+    let stdout_pipe = child.stdout.take().map(crate::task::drain_in_background);
+    let stderr_pipe = child.stderr.take().map(crate::task::drain_in_background);
 
     let waited = child.wait_timeout(Duration::from_millis(limit_ms));
-    let timed_out = matches!(waited, Ok(None));
-    let mut killed = 0usize;
-    if timed_out {
-        killed = crate::process_tree::kill_tree(child.id());
-        let _ = child.kill();
+    if matches!(waited, Ok(None)) {
+        let task_id =
+            crate::task::adopt_running(child, containment, lang, t0, stdout_pipe, stderr_pipe);
+        return json!({
+            "ok": true,
+            "timed_out": true,
+            "in_progress": true,
+            "task_id": task_id,
+            "elapsed_ms": t0.elapsed().as_millis() as u64,
+            "task_timeout_ms": 30 * 60 * 1000,
+            "decision_required": "this call hit its timeoutMs while work was still running; it remains alive in the task registry as task_id. Poll task-output with {\"id\":\"<task_id>\"} for progress or final output, or call task-stop with that id to kill it. The adopted task is killed if it remains active for 30 minutes."
+        });
     }
     let exit_code = child.wait().ok().and_then(|s| s.code()).unwrap_or(-1);
     let duration_ms = t0.elapsed().as_millis() as u64;
-    let drain_deadline = Instant::now() + PIPE_DRAIN_GRACE;
-    let stdout_buf = stdout_pipe.map(|p| p.collect(drain_deadline)).unwrap_or_default();
-    let stderr_buf = stderr_pipe.map(|p| p.collect(drain_deadline)).unwrap_or_default();
+    let drains_finished = stdout_pipe
+        .as_ref()
+        .map_or(true, crate::task::DrainedPipe::is_finished)
+        && stderr_pipe
+            .as_ref()
+            .map_or(true, crate::task::DrainedPipe::is_finished);
+    if !drains_finished {
+        let task_id =
+            crate::task::adopt_running(child, containment, lang, t0, stdout_pipe, stderr_pipe);
+        return json!({
+            "ok": true,
+            "timed_out": false,
+            "in_progress": true,
+            "task_id": task_id,
+            "exit_code": exit_code,
+            "duration_ms": duration_ms,
+            "task_timeout_ms": 30 * 60 * 1000,
+            "decision_required": "the direct process exited but a descendant still owns its output pipes; task-output with {\"id\":\"<task_id>\"} will retain output until every pipe closes. Call task-stop with that id to terminate the process group."
+        });
+    }
+    let stdout_buf = stdout_pipe.map(|p| p.collect()).unwrap_or_default();
+    let stderr_buf = stderr_pipe.map(|p| p.collect()).unwrap_or_default();
 
     let stdout_raw = String::from_utf8_lossy(&stdout_buf).into_owned();
     let stderr = String::from_utf8_lossy(&stderr_buf).into_owned();
 
-    if timed_out {
-        return timeout_failure(lang, limit_ms, clamped_from, killed, duration_ms, stdout_raw, stderr);
-    }
-
     match mode {
         ExecMode::Profile => {
             let (clean_stdout, parsed) = extract_sentinel(&stdout_raw, PROFILE_SENTINEL);
-            let ok = exit_code == 0 && parsed.as_ref().map(|p| p.get("user_error").map(|e| e.is_null()).unwrap_or(true)).unwrap_or(false);
+            let ok = exit_code == 0
+                && parsed
+                    .as_ref()
+                    .map(|p| p.get("user_error").map(|e| e.is_null()).unwrap_or(true))
+                    .unwrap_or(false);
             let mut v = json!({
                 "ok": ok,
                 "stdout": clean_stdout,
@@ -240,7 +273,11 @@ pub fn run(code: &str, opts: &Value, cwd: &Path) -> Value {
         }
         ExecMode::Mem => {
             let (clean_stdout, parsed) = extract_sentinel(&stdout_raw, META_SENTINEL);
-            let has_error = parsed.as_ref().and_then(|p| p.get("error")).map(|e| !e.is_null()).unwrap_or(false);
+            let has_error = parsed
+                .as_ref()
+                .and_then(|p| p.get("error"))
+                .map(|e| !e.is_null())
+                .unwrap_or(false);
             let ok = exit_code == 0 && parsed.is_some() && !has_error;
             let mut v = json!({
                 "ok": ok,
@@ -254,7 +291,11 @@ pub fn run(code: &str, opts: &Value, cwd: &Path) -> Value {
                 "wall_ms": parsed.as_ref().and_then(|p| p.get("wall_ms")).cloned().unwrap_or(Value::Null),
             });
             if has_error {
-                v["error"] = parsed.as_ref().and_then(|p| p.get("error")).cloned().unwrap_or(Value::Null);
+                v["error"] = parsed
+                    .as_ref()
+                    .and_then(|p| p.get("error"))
+                    .cloned()
+                    .unwrap_or(Value::Null);
             }
             v
         }
@@ -300,6 +341,48 @@ pub fn run(code: &str, opts: &Value, cwd: &Path) -> Value {
     }
 }
 
+pub(crate) fn configure_toolchain_path(command: &mut Command) {
+    let Some(cargo_bin) = cargo_bin_dir() else {
+        return;
+    };
+    if !cargo_bin.is_dir() {
+        return;
+    }
+    let Some(path) = prepend_path(&cargo_bin, std::env::var_os("PATH")) else {
+        return;
+    };
+    command.env("PATH", path);
+}
+
+fn cargo_bin_dir() -> Option<PathBuf> {
+    #[cfg(windows)]
+    let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"));
+    #[cfg(not(windows))]
+    let home = std::env::var_os("HOME");
+    cargo_bin_dir_from_homes(std::env::var_os("CARGO_HOME"), home)
+}
+
+fn cargo_bin_dir_from_homes(
+    cargo_home: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+) -> Option<PathBuf> {
+    if let Some(cargo_home) = cargo_home.filter(|value| !value.is_empty()) {
+        return Some(PathBuf::from(cargo_home).join("bin"));
+    }
+    Some(PathBuf::from(home?).join(".cargo").join("bin"))
+}
+
+fn prepend_path(bin: &Path, existing: Option<std::ffi::OsString>) -> Option<std::ffi::OsString> {
+    let existing = existing
+        .as_ref()
+        .map(|path| std::env::split_paths(path).collect::<Vec<_>>())
+        .unwrap_or_default();
+    if existing.iter().any(|entry| entry == bin) {
+        return None;
+    }
+    std::env::join_paths(std::iter::once(bin.to_path_buf()).chain(existing)).ok()
+}
+
 fn extract_sentinel(stdout: &str, sentinel: &str) -> (String, Option<Value>) {
     match stdout.find(sentinel) {
         Some(idx) => {
@@ -318,8 +401,12 @@ enum ExecMode {
     Profile,
 }
 
-pub(crate) fn build_command(lang: &str, code: &str) -> Option<(String, Vec<String>, Option<String>)> {
-    build_command_mode(lang, code, ExecMode::Default, &json!({})).map(|b| (b.cmd, b.args, b.stdin_payload))
+pub(crate) fn build_command(
+    lang: &str,
+    code: &str,
+) -> Option<(String, Vec<String>, Option<String>)> {
+    build_command_mode(lang, code, ExecMode::Default, &json!({}))
+        .map(|b| (b.cmd, b.args, b.stdin_payload))
 }
 
 fn build_command_mode(
@@ -408,19 +495,44 @@ fn build_command_mode(
             };
             let cmd = resolve_node_cmd();
             if command_is_node(&cmd) {
-                Some(BuiltCommand { cmd, args: vec!["-".to_string()], stdin_payload: Some(wrapped) })
+                Some(BuiltCommand {
+                    cmd,
+                    args: vec!["-".to_string()],
+                    stdin_payload: Some(wrapped),
+                })
             } else {
-                Some(BuiltCommand { cmd, args: vec!["-e".to_string(), wrapped], stdin_payload: None })
+                Some(BuiltCommand {
+                    cmd,
+                    args: vec!["-e".to_string(), wrapped],
+                    stdin_payload: None,
+                })
             }
         }
-        "python" | "py" => Some(BuiltCommand { cmd: "python".to_string(), args: vec!["-c".to_string(), code.to_string()], stdin_payload: None }),
-        "bash" | "sh" | "shell" => Some(BuiltCommand { cmd: resolve_bash_cmd(), args: vec!["-c".to_string(), code.to_string()], stdin_payload: None }),
-        "powershell" | "ps1" => Some(BuiltCommand {
-            cmd: "powershell".to_string(),
-            args: vec!["-NoProfile".to_string(), "-NonInteractive".to_string(), "-Command".to_string(), code.to_string()],
+        "python" | "py" => Some(BuiltCommand {
+            cmd: "python".to_string(),
+            args: vec!["-c".to_string(), code.to_string()],
             stdin_payload: None,
         }),
-        "deno" => Some(BuiltCommand { cmd: "deno".to_string(), args: vec!["eval".to_string(), code.to_string()], stdin_payload: None }),
+        "bash" | "sh" | "shell" => Some(BuiltCommand {
+            cmd: resolve_bash_cmd(),
+            args: vec!["-c".to_string(), code.to_string()],
+            stdin_payload: None,
+        }),
+        "powershell" | "ps1" => Some(BuiltCommand {
+            cmd: "powershell".to_string(),
+            args: vec![
+                "-NoProfile".to_string(),
+                "-NonInteractive".to_string(),
+                "-Command".to_string(),
+                code.to_string(),
+            ],
+            stdin_payload: None,
+        }),
+        "deno" => Some(BuiltCommand {
+            cmd: "deno".to_string(),
+            args: vec!["eval".to_string(), code.to_string()],
+            stdin_payload: None,
+        }),
         _ => None,
     }
 }
@@ -496,13 +608,21 @@ fn resolve_bash_cmd() -> String {
             return git_bash_usr.to_string_lossy().into_owned();
         }
     }
-    which("bash").map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|| "bash".to_string())
+    which("bash")
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "bash".to_string())
 }
 
 fn which(cmd: &str) -> Option<std::path::PathBuf> {
     let path_var = std::env::var_os("PATH")?;
-    let exe_name = if cfg!(windows) { format!("{cmd}.exe") } else { cmd.to_string() };
-    std::env::split_paths(&path_var).map(|p| p.join(&exe_name)).find(|p| p.exists())
+    let exe_name = if cfg!(windows) {
+        format!("{cmd}.exe")
+    } else {
+        cmd.to_string()
+    };
+    std::env::split_paths(&path_var)
+        .map(|p| p.join(&exe_name))
+        .find(|p| p.exists())
 }
 
 #[allow(dead_code)]
@@ -511,4 +631,229 @@ fn write_script(prefix: &str, content: &str) -> std::io::Result<std::path::PathB
     let mut f = std::fs::File::create(&path)?;
     f.write_all(content.as_bytes())?;
     Ok(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+    use std::time::{Duration, Instant};
+
+    use serde_json::json;
+
+    #[test]
+    fn foreground_timeout_hands_live_pipes_to_task_until_complete() {
+        let _guard = crate::task::test_registry_guard();
+        let result = super::run(
+            "printf '%s' before-; head -c 131072 /dev/zero | tr '\\000' x; printf '%s' -middle-; printf '%s' err-before- >&2; sleep 0.2; printf '%s' after; printf '%s' err-after >&2; (sleep 0.5; printf '%s' tail; printf '%s' err-tail >&2) &",
+            &json!({"lang": "bash", "timeoutMs": 100}),
+            Path::new("."),
+        );
+        assert_eq!(result.get("ok").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(
+            result.get("timed_out").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            result.get("in_progress").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            result.get("task_timeout_ms").and_then(|v| v.as_u64()),
+            Some(30 * 60 * 1000)
+        );
+        let id = result
+            .get("task_id")
+            .and_then(|v| v.as_str())
+            .expect("handoff task id")
+            .to_string();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut saw_finished_before_drains = false;
+        let final_output = loop {
+            let output = crate::task::handle(
+                "output",
+                &json!({"id": id, "max_bytes": 200_000}),
+                Path::new("."),
+            );
+            let finished = output.get("running").and_then(|v| v.as_bool()) == Some(false);
+            let stdout = output
+                .get("stdout")
+                .and_then(|v| v.as_str())
+                .expect("stdout");
+            let stderr = output
+                .get("stderr")
+                .and_then(|v| v.as_str())
+                .expect("stderr");
+            if finished && !stdout.contains("tail") && !stderr.contains("err-tail") {
+                saw_finished_before_drains = true;
+            }
+            if finished && stdout.contains("tail") && stderr.contains("err-tail") {
+                break output;
+            }
+            assert!(Instant::now() < deadline, "adopted task did not finish");
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert!(saw_finished_before_drains);
+        let stdout = final_output
+            .get("stdout")
+            .and_then(|v| v.as_str())
+            .expect("stdout");
+        let stderr = final_output
+            .get("stderr")
+            .and_then(|v| v.as_str())
+            .expect("stderr");
+        assert!(stdout.starts_with("before-"));
+        assert!(stdout.contains("-middle-aftertail"));
+        assert_eq!(stdout.matches('x').count(), 131072);
+        assert_eq!(stderr, "err-before-err-aftererr-tail");
+        assert_eq!(
+            final_output.get("exit_code").and_then(|v| v.as_i64()),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn exited_foreground_child_hands_late_descendant_output_to_task() {
+        let _guard = crate::task::test_registry_guard();
+        let result = super::run(
+            "printf '%s' before-; printf '%s' err-before- >&2; (sleep 0.5; printf '%s' tail; printf '%s' err-tail >&2) &",
+            &json!({"lang": "bash", "timeoutMs": 1_000}),
+            Path::new("."),
+        );
+        assert_eq!(result.get("ok").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(
+            result.get("timed_out").and_then(|v| v.as_bool()),
+            Some(false)
+        );
+        assert_eq!(
+            result.get("in_progress").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        assert_eq!(result.get("exit_code").and_then(|v| v.as_i64()), Some(0));
+        let id = result
+            .get("task_id")
+            .and_then(|v| v.as_str())
+            .expect("handoff task id")
+            .to_string();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut saw_finished_before_drains = false;
+        let final_output = loop {
+            let output = crate::task::handle("output", &json!({"id": id}), Path::new("."));
+            let finished = output.get("running").and_then(|v| v.as_bool()) == Some(false);
+            let stdout = output
+                .get("stdout")
+                .and_then(|v| v.as_str())
+                .expect("stdout");
+            let stderr = output
+                .get("stderr")
+                .and_then(|v| v.as_str())
+                .expect("stderr");
+            if finished && !stdout.contains("tail") && !stderr.contains("err-tail") {
+                saw_finished_before_drains = true;
+            }
+            if finished && stdout.contains("tail") && stderr.contains("err-tail") {
+                break output;
+            }
+            assert!(Instant::now() < deadline, "late descendant output was lost");
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert!(saw_finished_before_drains);
+        assert_eq!(
+            final_output.get("stdout").and_then(|v| v.as_str()),
+            Some("before-tail")
+        );
+        assert_eq!(
+            final_output.get("stderr").and_then(|v| v.as_str()),
+            Some("err-before-err-tail")
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn stopping_exited_shell_kills_its_delayed_pipe_owner_without_waiting_for_it() {
+        let _guard = crate::task::test_registry_guard();
+        let result = super::run(
+            "printf '%s' before-; (sleep 5; printf '%s' tail) &",
+            &json!({"lang": "bash", "timeoutMs": 1_000}),
+            Path::new("."),
+        );
+        let id = result
+            .get("task_id")
+            .and_then(|v| v.as_str())
+            .expect("handoff task id")
+            .to_string();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let output = crate::task::handle("output", &json!({"id": id}), Path::new("."));
+            if output.get("running").and_then(|v| v.as_bool()) == Some(false) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "shell did not exit");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let started = Instant::now();
+        let stopped = crate::task::handle("stop", &json!({"id": id}), Path::new("."));
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "stop waited for the descendant pipe owner"
+        );
+        assert_eq!(stopped.get("ok").and_then(|v| v.as_bool()), Some(true));
+    }
+
+    #[test]
+    fn prepends_cargo_bin_without_losing_caller_path_entries() {
+        let cargo_bin = std::path::PathBuf::from("configured-cargo").join("bin");
+        let caller = vec![
+            std::path::PathBuf::from("caller-one"),
+            std::path::PathBuf::from("caller-two"),
+        ];
+        let path =
+            super::prepend_path(&cargo_bin, Some(std::env::join_paths(&caller).unwrap())).unwrap();
+        assert_eq!(
+            std::env::split_paths(&path).collect::<Vec<_>>(),
+            [cargo_bin, caller[0].clone(), caller[1].clone()]
+        );
+    }
+
+    #[test]
+    fn does_not_duplicate_cargo_bin_in_caller_path() {
+        let cargo_bin = std::path::PathBuf::from("configured-cargo").join("bin");
+        let caller =
+            std::env::join_paths([cargo_bin.clone(), std::path::PathBuf::from("caller")]).unwrap();
+        assert!(super::prepend_path(&cargo_bin, Some(caller)).is_none());
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn foreground_bash_uses_the_configured_cargo_bin() {
+        let Some(home) = std::env::var_os("HOME") else {
+            return;
+        };
+        if !std::path::PathBuf::from(home)
+            .join(".cargo")
+            .join("bin")
+            .join("cargo")
+            .is_file()
+        {
+            return;
+        }
+        let result = super::run(
+            "cargo --version >/dev/null",
+            &json!({"lang": "bash", "timeoutMs": 5_000}),
+            Path::new("."),
+        );
+        assert_eq!(
+            result.get("ok").and_then(|value| value.as_bool()),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn explicit_cargo_home_takes_precedence_over_home() {
+        let cargo_home = std::ffi::OsString::from("configured-cargo-home");
+        let home = std::ffi::OsString::from("fallback-home");
+        assert_eq!(
+            super::cargo_bin_dir_from_homes(Some(cargo_home), Some(home)),
+            Some(std::path::PathBuf::from("configured-cargo-home").join("bin"))
+        );
+    }
 }

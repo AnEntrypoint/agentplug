@@ -1,23 +1,39 @@
 use serde_json::{json, Value};
 use std::path::Path;
 
-type SiblingPools = std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<crate::registry::SharedPluginPool>>>>;
+type SiblingPools = std::sync::Arc<
+    std::sync::Mutex<
+        std::collections::HashMap<String, std::sync::Arc<crate::registry::SharedPluginPool>>,
+    >,
+>;
 
 const PAGE_FIELD: &str = "page";
 
 fn strip_session_id_prefix(body: &str) -> (Option<String>, &str) {
     let trimmed = body.trim_start();
-    let Some(rest) = trimmed.strip_prefix("sessionId=") else { return (None, body) };
-    let Some(nl) = rest.find('\n') else { return (None, body) };
+    let Some(rest) = trimmed.strip_prefix("sessionId=") else {
+        return (None, body);
+    };
+    let Some(nl) = rest.find('\n') else {
+        return (None, body);
+    };
     let (id, remainder) = (&rest[..nl], &rest[nl + 1..]);
     let id = id.trim();
-    if id.is_empty() { (None, remainder) } else { (Some(id.to_string()), remainder) }
+    if id.is_empty() {
+        (None, remainder)
+    } else {
+        (Some(id.to_string()), remainder)
+    }
 }
 
 fn strip_timeout_prefix(body: &str) -> (Option<u64>, &str) {
     let trimmed = body.trim_start();
-    let Some(rest) = trimmed.strip_prefix("timeout=") else { return (None, body) };
-    let Some(nl) = rest.find('\n') else { return (None, body) };
+    let Some(rest) = trimmed.strip_prefix("timeout=") else {
+        return (None, body);
+    };
+    let Some(nl) = rest.find('\n') else {
+        return (None, body);
+    };
     let (num_str, remainder) = (&rest[..nl], &rest[nl + 1..]);
     match num_str.trim().parse::<u64>() {
         Ok(ms) => (Some(ms), remainder),
@@ -27,7 +43,9 @@ fn strip_timeout_prefix(body: &str) -> (Option<u64>, &str) {
 
 fn strip_dom_prefix(body: &str) -> (Option<String>, &str) {
     let trimmed = body.trim_start();
-    let Some(rest) = trimmed.strip_prefix("dom=") else { return (None, body) };
+    let Some(rest) = trimmed.strip_prefix("dom=") else {
+        return (None, body);
+    };
     let (selector, remainder) = match rest.find('\n') {
         Some(nl) => (rest[..nl].trim().to_string(), &rest[nl + 1..]),
         None => (rest.trim().to_string(), ""),
@@ -137,7 +155,9 @@ impl PageTarget<'_> {
     }
 
     fn attribute(&self, mut reply: Value) -> Value {
-        let Some(obj) = reply.as_object_mut() else { return reply };
+        let Some(obj) = reply.as_object_mut() else {
+            return reply;
+        };
         if !obj.contains_key(PAGE_FIELD) {
             obj.insert("page_partition_unsupported".to_string(), json!(true));
             obj.insert(
@@ -160,11 +180,18 @@ impl PageTarget<'_> {
         let sessions: Vec<Value> = pages
             .into_iter()
             .map(|mut entry| {
-                let page = entry.get(PAGE_FIELD).and_then(Value::as_str).unwrap_or_default().to_string();
+                let page = entry
+                    .get(PAGE_FIELD)
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
                 if let Some(obj) = entry.as_object_mut() {
                     obj.insert("session_id".to_string(), json!(page));
                     obj.insert("alive".to_string(), json!(true));
-                    obj.insert("is_caller_implicit_session".to_string(), json!(page == caller_implicit_session));
+                    obj.insert(
+                        "is_caller_implicit_session".to_string(),
+                        json!(page == caller_implicit_session),
+                    );
                 }
                 entry
             })
@@ -172,7 +199,10 @@ impl PageTarget<'_> {
         if let Some(obj) = reply.as_object_mut() {
             obj.insert("sessions".to_string(), json!(sessions));
             obj.insert("caller_gm_session".to_string(), json!(self.gm_session));
-            obj.insert("caller_implicit_session".to_string(), json!(caller_implicit_session));
+            obj.insert(
+                "caller_implicit_session".to_string(),
+                json!(caller_implicit_session),
+            );
         }
         reply
     }
@@ -194,7 +224,12 @@ fn call_oxibrowser(
     };
     let sibling_pool = match sibling_pool {
         Some(pool) => Some(pool),
-        None if crate::registry::ensure_sibling_registered(caller_root, "oxibrowser", &caller_siblings) => {
+        None if crate::registry::ensure_sibling_registered(
+            caller_root,
+            "oxibrowser",
+            &caller_siblings,
+        ) =>
+        {
             caller_siblings.lock().unwrap().get("oxibrowser").cloned()
         }
         None => None,
@@ -257,9 +292,7 @@ pub fn run(body: &str, opts: &str, cwd: &Path, session_id: &str, siblings: Sibli
 
     let (session_command, after_session_command) = parse_session_command(after_sid);
     let trailing_body_present = !after_session_command.trim().is_empty();
-    let terminal_refusal = |command: &str| {
-        json!({"ok": false, "error": format!("'{command}' is a terminal session command and the lines after it were not evaluated -- send them as their own dispatch, or stack them under 'session new'/'session reset <id>'")})
-    };
+    let terminal_refusal = |command: &str| json!({"ok": false, "error": format!("'{command}' is a terminal session command and the lines after it were not evaluated -- send them as their own dispatch, or stack them under 'session new'/'session reset <id>'")});
     let (target, script) = match session_command {
         SessionCommand::New if !trailing_body_present => {
             return own_page.attribute(json!({"ok": true, "page": own_page.page, "note": "oxibrowser opens a page on its first navigate/evaluate; session new reports the page this gm session owns"}));
@@ -270,7 +303,9 @@ pub fn run(body: &str, opts: &str, cwd: &Path, session_id: &str, siblings: Sibli
         SessionCommand::Close(id) | SessionCommand::Reset(id) if id.is_empty() => {
             return json!({"ok": false, "error": format!("session close/reset requires an explicit id, e.g. 'session close {caller_implicit_session}' for this gm session's own page")});
         }
-        SessionCommand::Close(_) if trailing_body_present => return terminal_refusal("session close <id>"),
+        SessionCommand::Close(_) if trailing_body_present => {
+            return terminal_refusal("session close <id>")
+        }
         SessionCommand::Close(id) => return named_page(id.to_string()).close(),
         SessionCommand::Reset(id) => {
             let target = named_page(id.to_string());
@@ -323,7 +358,9 @@ pub fn run(body: &str, opts: &str, cwd: &Path, session_id: &str, siblings: Sibli
             return nav;
         }
         if dom_selector.is_none() && !extract_markdown && rest.trim().is_empty() {
-            return target.attribute(json!({"ok": true, "navigated": true, "page": target.page, "url": nav}));
+            return target.attribute(
+                json!({"ok": true, "navigated": true, "page": target.page, "url": nav}),
+            );
         }
     }
     if let Some(selector) = dom_selector {

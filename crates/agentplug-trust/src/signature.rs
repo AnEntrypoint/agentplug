@@ -26,9 +26,13 @@ pub struct SignatureDoc {
 impl SignatureDoc {
     pub fn parse(text: &str) -> Result<SignatureDoc, String> {
         if text.len() > MAX_DOCUMENT_BYTES {
-            return Err(format!("signature document is {} bytes, over the {MAX_DOCUMENT_BYTES} byte limit", text.len()));
+            return Err(format!(
+                "signature document is {} bytes, over the {MAX_DOCUMENT_BYTES} byte limit",
+                text.len()
+            ));
         }
-        serde_json::from_str::<SignatureDoc>(text).map_err(|e| format!("signature document does not parse: {e}"))
+        serde_json::from_str::<SignatureDoc>(text)
+            .map_err(|e| format!("signature document does not parse: {e}"))
     }
 
     pub fn statement(&self) -> Result<Vec<u8>, String> {
@@ -36,8 +40,17 @@ impl SignatureDoc {
     }
 }
 
-pub fn statement(artifact: &str, version: &str, sequence: u64, sha256: &str) -> Result<Vec<u8>, String> {
-    for (label, value) in [("artifact", artifact), ("version", version), ("sha256", sha256)] {
+pub fn statement(
+    artifact: &str,
+    version: &str,
+    sequence: u64,
+    sha256: &str,
+) -> Result<Vec<u8>, String> {
+    for (label, value) in [
+        ("artifact", artifact),
+        ("version", version),
+        ("sha256", sha256),
+    ] {
         if value.is_empty() || value.contains(['\n', '\r']) {
             return Err(format!("{label} must be a non-empty single line"));
         }
@@ -58,7 +71,12 @@ pub fn sign(secret: &[u8; 32], statement: &[u8]) -> [u8; 64] {
 }
 
 pub fn verify(public: &[u8; 32], statement: &[u8], signature_hex: &str) -> bool {
-    let Some(sig_bytes) = hexutil::decode_fixed::<64>(signature_hex) else { return false };
-    let Ok(key) = VerifyingKey::from_bytes(public) else { return false };
-    key.verify_strict(statement, &Signature::from_bytes(&sig_bytes)).is_ok()
+    let Some(sig_bytes) = hexutil::decode_fixed::<64>(signature_hex) else {
+        return false;
+    };
+    let Ok(key) = VerifyingKey::from_bytes(public) else {
+        return false;
+    };
+    key.verify_strict(statement, &Signature::from_bytes(&sig_bytes))
+        .is_ok()
 }

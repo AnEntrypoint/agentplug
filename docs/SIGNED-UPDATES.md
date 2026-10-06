@@ -36,6 +36,13 @@ pin and the strictly-newer version requirement are all still checked first, and
 the local-build check is re-run at takeover; `AGENTPLUG_ALLOW_UPDATE_OVER_LOCAL_BUILD=1`
 still overrides it.
 
+
+## Local source and release bootstrap
+
+A local checkout is never an updater source. The runner only stages a strictly newer published release artifact and verifies it under the configured trust mode. It does not read, export, copy, or configure GitHub credentials, and it does not replace a runner binary or plugin from local source.
+
+Run `agentplug-runner release-bootstrap-status` to inspect this boundary. If a local source fix has not yet reached a published release, publish it through the repository's ordinary CI release workflow; after CI publishes the artifact, the daemon's normal update path can stage it.
+
 ## Trust file
 
 `~/.agentplug/trusted-keys.json` (or `$AGENTPLUG_HOME/trusted-keys.json`).

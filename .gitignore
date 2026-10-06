@@ -2,4 +2,4 @@
 Cargo.lock
 .gm/
 node_modules
-.agentplug-kv/git_commit_dedup/
+.agentplug-kv/
