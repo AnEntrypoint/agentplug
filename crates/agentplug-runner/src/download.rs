@@ -372,10 +372,6 @@ fn builtin_plugin_asset_spec(plugin_name: &str) -> Option<PluginAssetSpec> {
             repo: "AnEntrypoint/agentplug-crux-bin".to_string(),
             asset_basename: "crux".to_string(),
         }),
-        "liqology" => Some(PluginAssetSpec {
-            repo: "AnEntrypoint/liqology".to_string(),
-            asset_basename: "liqology".to_string(),
-        }),
         _ => None,
     }
 }
