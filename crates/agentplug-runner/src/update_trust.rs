@@ -46,6 +46,7 @@ pub struct Preflight {
 pub struct Finalized {
     pub authorized: Authorized,
     pub sha256: String,
+    signature: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -314,7 +315,11 @@ pub fn finalize(asset: &AssetIdentity, pre: &Preflight, bytes: &[u8]) -> anyhow:
                     write_events(&events);
                 }
             }
-            Ok(Finalized { authorized, sha256 })
+            Ok(Finalized {
+                authorized,
+                sha256,
+                signature: pre.signature.clone().ok(),
+            })
         }
         Err(rejected) => Err(rejection(asset, rejected.mode, rejected.reason)),
     }
@@ -360,6 +365,7 @@ pub fn record_stage_outcome(staged: &Path, asset: &AssetIdentity, finalized: &Fi
         "sha256": finalized.sha256,
         "verified": reason.is_none(),
         "reason": reason,
+        "signature": finalized.signature,
         "ts": now_ms(),
     });
     let _ = fs::write(sidecar_path(staged), record.to_string());
@@ -407,19 +413,6 @@ pub fn staged_runner_permitted(
         .as_ref()
         .and_then(|v| v.get("version"))
         .and_then(|v| v.as_str());
-    let verified = record
-        .as_ref()
-        .and_then(|v| v.get("verified"))
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    let reason = record
-        .as_ref()
-        .and_then(|v| v.get("reason"))
-        .and_then(|v| v.as_str())
-        .map(str::to_string)
-        .unwrap_or_else(|| {
-            "the staged runner carries no signature-verification record".to_string()
-        });
     if recorded_artifact != Some(expected_artifact) {
         return Err(format!(
             "the staged runner verification record is for artifact {:?}, not {expected_artifact:?}",
@@ -432,28 +425,42 @@ pub fn staged_runner_permitted(
             recorded_version
         ));
     }
+    let signature = record
+        .as_ref()
+        .and_then(|v| v.get("signature"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .map(Ok)
+        .unwrap_or_else(|| {
+            fetch_signature_text(&crate::download::runner_signature_url(
+                expected_artifact,
+                expected_version,
+            ))
+        });
     match recorded_sha {
         Some(sha) if sha.eq_ignore_ascii_case(&actual) => {
-            if verified {
-                return Ok(true);
+            match authorize(
+                &trust,
+                &install_dir(),
+                expected_artifact,
+                expected_version,
+                &actual,
+                signature.as_deref().map_err(String::as_str),
+            ) {
+                Ok(authorized) if authorized.verified() => {
+                    commit(&install_dir(), expected_artifact, &actual, &authorized)
+                        .map_err(|error| format!("could not record promoted runner sequence: {error}"))?;
+                    Ok(true)
+                }
+                Ok(_) => Ok(false),
+                Err(rejected) => Err(rejected.reason),
             }
-            if trust.mode == Mode::Enforce {
-                return Err(reason);
-            }
-            eprintln!("[agentplug UPDATE-TRUST WARN] proceeding with unverified staged runner (warn mode): {reason}");
-            Ok(false)
         }
         Some(sha) => Err(format!(
             "staged runner {} digest {actual} differs from the digest {sha} recorded when it was staged",
             staged.display()
         )),
-        None => {
-            if trust.mode == Mode::Enforce {
-                return Err(reason);
-            }
-            eprintln!("[agentplug UPDATE-TRUST WARN] proceeding with unverified staged runner (warn mode): {reason}");
-            Ok(false)
-        }
+        None => Err("the staged runner carries no verification record".to_string()),
     }
 }
 

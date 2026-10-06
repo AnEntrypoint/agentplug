@@ -1078,6 +1078,75 @@ fn takeover_ready_path() -> PathBuf {
     install_dir().join("daemon-takeover-ready.json")
 }
 
+const TAKEOVER_READY_MAX_AGE_MS: u64 = 2 * 60 * 1000;
+
+fn write_takeover_ready(version: &str) -> anyhow::Result<()> {
+    let path = takeover_ready_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let temporary = path.with_extension(format!("json.tmp.{}", std::process::id()));
+    fs::write(
+        &temporary,
+        serde_json::json!({"version": version, "pid": std::process::id(), "ts": now_ms()})
+            .to_string(),
+    )?;
+    fs::rename(temporary, path)?;
+    Ok(())
+}
+
+fn ready_takeover_successor() -> Option<(u64, String)> {
+    let path = takeover_ready_path();
+    let ready = fs::read_to_string(&path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok());
+    let Some(ready) = ready else {
+        return None;
+    };
+    let pid = ready.get("pid").and_then(|value| value.as_u64());
+    let version = ready
+        .get("version")
+        .and_then(|value| value.as_str())
+        .filter(|version| !version.is_empty())
+        .map(str::to_owned);
+    let fresh = ready
+        .get("ts")
+        .and_then(|value| value.as_u64())
+        .map(|ts| now_ms().saturating_sub(ts) <= TAKEOVER_READY_MAX_AGE_MS)
+        .unwrap_or(false);
+    match (pid, version, fresh) {
+        (Some(pid), Some(version), true) if pid_is_alive(pid) => Some((pid, version)),
+        _ => {
+            let _ = fs::remove_file(path);
+            None
+        }
+    }
+}
+
+fn hand_off_to_ready_successor() -> Option<(String, usize)> {
+    let (successor_pid, version) = ready_takeover_successor()?;
+    if !in_flight_map()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .is_empty()
+    {
+        return None;
+    }
+    if let Err(error) = reserve_ownership_for_handoff(successor_pid, &version) {
+        eprintln!(
+            "[agentplug daemon] ready takeover successor {version} cannot reserve the ownership handoff: {error}"
+        );
+        return None;
+    }
+    let claims = snapshot_in_flight_claims();
+    write_handoff_inherited_claims(&version, &claims);
+    agentplug_host::close_all_sessions();
+    release_ownership_for_handoff();
+    let requeued = requeue_claims_for_live_successor(&claims);
+    mark_intentional_exit("ready-takeover");
+    Some((version, requeued))
+}
+
 #[derive(serde::Deserialize)]
 struct InstructionSourceConfig {
     repo: String,
@@ -1477,6 +1546,17 @@ fn reexec_from_canonical_and_exit(canonical: &std::path::Path) -> ! {
 }
 
 pub fn run_takeover(version: &str) -> anyhow::Result<()> {
+    let staged_exe = std::env::current_exe()?;
+    let asset = crate::download::runner_asset_name()
+        .ok_or_else(|| anyhow::anyhow!("takeover: no runner asset exists for this platform"))?;
+    crate::update_trust::staged_runner_permitted(&staged_exe, asset, version).map_err(
+        |problem| {
+            anyhow::anyhow!(
+                "takeover: refusing to announce unverified staged runner {}: {problem}",
+                staged_exe.display()
+            )
+        },
+    )?;
     eprintln!("[agentplug daemon] takeover: building engine for version {version}");
     let mut plugin_modules = PluginModules::new()?;
     for plugin_name in ["gm", "bert", "libsql", "treesitter", "oxibrowser", "crux"] {
@@ -1484,11 +1564,7 @@ pub fn run_takeover(version: &str) -> anyhow::Result<()> {
             eprintln!("[agentplug daemon] takeover: pre-warm of {plugin_name} failed (non-fatal, will lazy-compile on first use): {e}");
         }
     }
-    let _ = fs::write(
-        takeover_ready_path(),
-        serde_json::json!({"version": version, "pid": std::process::id(), "ts": now_ms()})
-            .to_string(),
-    );
+    write_takeover_ready(version)?;
     let running_before = crate::download::installed_runner_version();
     eprintln!("[agentplug daemon] takeover: readiness marker written, waiting for old daemon to release ownership");
     for _ in 0..480 {
@@ -5634,6 +5710,13 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
             mark_intentional_exit("heartbeat-authority-lost");
             return Ok(());
         }
+        if let Some((version, requeued)) = hand_off_to_ready_successor() {
+            eprintln!(
+                "[agentplug daemon] ready takeover successor {version} reserved ownership after a safe batch boundary -- re-queued {requeued} inherited claim(s) and exiting"
+            );
+            return Ok(());
+        }
+
         let evict_before = Instant::now()
             .checked_sub(Duration::from_millis(daemon_cfg.project_idle_evict_ms()))
             .unwrap_or_else(Instant::now);
