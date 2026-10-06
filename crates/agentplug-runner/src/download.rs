@@ -519,6 +519,10 @@ fn record_plugin_install(
 
 const RUNNER_BIN_REPO: &str = "AnEntrypoint/agentplug-bin";
 
+pub fn runner_signature_url(asset: &str, version: &str) -> String {
+    format!("https://github.com/{RUNNER_BIN_REPO}/releases/download/v{version}/{asset}.sig")
+}
+
 fn runner_asset_name_for(os: &str, arch: &str) -> Option<&'static str> {
     match (os, arch) {
         ("windows", "x86_64") => Some("agentplug-runner-windows-x64.exe"),
