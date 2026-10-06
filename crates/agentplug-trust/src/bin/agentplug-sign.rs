@@ -146,18 +146,21 @@ fn read_secret(path: &str) -> Result<([u8; 32], String), String> {
         .and_then(|n| n.to_str())
         .map(|n| n.strip_suffix(".secret").unwrap_or(n).to_string())
         .unwrap_or_default();
+    if !signature::is_key_id(&id) {
+        return Err(format!(
+                "key id {id:?} derived from {path} must be 1-128 ASCII letters, digits, dots, underscores, or hyphens"
+            ));
+    }
     Ok((seed, id))
 }
 
 fn keygen(args: &Args) -> Result<i32, String> {
     refuse_in_ci()?;
     let id = args.one("id")?;
-    if id.is_empty()
-        || !id
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
-    {
-        return Err("--id may contain only letters, digits, - _ .".to_string());
+    if !signature::is_key_id(id) {
+        return Err(
+            "--id must be 1-128 ASCII letters, digits, dots, underscores, or hyphens".to_string(),
+        );
     }
     let out = PathBuf::from(args.one("out")?);
     std::fs::create_dir_all(&out).map_err(|e| format!("cannot create {}: {e}", out.display()))?;
@@ -249,6 +252,7 @@ fn sign(args: &Args) -> Result<i32, String> {
             sig: hexutil::encode(&sig),
         });
     }
+    doc.validate()?;
     let out = args
         .opt("out")
         .map(PathBuf::from)
