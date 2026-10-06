@@ -266,12 +266,6 @@ async function documentStateOf(sess) {
   }
 }
 
-// A url= dispatch must always end up evaluating a document that was really loaded for that url.
-// `Page.navigate` silently degrades to a same-document navigation when only the fragment differs
-// (or when it matches the current url exactly), which leaves the previous -- possibly blank --
-// document in place; `Page.reload` is what actually re-creates it. The load witnesses
-// (Page.loadEventFired vs Page.navigatedWithinDocument) are the protocol's own answer to "did a
-// new document exist", so a stale document is reported instead of being evaluated as if rendered.
 async function ensureDocumentForUrl(sess, startUrl, timeoutMs) {
   const target = String(startUrl);
   const budget = Math.min(Math.max(5000, Math.round(timeoutMs / 3)), NAV_BUDGET_CAP_MS);
@@ -1136,10 +1130,6 @@ async function main() {
       const debug = await collectDebug();
       if (res.exceptionDetails) {
         const msg = res.exceptionDetails.exception?.description || res.exceptionDetails.text || 'evaluate exception';
-        // The collected console/network/pageErrors used to be dropped on the exception path, so a
-        // failing `capture` dispatch reported `instrumented: false` and threw away the very page
-        // errors that explain the failure -- which is why capture looked nondeterministic: it
-        // "worked" exactly on the dispatches that succeeded.
         writeResult({ __cdpError: msg, debug: await collectDebug(), __document: res.__document });
         process.stderr.write(`cdp-eval: exception ${msg}\n`);
         sess.close();
@@ -1162,10 +1152,6 @@ async function main() {
       const debug = await collectDebug();
       if (res.exceptionDetails) {
         const msg = res.exceptionDetails.exception?.description || res.exceptionDetails.text || 'evaluate exception';
-        // The collected console/network/pageErrors used to be dropped on the exception path, so a
-        // failing `capture` dispatch reported `instrumented: false` and threw away the very page
-        // errors that explain the failure -- which is why capture looked nondeterministic: it
-        // "worked" exactly on the dispatches that succeeded.
         writeResult({ __cdpError: msg, debug: await collectDebug(), __document: res.__document });
         process.stderr.write(`cdp-eval: exception ${msg}\n`);
         sess.close();
@@ -1188,10 +1174,6 @@ async function main() {
       const captured = await stopTraceRecordingToFile(sess, recording, flushDeadline, artifactFile);
       if (res.exceptionDetails) {
         const msg = res.exceptionDetails.exception?.description || res.exceptionDetails.text || 'evaluate exception';
-        // The collected console/network/pageErrors used to be dropped on the exception path, so a
-        // failing `capture` dispatch reported `instrumented: false` and threw away the very page
-        // errors that explain the failure -- which is why capture looked nondeterministic: it
-        // "worked" exactly on the dispatches that succeeded.
         writeResult({ __cdpError: msg, debug: await collectDebug(), __document: res.__document });
         process.stderr.write(`cdp-eval: exception ${msg}\n`);
         sess.close();
@@ -1209,10 +1191,6 @@ async function main() {
       const res = await navigateIfNeededThenEvaluateOverCdp(sess, script, startUrl, timeoutMs);
       if (res.exceptionDetails) {
         const msg = res.exceptionDetails.exception?.description || res.exceptionDetails.text || 'evaluate exception';
-        // The collected console/network/pageErrors used to be dropped on the exception path, so a
-        // failing `capture` dispatch reported `instrumented: false` and threw away the very page
-        // errors that explain the failure -- which is why capture looked nondeterministic: it
-        // "worked" exactly on the dispatches that succeeded.
         writeResult({ __cdpError: msg, debug: await collectDebug(), __document: res.__document });
         process.stderr.write(`cdp-eval: exception ${msg}\n`);
         sess.close();
@@ -1259,10 +1237,6 @@ async function main() {
       const res = await navigateIfNeededThenEvaluateOverCdp(sess, wrapped, startUrl, timeoutMs);
       if (res.exceptionDetails) {
         const msg = res.exceptionDetails.exception?.description || res.exceptionDetails.text || 'evaluate exception';
-        // The collected console/network/pageErrors used to be dropped on the exception path, so a
-        // failing `capture` dispatch reported `instrumented: false` and threw away the very page
-        // errors that explain the failure -- which is why capture looked nondeterministic: it
-        // "worked" exactly on the dispatches that succeeded.
         writeResult({ __cdpError: msg, debug: await collectDebug(), __document: res.__document });
         process.stderr.write(`cdp-eval: exception ${msg}\n`);
         sess.close();
