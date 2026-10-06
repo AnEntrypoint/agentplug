@@ -153,7 +153,18 @@ pub fn load(dir: &Path) -> Trust {
     };
     let mut keys = Vec::new();
     let mut ids = BTreeSet::new();
+    let mut publics = BTreeSet::new();
     for raw_key in &raw.keys {
+        if !crate::signature::is_key_id(&raw_key.id) {
+            return Trust::broken(
+                    path.clone(),
+                    format!(
+                        "{} key id {:?} must be 1-128 ASCII letters, digits, dots, underscores, or hyphens",
+                        path.display(),
+                        raw_key.id
+                    ),
+                );
+        }
         let Some(public) = hexutil::decode_fixed::<32>(&raw_key.public_key) else {
             return Trust::broken(
                 path.clone(),
@@ -170,20 +181,28 @@ pub fn load(dir: &Path) -> Trust {
                 format!("{} lists key id {:?} twice", path.display(), raw_key.id),
             );
         }
+        if !publics.insert(public) {
+            return Trust::broken(
+                path.clone(),
+                format!(
+                    "{} lists the same ed25519 public key more than once",
+                    path.display()
+                ),
+            );
+        }
         keys.push(TrustedKey {
             id: raw_key.id.clone(),
             public,
         });
     }
-    let distinct_public: BTreeSet<[u8; 32]> = keys.iter().map(|k| k.public).collect();
     let threshold = raw.threshold.unwrap_or(1) as usize;
-    if mode != Mode::Off && (threshold == 0 || threshold > distinct_public.len()) {
+    if mode != Mode::Off && (threshold == 0 || threshold > keys.len()) {
         return Trust::broken(
             path.clone(),
             format!(
                 "{} threshold {threshold} cannot be met by {} distinct key(s)",
                 path.display(),
-                distinct_public.len()
+                keys.len()
             ),
         );
     }
