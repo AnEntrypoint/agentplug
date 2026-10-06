@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -147,8 +148,63 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-fn next_id(counter_seed: u64) -> String {
-    format!("task-{:x}", counter_seed)
+fn registry_instance() -> &'static str {
+    static INSTANCE: OnceLock<String> = OnceLock::new();
+    INSTANCE.get_or_init(|| {
+        let started_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        format!("{:x}-{:x}", std::process::id(), started_ns)
+    })
+}
+
+fn next_id() -> Result<String, String> {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let sequence = COUNTER
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            value.checked_add(1)
+        })
+        .map_err(|_| "task registry ID space exhausted".to_string())?;
+    Ok(format!("task-{}-{:x}", registry_instance(), sequence))
+}
+
+fn register_task(mut entry: TaskEntry) -> Result<String, String> {
+    let mut reg = registry().lock().unwrap_or_else(|error| error.into_inner());
+    let error = match next_id() {
+        Ok(id) => match reg.entry(id.clone()) {
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(entry);
+                drop(reg);
+                ensure_reaper_running();
+                return Ok(id);
+            }
+            std::collections::hash_map::Entry::Occupied(_) => {
+                "task registry ID already occupied".to_string()
+            }
+        },
+        Err(error) => error,
+    };
+    drop(reg);
+    crate::process_tree::terminate_containment(&entry.containment, entry.child.id());
+    let _ = entry.child.kill();
+    let _ = entry.child.wait();
+    Err(error)
+}
+
+fn missing_task(id: &str) -> Value {
+    let instance = registry_instance();
+    let same_registry = id.starts_with(&format!("task-{instance}-"));
+    json!({
+        "ok": false,
+        "error": if same_registry {
+            format!("no such task {id}; it was stopped or was never registered in this host")
+        } else {
+            format!("task {id} does not belong to this host registry; task handles are process-local and cannot survive a host restart")
+        },
+        "error_code": if same_registry { "task_not_found" } else { "task_registry_mismatch" },
+        "task_registry": instance,
+    })
 }
 
 fn poll_entry(entry: &mut TaskEntry) {
@@ -206,9 +262,8 @@ pub(crate) fn adopt_running(
     started: Instant,
     stdout_pipe: Option<DrainedPipe>,
     stderr_pipe: Option<DrainedPipe>,
-) -> String {
+) -> Result<String, String> {
     let started_ms = now_ms().saturating_sub(started.elapsed().as_millis() as u64);
-    let id = next_id(started_ms ^ (child.id() as u64));
     let entry = TaskEntry {
         child,
         containment,
@@ -223,11 +278,7 @@ pub(crate) fn adopt_running(
         exit_code: None,
         finished_ms: None,
     };
-    let mut reg = registry().lock().unwrap_or_else(|e| e.into_inner());
-    reg.insert(id.clone(), entry);
-    drop(reg);
-    ensure_reaper_running();
-    id
+    register_task(entry)
 }
 
 fn entry_summary(id: &str, entry: &TaskEntry) -> Value {
@@ -328,7 +379,6 @@ fn spawn(params: &Value, cwd: &Path) -> Value {
         return json!({"ok": false, "error": "timeoutMs is too large"});
     };
     let started = now_ms();
-    let id = next_id(started ^ (child.id() as u64));
     let entry = TaskEntry {
         child,
         containment,
@@ -342,10 +392,12 @@ fn spawn(params: &Value, cwd: &Path) -> Value {
         exit_code: None,
         finished_ms: None,
     };
-    let mut reg = registry().lock().unwrap();
-    reg.insert(id.clone(), entry);
-    drop(reg);
-    ensure_reaper_running();
+    let id = match register_task(entry) {
+        Ok(id) => id,
+        Err(error) => {
+            return json!({"ok": false, "error": error, "error_code": "task_registration_failed"})
+        }
+    };
     json!({"ok": true, "id": id, "started_ms": started, "cwd": cwd})
 }
 
@@ -373,7 +425,7 @@ fn output(params: &Value) -> Value {
     }
     let mut reg = registry().lock().unwrap();
     let Some(entry) = reg.get_mut(id) else {
-        return json!({"ok": false, "error": format!("no such task {id}")});
+        return missing_task(id);
     };
     poll_entry(entry);
     let tail = |buf: &[u8]| -> String {
@@ -408,7 +460,7 @@ fn stop(params: &Value) -> Value {
     let mut entry = {
         let mut reg = registry().lock().unwrap_or_else(|e| e.into_inner());
         let Some(entry) = reg.remove(id) else {
-            return json!({"ok": false, "error": format!("no such task {id}")});
+            return missing_task(id);
         };
         entry
     };
