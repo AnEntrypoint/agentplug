@@ -20,6 +20,7 @@ const RECENT_END_LIMIT: usize = 10;
 const IDLE_REAPER_TICK: Duration = Duration::from_secs(15);
 const GLOBAL_ORPHAN_LAUNCH_GRACE: Duration = Duration::from_secs(15);
 const LRU_EVICTION_IDLE_FLOOR: Duration = Duration::from_secs(60);
+const HOST_KILL_LEAD_MS: u64 = 2_500;
 
 #[derive(serde::Deserialize, Default)]
 pub(crate) struct BrowserRuntimeConfig {
@@ -318,18 +319,22 @@ fn starts_cdp_raw_body(trimmed: &str) -> bool {
 
 fn strip_mode_prefix(body: &str) -> (BrowserMode, String, &str) {
     let trimmed = body.trim_start();
-    if let Some(rest) = trimmed.strip_prefix("capture gl\n") {
-        return (BrowserMode::Capture, "gl".to_string(), rest);
-    }
-    for (prefix, mode) in [
-        ("capture\n", BrowserMode::Capture),
-        ("profile\n", BrowserMode::Profile),
-        ("trace\n", BrowserMode::Trace),
-        ("screenshot\n", BrowserMode::Screenshot),
-    ] {
-        if let Some(rest) = trimmed.strip_prefix(prefix) {
-            return (mode, String::new(), rest);
+    let Some(nl) = trimmed.find('\n') else {
+        if let Some(rest) = trimmed.strip_prefix("screenshot=") {
+            return (BrowserMode::Screenshot, rest.trim().to_string(), "");
         }
+        if let Some(rest) = trimmed.strip_prefix("dom=") {
+            return (BrowserMode::Dom, rest.trim().to_string(), "");
+        }
+        return (BrowserMode::Default, String::new(), body);
+    };
+    match trimmed[..nl].trim_end() {
+        "capture gl" => return (BrowserMode::Capture, "gl".to_string(), &trimmed[nl + 1..]),
+        "capture" => return (BrowserMode::Capture, String::new(), &trimmed[nl + 1..]),
+        "profile" => return (BrowserMode::Profile, String::new(), &trimmed[nl + 1..]),
+        "trace" => return (BrowserMode::Trace, String::new(), &trimmed[nl + 1..]),
+        "screenshot" => return (BrowserMode::Screenshot, String::new(), &trimmed[nl + 1..]),
+        _ => {}
     }
     if let Some(rest) = trimmed.strip_prefix("screenshot=") {
         let (name, remainder) = match rest.find('\n') {
@@ -354,17 +359,14 @@ fn strip_mode_prefix(body: &str) -> (BrowserMode, String, &str) {
 
 fn strip_debug_visibility_prefix(body: &str) -> (Option<bool>, &str) {
     let trimmed = body.trim_start();
-    for (prefix, quiet) in [
-        ("quiet\n", true),
-        ("debug=off\n", true),
-        ("debug=on\n", false),
-        ("verbose\n", false),
-    ] {
-        if let Some(rest) = trimmed.strip_prefix(prefix) {
-            return (Some(quiet), rest);
-        }
+    let Some(nl) = trimmed.find('\n') else {
+        return (None, body);
+    };
+    match trimmed[..nl].trim_end() {
+        "quiet" | "debug=off" => (Some(true), &trimmed[nl + 1..]),
+        "debug=on" | "verbose" => (Some(false), &trimmed[nl + 1..]),
+        _ => (None, body),
     }
-    (None, body)
 }
 
 const QUIET_DEBUG_NOTE: &str = "network, performance and gl detail omitted (quiet is the default); put `capture` as the first body line, or `debug=on`, for the full debug block";
@@ -467,6 +469,7 @@ fn compact_debug(debug: &Value) -> Value {
         }))
         .collect();
     json!({
+        "instrumented": true,
         "console_summary": { "total": console.len() as u64 + console_dropped, "by_type": by_type, "notable": notable },
         "pageErrors": shown_page_errors,
         "pageErrors_total": page_errors.len(),
@@ -2293,7 +2296,15 @@ pub fn run(body: &str, opts: &str, cwd_raw: &Path, session_id: &str) -> Value {
     reap_idle_sessions(cwd, &browser_cfg);
     reap_os_orphans(cwd);
 
-    let inner_body = body.to_string();
+    // A body authored with CRLF line endings (or a directive line with trailing spaces) used to
+    // miss every `"<directive>\n"` prefix, so `capture` silently fell through to the default mode
+    // and reported `instrumented: false` with no visible cause. Normalize once, before any
+    // directive is parsed, so mode/quiet/timeout/sessionId/viewport/url all behave identically.
+    let inner_body = if body.contains('\r') {
+        body.replace("\r\n", "\n")
+    } else {
+        body.to_string()
+    };
     let opts_v: Value = serde_json::from_str(opts).unwrap_or_else(|_| json!({}));
     let timeout_ms = opts_v
         .get("timeoutMs")
@@ -2553,16 +2564,44 @@ pub fn run(body: &str, opts: &str, cwd_raw: &Path, session_id: &str) -> Value {
         _lifecycle_guard_serializes_temp_files_reuse_check_launch_and_insert,
         queued_behind_same_page_ms,
     ) = match lifecycle_lock.try_lock() {
-        Ok(guard) => (guard, None),
-        Err(std::sync::TryLockError::Poisoned(poisoned)) => (poisoned.into_inner(), None),
+        Ok(guard) => (Some(guard), None),
+        Err(std::sync::TryLockError::Poisoned(poisoned)) => (Some(poisoned.into_inner()), None),
         Err(std::sync::TryLockError::WouldBlock) => {
             let queued_at = Instant::now();
-            let guard = lifecycle_lock.lock().unwrap_or_else(|e| e.into_inner());
+            // Bounded: an unbounded `lock()` here let a wedged holder keep every later dispatch
+            // on the same page waiting past the caller's own deadline, which is how the verb
+            // "hung" with no response at all. Give up and say so instead.
+            let budget = Duration::from_millis(timeout_ms.max(1_000));
+            let mut acquired = None;
+            while acquired.is_none() && queued_at.elapsed() < budget {
+                match lifecycle_lock.try_lock() {
+                    Ok(guard) => acquired = Some(guard),
+                    Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                        acquired = Some(poisoned.into_inner())
+                    }
+                    Err(std::sync::TryLockError::WouldBlock) => {
+                        std::thread::sleep(Duration::from_millis(50))
+                    }
+                }
+            }
             let waited_ms = queued_at.elapsed().as_millis() as u64;
-            eprintln!(
-                "[agentplug browser] queued {waited_ms}ms behind another dispatch on the same page (session '{session_id}'); use `sessionId=<other>` for an independent page"
-            );
-            (guard, Some(waited_ms))
+            match acquired {
+                Some(guard) => {
+                    eprintln!(
+                        "[agentplug browser] queued {waited_ms}ms behind another dispatch on the same page (session '{session_id}'); use `sessionId=<other>` for an independent page"
+                    );
+                    (Some(guard), Some(waited_ms))
+                }
+                None => {
+                    return annotate_queue_wait(
+                        json!({"ok": false, "stdout": "", "exit_code": 1, "timed_out": true,
+                            "duration_ms": waited_ms, "session_id": session_id,
+                            "stderr": format!("browser dispatch for session '{session_id}' waited {waited_ms}ms and gave up: another dispatch still holds this page's lifecycle lock, so no page was touched. Retry, or use `sessionId=<other>` for an independent page")}),
+                        Some(waited_ms),
+                        session_id,
+                    );
+                }
+            }
         }
     };
 
@@ -2788,7 +2827,9 @@ pub fn run(body: &str, opts: &str, cwd_raw: &Path, session_id: &str) -> Value {
         .arg(&helper_path)
         .arg(&cfg)
         .stdin(Stdio::null())
-        .stdout(Stdio::piped())
+        // Nothing ever reads the helper's stdout (results go to resultFile, diagnostics to
+        // stderr), so a piped stdout is only a 64KB write buffer the child can block on.
+        .stdout(Stdio::null())
         .stderr(Stdio::piped());
     #[cfg(windows)]
     {
@@ -2808,9 +2849,16 @@ pub fn run(body: &str, opts: &str, cwd_raw: &Path, session_id: &str) -> Value {
         }
     };
 
-    let timed_out = match child.wait_timeout(Duration::from_millis(
-        timeout_ms + browser_cfg.eval_timeout_grace(),
-    )) {
+    // Kill inside the caller's own deadline, not after it: waiting `timeout_ms + grace` meant the
+    // response could only ever land once the caller had already given up, which reads as a wedged
+    // verb. The lead is always larger than the helper's pre-kill watchdog margin, so the helper's
+    // honest "did not settle" result is already on disk when we get here.
+    let kill_lead = std::cmp::max(
+        HOST_KILL_LEAD_MS,
+        std::cmp::max(timeout_ms / 40, browser_cfg.eval_timeout_grace()),
+    );
+    let wait_budget_ms = timeout_ms.saturating_sub(kill_lead).max(1_000);
+    let timed_out = match child.wait_timeout(Duration::from_millis(wait_budget_ms)) {
         Ok(Some(_)) => false,
         Ok(None) => {
             let _ = child.kill();
@@ -2870,10 +2918,20 @@ pub fn run(body: &str, opts: &str, cwd_raw: &Path, session_id: &str) -> Value {
 
     let cdp_error = result_value.get("__cdpError").and_then(|v| v.as_str());
     let ok = exit_code == 0 && !timed_out && cdp_error.is_none();
-    let default_debug = || json!({"instrumented": false, "hint": "no console/network/pageError capture in this mode; prefix the body with `capture` (or `capture gl` for GL error tracking: draw calls are counted and getError is drained once per animation frame, errors are attributed to the frame's last draw and re-served to the page's own getError) to collect it"});
+    let default_debug = || json!({"instrumented": false, "hint": "no console/network/pageError capture in this mode; prefix the body with `capture` (or `capture gl` for GL error tracking: draw calls are counted and getError is drained once per animation frame, errors are attributed to the frame's last draw and re-served to the page's own getError) to collect it. The directive is the whole first line: `capture` alone on line one, nothing after it on that line -- a trailing space or a CRLF body used to silently miss it"});
+    let instrumented = matches!(
+        mode,
+        BrowserMode::Capture | BrowserMode::Profile | BrowserMode::Trace
+    );
     let shaped_debug = |raw: Option<&Value>| -> Value {
-        let debug = raw.cloned().unwrap_or_else(default_debug);
-        if quiet_debug && debug.get("instrumented") != Some(&Value::Bool(false)) {
+        let mut debug = raw.cloned().unwrap_or_else(default_debug);
+        // Authoritative and always present, so `capture` either clearly engaged or clearly did
+        // not: previously only the negative case carried a flag, which is what made the
+        // "instrumented: false" reports look like they had no pattern.
+        if let Some(obj) = debug.as_object_mut() {
+            obj.insert("instrumented".to_string(), json!(instrumented));
+        }
+        if quiet_debug && debug.get("instrumented") == Some(&Value::Bool(true)) {
             compact_debug(&debug)
         } else {
             debug
@@ -2881,6 +2939,8 @@ pub fn run(body: &str, opts: &str, cwd_raw: &Path, session_id: &str) -> Value {
     };
     let mut out = json!({
         "ok": ok,
+        "mode": mode_label(mode),
+        "instrumented": instrumented,
         "stderr": String::from_utf8_lossy(&stderr_buf).into_owned(),
         "exit_code": exit_code,
         "timed_out": timed_out,
@@ -2889,6 +2949,11 @@ pub fn run(body: &str, opts: &str, cwd_raw: &Path, session_id: &str) -> Value {
         "gm_session": owner_gm_session,
         "port": port,
     });
+    // The document the script actually ran in, plus how it got there. Without this a stale or
+    // blank document is indistinguishable from a rendered one in the caller's own output.
+    if let Some(doc) = result_value.get("__document").filter(|d| !d.is_null()) {
+        out["document"] = doc.clone();
+    }
     if session_created_by_this_dispatch {
         out["session_created"] = Value::Bool(true);
     }
