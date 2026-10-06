@@ -294,7 +294,7 @@ fn spawn(params: &Value, cwd: &Path) -> Value {
         })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    crate::exec_js::configure_toolchain_path(&mut command);
+    crate::exec_js::configure_execution_environment(&mut command);
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
