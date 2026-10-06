@@ -157,6 +157,11 @@ pub fn run(code: &str, opts: &Value, cwd: &Path) -> Value {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     configure_toolchain_path(&mut command);
+    if std::env::var_os("GH_CONFIG_DIR").is_none() {
+        if let Some(directory) = crate::github_cli_config_dir() {
+            command.env("GH_CONFIG_DIR", directory);
+        }
+    }
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;

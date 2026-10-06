@@ -18,9 +18,9 @@ the `agentplug-host` imports, and `agentplug-trust`. Work on `main` as GitHub us
 - Keep signing material only in the protected CI environment. Bind each signature to the immutable
   source revision that built its artifact, and publish a release only after every expected asset and
   signature is present.
-- A GitHub CLI credential store may be discovered, but it is passed only to Git child processes
-  with the transient `gh auth git-credential` helper. Never export, copy, print, or persist its
-  token.
+- A discovered same-user GitHub CLI credential directory is shared with Git and execution child
+  processes through `GH_CONFIG_DIR`; an explicit inherited directory takes precedence. Git uses
+  the transient `gh auth git-credential` helper. Never export, copy, print, or persist its token.
 
 ## Runtime invariants
 
