@@ -237,23 +237,38 @@ fn github_api_request(url: &str) -> ureq::Request {
         .set("User-Agent", "agentplug-runner")
 }
 
-fn github_token() -> Option<String> {
-    std::env::var("GITHUB_TOKEN")
+enum GithubToken {
+    Environment(String),
+    Cli(String),
+}
+
+fn github_token() -> Option<GithubToken> {
+    let explicit = std::env::var("GITHUB_TOKEN")
         .or_else(|_| std::env::var("GH_TOKEN"))
         .ok()
-        .filter(|t| !t.is_empty())
+        .filter(|t| !t.is_empty());
+    explicit
+        .map(GithubToken::Environment)
+        .or_else(|| agentplug_host::github_cli_token().map(GithubToken::Cli))
 }
 
 fn github_api_call(url: &str) -> Result<ureq::Response, ureq::Error> {
     let Some(token) = github_token() else {
         return github_api_request(url).call();
     };
+    let from_cli = matches!(&token, GithubToken::Cli(_));
+    let token = match token {
+        GithubToken::Environment(token) | GithubToken::Cli(token) => token,
+    };
     match github_api_request(url)
         .set("Authorization", &format!("Bearer {token}"))
         .call()
     {
         Err(ureq::Error::Status(401, _)) => {
-            eprintln!("[agentplug] GITHUB_TOKEN/GH_TOKEN rejected (401 Bad credentials) fetching {url} -- retrying unauthenticated");
+            if from_cli {
+                agentplug_host::invalidate_github_cli_token();
+            }
+            eprintln!("[agentplug] GitHub credentials rejected (401 Bad credentials) fetching {url} -- retrying unauthenticated");
             github_api_request(url).call()
         }
         other => other,
@@ -796,7 +811,10 @@ pub fn fetch_latest_runner_version() -> anyhow::Result<Option<String>> {
             match agentplug_host::shared_agent().get(&probe_url).call() {
                 Ok(resp) => {
                     let resolved_url = resp.get_url().to_string();
-                    Ok(extract_version_from_release_url(&resolved_url))
+                    extract_version_from_release_url(&resolved_url)
+                        .or_else(|| resolve_latest_tag_via_release_page(RUNNER_BIN_REPO))
+                        .map(Some)
+                        .ok_or_else(|| describe_github_api_error(&url, api_err))
                 }
                 Err(_) => Err(describe_github_api_error(&url, api_err)),
             }
