@@ -1542,6 +1542,7 @@ fn tool_step_released() -> &'static Condvar {
 const MAX_CONCURRENT_HEAVY_DISPATCHES: usize = 3;
 
 const UNSERIALIZED_VERBS: &[&str] = &[
+    "dream-replay-cycle",
     "exec_js",
     "lang",
     "nodejs",
