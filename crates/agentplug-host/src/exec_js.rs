@@ -384,8 +384,25 @@ pub fn run(code: &str, opts: &Value, cwd: &Path) -> Value {
             .as_ref()
             .map_or(true, crate::task::DrainedPipe::is_finished);
     if !drains_finished {
-        let task_id =
-            crate::task::adopt_running(child, containment, lang, t0, stdout_pipe, stderr_pipe);
+        let task_id = match crate::task::adopt_running(
+            child,
+            containment,
+            lang,
+            t0,
+            stdout_pipe,
+            stderr_pipe,
+        ) {
+            Ok(id) => id,
+            Err(error) => {
+                return json!({
+                    "ok": false,
+                    "error": error,
+                    "error_code": "task_registration_failed",
+                    "exit_code": exit_code,
+                    "duration_ms": duration_ms,
+                })
+            }
+        };
         return json!({
             "ok": true,
             "timed_out": false,
