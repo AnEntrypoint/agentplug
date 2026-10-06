@@ -113,6 +113,10 @@ fn is_runner_artifact(artifact: &str) -> bool {
     artifact.starts_with(RUNNER_ARTIFACT_PREFIX)
 }
 
+fn is_first_party_plugin_artifact(artifact: &str) -> bool {
+    matches!(artifact, "plugkit-slim.wasm" | "bert.wasm" | "crux.wasm")
+}
+
 fn embedded_runner_trust(path: PathBuf) -> Trust {
     let (id, public_key) = crate::build_info::embedded_runner_root();
     let public = hexutil::decode_fixed::<32>(public_key)
@@ -131,13 +135,37 @@ fn embedded_runner_trust(path: PathBuf) -> Trust {
     }
 }
 
+fn embedded_plugin_trust(path: PathBuf) -> Trust {
+    let (id, public_key) = crate::build_info::embedded_plugin_root();
+    let public = hexutil::decode_fixed::<32>(public_key)
+        .expect("the committed plugin release root must be a 64-hex-digit ed25519 public key");
+    Trust {
+        path,
+        configured: true,
+        mode: Mode::Enforce,
+        threshold: 1,
+        keys: vec![agentplug_trust::trust_file::TrustedKey {
+            id: id.to_string(),
+            public,
+        }],
+        min_sequence: BTreeMap::new(),
+        problem: None,
+    }
+}
+
 fn trust_for(artifact: &str) -> Trust {
     let mut trust = load_trust(&install_dir());
-    if !trust.configured && is_runner_artifact(artifact) {
-        trust = embedded_runner_trust(trust.path);
+    if !trust.configured {
+        trust = if is_runner_artifact(artifact) {
+            embedded_runner_trust(trust.path)
+        } else if is_first_party_plugin_artifact(artifact) {
+            embedded_plugin_trust(trust.path)
+        } else {
+            trust
+        };
     }
     if trust.mode != Mode::Enforce
-        && is_runner_artifact(artifact)
+        && (is_runner_artifact(artifact) || is_first_party_plugin_artifact(artifact))
         && (!trust.configured || strict_mode())
     {
         trust.mode = Mode::Enforce;
