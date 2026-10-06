@@ -105,6 +105,8 @@ the `agentplug-host` imports, and `agentplug-trust`. Work on `main` as GitHub us
   remove only that validated frame. Sentinel text inside returned strings or ordinary stdout
   must remain data, including when stdout has no preceding newline.
 - Plugin reload recovery must receive the current engine and module map at dispatch construction.
+  Nested calls reload registered empty sibling pools from that module map after shared-store eviction;
+  populated or busy pools retain their owners. Failed reloads remain failures, not indexed evidence.
   If poisoned-store recovery fails, capture the active module map and instantiation error before
   changing registry behavior.
 
