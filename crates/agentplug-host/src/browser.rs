@@ -490,7 +490,7 @@ fn strip_timeout_prefix(body: &str) -> (Option<u64>, &str) {
     }
 }
 
-fn strip_session_id_prefix(body: &str) -> (Option<String>, &str) {
+pub(crate) fn strip_session_id_prefix(body: &str) -> (Option<String>, &str) {
     let trimmed = body.trim_start();
     let Some(rest) = trimmed.strip_prefix("sessionId=") else {
         return (None, body);

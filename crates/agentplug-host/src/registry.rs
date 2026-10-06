@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -162,6 +162,105 @@ fn admission_starved_error(report: AdmissionWaitReport) -> PluginDispatchError {
         limit: report.limit,
         in_flight: report.in_flight,
         slots: report.slots,
+    }
+}
+
+fn browser_dispatch_page_key(root: &Path, verb: &str, body: &str) -> Option<(PathBuf, String)> {
+    if !matches!(verb, "browser" | "cdp" | "serp") {
+        return None;
+    }
+    let envelope = serde_json::from_str::<serde_json::Value>(body).ok();
+    let code = match envelope.as_ref() {
+        Some(serde_json::Value::Object(fields)) => fields
+            .get("code")
+            .or_else(|| fields.get("body"))
+            .and_then(serde_json::Value::as_str)
+            .filter(|code| !code.is_empty())?,
+        _ => body,
+    };
+    let browser_root = envelope
+        .as_ref()
+        .and_then(|fields| fields.get("cwd"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|cwd| !cwd.trim().is_empty())
+        .map(Path::new)
+        .unwrap_or(root);
+    let origin = crate::dispatch_origin::current_dispatch_origin();
+    let fallback = envelope
+        .as_ref()
+        .and_then(|fields| fields.get("sessionId"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|session| !session.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            if origin.gm_session.is_none() && origin.named_page_session.is_none() {
+                std::fs::read_to_string(root.join(".gm/exec-spool/.session-current"))
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            }
+        });
+    let (explicit_session, _) = crate::browser::strip_session_id_prefix(code);
+    Some((
+        crate::browser::canonical_project_root(browser_root),
+        origin.page_session(explicit_session, &fallback),
+    ))
+}
+
+fn browser_dispatch_pages() -> &'static (Mutex<HashSet<(PathBuf, String)>>, Condvar) {
+    static PAGES: OnceLock<(Mutex<HashSet<(PathBuf, String)>>, Condvar)> = OnceLock::new();
+    PAGES.get_or_init(|| (Mutex::new(HashSet::new()), Condvar::new()))
+}
+
+struct BrowserDispatchGuard {
+    key: Option<(PathBuf, String)>,
+}
+
+impl BrowserDispatchGuard {
+    fn acquire_within(
+        root: &Path,
+        verb: &str,
+        body: &str,
+        max_wait: Duration,
+        slots: usize,
+    ) -> Result<Self, AdmissionWaitReport> {
+        let Some(key) = browser_dispatch_page_key(root, verb, body) else {
+            return Ok(Self { key: None });
+        };
+        let started = Instant::now();
+        let (pages, released) = browser_dispatch_pages();
+        let mut active = pages.lock().unwrap_or_else(|e| e.into_inner());
+        while active.contains(&key) {
+            let remaining = max_wait.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                clear_admission_wait();
+                return Err(AdmissionWaitReport {
+                    kind: "browser_page",
+                    waited_ms: started.elapsed().as_millis() as u64,
+                    limit: 1,
+                    in_flight: 1,
+                    slots,
+                });
+            }
+            mark_admission_wait("browser_page", 1, 1);
+            let (next, _) = released
+                .wait_timeout(active, remaining)
+                .unwrap_or_else(|e| e.into_inner());
+            active = next;
+        }
+        active.insert(key.clone());
+        clear_admission_wait();
+        Ok(Self { key: Some(key) })
+    }
+}
+
+impl Drop for BrowserDispatchGuard {
+    fn drop(&mut self) {
+        let Some(key) = self.key.take() else { return };
+        let (pages, released) = browser_dispatch_pages();
+        pages.lock().unwrap_or_else(|e| e.into_inner()).remove(&key);
+        released.notify_all();
     }
 }
 
@@ -1164,6 +1263,14 @@ impl ProjectPlugins {
         let pool = pool.ok_or_else(|| PluginDispatchError::NotRegistered {
             plugin_name: plugin_name.to_string(),
         })?;
+        let _browser_page = BrowserDispatchGuard::acquire_within(
+            &self.root,
+            verb,
+            body,
+            admission_wait_max(),
+            pool.slots.len(),
+        )
+        .map_err(admission_starved_error)?;
         let cost_class = cost_class_for_dispatch(verb, body);
         let _heavy_admission =
             SharedPluginPool::admit_within(&pool, cost_class, admission_wait_max())
@@ -1288,6 +1395,14 @@ impl DispatchHandle {
         let pool = pool.ok_or_else(|| PluginDispatchError::NotRegistered {
             plugin_name: plugin_name.to_string(),
         })?;
+        let _browser_page = BrowserDispatchGuard::acquire_within(
+            &self.root,
+            verb,
+            body,
+            admission_wait_max(),
+            pool.slots.len(),
+        )
+        .map_err(admission_starved_error)?;
         let cost_class = cost_class_for_dispatch(verb, body);
         let _heavy_admission =
             SharedPluginPool::admit_within(&pool, cost_class, admission_wait_max())
