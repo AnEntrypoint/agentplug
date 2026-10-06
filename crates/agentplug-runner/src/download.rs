@@ -73,6 +73,11 @@ pub fn gc_stale_tmp_files(min_age: Duration) {
     }
 }
 
+fn release_version_from_tag(tag: &str) -> Option<String> {
+    let version = tag.strip_prefix('v')?;
+    is_recognized_release_semver(version).then(|| version.to_string())
+}
+
 fn extract_version_from_release_url(url: &str) -> Option<String> {
     let idx = url.find("/releases/download/")?;
     let rest = &url[idx + "/releases/download/".len()..];
@@ -80,7 +85,7 @@ fn extract_version_from_release_url(url: &str) -> Option<String> {
     if tag.is_empty() {
         return None;
     }
-    Some(tag.trim_start_matches('v').to_string())
+    release_version_from_tag(tag)
 }
 
 fn is_safe_identifier_component(value: &str) -> bool {
@@ -118,7 +123,53 @@ fn resolve_latest_tag_via_release_page(repo: &str) -> Option<String> {
     if tag.is_empty() {
         return None;
     }
-    Some(tag.trim_start_matches('v').to_string())
+    release_version_from_tag(tag)
+}
+
+fn release_has_unambiguous_asset_pair(release: &serde_json::Value, asset_basename: &str) -> bool {
+    let Some(assets) = release.get("assets").and_then(|assets| assets.as_array()) else {
+        return false;
+    };
+    let wasm = format!("{asset_basename}.wasm");
+    let sha256 = format!("{wasm}.sha256");
+    let count = |wanted: &str| {
+        assets
+            .iter()
+            .filter(|asset| asset.get("name").and_then(|name| name.as_str()) == Some(wanted))
+            .count()
+    };
+    count(&wasm) == 1 && count(&sha256) == 1
+}
+
+fn release_candidate_version(
+    release: &serde_json::Value,
+    asset_basenames: &[String],
+) -> Option<String> {
+    if release.get("draft").and_then(|value| value.as_bool()) != Some(false)
+        || release.get("prerelease").and_then(|value| value.as_bool()) != Some(false)
+        || release
+            .get("published_at")
+            .and_then(|value| value.as_str())
+            .is_none_or(str::is_empty)
+    {
+        return None;
+    }
+    let tag = release.get("tag_name").and_then(|value| value.as_str())?;
+    let version = release_version_from_tag(tag)?;
+    asset_basenames
+        .iter()
+        .any(|asset_basename| release_has_unambiguous_asset_pair(release, asset_basename))
+        .then_some(version)
+}
+
+fn retain_newer_release_version(latest: &mut Option<String>, candidate: String) {
+    if latest
+        .as_deref()
+        .and_then(|known| compare_release_semver(&candidate, known))
+        .is_none_or(|order| order.is_gt())
+    {
+        *latest = Some(candidate);
+    }
 }
 
 fn try_ensure_plugin_installed_via_direct_release_latest(
@@ -702,10 +753,12 @@ pub fn fetch_latest_runner_version() -> anyhow::Result<Option<String>> {
     match github_api_call(&url) {
         Ok(resp) => {
             let body: serde_json::Value = serde_json::from_str(&resp.into_string()?)?;
-            Ok(body
-                .get("tag_name")
-                .and_then(|v| v.as_str())
-                .map(|s| s.trim_start_matches('v').to_string()))
+            match body.get("tag_name").and_then(|value| value.as_str()) {
+                Some(tag) => release_version_from_tag(tag).map(Some).ok_or_else(|| {
+                    anyhow::anyhow!("latest runner release tag {tag:?} is not vX.Y.Z semver")
+                }),
+                None => Ok(None),
+            }
         }
         Err(api_err) => {
             let Some(asset) = runner_asset_name() else {
@@ -824,44 +877,39 @@ pub fn fetch_latest_plugin_version(plugin_name: &str) -> anyhow::Result<Option<S
     let Some(spec) = plugin_asset_spec(plugin_name) else {
         anyhow::bail!("unknown plugin {plugin_name} -- not registered in agentplug-runner's plugin_asset_spec map");
     };
-    let url = format!(
-        "https://api.github.com/repos/{}/releases?per_page=100",
-        spec.repo
-    );
-    let resp = github_api_call(&url).map_err(|e| describe_github_api_error(&url, e))?;
-    let body: serde_json::Value = serde_json::from_str(&resp.into_string()?)?;
-    let Some(releases) = body.as_array() else {
-        anyhow::bail!("unexpected releases-list response shape for {}", spec.repo);
-    };
-    let wanted_names: [String; 2] = [
-        format!("{}.wasm", spec.asset_basename),
+    let wanted_basenames: [String; 2] = [
+        spec.asset_basename.clone(),
         if spec.asset_basename == "plugkit-slim" {
-            "plugkit.wasm".to_string()
+            "plugkit".to_string()
         } else {
-            format!("{}.wasm", spec.asset_basename)
+            spec.asset_basename.clone()
         },
     ];
-    for release in releases {
-        let has_asset = release
-            .get("assets")
-            .and_then(|a| a.as_array())
-            .map(|assets| {
-                assets.iter().any(|a| {
-                    a.get("name")
-                        .and_then(|n| n.as_str())
-                        .map(|n| wanted_names.iter().any(|w| w == n))
-                        .unwrap_or(false)
-                })
-            })
-            .unwrap_or(false);
-        if has_asset {
-            return Ok(release
-                .get("tag_name")
-                .and_then(|v| v.as_str())
-                .map(|s| s.trim_start_matches('v').to_string()));
+    let mut latest: Option<String> = None;
+    for page in 1..=1_000_u16 {
+        let url = format!(
+            "https://api.github.com/repos/{}/releases?per_page=100&page={page}",
+            spec.repo
+        );
+        let resp = github_api_call(&url).map_err(|e| describe_github_api_error(&url, e))?;
+        let body: serde_json::Value = serde_json::from_str(&resp.into_string()?)?;
+        let Some(releases) = body.as_array() else {
+            anyhow::bail!("unexpected releases-list response shape for {}", spec.repo);
+        };
+        for release in releases {
+            let Some(version) = release_candidate_version(release, &wanted_basenames) else {
+                continue;
+            };
+            retain_newer_release_version(&mut latest, version);
+        }
+        if releases.len() < 100 {
+            return Ok(latest);
         }
     }
-    Ok(None)
+    anyhow::bail!(
+        "release discovery for {} exceeded 1000 full GitHub API pages; refusing a potentially truncated result",
+        spec.repo
+    )
 }
 
 pub fn installed_plugin_version(plugin_name: &str) -> Option<String> {
@@ -1304,4 +1352,86 @@ fn ensure_plugin_installed_via_github(
     let finalized = download_and_verify(&wasm_url, dest, &expected_sha, &identity)?;
     record_plugin_install(dest, version_file, &version, &identity, &finalized)?;
     Ok(dest.to_path_buf())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn release(tag: &str, draft: bool, prerelease: bool, assets: &[&str]) -> serde_json::Value {
+        serde_json::json!({
+            "tag_name": tag,
+            "draft": draft,
+            "prerelease": prerelease,
+            "published_at": "2026-10-06T00:00:00Z",
+            "assets": assets.iter().map(|name| serde_json::json!({"name": name})).collect::<Vec<_>>(),
+        })
+    }
+
+    #[test]
+    fn release_metadata_requires_one_published_pair_at_a_prefixed_semver_tag() {
+        let wanted = ["bert".to_string()];
+        let valid = release("v1.2.3", false, false, &["bert.wasm", "bert.wasm.sha256"]);
+        assert_eq!(
+            release_candidate_version(&valid, &wanted),
+            Some("1.2.3".to_string())
+        );
+        assert_eq!(
+            release_candidate_version(
+                &release("1.2.3", false, false, &["bert.wasm", "bert.wasm.sha256"]),
+                &wanted
+            ),
+            None
+        );
+        assert_eq!(
+            release_candidate_version(
+                &release("v1.2.3", true, false, &["bert.wasm", "bert.wasm.sha256"]),
+                &wanted
+            ),
+            None
+        );
+        assert_eq!(
+            release_candidate_version(
+                &release("v1.2.3", false, true, &["bert.wasm", "bert.wasm.sha256"]),
+                &wanted
+            ),
+            None
+        );
+        assert_eq!(
+            release_candidate_version(&release("v1.2.3", false, false, &["bert.wasm"]), &wanted),
+            None
+        );
+        assert_eq!(
+            release_candidate_version(
+                &release(
+                    "v1.2.3",
+                    false,
+                    false,
+                    &["bert.wasm", "bert.wasm", "bert.wasm.sha256"]
+                ),
+                &wanted
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn release_metadata_keeps_the_highest_valid_version_across_pages() {
+        let mut latest = None;
+        retain_newer_release_version(&mut latest, "1.2.3".to_string());
+        retain_newer_release_version(&mut latest, "1.10.0".to_string());
+        retain_newer_release_version(&mut latest, "1.9.9".to_string());
+        assert_eq!(latest, Some("1.10.0".to_string()));
+    }
+
+    #[test]
+    fn release_tags_require_the_download_url_convention() {
+        assert_eq!(
+            release_version_from_tag("v1.2.3"),
+            Some("1.2.3".to_string())
+        );
+        assert_eq!(release_version_from_tag("1.2.3"), None);
+        assert_eq!(release_version_from_tag("vv1.2.3"), None);
+        assert_eq!(release_version_from_tag("v1.2"), None);
+    }
 }
