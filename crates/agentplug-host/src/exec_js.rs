@@ -284,6 +284,12 @@ pub fn run(code: &str, opts: &Value, cwd: &Path) -> Value {
         None => return json!({"ok": false, "error": format!("unsupported lang: {lang}")}),
     };
 
+    let _admission = match crate::task::admit_execution() {
+        Ok(guard) => guard,
+        Err(error) => {
+            return json!({"ok": false, "error": error, "error_code": "task_handoff_pending", "execution_started": false})
+        }
+    };
     let t0 = Instant::now();
     let mut command = Command::new(&built.cmd);
     command

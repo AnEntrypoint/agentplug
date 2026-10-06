@@ -1132,6 +1132,14 @@ fn hand_off_to_ready_successor() -> Option<(String, usize)> {
     {
         return None;
     }
+    let task_handoff = match agentplug_host::prepare_task_handoff() {
+        Ok(Some(guard)) => guard,
+        Ok(None) => return None,
+        Err(error) => {
+            eprintln!("[agentplug daemon] task result preservation refuses ready-successor handoff: {error}");
+            return None;
+        }
+    };
     if let Err(error) = reserve_ownership_for_handoff(successor_pid, &version) {
         eprintln!(
             "[agentplug daemon] ready takeover successor {version} cannot reserve the ownership handoff: {error}"
@@ -1142,6 +1150,7 @@ fn hand_off_to_ready_successor() -> Option<(String, usize)> {
     write_handoff_inherited_claims(&version, &claims);
     agentplug_host::close_all_sessions();
     release_ownership_for_handoff();
+    task_handoff.commit();
     let requeued = requeue_claims_for_live_successor(&claims);
     mark_intentional_exit("ready-takeover");
     Some((version, requeued))
@@ -5778,11 +5787,23 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
         if self_update_backed_off {
             pending_self_update_staged_at = None;
         }
-        if !self_update_backed_off
+        let task_handoff = if pending_self_update.is_some()
+            && !self_update_backed_off
             && ((!any_work && !detached_still_running)
                 || force_handoff_despite_in_flight
                 || force_handoff_never_idle)
         {
+            match agentplug_host::prepare_task_handoff() {
+                Ok(guard) => guard,
+                Err(error) => {
+                    eprintln!("[agentplug daemon] task result preservation refuses staged runner handoff: {error}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        if let Some(task_handoff) = task_handoff {
             if let Some((staged, version)) = pending_self_update.take() {
                 let claims_the_successor_inherits = snapshot_in_flight_claims();
                 write_handoff_inherited_claims(&version, &claims_the_successor_inherits);
@@ -5800,6 +5821,7 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
                     );
                 }
                 if attempt_self_update_handoff(&staged, &version) {
+                    task_handoff.commit();
                     agentplug_host::close_all_sessions();
                     let requeued =
                         requeue_claims_for_live_successor(&claims_the_successor_inherits);

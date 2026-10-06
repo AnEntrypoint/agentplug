@@ -32,9 +32,23 @@ the `agentplug-host` imports, and `agentplug-trust`. Work on `main` as GitHub us
 - `host_fs_readdir` returns zero on directory or entry-read failure, never a successful empty
   or partial array. Structural indexing propagates that failure and refuses pruning or graph
   evidence; legacy guest wrappers may explicitly retain their empty-list fallback.
-- Task handles are process-local. Spawn and JavaScript adoption share checked monotonic IDs
-  and never overwrite occupied entries. Registry-instance mismatch identifies lost host ownership,
-  including restart; failed registration cleans up only the newly owned child and process group.
+- Spawn and JavaScript adoption share process-instance checked monotonic IDs and never overwrite
+  occupied entries. Failed registration cleans up only the newly owned child and process group.
+  Task output first checks the live registry, then its private durable result store; missing handles
+  distinguish registry-instance mismatch from a missing current-instance task.
+- Runner handoff acquires execution admission before preserving completed results; active execution,
+  children, or pipe drains defer it. Acquire shared admission before a child can execute and retain
+  it through registration/adoption. Failed preparation or ownership transfer releases admission;
+  successful transfer closes it before the old host can start another child.
+- Completed results retain the last 64 KiB of each stream with explicit omitted-byte counts for
+  30 minutes after child exit. Private schema-checked atomic records are bounded to 1 MiB each,
+  512 entries and 64 MiB total; directory scans stop at 1024 entries or five seconds. Expiry and
+  explicit task-stop remove records; full or invalid stores refuse handoff without evicting
+  unexpired results. Default task-list does not persist; explicit `prepare_handoff:true` uses the
+  production preparation function and releases its guard without transferring ownership.
+  New and loaded records share validation; reversed wall-clock timestamps refuse preservation.
+  Unix result directories/files must be private and effective-user-owned. `libc::geteuid` has no
+  pointer inputs or failure mode; record reads reject symlinks with `O_NOFOLLOW`.
 - The spool daemon is a singleton per project. Requests are written atomically, claimed by rename,
   and identified by `(verb, session-id-task-number)`; preserve those properties when changing
   dispatch or recovery.
