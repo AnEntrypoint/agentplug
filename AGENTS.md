@@ -18,6 +18,9 @@ the `agentplug-host` imports, and `agentplug-trust`. Work on `main` as GitHub us
 - Keep signing material only in the protected CI environment. Bind each signature to the immutable
   source revision that built its artifact, and publish a release only after every expected asset and
   signature is present.
+- Build provenance watches Git-resolved HEAD, every symbolic ref, and packed refs across submodule
+  and worktree gitdirs. Missing loose refs watch their nearest existing parent; ordinary commits
+  must refresh embedded COMMIT without touching source or clearing Cargo caches.
 - Canonical runner promotion atomically persists the staging receipt beside the promoted binary
   and rechecks its artifact, version, bytes and signature before re-exec. Receipt or verification
   failure keeps the permitted staged daemon serving. Preserve the authoritative checker’s explicit
