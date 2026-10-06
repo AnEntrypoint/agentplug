@@ -8,7 +8,7 @@ use std::os::windows::process::CommandExt;
 
 use wasmtime::{Engine, Module, Trap};
 
-use agentplug_host::{build_engine, install_dir, now_ms, read_project_plugin_list, DispatchHandle, GmFairnessGuard, ProjectPlugins, ToolDispatchGuard};
+use agentplug_host::{build_engine, dispatch_serial_lane, install_dir, now_ms, read_project_plugin_list, DispatchHandle, GmFairnessGuard, LaneWaitReport, ProjectPlugins, ToolDispatchGuard, ToolQueueWaitReport};
 
 use crate::download::{ensure_plugin_installed, installed_plugin_version, installed_runner_version, is_recognized_release_semver, record_runner_version};
 
@@ -2175,6 +2175,84 @@ pub(crate) fn in_flight_map() -> &'static Mutex<HashMap<InFlightKey, InFlightHan
 
 const MAX_CLAIMED_DISPATCHES_PER_PROJECT: usize = 32;
 
+const LANE_WAIT_MAX_MS_DEFAULT: u64 = 120_000;
+const DISPATCH_WAIT_LEDGER_FILE: &str = ".dispatch-wait.json";
+const LEDGER_REFRESH_MIN_INTERVAL_MS: u64 = 250;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DispatchStage {
+    WaitingForLane,
+    WaitingForToolQueue,
+    Running,
+}
+
+struct DispatchWaitRecord {
+    claimed_at_ms: u64,
+    stage: DispatchStage,
+    stage_since_ms: u64,
+    lane: Option<&'static str>,
+    thread: std::thread::ThreadId,
+}
+
+fn dispatch_wait_records() -> &'static Mutex<HashMap<InFlightKey, DispatchWaitRecord>> {
+    static RECORDS: OnceLock<Mutex<HashMap<InFlightKey, DispatchWaitRecord>>> = OnceLock::new();
+    RECORDS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn note_dispatch_stage(root: &Path, verb: &str, task: &str, stage: DispatchStage, lane: Option<&'static str>) {
+    let key = (root.to_path_buf(), verb.to_string(), task.to_string());
+    let now = now_ms();
+    {
+        let mut records = dispatch_wait_records().lock().unwrap_or_else(|e| e.into_inner());
+        let claimed_at_ms = records.get(&key).map(|record| record.claimed_at_ms).unwrap_or(now);
+        records.insert(key, DispatchWaitRecord { claimed_at_ms, stage, stage_since_ms: now, lane, thread: std::thread::current().id() });
+    }
+    publish_dispatch_wait_ledger(root);
+}
+
+fn ledger_last_refresh_ms() -> &'static Mutex<HashMap<PathBuf, u64>> {
+    static LAST: OnceLock<Mutex<HashMap<PathBuf, u64>>> = OnceLock::new();
+    LAST.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn publish_dispatch_wait_ledger(root: &Path) {
+    let now = now_ms();
+    {
+        let mut last = ledger_last_refresh_ms().lock().unwrap_or_else(|e| e.into_inner());
+        if now.saturating_sub(last.get(root).copied().unwrap_or(0)) < LEDGER_REFRESH_MIN_INTERVAL_MS {
+            return;
+        }
+        last.insert(root.to_path_buf(), now);
+    }
+    refresh_dispatch_wait_ledger(root);
+}
+
+fn dispatch_wait_record(root: &Path, verb: &str, task: &str) -> Option<DispatchWaitRecord> {
+    let key = (root.to_path_buf(), verb.to_string(), task.to_string());
+    let records = dispatch_wait_records().lock().unwrap_or_else(|e| e.into_inner());
+    let record = records.get(&key)?;
+    Some(DispatchWaitRecord {
+        claimed_at_ms: record.claimed_at_ms,
+        stage: record.stage,
+        stage_since_ms: record.stage_since_ms,
+        lane: record.lane,
+        thread: record.thread,
+    })
+}
+
+fn forget_dispatch_wait_record(root: &Path, verb: &str, task: &str) {
+    let key = (root.to_path_buf(), verb.to_string(), task.to_string());
+    dispatch_wait_records().lock().unwrap_or_else(|e| e.into_inner()).remove(&key);
+}
+
+fn dispatch_stage_name(stage: DispatchStage) -> &'static str {
+    match stage {
+        DispatchStage::WaitingForLane => "claimed_waiting_for_serial_lane",
+        DispatchStage::WaitingForToolQueue => "claimed_waiting_for_tool_queue",
+        DispatchStage::Running => "claimed_running",
+    }
+}
+
 fn project_in_flight_count(root: &Path) -> usize {
     in_flight_map()
         .lock()
@@ -2699,6 +2777,123 @@ pub(crate) fn last_measured_dispatch_queue_wait_ms() -> u64 {
     LAST_MEASURED_DISPATCH_QUEUE_WAIT_MS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+fn admission_starved_answer(
+    root: &Path,
+    verb: &str,
+    task: &str,
+    lane: Option<&'static str>,
+    kind: &'static str,
+    waited_ms: u64,
+    limit: usize,
+    in_flight: usize,
+    slots: usize,
+) -> String {
+    let spool_dir = spool_dir_of_root(root);
+    let (request_path, claim_path, out_path) = unanswered_spool_paths(&spool_dir, verb, task);
+    serde_json::json!({
+        "ok": false,
+        "error_code": "dispatch_starved_waiting_for_admission",
+        "verb": verb,
+        "task": task,
+        "lane": lane,
+        "admission_kind": kind,
+        "admission_in_flight": in_flight,
+        "admission_limit": limit,
+        "plugin_slots": slots,
+        "waited_ms": waited_ms,
+        "daemon_pid": std::process::id(),
+        "request_path": request_path.to_string_lossy(),
+        "claim_path": claim_path.to_string_lossy(),
+        "out_path": out_path.to_string_lossy(),
+        "dispatch_wait_ledger": spool_dir.join(DISPATCH_WAIT_LEDGER_FILE).to_string_lossy(),
+        "executed": false,
+        "re_dispatch_safe": true,
+        "error": format!(
+            "verb {} (task {}) was claimed by daemon pid {} but never entered the {} admission gate within {}ms -- {} dispatches already hold the {} admitted slots of {}, so it was NOT executed and re-dispatching is safe. Live state for every unanswered request is in {}.",
+            verb, task, std::process::id(), kind, waited_ms, in_flight, limit, slots,
+            spool_dir.join(DISPATCH_WAIT_LEDGER_FILE).display()
+        ),
+    })
+    .to_string()
+}
+
+fn unanswered_spool_paths(spool_dir: &Path, verb: &str, task: &str) -> (PathBuf, PathBuf, PathBuf) {
+    let in_dir = spool_dir.join("in");
+    let out_dir = spool_dir.join("out");
+    let request_path = in_dir.join(verb).join(format!("{task}.txt"));
+    let claim_path = inflight_claim_path(&in_dir, verb, task);
+    let out_path = out_dir.join(format!("{verb}-{task}.json"));
+    (request_path, claim_path, out_path)
+}
+
+fn spool_dir_of_root(root: &Path) -> PathBuf {
+    root.join(".gm").join("exec-spool")
+}
+
+fn lane_wait_max() -> Duration {
+    Duration::from_millis(env_ms_or("AGENTPLUG_LANE_WAIT_MAX_MS", LANE_WAIT_MAX_MS_DEFAULT))
+}
+
+fn lane_starved_answer(root: &Path, verb: &str, task: &str, lane: Option<&'static str>, report: &LaneWaitReport) -> String {
+    let spool_dir = spool_dir_of_root(root);
+    let (request_path, claim_path, out_path) = unanswered_spool_paths(&spool_dir, verb, task);
+    serde_json::json!({
+        "ok": false,
+        "error_code": "dispatch_starved_waiting_for_serial_lane",
+        "verb": verb,
+        "task": task,
+        "lane": lane,
+        "waited_ms": report.waited_ms,
+        "lane_waiters": report.waiters,
+        "lane_holder_task": report.lane_holder_task,
+        "daemon_pid": std::process::id(),
+        "request_path": request_path.to_string_lossy(),
+        "claim_path": claim_path.to_string_lossy(),
+        "out_path": out_path.to_string_lossy(),
+        "dispatch_wait_ledger": spool_dir.join(DISPATCH_WAIT_LEDGER_FILE).to_string_lossy(),
+        "executed": false,
+        "re_dispatch_safe": true,
+        "error": format!(
+            "verb {} (task {}) was claimed by daemon pid {} but never reached the {} serial lane within {}ms, so it was NOT executed -- re-dispatching is safe because nothing ran. The lane is held by one dispatch at a time per project (git, store, state lanes); holder task {}. Live state for every unanswered request is in {}.",
+            verb, task, std::process::id(), lane.unwrap_or("unassigned"), report.waited_ms,
+            report.lane_holder_task.as_deref().unwrap_or("unknown"),
+            spool_dir.join(DISPATCH_WAIT_LEDGER_FILE).display()
+        ),
+    })
+    .to_string()
+}
+
+fn tool_queue_starved_answer(root: &Path, verb: &str, task: &str, lane: Option<&'static str>, report: &ToolQueueWaitReport) -> String {
+    let spool_dir = spool_dir_of_root(root);
+    let (request_path, claim_path, out_path) = unanswered_spool_paths(&spool_dir, verb, task);
+    let queue_key = report.queue_key.replace('\u{0}', "/");
+    serde_json::json!({
+        "ok": false,
+        "error_code": "dispatch_starved_waiting_for_tool_queue",
+        "verb": verb,
+        "task": task,
+        "lane": lane,
+        "tool_queue": queue_key,
+        "queue_position": report.position,
+        "queue_holder_task": report.holder_task,
+        "waited_ms": report.waited_ms,
+        "daemon_pid": std::process::id(),
+        "request_path": request_path.to_string_lossy(),
+        "claim_path": claim_path.to_string_lossy(),
+        "out_path": out_path.to_string_lossy(),
+        "dispatch_wait_ledger": spool_dir.join(DISPATCH_WAIT_LEDGER_FILE).to_string_lossy(),
+        "executed": false,
+        "re_dispatch_safe": true,
+        "error": format!(
+            "verb {} (task {}) was claimed by daemon pid {} but never reached the front of the global {} FIFO within {}ms, so it was NOT executed -- re-dispatching is safe because nothing ran. That queue is global across every project this daemon serves, not per project; holder task {}. Live state for every unanswered request is in {}.",
+            verb, task, std::process::id(), queue_key, report.waited_ms,
+            report.holder_task.as_deref().unwrap_or("unknown"),
+            spool_dir.join(DISPATCH_WAIT_LEDGER_FILE).display()
+        ),
+    })
+    .to_string()
+}
+
 pub(crate) fn run_gm_dispatch_to_file(root: &Path, handle: &DispatchHandle, verb: &str, task: &str, body: &str, out_dir: &Path, queue_wait_ms: u64, submitted_at_ms: Option<u64>) {
     LAST_MEASURED_DISPATCH_QUEUE_WAIT_MS.store(queue_wait_ms, std::sync::atomic::Ordering::Relaxed);
     let plugin_name = if RAW_PLUGIN_SPOOL_VERBS.contains(&verb) { verb } else { "gm" };
@@ -2711,8 +2906,39 @@ pub(crate) fn run_gm_dispatch_to_file(root: &Path, handle: &DispatchHandle, verb
             .unwrap_or_else(|| "capabilities".to_string())
     };
     let tool_verb = if plugin_name == "gm" { verb } else { inner_verb_owned.as_str() };
-    let _fairness_guard = GmFairnessGuard::acquire(root, tool_verb, body);
-    let _tool_guard = ToolDispatchGuard::acquire(plugin_name, tool_verb, body);
+    let lane = dispatch_serial_lane(tool_verb, body);
+    let in_dir = root.join(".gm").join("exec-spool").join("in");
+    note_dispatch_stage(root, verb, task, DispatchStage::WaitingForLane, lane);
+    let _fairness_guard = match GmFairnessGuard::acquire_within(root, tool_verb, body, task, lane_wait_max()) {
+        Ok(guard) => guard,
+        Err(report) => {
+            let out_body = lane_starved_answer(root, verb, task, lane, &report);
+            eprintln!(
+                "[agentplug daemon] {verb}/{task} for {} was claimed but never reached the {:?} lane within {}ms -- answered dispatch_starved_waiting_for_serial_lane; the verb did not run",
+                root.display(), lane, report.waited_ms
+            );
+            write_spool_out_and_release_claim(out_dir, &in_dir, verb, task, &out_body);
+            forget_dispatch_wait_record(root, verb, task);
+            refresh_dispatch_wait_ledger(root);
+            return;
+        }
+    };
+    note_dispatch_stage(root, verb, task, DispatchStage::WaitingForToolQueue, lane);
+    let _tool_guard = match ToolDispatchGuard::acquire_within(plugin_name, tool_verb, body, task, lane_wait_max()) {
+        Ok(guard) => guard,
+        Err(report) => {
+            let out_body = tool_queue_starved_answer(root, verb, task, lane, &report);
+            eprintln!(
+                "[agentplug daemon] {verb}/{task} for {} was claimed but never reached the front of queue {} within {}ms -- answered dispatch_starved_waiting_for_tool_queue; the verb did not run",
+                root.display(), report.queue_key.replace('\u{0}', "/"), report.waited_ms
+            );
+            write_spool_out_and_release_claim(out_dir, &in_dir, verb, task, &out_body);
+            forget_dispatch_wait_record(root, verb, task);
+            refresh_dispatch_wait_ledger(root);
+            return;
+        }
+    };
+    note_dispatch_stage(root, verb, task, DispatchStage::Running, lane);
     let _dispatch_origin_scope = agentplug_host::enter_dispatch_origin_scope(task, body, submitted_at_ms);
     let dispatch_result = if plugin_name == "gm" {
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handle.dispatch("gm", verb, body)))
@@ -2722,7 +2948,16 @@ pub(crate) fn run_gm_dispatch_to_file(root: &Path, handle: &DispatchHandle, verb
     let out_body = match dispatch_result {
         Ok(Ok(s)) if !s.is_empty() => s,
         Ok(Ok(_)) => serde_json::json!({"ok": false, "error": "empty dispatch result", "verb": verb}).to_string(),
-        Ok(Err(e)) => serde_json::json!({"ok": false, "error": describe_dispatch_error_naming_wasm_trap_kind_distinctly_from_a_guest_logic_error(&e), "verb": verb}).to_string(),
+        Ok(Err(e)) => match e.downcast_ref::<agentplug_host::PluginDispatchError>() {
+            Some(agentplug_host::PluginDispatchError::AdmissionStarved { kind, waited_ms, limit, in_flight, slots }) => {
+                eprintln!(
+                    "[agentplug daemon] {verb}/{task} for {} was claimed but never entered the {kind} admission gate within {waited_ms}ms -- answered dispatch_starved_waiting_for_admission; the verb did not run",
+                    root.display()
+                );
+                admission_starved_answer(root, verb, task, lane, *kind, *waited_ms, *limit, *in_flight, *slots)
+            }
+            _ => serde_json::json!({"ok": false, "error": describe_dispatch_error_naming_wasm_trap_kind_distinctly_from_a_guest_logic_error(&e), "verb": verb}).to_string(),
+        },
         Err(panic_payload) => {
             let msg = panic_payload
                 .downcast_ref::<&str>()
@@ -2737,7 +2972,6 @@ pub(crate) fn run_gm_dispatch_to_file(root: &Path, handle: &DispatchHandle, verb
     let out_body = spill_large_exec_output_to_text_sibling(out_dir, verb, task, out_body);
     let out_name = format!("{verb}-{task}.json");
     let out_confirmed = write_spool_out_confirmed(out_dir, &out_name, &out_body);
-    let in_dir = root.join(".gm").join("exec-spool").join("in");
     if out_confirmed {
         let _ = fs::remove_file(inflight_claim_path(&in_dir, verb, task));
     } else {
@@ -2745,6 +2979,108 @@ pub(crate) fn run_gm_dispatch_to_file(root: &Path, handle: &DispatchHandle, verb
     }
     let key: InFlightKey = (root.to_path_buf(), verb.to_string(), task.to_string());
     in_flight_map().lock().unwrap_or_else(|e| e.into_inner()).remove(&key);
+    forget_dispatch_wait_record(root, verb, task);
+    refresh_dispatch_wait_ledger(root);
+}
+
+fn refresh_dispatch_wait_ledger(root: &Path) {
+    let spool_dir = spool_dir_of_root(root);
+    let ledger_path = spool_dir.join(DISPATCH_WAIT_LEDGER_FILE);
+    let (queued, claimed) = spool_step_counts(root);
+    let records_empty = dispatch_wait_records().lock().unwrap_or_else(|e| e.into_inner()).is_empty();
+    if records_empty && queued == 0 && claimed == 0 {
+        if ledger_path.exists() {
+            let _ = fs::remove_file(&ledger_path);
+        }
+        return;
+    }
+    let in_dir = spool_dir.join("in");
+    let out_dir = spool_dir.join("out");
+    let Ok(verb_dirs) = fs::read_dir(&in_dir) else { return };
+    let now = now_ms();
+    let mut rows: Vec<serde_json::Value> = Vec::new();
+    for verb_entry in verb_dirs.flatten() {
+        if !verb_entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let verb = verb_entry.file_name().to_string_lossy().into_owned();
+        let Ok(files) = fs::read_dir(verb_entry.path()) else { continue };
+        for file_entry in files.flatten() {
+            let path = file_entry.path();
+            let name = file_entry.file_name().to_string_lossy().into_owned();
+            let is_claim = name.ends_with(&format!(".{}", ORPHAN_CLAIM_EXT));
+            let is_queued_request = !is_claim && is_spool_request_path(&verb, &path);
+            if !is_claim && !is_queued_request {
+                continue;
+            }
+            let task = if is_claim {
+                Path::new(path.file_stem().unwrap_or_default())
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+            } else {
+                path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()
+            };
+            if task.is_empty() || out_dir.join(format!("{verb}-{task}.json")).exists() {
+                continue;
+            }
+            let modified_ms = file_entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(now);
+            let (request_path, claim_path, out_path) = unanswered_spool_paths(&spool_dir, &verb, &task);
+            let record = dispatch_wait_record(root, &verb, &task);
+            let admission_wait = record
+                .as_ref()
+                .and_then(|record| agentplug_host::admission_wait_state_for_thread(record.thread));
+            let state = match (&record, &admission_wait) {
+                (_, Some(_)) => "claimed_waiting_for_admission",
+                (Some(record), None) => dispatch_stage_name(record.stage),
+                (None, None) if is_claim => "claimed_not_yet_tracked",
+                (None, None) => "never_claimed",
+            };
+            let stage_age_ms = admission_wait
+                .as_ref()
+                .map(|wait| now.saturating_sub(wait.since_ms))
+                .or_else(|| record.as_ref().map(|record| now.saturating_sub(record.stage_since_ms)))
+                .unwrap_or(0);
+            let lane = record.as_ref().and_then(|record| record.lane);
+            rows.push(serde_json::json!({
+                "verb": verb,
+                "task": task,
+                "state": state,
+                "lane": lane,
+                "admission_kind": admission_wait.as_ref().map(|wait| wait.kind),
+                "admission_in_flight": admission_wait.as_ref().map(|wait| wait.in_flight),
+                "admission_limit": admission_wait.as_ref().map(|wait| wait.limit),
+                "file_age_ms": now.saturating_sub(modified_ms),
+                "stage_age_ms": stage_age_ms,
+                "request_path": request_path.to_string_lossy(),
+                "claim_path": if is_claim { claim_path.to_string_lossy().into_owned() } else { String::new() },
+                "out_path": out_path.to_string_lossy(),
+            }));
+        }
+    }
+    if rows.is_empty() {
+        let _ = fs::remove_file(&ledger_path);
+        return;
+    }
+    let payload = serde_json::json!({
+        "daemon_pid": std::process::id(),
+        "ts": now,
+        "root": root.to_string_lossy(),
+        "project_in_flight": project_in_flight_count(root),
+        "project_in_flight_cap": MAX_CLAIMED_DISPATCHES_PER_PROJECT,
+        "requests": rows,
+    })
+    .to_string();
+    let tmp = spool_dir.join(format!("{DISPATCH_WAIT_LEDGER_FILE}.tmp.{}", std::process::id()));
+    if fs::write(&tmp, payload).is_ok() {
+        let _ = fs::rename(&tmp, &ledger_path);
+    }
 }
 
 fn dir_has_any_verb_subdir_with_claimable_request(base: &Path, language_stems: bool) -> bool {
@@ -3755,6 +4091,7 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
         if !roots_new_this_registry_poll.is_empty() || last_per_root_plugin_scan.elapsed() >= PER_ROOT_PLUGIN_SCAN_INTERVAL {
             last_per_root_plugin_scan = Instant::now();
             for root in &known_roots {
+                refresh_dispatch_wait_ledger(root);
                 for plugin_name in read_project_plugin_list(root) {
                     if plugin_compile_in_backoff(&plugin_name) {
                         continue;
