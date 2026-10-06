@@ -6,7 +6,10 @@ pub const WATCHER_LOG_MAX_BYTES: u64 = 10 * 1024 * 1024;
 pub const WATCHER_LOG_BACKUPS: u32 = 2;
 
 fn backup_path(path: &Path, generation: u32) -> std::path::PathBuf {
-    let mut name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "watcher.log".to_string());
+    let mut name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "watcher.log".to_string());
     name.push_str(&format!(".{generation}"));
     path.with_file_name(name)
 }
@@ -48,7 +51,11 @@ pub fn append_watcher_line(root: &Path, line: &str) {
         return;
     }
     rotate_if_oversized(&log_path);
-    let mut file = match fs::OpenOptions::new().create(true).append(true).open(&log_path) {
+    let mut file = match fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+    {
         Ok(file) => file,
         Err(_) => return,
     };
