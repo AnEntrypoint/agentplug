@@ -146,7 +146,8 @@ fn main() -> anyhow::Result<()> {
             let root = args.get(2).map(PathBuf::from).unwrap_or_else(|| std::env::current_dir().expect("cwd unavailable"));
             daemon::sweep_orphaned_claims(&root);
             daemon::sweep_unconsumable_spool_files(&root);
-            println!("swept orphaned claims and unconsumable spool files under {}", root.display());
+            let reaped = daemon::reap_spool_out_files(&root, true);
+            println!("swept orphaned claims and unconsumable spool files under {} (reaped {reaped} answered out-file(s))", root.display());
             Ok(())
         }
         "reap-orphans" => {
@@ -460,9 +461,22 @@ fn run_spool_watcher_single_process(project: &mut ProjectPlugins, spool_dir: &st
     fs::create_dir_all(&out_dir)?;
     let status_path = spool_dir.join(".status.json");
 
+    // A second watcher on this project has no way to see the first one's
+    // claims, so it would sweep the other's in-flight work as orphaned and
+    // delete the claim out from under it. Refuse the role instead -- the live
+    // watcher is already serving this spool.
+    if !daemon::claim_standalone_watcher_slot(spool_dir) {
+        eprintln!(
+            "[agentplug] another standalone watcher is already live for {} -- exiting rather than sweeping the claims it is serving",
+            spool_dir.display()
+        );
+        return Ok(());
+    }
+
     loop {
         if daemon::shared_daemon_is_serving() {
             clear_standalone_status(&status_path);
+            daemon::release_standalone_watcher_slot(spool_dir);
             eprintln!(
                 "[agentplug] shared daemon is serving again -- standalone watcher for {} exiting between dispatches, leaving every unclaimed request in the spool for it",
                 spool_dir.display()
