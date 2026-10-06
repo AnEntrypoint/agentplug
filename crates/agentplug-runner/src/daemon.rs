@@ -2042,6 +2042,20 @@ fn write_project_heartbeat_with_queue_info(
         map.remove("runner_update_in_progress");
         map.remove("runner_update_waiting_ms");
     }
+    match sweep_holder_report() {
+        Some((phase, root, held_ms)) => {
+            payload["sweep_holder_phase"] = serde_json::json!(phase);
+            payload["sweep_holder_root"] = serde_json::json!(root);
+            payload["sweep_holder_ms"] = serde_json::json!(held_ms);
+        }
+        None => {
+            if let Some(map) = payload.as_object_mut() {
+                map.remove("sweep_holder_phase");
+                map.remove("sweep_holder_root");
+                map.remove("sweep_holder_ms");
+            }
+        }
+    }
     let failures = last_plugin_compile_failure()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -2097,6 +2111,87 @@ fn project_heartbeat_due(root: &Path, has_queued_work: bool) -> bool {
     due
 }
 
+struct SweepHolder {
+    phase: &'static str,
+    root: String,
+    since: Instant,
+}
+
+fn sweep_holder() -> &'static Mutex<Option<SweepHolder>> {
+    static SLOT: OnceLock<Mutex<Option<SweepHolder>>> = OnceLock::new();
+    SLOT.get_or_init(|| Mutex::new(None))
+}
+
+fn set_sweep_holder(phase: &'static str, root: &Path) {
+    if let Ok(mut slot) = sweep_holder().lock() {
+        *slot = Some(SweepHolder {
+            phase,
+            root: root.display().to_string(),
+            since: Instant::now(),
+        });
+    }
+}
+
+fn clear_sweep_holder() {
+    if let Ok(mut slot) = sweep_holder().lock() {
+        *slot = None;
+    }
+}
+
+fn sweep_holder_report() -> Option<(String, String, u64)> {
+    sweep_holder().lock().ok().and_then(|slot| {
+        slot.as_ref()
+            .map(|h| (h.phase.to_string(), h.root.clone(), h.since.elapsed().as_millis() as u64))
+    })
+}
+
+struct RegistryWalk {
+    cursor: usize,
+}
+
+impl RegistryWalk {
+    fn reset(&mut self) {
+        self.cursor = 0;
+    }
+
+    fn walk<F: FnMut(&PathBuf)>(
+        &mut self,
+        roots: &[PathBuf],
+        budget: Duration,
+        phase: &'static str,
+        mut body: F,
+    ) -> bool {
+        if roots.is_empty() {
+            return true;
+        }
+        let started = Instant::now();
+        let begin = self.cursor % roots.len();
+        let mut next = begin;
+        let mut completed = true;
+        for offset in 0..roots.len() {
+            let index = (begin + offset) % roots.len();
+            let root = &roots[index];
+            next = (index + 1) % roots.len();
+            set_sweep_holder(phase, root);
+            body(root);
+            if started.elapsed() >= budget {
+                completed = false;
+                break;
+            }
+        }
+        self.cursor = next;
+        clear_sweep_holder();
+        completed
+    }
+}
+
+fn project_heartbeat_cursor() -> &'static Mutex<usize> {
+    static SLOT: OnceLock<Mutex<usize>> = OnceLock::new();
+    SLOT.get_or_init(|| Mutex::new(0))
+}
+
+const PROJECT_HEARTBEAT_PASS_BUDGET: Duration = Duration::from_millis(4_000);
+
 fn spawn_project_heartbeat_ticker(interval: Duration) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || loop {
         std::thread::sleep(interval);
@@ -2107,17 +2202,36 @@ fn spawn_project_heartbeat_ticker(interval: Duration) -> std::thread::JoinHandle
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
-        for root in roots {
-            let spool_dir = spool_dir_of(&root);
+        if roots.is_empty() {
+            continue;
+        }
+        let started = Instant::now();
+        let begin = *project_heartbeat_cursor()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut next = begin;
+        for offset in 0..roots.len() {
+            let index = (begin + offset) % roots.len();
+            let root = &roots[index];
+            next = (index + 1) % roots.len();
+            let spool_dir = spool_dir_of(root);
             if !spool_dir.exists() {
                 continue;
             }
-            let (queued, claimed) = spool_step_counts(&root);
-            if !project_heartbeat_due(&root, queued + claimed > 0) {
+            set_sweep_holder("project-heartbeat", root);
+            let (queued, claimed) = spool_step_counts(root);
+            if !project_heartbeat_due(root, queued + claimed > 0) {
                 continue;
             }
-            write_project_heartbeat(&root, busy_until_for_project_ticker(&root));
+            write_project_heartbeat(root, busy_until_for_project_ticker(root));
+            if started.elapsed() >= PROJECT_HEARTBEAT_PASS_BUDGET {
+                break;
+            }
         }
+        *project_heartbeat_cursor()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = next;
+        clear_sweep_holder();
     })
 }
 
@@ -5395,10 +5509,14 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
     let mut last_cold_project_sweep = Instant::now()
         .checked_sub(COLD_PROJECT_SWEEP_INTERVAL)
         .unwrap_or_else(Instant::now);
+    let mut cold_sweep_pending = false;
+    let mut cold_sweep_walk = RegistryWalk { cursor: 0 };
     let mut project_round_robin_cursor = 0usize;
     let mut last_per_root_plugin_scan = Instant::now()
         .checked_sub(Duration::from_secs(60))
         .unwrap_or_else(Instant::now);
+    let mut per_root_plugin_scan_pending = false;
+    let mut per_root_plugin_scan_walk = RegistryWalk { cursor: 0 };
 
     const SELF_RECYCLE_IDLE_MS: u64 = 60 * 60 * 1000;
     let mut last_any_dispatch = Instant::now();
@@ -5550,40 +5668,54 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
         let max_concurrent_projects = daemon_cfg.max_concurrent_projects();
 
         const PER_ROOT_PLUGIN_SCAN_INTERVAL: Duration = Duration::from_secs(5);
-        if !roots_new_this_registry_poll.is_empty()
-            || last_per_root_plugin_scan.elapsed() >= PER_ROOT_PLUGIN_SCAN_INTERVAL
-        {
-            last_per_root_plugin_scan = Instant::now();
-            for root in &known_roots {
-                refresh_dispatch_wait_ledger(root);
-                for plugin_name in read_project_plugin_list(root) {
-                    if plugin_compile_in_backoff(&plugin_name) {
-                        continue;
-                    }
-                    match plugin_modules.get_or_compile(&plugin_name) {
-                        Ok(()) => clear_plugin_compile_failure(&plugin_name),
-                        Err(e) => {
-                            eprintln!("[agentplug daemon] failed to compile/install plugin {plugin_name} for {}: {e:#}", root.display());
-                            record_plugin_compile_failure(&plugin_name, format!("{e:#}"));
+        const PER_ROOT_PASS_BUDGET: Duration = Duration::from_millis(250);
+        if per_root_plugin_scan_pending {
+            let completed = per_root_plugin_scan_walk.walk(
+                &known_roots,
+                PER_ROOT_PASS_BUDGET,
+                "per-root-plugin-scan",
+                |root| {
+                    refresh_dispatch_wait_ledger(root);
+                    for plugin_name in read_project_plugin_list(root) {
+                        if plugin_compile_in_backoff(&plugin_name) {
+                            continue;
+                        }
+                        match plugin_modules.get_or_compile(&plugin_name) {
+                            Ok(()) => clear_plugin_compile_failure(&plugin_name),
+                            Err(e) => {
+                                eprintln!("[agentplug daemon] failed to compile/install plugin {plugin_name} for {}: {e:#}", root.display());
+                                record_plugin_compile_failure(&plugin_name, format!("{e:#}"));
+                            }
                         }
                     }
-                }
-                let due = last_instruction_source_sync
-                    .get(root)
-                    .map(|t| t.elapsed() >= instruction_source_poll_interval)
-                    .unwrap_or(true);
-                if due && instruction_source_syncing.insert(root.clone()) {
-                    last_instruction_source_sync.insert(root.clone(), Instant::now());
-                    let thread_root = root.clone();
-                    let done = instruction_source_sync_done_tx.clone();
-                    std::thread::spawn(move || {
-                        if let Err(e) = sync_instruction_source_if_configured(&thread_root) {
-                            eprintln!("[agentplug daemon] instruction source-repo sync failed for {}: {e:#}", thread_root.display());
-                        }
-                        let _ = done.send(thread_root);
-                    });
-                }
+                    let due = last_instruction_source_sync
+                        .get(root)
+                        .map(|t| t.elapsed() >= instruction_source_poll_interval)
+                        .unwrap_or(true);
+                    if due && instruction_source_syncing.insert(root.clone()) {
+                        last_instruction_source_sync.insert(root.clone(), Instant::now());
+                        let thread_root = root.clone();
+                        let done = instruction_source_sync_done_tx.clone();
+                        std::thread::spawn(move || {
+                            if let Err(e) = sync_instruction_source_if_configured(&thread_root) {
+                                eprintln!("[agentplug daemon] instruction source-repo sync failed for {}: {e:#}", thread_root.display());
+                            }
+                            let _ = done.send(thread_root);
+                        });
+                    }
+                },
+            );
+            if completed {
+                per_root_plugin_scan_pending = false;
+                last_per_root_plugin_scan = Instant::now();
             }
+        }
+        if !per_root_plugin_scan_pending
+            && (!roots_new_this_registry_poll.is_empty()
+                || last_per_root_plugin_scan.elapsed() >= PER_ROOT_PLUGIN_SCAN_INTERVAL)
+        {
+            per_root_plugin_scan_pending = true;
+            per_root_plugin_scan_walk.reset();
         }
         for plugin_name in ["gm", "libsql", "bert", "treesitter", "oxibrowser", "crux"] {
             if plugin_compile_in_backoff(plugin_name) {
@@ -5602,15 +5734,34 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
             plugin_modules.modules_with_hashes(),
         ));
 
-        let sweep_cold_this_tick = last_cold_project_sweep.elapsed() >= COLD_PROJECT_SWEEP_INTERVAL;
-        if sweep_cold_this_tick {
-            last_cold_project_sweep = Instant::now();
+        const COLD_SWEEP_PASS_BUDGET: Duration = Duration::from_millis(500);
+        let mut cold_sweep_ran_this_tick = false;
+        if cold_sweep_pending {
+            cold_sweep_ran_this_tick = true;
             let no_inherited_claims = HashSet::new();
-            for root in &known_roots {
-                sweep_orphaned_claims_distinguishing_handoff_from_crash(root, &no_inherited_claims);
-                reap_spool_out_files(root, false);
-                sweep_unconsumable_spool_files(root);
+            let completed = cold_sweep_walk.walk(
+                &known_roots,
+                COLD_SWEEP_PASS_BUDGET,
+                "cold-sweep",
+                |root| {
+                    sweep_orphaned_claims_distinguishing_handoff_from_crash(
+                        root,
+                        &no_inherited_claims,
+                    );
+                    reap_spool_out_files(root, false);
+                    sweep_unconsumable_spool_files(root);
+                },
+            );
+            if completed {
+                cold_sweep_pending = false;
+                last_cold_project_sweep = Instant::now();
             }
+        }
+        if !cold_sweep_pending
+            && last_cold_project_sweep.elapsed() >= COLD_PROJECT_SWEEP_INTERVAL
+        {
+            cold_sweep_pending = true;
+            cold_sweep_walk.reset();
         }
         let mut all_projects: Vec<(PathBuf, ProjectPlugins)> =
             Vec::with_capacity(known_roots.len());
@@ -5622,7 +5773,7 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
                     all_projects.push((root.clone(), p));
                     is_genuinely_active.push(project_has_queued_spool_work_cached(root));
                 }
-                None if sweep_cold_this_tick
+                None if cold_sweep_ran_this_tick
                     || roots_new_this_registry_poll.contains(root)
                     || project_has_queued_spool_work_cached(root) =>
                 {
