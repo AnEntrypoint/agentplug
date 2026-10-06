@@ -535,8 +535,13 @@ pub(crate) fn runner_asset_name() -> Option<&'static str> {
     runner_asset_name_for(std::env::consts::OS, std::env::consts::ARCH)
 }
 
-fn runner_version_path() -> PathBuf {
+pub fn runner_version_path() -> PathBuf {
     install_dir().join("agentplug-runner.version")
+}
+
+pub fn local_build_pin_record() -> Option<serde_json::Value> {
+    let raw = fs::read_to_string(local_build_pin_path()).ok()?;
+    serde_json::from_str(&raw).ok()
 }
 
 pub fn installed_runner_version() -> Option<String> {
