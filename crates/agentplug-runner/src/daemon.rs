@@ -3214,6 +3214,36 @@ fn dispatch_wait_ledger_is_mine_or_stale(ledger_path: &Path) -> bool {
     mine || stale
 }
 
+const CODE_INDEX_CONSUMING_VERBS: &[&str] = &[
+    "codesearch",
+    "codeinsight",
+    "codeinsight_callers",
+    "codeinsight_index",
+    "search",
+];
+
+struct CodeIndexState {
+    cold: bool,
+    partial: bool,
+    digest: Option<String>,
+}
+
+fn code_index_state(spool_dir: &Path) -> CodeIndexState {
+    let Ok(raw) = fs::read_to_string(spool_dir.join(".codeinsight-digest")) else {
+        return CodeIndexState { cold: true, partial: false, digest: None };
+    };
+    let digest = raw.trim().to_string();
+    if digest.is_empty() {
+        return CodeIndexState { cold: true, partial: false, digest: None };
+    }
+    let deferred = digest
+        .rsplit_once(":partial=")
+        .and_then(|(_, tail)| tail.split(':').next())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(0);
+    CodeIndexState { cold: false, partial: deferred > 0, digest: Some(digest) }
+}
+
 fn refresh_dispatch_wait_ledger(root: &Path) {
     let spool_dir = spool_dir_of_root(root);
     let ledger_path = spool_dir.join(DISPATCH_WAIT_LEDGER_FILE);
@@ -3279,6 +3309,11 @@ fn refresh_dispatch_wait_ledger(root: &Path) {
                 .or_else(|| record.as_ref().map(|record| now.saturating_sub(record.stage_since_ms)))
                 .unwrap_or(0);
             let lane = record.as_ref().and_then(|record| record.lane);
+            let index_state = if CODE_INDEX_CONSUMING_VERBS.contains(&verb.as_str()) {
+                Some(code_index_state(&spool_dir))
+            } else {
+                None
+            };
             rows.push(serde_json::json!({
                 "verb": verb,
                 "task": task,
@@ -3289,6 +3324,9 @@ fn refresh_dispatch_wait_ledger(root: &Path) {
                 "admission_limit": admission_wait.as_ref().map(|wait| wait.limit),
                 "file_age_ms": now.saturating_sub(modified_ms),
                 "stage_age_ms": stage_age_ms,
+                "index_cold": index_state.as_ref().map(|state| state.cold),
+                "index_partial": index_state.as_ref().map(|state| state.partial),
+                "index_digest": index_state.as_ref().and_then(|state| state.digest.clone()),
                 "request_path": request_path.to_string_lossy(),
                 "claim_path": if is_claim { claim_path.to_string_lossy().into_owned() } else { String::new() },
                 "out_path": out_path.to_string_lossy(),
