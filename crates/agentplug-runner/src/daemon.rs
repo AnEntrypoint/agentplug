@@ -2713,10 +2713,22 @@ pub fn sweep_unconsumable_spool_files(root: &Path) {
     let quarantine_dir = spool_dir.join("in-quarantine");
     let Ok(verb_dirs) = fs::read_dir(&in_dir) else { return };
     for verb_entry in verb_dirs.flatten() {
+        let verb = verb_entry.file_name().to_string_lossy().into_owned();
         if !verb_entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            if verb.is_empty() {
+                continue;
+            }
+            let _ = fs::create_dir_all(&quarantine_dir);
+            let dest = quarantine_dir.join(format!("_toplevel__{verb}"));
+            if fs::rename(&verb_entry.path(), &dest).is_ok() {
+                eprintln!(
+                    "[agentplug daemon] quarantined stray file in/{verb} to {} -- the spool ABI puts every request in/<verb>/<file>, so a file sitting directly in in/ is never claimed by the dispatch loop and would otherwise sit invisibly forever{}",
+                    dest.display(),
+                    if verb.contains("${") { " (its name still holds an unexpanded shell template)" } else { "" }
+                );
+            }
             continue;
         }
-        let verb = verb_entry.file_name().to_string_lossy().into_owned();
         let Ok(files) = fs::read_dir(verb_entry.path()) else { continue };
         for file_entry in files.flatten() {
             let path = file_entry.path();
@@ -2741,6 +2753,207 @@ pub fn sweep_unconsumable_spool_files(root: &Path) {
             }
         }
     }
+}
+
+const SPOOL_OUT_REAP_INTERVAL_MS: u64 = 60 * 1000;
+const SPOOL_OUT_MIN_AGE_MS: u64 = 10 * 60 * 1000;
+const SPOOL_OUT_DEFAULT_MAX_FILES: usize = 3000;
+const SPOOL_OUT_DEFAULT_MAX_AGE_MS: u64 = 24 * 60 * 60 * 1000;
+const SPOOL_OUT_MAX_REAP_PER_PASS: usize = 1500;
+
+fn spool_out_env_usize(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
+}
+
+fn spool_out_env_u64(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
+}
+
+fn spool_out_max_files() -> usize {
+    spool_out_env_usize("GM_SPOOL_OUT_MAX_FILES", SPOOL_OUT_DEFAULT_MAX_FILES)
+}
+
+fn spool_out_max_age_ms() -> u64 {
+    spool_out_env_u64("GM_SPOOL_OUT_MAX_AGE_MS", SPOOL_OUT_DEFAULT_MAX_AGE_MS)
+}
+
+fn spool_out_reap_timestamps() -> &'static Mutex<HashMap<PathBuf, u64>> {
+    static SLOT: OnceLock<Mutex<HashMap<PathBuf, u64>>> = OnceLock::new();
+    SLOT.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn out_file_age_ms(metadata: &fs::Metadata, now: u64) -> u64 {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as u64)
+        .map(|modified_ms| now.saturating_sub(modified_ms))
+        .unwrap_or(0)
+}
+
+fn out_meta_stamp_ms(metadata: &fs::Metadata, now: u64) -> u64 {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(now)
+}
+
+fn out_stamp_ms(stem: &str) -> Option<u64> {
+    let mut tail = stem.rsplitn(3, '-');
+    let seq = tail.next().unwrap_or_default();
+    let stamp = tail.next().unwrap_or_default();
+    if seq.is_empty() || !seq.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    if stamp.len() < 12 || !stamp.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    stamp.parse::<u64>().ok()
+}
+
+fn remove_out_file_and_markers(path: &Path) {
+    let file_name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    if let Some(parent) = path.parent() {
+        if !file_name.is_empty() {
+            let mut ready = file_name.clone();
+            ready.push_str(".ready");
+            let _ = fs::remove_file(parent.join(&ready));
+        }
+        if !stem.is_empty() {
+            let _ = fs::remove_file(parent.join(format!("{stem}.txt")));
+        }
+    }
+    let _ = fs::remove_file(path);
+}
+
+fn live_out_stems(root: &Path) -> HashSet<String> {
+    let in_dir = spool_dir_of_root(root).join("in");
+    let mut live: HashSet<String> = HashSet::new();
+    let Ok(verb_dirs) = fs::read_dir(&in_dir) else { return live };
+    for verb_entry in verb_dirs.flatten() {
+        if !verb_entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let verb = verb_entry.file_name().to_string_lossy().into_owned();
+        let Ok(files) = fs::read_dir(verb_entry.path()) else { continue };
+        for file_entry in files.flatten() {
+            if !file_entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+                continue;
+            }
+            let file_name = file_entry.file_name().to_string_lossy().into_owned();
+            let without_claim = file_name.strip_suffix(&format!(".{ORPHAN_CLAIM_EXT}")).unwrap_or(file_name.as_str());
+            let task = without_claim.rsplit_once('.').map(|(head, _)| head).unwrap_or(without_claim);
+            if !task.is_empty() {
+                live.insert(format!("{verb}-{task}"));
+            }
+        }
+    }
+    live
+}
+
+pub fn reap_spool_out_files(root: &Path, force: bool) -> usize {
+    let spool_dir = spool_dir_of_root(root);
+    let out_dir = spool_dir.join("out");
+    let now = now_ms();
+    if !force {
+        let mut last = spool_out_reap_timestamps().lock().unwrap_or_else(|e| e.into_inner());
+        if now.saturating_sub(last.get(root).copied().unwrap_or(0)) < SPOOL_OUT_REAP_INTERVAL_MS {
+            return 0;
+        }
+        last.insert(root.to_path_buf(), now);
+    }
+    let Ok(entries) = fs::read_dir(&out_dir) else { return 0 };
+    let live = live_out_stems(root);
+
+    struct OutRow {
+        path: PathBuf,
+        stem: String,
+        stamp_ms: u64,
+    }
+    let mut rows: Vec<OutRow> = Vec::new();
+    let mut total_entries = 0usize;
+    let mut stat_fallbacks = 0usize;
+    let mut stale_tmp = 0usize;
+    for entry in entries.flatten() {
+        total_entries += 1;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.contains(".tmp.") {
+            let age_ms = entry.metadata().ok().map(|m| out_file_age_ms(&m, now)).unwrap_or(0);
+            if age_ms >= SPOOL_OUT_MIN_AGE_MS && fs::remove_file(entry.path()).is_ok() {
+                stale_tmp += 1;
+            }
+            continue;
+        }
+        if !name.ends_with(".json") {
+            continue;
+        }
+        let stem = entry.path().file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+        let stamp_ms = match out_stamp_ms(&stem) {
+            Some(ms) => ms,
+            None => {
+                stat_fallbacks += 1;
+                entry.metadata().ok().map(|m| out_meta_stamp_ms(&m, now)).unwrap_or(now)
+            }
+        };
+        rows.push(OutRow { path: entry.path(), stem, stamp_ms });
+    }
+
+    rows.sort_by_key(|row| row.stamp_ms);
+    let max_files = spool_out_max_files();
+    let max_age_ms = spool_out_max_age_ms();
+    let keep_json = if total_entries > max_files && !rows.is_empty() {
+        ((max_files * rows.len()) / total_entries).clamp(1, rows.len())
+    } else {
+        rows.len()
+    };
+    let over_cap = rows.len().saturating_sub(keep_json);
+    let mut reaped = 0usize;
+    for (index, row) in rows.iter().enumerate() {
+        if reaped >= SPOOL_OUT_MAX_REAP_PER_PASS {
+            break;
+        }
+        let age_ms = now.saturating_sub(row.stamp_ms);
+        if age_ms < SPOOL_OUT_MIN_AGE_MS {
+            break;
+        }
+        if live.contains(&row.stem) {
+            continue;
+        }
+        let over_count_cap = index < over_cap;
+        let expired_by_age = age_ms >= max_age_ms;
+        if !(over_count_cap || expired_by_age) {
+            continue;
+        }
+        remove_out_file_and_markers(&row.path);
+        reaped += 1;
+    }
+    if reaped > 0 || stale_tmp > 0 {
+        eprintln!(
+            "[agentplug daemon] reaped {} answered out-file(s) and {} stale tmp file(s) under {} -- out/ had {} entries ({} json, {} needed a stat), capped at {} files / {}h, {} dispatches still live",
+            reaped,
+            stale_tmp,
+            out_dir.display(),
+            total_entries,
+            rows.len(),
+            stat_fallbacks,
+            max_files,
+            max_age_ms / (60 * 60 * 1000),
+            live.len()
+        );
+    }
+    reaped
 }
 
 const RAW_PLUGIN_SPOOL_VERBS: &[&str] = &["libsql", "bert"];
@@ -2983,13 +3196,31 @@ pub(crate) fn run_gm_dispatch_to_file(root: &Path, handle: &DispatchHandle, verb
     refresh_dispatch_wait_ledger(root);
 }
 
+const DISPATCH_WAIT_LEDGER_STALE_MS: u64 = 60_000;
+
+fn dispatch_wait_ledger_is_mine_or_stale(ledger_path: &Path) -> bool {
+    let Ok(raw) = fs::read_to_string(ledger_path) else { return true };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) else { return true };
+    let mine = value
+        .get("daemon_pid")
+        .and_then(|p| p.as_u64())
+        .map(|pid| pid == std::process::id() as u64)
+        .unwrap_or(true);
+    let stale = value
+        .get("ts")
+        .and_then(|t| t.as_u64())
+        .map(|ts| now_ms().saturating_sub(ts) > DISPATCH_WAIT_LEDGER_STALE_MS)
+        .unwrap_or(true);
+    mine || stale
+}
+
 fn refresh_dispatch_wait_ledger(root: &Path) {
     let spool_dir = spool_dir_of_root(root);
     let ledger_path = spool_dir.join(DISPATCH_WAIT_LEDGER_FILE);
     let (queued, claimed) = spool_step_counts(root);
     let records_empty = dispatch_wait_records().lock().unwrap_or_else(|e| e.into_inner()).is_empty();
     if records_empty && queued == 0 && claimed == 0 {
-        if ledger_path.exists() {
+        if ledger_path.exists() && dispatch_wait_ledger_is_mine_or_stale(&ledger_path) {
             let _ = fs::remove_file(&ledger_path);
         }
         return;
@@ -4141,6 +4372,8 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
             let no_inherited_claims = HashSet::new();
             for root in &known_roots {
                 sweep_orphaned_claims_distinguishing_handoff_from_crash(root, &no_inherited_claims);
+                reap_spool_out_files(root, false);
+                sweep_unconsumable_spool_files(root);
             }
         }
         let mut all_projects: Vec<(PathBuf, ProjectPlugins)> = Vec::with_capacity(known_roots.len());
