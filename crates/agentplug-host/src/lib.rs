@@ -42,14 +42,15 @@ pub use memory_pressure::{
 };
 pub use precompiled::{load_module_file_backed, precompiled_module_path};
 pub use registry::{
-    advance_plugin_fiber, cost_class_for_dispatch, cost_class_for_verb, epoch_ticks_for_seconds,
-    get_active_provider, note_shared_plugin_bytes_current, read_plugin_lifecycle,
-    read_project_plugin_list, release_shared_plugin, request_shared_store_swap, set_gm_pool_size,
-    set_sibling_reload_source, set_side_plugin_pool_size, shared_plugin_slot_content_hashes,
+    admission_wait_state_for_thread, advance_plugin_fiber, cost_class_for_dispatch,
+    cost_class_for_verb, dispatch_serial_lane, epoch_ticks_for_seconds, get_active_provider,
+    note_shared_plugin_bytes_current, read_plugin_lifecycle, read_project_plugin_list,
+    release_shared_plugin, request_shared_store_swap, set_gm_pool_size, set_sibling_reload_source,
+    set_side_plugin_pool_size, shared_plugin_slot_content_hashes,
     shared_plugin_slot_snapshot_without_blocking, shared_plugin_swap_pending_hashes,
-    DispatchCostClass, DispatchHandle, GmFairnessGuard, PluginFiberLifecycle, ProjectPlugins,
-    SharedPluginPool, SlotContentSnapshot, ToolDispatchGuard, EPOCH_TICK_INTERVAL_MS,
-    PLUGIN_IDLE_EVICT_MS, RELEASABLE_SHARED_PLUGINS,
+    DispatchCostClass, DispatchHandle, GmFairnessGuard, LaneWaitReport, PluginDispatchError,
+    PluginFiberLifecycle, ProjectPlugins, SharedPluginPool, SlotContentSnapshot, ToolDispatchGuard,
+    ToolQueueWaitReport, EPOCH_TICK_INTERVAL_MS, PLUGIN_IDLE_EVICT_MS, RELEASABLE_SHARED_PLUGINS,
 };
 pub use windowless::{apply_windowless, ensure_hidden_console};
 

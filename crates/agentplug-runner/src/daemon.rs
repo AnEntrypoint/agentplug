@@ -11,8 +11,9 @@ use fs2::FileExt;
 use wasmtime::{Engine, Module, Trap};
 
 use agentplug_host::{
-    build_engine, install_dir, now_ms, read_project_plugin_list, DispatchHandle, GmFairnessGuard,
-    ProjectPlugins, ToolDispatchGuard,
+    build_engine, dispatch_serial_lane, install_dir, now_ms, read_project_plugin_list,
+    DispatchHandle, GmFairnessGuard, LaneWaitReport, ProjectPlugins, ToolDispatchGuard,
+    ToolQueueWaitReport,
 };
 
 use crate::download::{
@@ -937,12 +938,70 @@ pub fn claim_spool_launcher_slot(spool_dir: &Path) -> bool {
     true
 }
 
-pub fn arm_spool_launcher_deadline() {
-    std::thread::spawn(|| {
+fn standalone_watcher_slot() -> &'static Mutex<Option<(PathBuf, fs::File)>> {
+    static SLOT: OnceLock<Mutex<Option<(PathBuf, fs::File)>>> = OnceLock::new();
+    SLOT.get_or_init(|| Mutex::new(None))
+}
+
+pub fn claim_standalone_watcher_slot(spool_dir: &Path) -> bool {
+    let Ok(mut held) = standalone_watcher_slot().lock() else {
+        return false;
+    };
+    if let Some((held_spool_dir, _)) = held.as_ref() {
+        return held_spool_dir == spool_dir;
+    }
+    let slot = spool_dir.join(".standalone-watcher.pid");
+    let Ok(mut file) = fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(slot)
+    else {
+        return false;
+    };
+    if file.try_lock_exclusive().is_err() {
+        return false;
+    }
+    if file.set_len(0).is_err()
+        || file
+            .write_all(std::process::id().to_string().as_bytes())
+            .is_err()
+    {
+        let _ = file.unlock();
+        return false;
+    }
+    *held = Some((spool_dir.to_path_buf(), file));
+    true
+}
+
+pub fn release_standalone_watcher_slot(spool_dir: &Path) {
+    let Ok(mut held) = standalone_watcher_slot().lock() else {
+        return;
+    };
+    if held
+        .as_ref()
+        .is_some_and(|(held_spool_dir, _)| held_spool_dir == spool_dir)
+    {
+        *held = None;
+    }
+}
+
+pub fn shared_daemon_is_serving() -> bool {
+    shared_daemon_owner_that_would_refuse_this_process().is_some()
+}
+
+pub fn arm_spool_launcher_deadline() -> Arc<std::sync::atomic::AtomicBool> {
+    let disarmed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let deadline_disarmed = disarmed.clone();
+    std::thread::spawn(move || {
         std::thread::sleep(SPOOL_LAUNCHER_HARD_DEADLINE);
+        if deadline_disarmed.load(std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
         eprintln!("[agentplug] spool launcher exceeded {}s without converging -- exiting so a wedged launch never lingers", SPOOL_LAUNCHER_HARD_DEADLINE.as_secs());
         std::process::exit(2);
     });
+    disarmed
 }
 
 #[cfg(not(windows))]
@@ -1568,6 +1627,7 @@ fn write_daemon_heartbeat(project_count: usize, plugin_module_count: usize) {
             "last_handoff_attempt_ts": handoff_attempt.as_ref().map(|(ts, _)| serde_json::json!(ts)).unwrap_or(serde_json::Value::Null),
             "last_handoff_error": handoff_attempt.as_ref().and_then(|(_, err)| err.clone()),
             "last_completed_runner_swap": read_last_completed_runner_swap().unwrap_or(serde_json::Value::Null),
+            "runner_version_parity": runner_version_parity_json(),
             "runner_update_trust_mode": crate::update_trust::runner_mode_str(),
             "runner_signature_required": crate::update_trust::strict_mode(),
             "runner_unverified_update": crate::update_trust::unverified_promotion().unwrap_or(serde_json::Value::Null),
@@ -1589,15 +1649,171 @@ fn last_completed_runner_swap_path() -> PathBuf {
 }
 
 fn record_completed_runner_swap(version: &str) {
-    let _ = fs::write(
-        last_completed_runner_swap_path(),
-        serde_json::json!({ "version": version, "swapped_at_ts": now_ms() }).to_string(),
-    );
+    let sha256 = canonical_runner_exe_path()
+        .and_then(|p| fs::read(p).ok())
+        .map(|bytes| crate::download::sha256_hex(&bytes));
+    let mut record = serde_json::json!({ "version": version, "swapped_at_ts": now_ms() });
+    if let Some(sha256) = sha256 {
+        record["sha256"] = serde_json::json!(sha256);
+    }
+    let _ = fs::write(last_completed_runner_swap_path(), record.to_string());
 }
 
 fn read_last_completed_runner_swap() -> Option<serde_json::Value> {
     let text = fs::read_to_string(last_completed_runner_swap_path()).ok()?;
     serde_json::from_str(&text).ok()
+}
+
+fn read_recorded_swap_field(field: &str) -> Option<String> {
+    read_last_completed_runner_swap()?
+        .get(field)?
+        .as_str()
+        .map(|s| s.to_string())
+}
+
+struct RunnerVersionParity {
+    exe: Option<String>,
+    sha256: Option<String>,
+    exe_reported_version: Option<String>,
+    compiled_version: String,
+    installed_version_file: Option<String>,
+    recorded_swap_version: Option<String>,
+    recorded_swap_sha256: Option<String>,
+    pinned_local_build_sha256: Option<String>,
+}
+
+fn exe_reported_runner_version(exe: &Path) -> Option<String> {
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("--version");
+    agentplug_host::apply_windowless(&mut cmd);
+    let out = cmd.output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let version = String::from_utf8_lossy(&out.stdout)
+        .split_whitespace()
+        .last()
+        .unwrap_or_default()
+        .trim_start_matches('v')
+        .to_string();
+    if version.is_empty() {
+        None
+    } else {
+        Some(version)
+    }
+}
+
+fn probe_runner_version_parity() -> RunnerVersionParity {
+    let exe = canonical_runner_exe_path();
+    let sha256 = exe
+        .as_ref()
+        .and_then(|p| fs::read(p).ok())
+        .map(|b| crate::download::sha256_hex(&b));
+    let pinned_local_build_sha256 = crate::download::local_build_pin_record()
+        .as_ref()
+        .and_then(|v| v.get("sha256"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    RunnerVersionParity {
+        exe: exe.as_ref().map(|p| p.display().to_string()),
+        sha256,
+        exe_reported_version: exe.as_ref().and_then(|p| exe_reported_runner_version(p)),
+        compiled_version: env!("CARGO_PKG_VERSION").to_string(),
+        installed_version_file: installed_runner_version(),
+        recorded_swap_version: read_recorded_swap_field("version"),
+        recorded_swap_sha256: read_recorded_swap_field("sha256"),
+        pinned_local_build_sha256,
+    }
+}
+
+impl RunnerVersionParity {
+    fn live_sha256(&self) -> &str {
+        self.sha256.as_deref().unwrap_or("unreadable")
+    }
+
+    fn sha_matches(&self, candidate: Option<&String>) -> bool {
+        candidate
+            .map(|c| c.eq_ignore_ascii_case(self.live_sha256()))
+            .unwrap_or(false)
+    }
+
+    fn installed_by_recorded_swap(&self) -> bool {
+        self.sha_matches(self.recorded_swap_sha256.as_ref())
+    }
+
+    fn installed_by_local_build_pin(&self) -> bool {
+        self.sha_matches(self.pinned_local_build_sha256.as_ref())
+    }
+
+    fn disagreements(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        let live = self.live_sha256();
+        if !self.installed_by_recorded_swap() && !self.installed_by_local_build_pin() {
+            if self.recorded_swap_sha256.is_none() && self.pinned_local_build_sha256.is_none() {
+                out.push(format!(
+                    "no completed runner swap and no local-build pin names which bytes should be live, so this daemon runs sha256 {live} on trust alone"
+                ));
+            } else {
+                out.push(format!(
+                    "this daemon runs sha256 {live} but the last completed runner swap names sha256 {} and the local-build pin names sha256 {} -- the live bytes were installed by neither",
+                    self.recorded_swap_sha256.as_deref().unwrap_or("none"),
+                    self.pinned_local_build_sha256.as_deref().unwrap_or("none")
+                ));
+            }
+        }
+        if let Some(reported) = self.exe_reported_version.as_deref() {
+            if reported != self.compiled_version {
+                out.push(format!(
+                    "the runner exe at {} reports --version {reported} but this daemon was compiled as {} -- the exe on disk was replaced after this process started",
+                    self.exe.as_deref().unwrap_or("an unresolvable path"),
+                    self.compiled_version
+                ));
+            }
+        }
+        if let Some(installed) = self.installed_version_file.as_deref() {
+            if installed != self.compiled_version {
+                out.push(format!(
+                    "{} records {installed} but this daemon was compiled as {} -- the version file and the live binary disagree",
+                    crate::download::runner_version_path().display(),
+                    self.compiled_version
+                ));
+            }
+        }
+        if let Some(swap) = self.recorded_swap_version.as_deref() {
+            if swap != self.compiled_version && !self.installed_by_local_build_pin() {
+                out.push(format!(
+                    "the last completed runner swap records version {swap} but this daemon was compiled as {} and is not the pinned local build -- the bytes that are meant to be live are not the bytes running",
+                    self.compiled_version
+                ));
+            }
+        }
+        out
+    }
+
+    fn json(&self) -> serde_json::Value {
+        let disagreements = self.disagreements();
+        serde_json::json!({
+            "agrees": disagreements.is_empty(),
+            "exe": self.exe,
+            "exe_sha256": self.sha256,
+            "exe_reported_version": self.exe_reported_version,
+            "compiled_version": self.compiled_version,
+            "installed_version_file": self.installed_version_file,
+            "recorded_swap_version": self.recorded_swap_version,
+            "recorded_swap_sha256": self.recorded_swap_sha256,
+            "pinned_local_build_sha256": self.pinned_local_build_sha256,
+            "disagreements": disagreements,
+        })
+    }
+}
+
+fn runner_version_parity() -> &'static RunnerVersionParity {
+    static SLOT: OnceLock<RunnerVersionParity> = OnceLock::new();
+    SLOT.get_or_init(probe_runner_version_parity)
+}
+
+fn runner_version_parity_json() -> serde_json::Value {
+    runner_version_parity().json()
 }
 
 fn canonical_runner_exe_path() -> Option<PathBuf> {
@@ -1675,15 +1891,16 @@ fn cached_staged_runner() -> Option<(u64, u64)> {
         .unwrap_or_else(|e| e.into_inner())
 }
 
-fn write_project_heartbeat(spool_dir: &Path, busy_until: Option<u64>) {
-    write_project_heartbeat_with_queue_info(spool_dir, busy_until, None);
+fn write_project_heartbeat(root: &Path, busy_until: Option<u64>) {
+    write_project_heartbeat_with_queue_info(root, busy_until, None);
 }
 
 fn write_project_heartbeat_with_queue_info(
-    spool_dir: &Path,
+    root: &Path,
     busy_until: Option<u64>,
     queue_info: Option<(usize, usize)>,
 ) {
+    let spool_dir = spool_dir_of(root);
     let status_path = spool_dir.join(".status.json");
     let mut payload = match fs::read_to_string(&status_path)
         .ok()
@@ -1706,7 +1923,7 @@ fn write_project_heartbeat_with_queue_info(
         payload["queue_position"] = serde_json::json!(position);
         payload["queue_depth"] = serde_json::json!(total);
     }
-    let (queued_steps, claimed_steps) = spool_step_counts(spool_dir);
+    let (queued_steps, claimed_steps) = spool_step_counts(root);
     payload["queued_step_count"] = serde_json::json!(queued_steps);
     payload["claimed_step_count"] = serde_json::json!(claimed_steps);
     payload["gm_processor_capacity"] =
@@ -1764,6 +1981,29 @@ pub fn read_known_project_roots() -> Vec<PathBuf> {
         .clone()
 }
 
+const IDLE_PROJECT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
+
+fn project_heartbeat_last_write() -> &'static Mutex<HashMap<PathBuf, Instant>> {
+    static SLOT: OnceLock<Mutex<HashMap<PathBuf, Instant>>> = OnceLock::new();
+    SLOT.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn project_heartbeat_due(root: &Path, has_queued_work: bool) -> bool {
+    let now = Instant::now();
+    let mut last_writes = project_heartbeat_last_write()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let due = has_queued_work
+        || match last_writes.get(root) {
+            Some(at) => now.saturating_duration_since(*at) >= IDLE_PROJECT_HEARTBEAT_INTERVAL,
+            None => true,
+        };
+    if due {
+        last_writes.insert(root.to_path_buf(), now);
+    }
+    due
+}
+
 fn spawn_project_heartbeat_ticker(interval: Duration) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || loop {
         std::thread::sleep(interval);
@@ -1775,11 +2015,15 @@ fn spawn_project_heartbeat_ticker(interval: Duration) -> std::thread::JoinHandle
             .unwrap_or_else(|e| e.into_inner())
             .clone();
         for root in roots {
-            let spool_dir = root.join(".gm").join("exec-spool");
+            let spool_dir = spool_dir_of(&root);
             if !spool_dir.exists() {
                 continue;
             }
-            write_project_heartbeat(&spool_dir, busy_until_for_project_ticker(&root, &spool_dir));
+            let (queued, claimed) = spool_step_counts(&root);
+            if !project_heartbeat_due(&root, queued + claimed > 0) {
+                continue;
+            }
+            write_project_heartbeat(&root, busy_until_for_project_ticker(&root));
         }
     })
 }
@@ -1889,8 +2133,12 @@ fn spawn_dream_rsi_cycle_ticker(interval: Duration) -> std::thread::JoinHandle<(
     })
 }
 
-fn read_status_busy_until_if_future(spool_dir: &Path) -> Option<u64> {
-    let text = fs::read_to_string(spool_dir.join(".status.json")).ok()?;
+fn spool_dir_of(root: &Path) -> PathBuf {
+    root.join(".gm").join("exec-spool")
+}
+
+fn read_status_busy_until_if_future(root: &Path) -> Option<u64> {
+    let text = fs::read_to_string(spool_dir_of(root).join(".status.json")).ok()?;
     let value: serde_json::Value = serde_json::from_str(&text).ok()?;
     let busy_until = value.get("busy_until")?.as_u64()?;
     (busy_until > now_ms()).then_some(busy_until)
@@ -1898,43 +2146,46 @@ fn read_status_busy_until_if_future(spool_dir: &Path) -> Option<u64> {
 
 const TICKER_BUSY_UNTIL_EXTEND_MS: u64 = 60_000;
 
-fn busy_until_for_project_ticker(root: &Path, spool_dir: &Path) -> Option<u64> {
-    if project_in_flight_count(root) > 0 || spool_has_queued_work(spool_dir) {
+fn busy_until_for_project_ticker(root: &Path) -> Option<u64> {
+    if project_in_flight_count(root) > 0 || spool_has_queued_work(root) {
         return Some(now_ms() + TICKER_BUSY_UNTIL_EXTEND_MS);
     }
-    read_status_busy_until_if_future(spool_dir)
+    read_status_busy_until_if_future(root)
 }
 
-fn spool_has_queued_work(spool_dir: &Path) -> bool {
-    let in_dir = spool_dir.join("in");
-    let Ok(verbs) = fs::read_dir(&in_dir) else {
-        return false;
-    };
-    for verb_entry in verbs.flatten() {
-        if !verb_entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-            continue;
-        }
-        let verb = verb_entry.file_name().to_string_lossy().into_owned();
-        let Ok(files) = fs::read_dir(verb_entry.path()) else {
-            continue;
-        };
-        for file_entry in files.flatten() {
-            let name = file_entry.file_name();
-            let name = name.to_string_lossy();
-            if name.ends_with(".inflight") || is_spool_request_path(&verb, &file_entry.path()) {
-                return true;
-            }
-        }
+const SPOOL_SCAN_BACKSTOP_TTL: Duration = Duration::from_secs(30);
+
+struct RootScan {
+    at: Instant,
+    claimable: bool,
+    has_queued_work: bool,
+    queued_steps: usize,
+    claimed_steps: usize,
+}
+
+fn spool_dirty_roots() -> &'static Mutex<HashSet<PathBuf>> {
+    static SLOT: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+    SLOT.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn mark_spool_dirty(root: &Path) {
+    if let Ok(mut dirty) = spool_dirty_roots().lock() {
+        dirty.insert(root.to_path_buf());
     }
-    false
 }
 
-fn spool_step_counts(spool_dir: &Path) -> (usize, usize) {
+fn root_scan_cache() -> &'static Mutex<HashMap<PathBuf, RootScan>> {
+    static SLOT: OnceLock<Mutex<HashMap<PathBuf, RootScan>>> = OnceLock::new();
+    SLOT.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn count_spool_steps(root: &Path) -> (bool, usize, usize) {
     let mut queued = 0usize;
     let mut claimed = 0usize;
-    let in_dir = spool_dir.join("in");
-    let Ok(verbs) = fs::read_dir(in_dir) else {
-        return (queued, claimed);
+    let mut has_queued_work = false;
+    let in_dir = spool_dir_of(root).join("in");
+    let Ok(verbs) = fs::read_dir(&in_dir) else {
+        return (has_queued_work, queued, claimed);
     };
     for verb_entry in verbs.flatten() {
         if !verb_entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
@@ -1945,15 +2196,73 @@ fn spool_step_counts(spool_dir: &Path) -> (usize, usize) {
             continue;
         };
         for file_entry in files.flatten() {
-            let name = file_entry.file_name();
-            let name = name.to_string_lossy();
+            let name = file_entry.file_name().to_string_lossy().into_owned();
             if is_spool_request_path(&verb, &file_entry.path()) {
                 queued += 1;
+                has_queued_work = true;
             } else if name.ends_with(".inflight") {
                 claimed += 1;
+                has_queued_work = true;
             }
         }
     }
+    (has_queued_work, queued, claimed)
+}
+
+fn cached_root_scan(root: &Path) -> (bool, bool, usize, usize) {
+    let now = Instant::now();
+    let dirty = spool_dirty_roots()
+        .lock()
+        .map(|d| d.contains(root))
+        .unwrap_or(true);
+    if !dirty {
+        let cached = root_scan_cache().lock().ok().and_then(|cache| {
+            cache.get(root).map(|s| {
+                (
+                    s.at,
+                    s.claimable,
+                    s.has_queued_work,
+                    s.queued_steps,
+                    s.claimed_steps,
+                )
+            })
+        });
+        if let Some((at, claimable, has_queued_work, queued_steps, claimed_steps)) = cached {
+            if now.saturating_duration_since(at) < SPOOL_SCAN_BACKSTOP_TTL {
+                return (claimable, has_queued_work, queued_steps, claimed_steps);
+            }
+        }
+    }
+    let queued_work = project_has_queued_spool_work(root);
+    let counted = count_spool_steps(root);
+    let scan = RootScan {
+        at: Instant::now(),
+        claimable: queued_work,
+        has_queued_work: counted.0,
+        queued_steps: counted.1,
+        claimed_steps: counted.2,
+    };
+    let result = (
+        scan.claimable,
+        scan.has_queued_work,
+        scan.queued_steps,
+        scan.claimed_steps,
+    );
+    if let Ok(mut cache) = root_scan_cache().lock() {
+        cache.insert(root.to_path_buf(), scan);
+    }
+    if let Ok(mut dirty) = spool_dirty_roots().lock() {
+        dirty.remove(root);
+    }
+    result
+}
+
+fn spool_has_queued_work(root: &Path) -> bool {
+    cached_root_scan(root).1
+}
+
+fn spool_step_counts(root: &Path) -> (usize, usize) {
+    let (_, _, queued, claimed) = cached_root_scan(root);
     (queued, claimed)
 }
 
@@ -2482,6 +2791,112 @@ pub(crate) fn in_flight_map() -> &'static Mutex<HashMap<InFlightKey, InFlightHan
 }
 
 const MAX_CLAIMED_DISPATCHES_PER_PROJECT: usize = 32;
+
+const LANE_WAIT_MAX_MS_DEFAULT: u64 = 120_000;
+const DISPATCH_WAIT_LEDGER_FILE: &str = ".dispatch-wait.json";
+const LEDGER_REFRESH_MIN_INTERVAL_MS: u64 = 250;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DispatchStage {
+    WaitingForLane,
+    WaitingForToolQueue,
+    Running,
+}
+
+struct DispatchWaitRecord {
+    claimed_at_ms: u64,
+    stage: DispatchStage,
+    stage_since_ms: u64,
+    lane: Option<&'static str>,
+    thread: std::thread::ThreadId,
+}
+
+fn dispatch_wait_records() -> &'static Mutex<HashMap<InFlightKey, DispatchWaitRecord>> {
+    static RECORDS: OnceLock<Mutex<HashMap<InFlightKey, DispatchWaitRecord>>> = OnceLock::new();
+    RECORDS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn note_dispatch_stage(
+    root: &Path,
+    verb: &str,
+    task: &str,
+    stage: DispatchStage,
+    lane: Option<&'static str>,
+) {
+    let key = (root.to_path_buf(), verb.to_string(), task.to_string());
+    let now = now_ms();
+    {
+        let mut records = dispatch_wait_records()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let claimed_at_ms = records
+            .get(&key)
+            .map(|record| record.claimed_at_ms)
+            .unwrap_or(now);
+        records.insert(
+            key,
+            DispatchWaitRecord {
+                claimed_at_ms,
+                stage,
+                stage_since_ms: now,
+                lane,
+                thread: std::thread::current().id(),
+            },
+        );
+    }
+    publish_dispatch_wait_ledger(root);
+}
+
+fn ledger_last_refresh_ms() -> &'static Mutex<HashMap<PathBuf, u64>> {
+    static LAST: OnceLock<Mutex<HashMap<PathBuf, u64>>> = OnceLock::new();
+    LAST.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn publish_dispatch_wait_ledger(root: &Path) {
+    let now = now_ms();
+    {
+        let mut last = ledger_last_refresh_ms()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if now.saturating_sub(last.get(root).copied().unwrap_or(0)) < LEDGER_REFRESH_MIN_INTERVAL_MS
+        {
+            return;
+        }
+        last.insert(root.to_path_buf(), now);
+    }
+    refresh_dispatch_wait_ledger(root);
+}
+
+fn dispatch_wait_record(root: &Path, verb: &str, task: &str) -> Option<DispatchWaitRecord> {
+    let key = (root.to_path_buf(), verb.to_string(), task.to_string());
+    let records = dispatch_wait_records()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let record = records.get(&key)?;
+    Some(DispatchWaitRecord {
+        claimed_at_ms: record.claimed_at_ms,
+        stage: record.stage,
+        stage_since_ms: record.stage_since_ms,
+        lane: record.lane,
+        thread: record.thread,
+    })
+}
+
+fn forget_dispatch_wait_record(root: &Path, verb: &str, task: &str) {
+    let key = (root.to_path_buf(), verb.to_string(), task.to_string());
+    dispatch_wait_records()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&key);
+}
+
+fn dispatch_stage_name(stage: DispatchStage) -> &'static str {
+    match stage {
+        DispatchStage::WaitingForLane => "claimed_waiting_for_serial_lane",
+        DispatchStage::WaitingForToolQueue => "claimed_waiting_for_tool_queue",
+        DispatchStage::Running => "claimed_running",
+    }
+}
 
 fn project_in_flight_count(root: &Path) -> usize {
     in_flight_map()
@@ -3059,10 +3474,22 @@ pub fn sweep_unconsumable_spool_files(root: &Path) {
         return;
     };
     for verb_entry in verb_dirs.flatten() {
+        let verb = verb_entry.file_name().to_string_lossy().into_owned();
         if !verb_entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            if verb.is_empty() {
+                continue;
+            }
+            let _ = fs::create_dir_all(&quarantine_dir);
+            let dest = quarantine_dir.join(format!("_toplevel__{verb}"));
+            if fs::rename(&verb_entry.path(), &dest).is_ok() {
+                eprintln!(
+                    "[agentplug daemon] quarantined stray file in/{verb} to {} -- the spool ABI puts every request in/<verb>/<file>, so a file sitting directly in in/ is never claimed by the dispatch loop and would otherwise sit invisibly forever{}",
+                    dest.display(),
+                    if verb.contains("${") { " (its name still holds an unexpanded shell template)" } else { "" }
+                );
+            }
             continue;
         }
-        let verb = verb_entry.file_name().to_string_lossy().into_owned();
         let Ok(files) = fs::read_dir(verb_entry.path()) else {
             continue;
         };
@@ -3092,6 +3519,242 @@ pub fn sweep_unconsumable_spool_files(root: &Path) {
             }
         }
     }
+}
+
+const SPOOL_OUT_REAP_INTERVAL_MS: u64 = 60 * 1000;
+const SPOOL_OUT_MIN_AGE_MS: u64 = 10 * 60 * 1000;
+const SPOOL_OUT_DEFAULT_MAX_FILES: usize = 3000;
+const SPOOL_OUT_DEFAULT_MAX_AGE_MS: u64 = 24 * 60 * 60 * 1000;
+const SPOOL_OUT_MAX_REAP_PER_PASS: usize = 1500;
+
+fn spool_out_env_usize(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
+}
+
+fn spool_out_env_u64(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
+}
+
+fn spool_out_max_files() -> usize {
+    spool_out_env_usize("GM_SPOOL_OUT_MAX_FILES", SPOOL_OUT_DEFAULT_MAX_FILES)
+}
+
+fn spool_out_max_age_ms() -> u64 {
+    spool_out_env_u64("GM_SPOOL_OUT_MAX_AGE_MS", SPOOL_OUT_DEFAULT_MAX_AGE_MS)
+}
+
+fn spool_out_reap_timestamps() -> &'static Mutex<HashMap<PathBuf, u64>> {
+    static SLOT: OnceLock<Mutex<HashMap<PathBuf, u64>>> = OnceLock::new();
+    SLOT.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn out_file_age_ms(metadata: &fs::Metadata, now: u64) -> u64 {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as u64)
+        .map(|modified_ms| now.saturating_sub(modified_ms))
+        .unwrap_or(0)
+}
+
+fn out_meta_stamp_ms(metadata: &fs::Metadata, now: u64) -> u64 {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(now)
+}
+
+fn out_stamp_ms(stem: &str) -> Option<u64> {
+    let mut tail = stem.rsplitn(3, '-');
+    let seq = tail.next().unwrap_or_default();
+    let stamp = tail.next().unwrap_or_default();
+    if seq.is_empty() || !seq.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    if stamp.len() < 12 || !stamp.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    stamp.parse::<u64>().ok()
+}
+
+fn remove_out_file_and_markers(path: &Path) {
+    let file_name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let stem = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    if let Some(parent) = path.parent() {
+        if !file_name.is_empty() {
+            let mut ready = file_name.clone();
+            ready.push_str(".ready");
+            let _ = fs::remove_file(parent.join(&ready));
+        }
+        if !stem.is_empty() {
+            let _ = fs::remove_file(parent.join(format!("{stem}.txt")));
+        }
+    }
+    let _ = fs::remove_file(path);
+}
+
+fn live_out_stems(root: &Path) -> HashSet<String> {
+    let in_dir = spool_dir_of_root(root).join("in");
+    let mut live: HashSet<String> = HashSet::new();
+    let Ok(verb_dirs) = fs::read_dir(&in_dir) else {
+        return live;
+    };
+    for verb_entry in verb_dirs.flatten() {
+        if !verb_entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let verb = verb_entry.file_name().to_string_lossy().into_owned();
+        let Ok(files) = fs::read_dir(verb_entry.path()) else {
+            continue;
+        };
+        for file_entry in files.flatten() {
+            if !file_entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+                continue;
+            }
+            let file_name = file_entry.file_name().to_string_lossy().into_owned();
+            let without_claim = file_name
+                .strip_suffix(&format!(".{ORPHAN_CLAIM_EXT}"))
+                .unwrap_or(file_name.as_str());
+            let task = without_claim
+                .rsplit_once('.')
+                .map(|(head, _)| head)
+                .unwrap_or(without_claim);
+            if !task.is_empty() {
+                live.insert(format!("{verb}-{task}"));
+            }
+        }
+    }
+    live
+}
+
+pub fn reap_spool_out_files(root: &Path, force: bool) -> usize {
+    let spool_dir = spool_dir_of_root(root);
+    let out_dir = spool_dir.join("out");
+    let now = now_ms();
+    if !force {
+        let mut last = spool_out_reap_timestamps()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if now.saturating_sub(last.get(root).copied().unwrap_or(0)) < SPOOL_OUT_REAP_INTERVAL_MS {
+            return 0;
+        }
+        last.insert(root.to_path_buf(), now);
+    }
+    let Ok(entries) = fs::read_dir(&out_dir) else {
+        return 0;
+    };
+    let live = live_out_stems(root);
+
+    struct OutRow {
+        path: PathBuf,
+        stem: String,
+        stamp_ms: u64,
+    }
+    let mut rows: Vec<OutRow> = Vec::new();
+    let mut total_entries = 0usize;
+    let mut stat_fallbacks = 0usize;
+    let mut stale_tmp = 0usize;
+    for entry in entries.flatten() {
+        total_entries += 1;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.contains(".tmp.") {
+            let age_ms = entry
+                .metadata()
+                .ok()
+                .map(|m| out_file_age_ms(&m, now))
+                .unwrap_or(0);
+            if age_ms >= SPOOL_OUT_MIN_AGE_MS && fs::remove_file(entry.path()).is_ok() {
+                stale_tmp += 1;
+            }
+            continue;
+        }
+        if !name.ends_with(".json") {
+            continue;
+        }
+        let stem = entry
+            .path()
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let stamp_ms = match out_stamp_ms(&stem) {
+            Some(ms) => ms,
+            None => {
+                stat_fallbacks += 1;
+                entry
+                    .metadata()
+                    .ok()
+                    .map(|m| out_meta_stamp_ms(&m, now))
+                    .unwrap_or(now)
+            }
+        };
+        rows.push(OutRow {
+            path: entry.path(),
+            stem,
+            stamp_ms,
+        });
+    }
+
+    rows.sort_by_key(|row| row.stamp_ms);
+    let max_files = spool_out_max_files();
+    let max_age_ms = spool_out_max_age_ms();
+    let keep_json = if total_entries > max_files && !rows.is_empty() {
+        ((max_files * rows.len()) / total_entries).clamp(1, rows.len())
+    } else {
+        rows.len()
+    };
+    let over_cap = rows.len().saturating_sub(keep_json);
+    let mut reaped = 0usize;
+    for (index, row) in rows.iter().enumerate() {
+        if reaped >= SPOOL_OUT_MAX_REAP_PER_PASS {
+            break;
+        }
+        let age_ms = now.saturating_sub(row.stamp_ms);
+        if age_ms < SPOOL_OUT_MIN_AGE_MS {
+            break;
+        }
+        if live.contains(&row.stem) {
+            continue;
+        }
+        let over_count_cap = index < over_cap;
+        let expired_by_age = age_ms >= max_age_ms;
+        if !(over_count_cap || expired_by_age) {
+            continue;
+        }
+        remove_out_file_and_markers(&row.path);
+        reaped += 1;
+    }
+    if reaped > 0 || stale_tmp > 0 {
+        eprintln!(
+            "[agentplug daemon] reaped {} answered out-file(s) and {} stale tmp file(s) under {} -- out/ had {} entries ({} json, {} needed a stat), capped at {} files / {}h, {} dispatches still live",
+            reaped,
+            stale_tmp,
+            out_dir.display(),
+            total_entries,
+            rows.len(),
+            stat_fallbacks,
+            max_files,
+            max_age_ms / (60 * 60 * 1000),
+            live.len()
+        );
+    }
+    reaped
 }
 
 const RAW_PLUGIN_SPOOL_VERBS: &[&str] = &["libsql", "bert"];
@@ -3129,6 +3792,138 @@ pub(crate) fn last_measured_dispatch_queue_wait_ms() -> u64 {
     LAST_MEASURED_DISPATCH_QUEUE_WAIT_MS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+fn admission_starved_answer(
+    root: &Path,
+    verb: &str,
+    task: &str,
+    lane: Option<&'static str>,
+    kind: &'static str,
+    waited_ms: u64,
+    limit: usize,
+    in_flight: usize,
+    slots: usize,
+) -> String {
+    let spool_dir = spool_dir_of_root(root);
+    let (request_path, claim_path, out_path) = unanswered_spool_paths(&spool_dir, verb, task);
+    serde_json::json!({
+        "ok": false,
+        "error_code": "dispatch_starved_waiting_for_admission",
+        "verb": verb,
+        "task": task,
+        "lane": lane,
+        "admission_kind": kind,
+        "admission_in_flight": in_flight,
+        "admission_limit": limit,
+        "plugin_slots": slots,
+        "waited_ms": waited_ms,
+        "daemon_pid": std::process::id(),
+        "request_path": request_path.to_string_lossy(),
+        "claim_path": claim_path.to_string_lossy(),
+        "out_path": out_path.to_string_lossy(),
+        "dispatch_wait_ledger": spool_dir.join(DISPATCH_WAIT_LEDGER_FILE).to_string_lossy(),
+        "executed": false,
+        "re_dispatch_safe": true,
+        "error": format!(
+            "verb {} (task {}) was claimed by daemon pid {} but never entered the {} admission gate within {}ms -- {} dispatches already hold the {} admitted slots of {}, so it was NOT executed and re-dispatching is safe. Live state for every unanswered request is in {}.",
+            verb, task, std::process::id(), kind, waited_ms, in_flight, limit, slots,
+            spool_dir.join(DISPATCH_WAIT_LEDGER_FILE).display()
+        ),
+    })
+    .to_string()
+}
+
+fn unanswered_spool_paths(spool_dir: &Path, verb: &str, task: &str) -> (PathBuf, PathBuf, PathBuf) {
+    let in_dir = spool_dir.join("in");
+    let out_dir = spool_dir.join("out");
+    let request_path = in_dir.join(verb).join(format!("{task}.txt"));
+    let claim_path = inflight_claim_path(&in_dir, verb, task);
+    let out_path = out_dir.join(format!("{verb}-{task}.json"));
+    (request_path, claim_path, out_path)
+}
+
+fn spool_dir_of_root(root: &Path) -> PathBuf {
+    root.join(".gm").join("exec-spool")
+}
+
+fn lane_wait_max() -> Duration {
+    Duration::from_millis(env_ms_or(
+        "AGENTPLUG_LANE_WAIT_MAX_MS",
+        LANE_WAIT_MAX_MS_DEFAULT,
+    ))
+}
+
+fn lane_starved_answer(
+    root: &Path,
+    verb: &str,
+    task: &str,
+    lane: Option<&'static str>,
+    report: &LaneWaitReport,
+) -> String {
+    let spool_dir = spool_dir_of_root(root);
+    let (request_path, claim_path, out_path) = unanswered_spool_paths(&spool_dir, verb, task);
+    serde_json::json!({
+        "ok": false,
+        "error_code": "dispatch_starved_waiting_for_serial_lane",
+        "verb": verb,
+        "task": task,
+        "lane": lane,
+        "waited_ms": report.waited_ms,
+        "lane_waiters": report.waiters,
+        "lane_holder_task": report.lane_holder_task,
+        "daemon_pid": std::process::id(),
+        "request_path": request_path.to_string_lossy(),
+        "claim_path": claim_path.to_string_lossy(),
+        "out_path": out_path.to_string_lossy(),
+        "dispatch_wait_ledger": spool_dir.join(DISPATCH_WAIT_LEDGER_FILE).to_string_lossy(),
+        "executed": false,
+        "re_dispatch_safe": true,
+        "error": format!(
+            "verb {} (task {}) was claimed by daemon pid {} but never reached the {} serial lane within {}ms, so it was NOT executed -- re-dispatching is safe because nothing ran. The lane is held by one dispatch at a time per project (git, store, state lanes); holder task {}. Live state for every unanswered request is in {}.",
+            verb, task, std::process::id(), lane.unwrap_or("unassigned"), report.waited_ms,
+            report.lane_holder_task.as_deref().unwrap_or("unknown"),
+            spool_dir.join(DISPATCH_WAIT_LEDGER_FILE).display()
+        ),
+    })
+    .to_string()
+}
+
+fn tool_queue_starved_answer(
+    root: &Path,
+    verb: &str,
+    task: &str,
+    lane: Option<&'static str>,
+    report: &ToolQueueWaitReport,
+) -> String {
+    let spool_dir = spool_dir_of_root(root);
+    let (request_path, claim_path, out_path) = unanswered_spool_paths(&spool_dir, verb, task);
+    let queue_key = report.queue_key.replace('\u{0}', "/");
+    serde_json::json!({
+        "ok": false,
+        "error_code": "dispatch_starved_waiting_for_tool_queue",
+        "verb": verb,
+        "task": task,
+        "lane": lane,
+        "tool_queue": queue_key,
+        "queue_position": report.position,
+        "queue_holder_task": report.holder_task,
+        "waited_ms": report.waited_ms,
+        "daemon_pid": std::process::id(),
+        "request_path": request_path.to_string_lossy(),
+        "claim_path": claim_path.to_string_lossy(),
+        "out_path": out_path.to_string_lossy(),
+        "dispatch_wait_ledger": spool_dir.join(DISPATCH_WAIT_LEDGER_FILE).to_string_lossy(),
+        "executed": false,
+        "re_dispatch_safe": true,
+        "error": format!(
+            "verb {} (task {}) was claimed by daemon pid {} but never reached the front of the global {} FIFO within {}ms, so it was NOT executed -- re-dispatching is safe because nothing ran. That queue is global across every project this daemon serves, not per project; holder task {}. Live state for every unanswered request is in {}.",
+            verb, task, std::process::id(), queue_key, report.waited_ms,
+            report.holder_task.as_deref().unwrap_or("unknown"),
+            spool_dir.join(DISPATCH_WAIT_LEDGER_FILE).display()
+        ),
+    })
+    .to_string()
+}
+
 pub(crate) fn run_gm_dispatch_to_file(
     root: &Path,
     handle: &DispatchHandle,
@@ -3162,8 +3957,51 @@ pub(crate) fn run_gm_dispatch_to_file(
     } else {
         inner_verb_owned.as_str()
     };
-    let _fairness_guard = GmFairnessGuard::acquire(root, tool_verb, body);
-    let _tool_guard = ToolDispatchGuard::acquire(plugin_name, tool_verb, body);
+    let lane = dispatch_serial_lane(tool_verb, body);
+    let in_dir = root.join(".gm").join("exec-spool").join("in");
+    note_dispatch_stage(root, verb, task, DispatchStage::WaitingForLane, lane);
+    let _fairness_guard = match GmFairnessGuard::acquire_within(
+        root,
+        tool_verb,
+        body,
+        task,
+        lane_wait_max(),
+    ) {
+        Ok(guard) => guard,
+        Err(report) => {
+            let out_body = lane_starved_answer(root, verb, task, lane, &report);
+            eprintln!(
+                "[agentplug daemon] {verb}/{task} for {} was claimed but never reached the {:?} lane within {}ms -- answered dispatch_starved_waiting_for_serial_lane; the verb did not run",
+                root.display(), lane, report.waited_ms
+            );
+            write_spool_out_and_release_claim(out_dir, &in_dir, verb, task, &out_body);
+            forget_dispatch_wait_record(root, verb, task);
+            refresh_dispatch_wait_ledger(root);
+            return;
+        }
+    };
+    note_dispatch_stage(root, verb, task, DispatchStage::WaitingForToolQueue, lane);
+    let _tool_guard = match ToolDispatchGuard::acquire_within(
+        plugin_name,
+        tool_verb,
+        body,
+        task,
+        lane_wait_max(),
+    ) {
+        Ok(guard) => guard,
+        Err(report) => {
+            let out_body = tool_queue_starved_answer(root, verb, task, lane, &report);
+            eprintln!(
+                "[agentplug daemon] {verb}/{task} for {} was claimed but never reached the front of queue {} within {}ms -- answered dispatch_starved_waiting_for_tool_queue; the verb did not run",
+                root.display(), report.queue_key.replace('\u{0}', "/"), report.waited_ms
+            );
+            write_spool_out_and_release_claim(out_dir, &in_dir, verb, task, &out_body);
+            forget_dispatch_wait_record(root, verb, task);
+            refresh_dispatch_wait_ledger(root);
+            return;
+        }
+    };
+    note_dispatch_stage(root, verb, task, DispatchStage::Running, lane);
     let _dispatch_origin_scope =
         agentplug_host::enter_dispatch_origin_scope(task, body, submitted_at_ms);
     let dispatch_result = if plugin_name == "gm" {
@@ -3178,7 +4016,16 @@ pub(crate) fn run_gm_dispatch_to_file(
     let out_body = match dispatch_result {
         Ok(Ok(s)) if !s.is_empty() => s,
         Ok(Ok(_)) => serde_json::json!({"ok": false, "error": "empty dispatch result", "verb": verb}).to_string(),
-        Ok(Err(e)) => serde_json::json!({"ok": false, "error": describe_dispatch_error_naming_wasm_trap_kind_distinctly_from_a_guest_logic_error(&e), "verb": verb}).to_string(),
+        Ok(Err(e)) => match e.downcast_ref::<agentplug_host::PluginDispatchError>() {
+            Some(agentplug_host::PluginDispatchError::AdmissionStarved { kind, waited_ms, limit, in_flight, slots }) => {
+                eprintln!(
+                    "[agentplug daemon] {verb}/{task} for {} was claimed but never entered the {kind} admission gate within {waited_ms}ms -- answered dispatch_starved_waiting_for_admission; the verb did not run",
+                    root.display()
+                );
+                admission_starved_answer(root, verb, task, lane, *kind, *waited_ms, *limit, *in_flight, *slots)
+            }
+            _ => serde_json::json!({"ok": false, "error": describe_dispatch_error_naming_wasm_trap_kind_distinctly_from_a_guest_logic_error(&e), "verb": verb}).to_string(),
+        },
         Err(panic_payload) => {
             let msg = panic_payload
                 .downcast_ref::<&str>()
@@ -3193,7 +4040,6 @@ pub(crate) fn run_gm_dispatch_to_file(
     let out_body = spill_large_exec_output_to_text_sibling(out_dir, verb, task, out_body);
     let out_name = format!("{verb}-{task}.json");
     let out_confirmed = write_spool_out_confirmed(out_dir, &out_name, &out_body);
-    let in_dir = root.join(".gm").join("exec-spool").join("in");
     if out_confirmed {
         let _ = fs::remove_file(inflight_claim_path(&in_dir, verb, task));
     } else {
@@ -3204,6 +4050,197 @@ pub(crate) fn run_gm_dispatch_to_file(
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .remove(&key);
+    forget_dispatch_wait_record(root, verb, task);
+    refresh_dispatch_wait_ledger(root);
+}
+
+const DISPATCH_WAIT_LEDGER_STALE_MS: u64 = 60_000;
+
+fn dispatch_wait_ledger_is_mine_or_stale(ledger_path: &Path) -> bool {
+    let Ok(raw) = fs::read_to_string(ledger_path) else {
+        return true;
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return true;
+    };
+    let mine = value
+        .get("daemon_pid")
+        .and_then(|p| p.as_u64())
+        .map(|pid| pid == std::process::id() as u64)
+        .unwrap_or(true);
+    let stale = value
+        .get("ts")
+        .and_then(|t| t.as_u64())
+        .map(|ts| now_ms().saturating_sub(ts) > DISPATCH_WAIT_LEDGER_STALE_MS)
+        .unwrap_or(true);
+    mine || stale
+}
+
+const CODE_INDEX_CONSUMING_VERBS: &[&str] = &[
+    "codesearch",
+    "codeinsight",
+    "codeinsight_callers",
+    "codeinsight_index",
+    "search",
+];
+
+struct CodeIndexState {
+    cold: bool,
+    partial: bool,
+    digest: Option<String>,
+}
+
+fn code_index_state(spool_dir: &Path) -> CodeIndexState {
+    let Ok(raw) = fs::read_to_string(spool_dir.join(".codeinsight-digest")) else {
+        return CodeIndexState {
+            cold: true,
+            partial: false,
+            digest: None,
+        };
+    };
+    let digest = raw.trim().to_string();
+    if digest.is_empty() {
+        return CodeIndexState {
+            cold: true,
+            partial: false,
+            digest: None,
+        };
+    }
+    let deferred = digest
+        .rsplit_once(":partial=")
+        .and_then(|(_, tail)| tail.split(':').next())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(0);
+    CodeIndexState {
+        cold: false,
+        partial: deferred > 0,
+        digest: Some(digest),
+    }
+}
+
+fn refresh_dispatch_wait_ledger(root: &Path) {
+    let spool_dir = spool_dir_of_root(root);
+    let ledger_path = spool_dir.join(DISPATCH_WAIT_LEDGER_FILE);
+    let (queued, claimed) = spool_step_counts(root);
+    let records_empty = dispatch_wait_records()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .is_empty();
+    if records_empty && queued == 0 && claimed == 0 {
+        if ledger_path.exists() && dispatch_wait_ledger_is_mine_or_stale(&ledger_path) {
+            let _ = fs::remove_file(&ledger_path);
+        }
+        return;
+    }
+    let in_dir = spool_dir.join("in");
+    let out_dir = spool_dir.join("out");
+    let Ok(verb_dirs) = fs::read_dir(&in_dir) else {
+        return;
+    };
+    let now = now_ms();
+    let mut rows: Vec<serde_json::Value> = Vec::new();
+    for verb_entry in verb_dirs.flatten() {
+        if !verb_entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let verb = verb_entry.file_name().to_string_lossy().into_owned();
+        let Ok(files) = fs::read_dir(verb_entry.path()) else {
+            continue;
+        };
+        for file_entry in files.flatten() {
+            let path = file_entry.path();
+            let name = file_entry.file_name().to_string_lossy().into_owned();
+            let is_claim = name.ends_with(&format!(".{}", ORPHAN_CLAIM_EXT));
+            let is_queued_request = !is_claim && is_spool_request_path(&verb, &path);
+            if !is_claim && !is_queued_request {
+                continue;
+            }
+            let task = if is_claim {
+                Path::new(path.file_stem().unwrap_or_default())
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+            } else {
+                path.file_stem()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+            };
+            if task.is_empty() || out_dir.join(format!("{verb}-{task}.json")).exists() {
+                continue;
+            }
+            let modified_ms = file_entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(now);
+            let (request_path, claim_path, out_path) =
+                unanswered_spool_paths(&spool_dir, &verb, &task);
+            let record = dispatch_wait_record(root, &verb, &task);
+            let admission_wait = record
+                .as_ref()
+                .and_then(|record| agentplug_host::admission_wait_state_for_thread(record.thread));
+            let state = match (&record, &admission_wait) {
+                (_, Some(_)) => "claimed_waiting_for_admission",
+                (Some(record), None) => dispatch_stage_name(record.stage),
+                (None, None) if is_claim => "claimed_not_yet_tracked",
+                (None, None) => "never_claimed",
+            };
+            let stage_age_ms = admission_wait
+                .as_ref()
+                .map(|wait| now.saturating_sub(wait.since_ms))
+                .or_else(|| {
+                    record
+                        .as_ref()
+                        .map(|record| now.saturating_sub(record.stage_since_ms))
+                })
+                .unwrap_or(0);
+            let lane = record.as_ref().and_then(|record| record.lane);
+            let index_state = if CODE_INDEX_CONSUMING_VERBS.contains(&verb.as_str()) {
+                Some(code_index_state(&spool_dir))
+            } else {
+                None
+            };
+            rows.push(serde_json::json!({
+                "verb": verb,
+                "task": task,
+                "state": state,
+                "lane": lane,
+                "admission_kind": admission_wait.as_ref().map(|wait| wait.kind),
+                "admission_in_flight": admission_wait.as_ref().map(|wait| wait.in_flight),
+                "admission_limit": admission_wait.as_ref().map(|wait| wait.limit),
+                "file_age_ms": now.saturating_sub(modified_ms),
+                "stage_age_ms": stage_age_ms,
+                "index_cold": index_state.as_ref().map(|state| state.cold),
+                "index_partial": index_state.as_ref().map(|state| state.partial),
+                "index_digest": index_state.as_ref().and_then(|state| state.digest.clone()),
+                "request_path": request_path.to_string_lossy(),
+                "claim_path": if is_claim { claim_path.to_string_lossy().into_owned() } else { String::new() },
+                "out_path": out_path.to_string_lossy(),
+            }));
+        }
+    }
+    if rows.is_empty() {
+        let _ = fs::remove_file(&ledger_path);
+        return;
+    }
+    let payload = serde_json::json!({
+        "daemon_pid": std::process::id(),
+        "ts": now,
+        "root": root.to_string_lossy(),
+        "project_in_flight": project_in_flight_count(root),
+        "project_in_flight_cap": MAX_CLAIMED_DISPATCHES_PER_PROJECT,
+        "requests": rows,
+    })
+    .to_string();
+    let tmp = spool_dir.join(format!(
+        "{DISPATCH_WAIT_LEDGER_FILE}.tmp.{}",
+        std::process::id()
+    ));
+    if fs::write(&tmp, payload).is_ok() {
+        let _ = fs::rename(&tmp, &ledger_path);
+    }
 }
 
 fn dir_has_any_verb_subdir_with_claimable_request(base: &Path, language_stems: bool) -> bool {
@@ -3271,7 +4308,7 @@ fn verb_dir_has_claimable_request(verb_dir: &Path, verb: &str, language_stems: b
 
 #[cfg(windows)]
 struct IdleInDirWatch {
-    entries: Vec<(PathBuf, windows_sys::Win32::Foundation::HANDLE)>,
+    entries: Vec<(PathBuf, PathBuf, windows_sys::Win32::Foundation::HANDLE)>,
 }
 
 #[cfg(windows)]
@@ -3284,7 +4321,7 @@ impl IdleInDirWatch {
 
     fn close_all(&mut self) {
         use windows_sys::Win32::Storage::FileSystem::FindCloseChangeNotification;
-        for (_, handle) in self.entries.drain(..) {
+        for (_, _, handle) in self.entries.drain(..) {
             unsafe {
                 FindCloseChangeNotification(handle);
             }
@@ -3298,16 +4335,21 @@ impl IdleInDirWatch {
             FindFirstChangeNotificationW, FILE_NOTIFY_CHANGE_DIR_NAME,
             FILE_NOTIFY_CHANGE_FILE_NAME, FILE_NOTIFY_CHANGE_SIZE,
         };
-        let wanted: Vec<PathBuf> = roots
+        let wanted: Vec<(PathBuf, PathBuf)> = roots
             .iter()
-            .map(|root| root.join(".gm").join("exec-spool").join("in"))
-            .filter(|dir| dir.is_dir())
+            .map(|root| (root.clone(), spool_dir_of(root).join("in")))
+            .filter(|(_, dir)| dir.is_dir())
             .collect();
-        if self.entries.iter().map(|(p, _)| p).eq(wanted.iter()) {
+        if self
+            .entries
+            .iter()
+            .map(|(_, dir, _)| dir)
+            .eq(wanted.iter().map(|(_, dir)| dir))
+        {
             return;
         }
         self.close_all();
-        for dir in wanted {
+        for (root, dir) in wanted {
             let mut wide: Vec<u16> = dir.as_os_str().encode_wide().collect();
             wide.push(0);
             let handle = unsafe {
@@ -3320,26 +4362,27 @@ impl IdleInDirWatch {
                 )
             };
             if handle != INVALID_HANDLE_VALUE {
-                self.entries.push((dir, handle));
+                mark_spool_dirty(&root);
+                self.entries.push((root, dir, handle));
             }
         }
     }
 
     const WAIT_CHUNK_HANDLES: usize = 64;
 
-    fn wait(&self, cap: Duration) -> bool {
+    fn wait(&self, cap: Duration) -> Option<PathBuf> {
         use windows_sys::Win32::Storage::FileSystem::FindNextChangeNotification;
         use windows_sys::Win32::System::Threading::WaitForMultipleObjects;
         if self.entries.is_empty() {
             std::thread::sleep(cap);
-            return false;
+            return None;
         }
         const WAIT_OBJECT_0: u32 = 0;
-        let chunks: Vec<&[(PathBuf, windows_sys::Win32::Foundation::HANDLE)]> =
+        let chunks: Vec<&[(PathBuf, PathBuf, windows_sys::Win32::Foundation::HANDLE)]> =
             self.entries.chunks(Self::WAIT_CHUNK_HANDLES).collect();
         let per_chunk_ms = (cap.as_millis() as u64 / chunks.len() as u64).max(1);
         for chunk in chunks {
-            let handles: Vec<_> = chunk.iter().map(|(_, h)| *h).collect();
+            let handles: Vec<_> = chunk.iter().map(|(_, _, h)| *h).collect();
             let rc = unsafe {
                 WaitForMultipleObjects(
                     handles.len() as u32,
@@ -3350,15 +4393,15 @@ impl IdleInDirWatch {
             };
             if (WAIT_OBJECT_0..WAIT_OBJECT_0 + handles.len() as u32).contains(&rc) {
                 let idx = (rc - WAIT_OBJECT_0) as usize;
-                if let Some((_, handle)) = chunk.get(idx) {
+                if let Some((_, _, handle)) = chunk.get(idx) {
                     unsafe {
                         FindNextChangeNotification(*handle);
                     }
                 }
-                return true;
+                return chunk.get(idx).map(|(root, _, _)| root.clone());
             }
         }
-        false
+        None
     }
 }
 
@@ -3378,10 +4421,8 @@ fn wait_for_in_dir_change(watch: &mut IdleInDirWatch, roots: &[PathBuf], cap: Du
     {
         return;
     }
-    if watch.wait(cap) {
-        if let Ok(mut cache) = spool_work_cache().lock() {
-            cache.clear();
-        }
+    if let Some(changed_root) = watch.wait(cap) {
+        mark_spool_dirty(&changed_root);
     }
 }
 
@@ -3405,29 +4446,8 @@ fn project_has_queued_spool_work(root: &Path) -> bool {
     dir_has_any_verb_subdir_with_claimable_request(&gm_in, true)
 }
 
-const SPOOL_WORK_CACHE_TTL: Duration = Duration::from_millis(200);
-
-fn spool_work_cache() -> &'static Mutex<HashMap<PathBuf, (Instant, bool)>> {
-    static SLOT: OnceLock<Mutex<HashMap<PathBuf, (Instant, bool)>>> = OnceLock::new();
-    SLOT.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
 fn project_has_queued_spool_work_cached(root: &Path) -> bool {
-    let now = Instant::now();
-    let fresh = spool_work_cache()
-        .lock()
-        .ok()
-        .and_then(|cache| cache.get(root).copied())
-        .filter(|(at, _)| now.saturating_duration_since(*at) < SPOOL_WORK_CACHE_TTL)
-        .map(|(_, value)| value);
-    if let Some(value) = fresh {
-        return value;
-    }
-    let value = project_has_queued_spool_work(root);
-    if let Ok(mut cache) = spool_work_cache().lock() {
-        cache.insert(root.to_path_buf(), (Instant::now(), value));
-    }
-    value
+    cached_root_scan(root).0
 }
 
 fn project_has_pending_dispatch_work(root: &Path) -> bool {
@@ -3441,6 +4461,7 @@ fn dispatch_project(
     plugin_modules: &PluginModules,
 ) -> bool {
     let mut did_work = false;
+    mark_spool_dirty(root);
 
     let spool_dir = root.join(".gm").join("exec-spool");
     let in_dir = spool_dir.join("in");
@@ -3530,7 +4551,7 @@ fn dispatch_project(
     if fs::create_dir_all(&in_dir).is_err() || fs::create_dir_all(&out_dir).is_err() {
         return did_work;
     }
-    write_project_heartbeat(&spool_dir, read_status_busy_until_if_future(&spool_dir));
+    write_project_heartbeat(root, read_status_busy_until_if_future(root));
 
     let requested_plugins = {
         let mut list = vec!["gm".to_string()];
@@ -3696,7 +4717,7 @@ fn dispatch_project(
             }
 
             answer_bg_converts(bg_convert_requests);
-            write_project_heartbeat(&spool_dir, Some(now_ms() + TICKER_BUSY_UNTIL_EXTEND_MS));
+            write_project_heartbeat(root, Some(now_ms() + TICKER_BUSY_UNTIL_EXTEND_MS));
         }
     }
 
@@ -4106,6 +5127,7 @@ pub fn run_daemon() -> anyhow::Result<()> {
 
     clear_wasted_daemon_start_backoff();
     configure_github_cli_config_dir();
+    runner_version_parity();
 
     let plugin_modules = PluginModules::new()?;
     let previously_recorded_version = installed_runner_version();
@@ -4217,12 +5239,22 @@ fn spawn_update_poll_worker(
 fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
     HEARTBEAT_DAEMON_BOOT_TS.store(now_ms(), std::sync::atomic::Ordering::Relaxed);
     write_daemon_heartbeat(0, 0);
+    let parity = runner_version_parity();
     eprintln!(
-        "[agentplug daemon] BOOT pid={} version={} ts={}",
+        "[agentplug daemon] BOOT pid={} version={} exe_sha256={} runner_version_parity={} ts={}",
         std::process::id(),
         env!("CARGO_PKG_VERSION"),
+        parity.live_sha256(),
+        if parity.disagreements().is_empty() {
+            "ok"
+        } else {
+            "MISMATCH"
+        },
         now_ms()
     );
+    for disagreement in parity.disagreements() {
+        eprintln!("[agentplug daemon] RUNNER VERSION PARITY MISMATCH: {disagreement}");
+    }
 
     ensure_daemon_guard();
 
@@ -4383,6 +5415,9 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
                 .filter(|r| !previous_roots.contains(*r))
                 .cloned()
                 .collect();
+            for root in &roots_new_this_registry_poll {
+                mark_spool_dirty(root);
+            }
             set_known_project_roots(&known_roots);
             if sweep_orphans_left_by_whatever_daemon_died_before_answering {
                 sweep_orphaned_claims_across_roots(&known_roots);
@@ -4421,6 +5456,7 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
         {
             last_per_root_plugin_scan = Instant::now();
             for root in &known_roots {
+                refresh_dispatch_wait_ledger(root);
                 for plugin_name in read_project_plugin_list(root) {
                     if plugin_compile_in_backoff(&plugin_name) {
                         continue;
@@ -4473,6 +5509,8 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
             let no_inherited_claims = HashSet::new();
             for root in &known_roots {
                 sweep_orphaned_claims_distinguishing_handoff_from_crash(root, &no_inherited_claims);
+                reap_spool_out_files(root, false);
+                sweep_unconsumable_spool_files(root);
             }
         }
         let mut all_projects: Vec<(PathBuf, ProjectPlugins)> =
@@ -4515,8 +5553,8 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
                 let spool_dir = root.join(".gm").join("exec-spool");
                 if fs::create_dir_all(&spool_dir).is_ok() {
                     write_project_heartbeat_with_queue_info(
-                        &spool_dir,
-                        read_status_busy_until_if_future(&spool_dir),
+                        root,
+                        read_status_busy_until_if_future(root),
                         Some((position, reported_queue_total)),
                     );
                 }
@@ -4571,8 +5609,8 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
                 let spool_dir = root.join(".gm").join("exec-spool");
                 if fs::create_dir_all(&spool_dir).is_ok() {
                     write_project_heartbeat_with_queue_info(
-                        &spool_dir,
-                        read_status_busy_until_if_future(&spool_dir),
+                        root.as_path(),
+                        read_status_busy_until_if_future(root.as_path()),
                         Some((0, 0)),
                     );
                 }
