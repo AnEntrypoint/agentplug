@@ -1147,12 +1147,14 @@ const STORE_LANE_VERBS: &[&str] = &[
     "cache_get", "cache_put", "cache_invalidate", "cache_stats", "kv_put", "kv_query",
 ];
 
-fn codesearch_reads_the_tree_without_indexing(verb: &str, body: &str) -> bool {
-    verb == "codesearch" && cost_class_for_dispatch(verb, body) == DispatchCostClass::Cheap
+const TREE_SCAN_VERBS: &[&str] = &["grep", "codesearch"];
+
+fn tree_scan_without_indexing(verb: &str, body: &str) -> bool {
+    TREE_SCAN_VERBS.contains(&verb) && cost_class_for_dispatch(verb, body) == DispatchCostClass::Cheap
 }
 
 pub fn is_unserialized_dispatch(verb: &str, body: &str) -> bool {
-    UNSERIALIZED_VERBS.contains(&verb) || codesearch_reads_the_tree_without_indexing(verb, body)
+    UNSERIALIZED_VERBS.contains(&verb) || tree_scan_without_indexing(verb, body)
 }
 
 fn serial_lane_for_dispatch(verb: &str, body: &str) -> Option<&'static str> {
