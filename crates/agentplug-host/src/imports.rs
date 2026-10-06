@@ -27,7 +27,7 @@ fn compiled_default_capability_allowlist(caller_plugin: &str, callee_plugin: &st
     match caller_plugin {
         "gm" => matches!(
             callee_plugin,
-            "bert" | "libsql" | "treesitter" | "liqology" | "crux"
+            "bert" | "libsql" | "treesitter" | "crux"
         ),
         _ => false,
     }
@@ -607,18 +607,7 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
             let plugin = caller.data().plugin_name.clone();
             if let Some(evt_line) = msg.strip_prefix("evt: ") {
                 let cwd = caller.data().cwd.lock().unwrap().clone();
-                let log_path = cwd.join(".gm").join("exec-spool").join(".watcher.log");
-                if let Some(parent) = log_path.parent() {
-                    let _ = fs::create_dir_all(parent);
-                }
-                if let Ok(mut f) = fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(&log_path)
-                {
-                    use std::io::Write;
-                    let _ = writeln!(f, "evt: {evt_line}");
-                }
+                crate::watcher_log::append_watcher_line(&cwd, &format!("evt: {evt_line}"));
                 return 1;
             }
             eprintln!("[agentplug:{plugin} L{level}] {msg}");

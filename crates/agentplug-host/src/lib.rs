@@ -17,6 +17,7 @@ mod precompiled;
 mod process_tree;
 mod registry;
 mod task;
+mod watcher_log;
 mod windowless;
 
 pub use broker::{
@@ -51,6 +52,10 @@ pub use registry::{
     DispatchCostClass, DispatchHandle, GmFairnessGuard, LaneWaitReport, PluginDispatchError,
     PluginFiberLifecycle, ProjectPlugins, SharedPluginPool, SlotContentSnapshot, ToolDispatchGuard,
     ToolQueueWaitReport, EPOCH_TICK_INTERVAL_MS, PLUGIN_IDLE_EVICT_MS, RELEASABLE_SHARED_PLUGINS,
+};
+pub use watcher_log::{
+    append_watcher_event, append_watcher_line, watcher_log_path, WATCHER_LOG_BACKUPS,
+    WATCHER_LOG_MAX_BYTES,
 };
 pub use windowless::{apply_windowless, ensure_hidden_console};
 
