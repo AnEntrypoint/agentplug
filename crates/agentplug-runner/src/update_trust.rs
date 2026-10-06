@@ -112,8 +112,29 @@ fn is_runner_artifact(artifact: &str) -> bool {
     artifact.starts_with(RUNNER_ARTIFACT_PREFIX)
 }
 
+fn embedded_runner_trust(path: PathBuf) -> Trust {
+    let (id, public_key) = crate::build_info::embedded_runner_root();
+    let public = hexutil::decode_fixed::<32>(public_key)
+        .expect("the committed runner release root must be a 64-hex-digit ed25519 public key");
+    Trust {
+        path,
+        configured: true,
+        mode: Mode::Enforce,
+        threshold: 1,
+        keys: vec![agentplug_trust::trust_file::TrustedKey {
+            id: id.to_string(),
+            public,
+        }],
+        min_sequence: BTreeMap::new(),
+        problem: None,
+    }
+}
+
 fn trust_for(artifact: &str) -> Trust {
     let mut trust = load_trust(&install_dir());
+    if !trust.configured && is_runner_artifact(artifact) {
+        trust = embedded_runner_trust(trust.path);
+    }
     if trust.mode != Mode::Enforce
         && is_runner_artifact(artifact)
         && (!trust.configured || strict_mode())
@@ -509,14 +530,24 @@ pub fn unverified_promotion() -> Option<serde_json::Value> {
 pub fn status() -> serde_json::Value {
     let dir = install_dir();
     let trust = load_trust(&dir);
+    let runner_trust = runner_trust();
+    let (embedded_id, embedded_public_key) = crate::build_info::embedded_runner_root();
+    let runner_uses_embedded_root = !trust.configured;
     let events = read_events();
     serde_json::json!({
         "trust_file": trust.path.display().to_string(),
         "configured": trust.configured,
         "mode": trust.mode.as_str(),
-        "runner_mode": runner_trust().mode.as_str(),
+        "runner_mode": runner_trust.mode.as_str(),
         "runner_signature_required": strict_mode(),
         "runner_signature_required_by": strict_mode_source(),
+        "runner_trust_source": if runner_uses_embedded_root { "embedded-release-root" } else { "trusted-keys.json" },
+        "embedded_runner_root": {"id": embedded_id, "public_key": embedded_public_key},
+        "runner_trust": {
+            "configured": runner_trust.configured,
+            "threshold": runner_trust.threshold,
+            "keys": runner_trust.keys.iter().map(|k| serde_json::json!({"id": k.id, "public_key": hexutil::encode(&k.public)})).collect::<Vec<_>>(),
+        },
         "threshold": trust.threshold,
         "keys": trust.keys.iter().map(|k| serde_json::json!({"id": k.id, "public_key": hexutil::encode(&k.public)})).collect::<Vec<_>>(),
         "min_sequence": trust.min_sequence,

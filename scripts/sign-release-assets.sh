@@ -38,6 +38,13 @@ printf '%s\n' "$key" > "$key_file"
 unset AGENTPLUG_RELEASE_SIGNING_KEY
 export AGENTPLUG_RELEASE_SIGNING_CI_AUTHORIZED=true
 public_key=$(cargo run --quiet --locked --manifest-path "$source_dir/Cargo.toml" -p agentplug-trust --bin agentplug-sign -- pubkey --key "$key_file")
+embedded_root=$(cargo run --quiet --locked --manifest-path "$source_dir/Cargo.toml" -p agentplug-runner --bin agentplug-runner -- embedded-release-root)
+embedded_key_id=$(jq -er '.id | strings' <<<"$embedded_root")
+embedded_public_key=$(jq -er '.public_key | strings' <<<"$embedded_root")
+if [[ "$embedded_key_id" != "$key_id" || "$embedded_public_key" != "$public_key" ]]; then
+  echo "committed runner release root does not match the protected signing key" >&2
+  exit 1
+fi
 jq -n --arg id "$key_id" --arg public_key "$public_key" '{mode:"enforce",threshold:1,keys:[{id:$id,public_key:$public_key}]}' > "$work/trusted-keys.json"
 
 shopt -s nullglob

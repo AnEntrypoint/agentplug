@@ -209,6 +209,14 @@ fn main() -> anyhow::Result<()> {
             );
             Ok(())
         }
+        "embedded-release-root" => {
+            let (id, public_key) = build_info::embedded_runner_root();
+            println!(
+                "{}",
+                serde_json::to_string(&serde_json::json!({"id": id, "public_key": public_key}))?
+            );
+            Ok(())
+        }
         "trust-status" => {
             println!("{}", serde_json::to_string_pretty(&update_trust::status())?);
             Ok(())
@@ -239,7 +247,7 @@ fn main() -> anyhow::Result<()> {
         "selfcheck-spool-claim" => selfcheck_spool_claim(),
         other => {
             eprintln!(
-                "agentplug-runner: unknown command '{other}'. Usage: agentplug-runner <plugin <name> [version]|spool|daemon|takeover <version>|dispatch [plugin] <verb> [body]|reap-orphans|sweep-spool [root]|update-runner|release-bootstrap-status|trust-status|build-info|pin-local-build|unpin-local-build|selfcheck-registry|selfcheck-inflight|version>"
+                "agentplug-runner: unknown command '{other}'. Usage: agentplug-runner <plugin <name> [version]|spool|daemon|takeover <version>|dispatch [plugin] <verb> [body]|reap-orphans|sweep-spool [root]|update-runner|release-bootstrap-status|embedded-release-root|trust-status|build-info|pin-local-build|unpin-local-build|selfcheck-registry|selfcheck-inflight|version>"
             );
             std::process::exit(1);
         }
