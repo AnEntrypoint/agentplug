@@ -271,19 +271,6 @@ fn log_poisoned_store_eviction_event(
     reinstantiation_succeeded: bool,
     prior_dispatch_error: &str,
 ) {
-    let log_path = root.join(".gm").join("exec-spool").join(".watcher.log");
-    let Some(parent) = log_path.parent() else {
-        return;
-    };
-    let _ = std::fs::create_dir_all(parent);
-    let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)
-    else {
-        return;
-    };
-    use std::io::Write;
     let line = serde_json::json!({
         "event": "plugin_poisoned_store_evicted",
         "plugin": plugin_name,
@@ -292,7 +279,7 @@ fn log_poisoned_store_eviction_event(
         "prior_dispatch_error": prior_dispatch_error,
         "ts": crate::now_ms(),
     });
-    let _ = writeln!(f, "evt: {line}");
+    crate::watcher_log::append_watcher_line(root, &format!("evt: {line}"));
 }
 
 static GM_POOL_SIZE: OnceLock<usize> = OnceLock::new();
