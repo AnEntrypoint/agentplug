@@ -1,5 +1,5 @@
 use sha2::{Digest, Sha256};
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -303,29 +303,38 @@ pub fn download_and_verify(
         );
     }
     let finalized = update_trust::finalize(identity, &preflight, &bytes)?;
+    write_download_atomically(dest, &bytes)?;
+    Ok(finalized)
+}
+
+fn write_download_atomically(dest: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent)?;
     }
     let tmp = dest.with_extension(format!("tmp.{}", std::process::id()));
+    let mut tmp_created = false;
     let write_result = (|| -> anyhow::Result<()> {
-        let mut f = fs::File::create(&tmp)?;
+        let mut f = OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+        tmp_created = true;
         f.write_all(&bytes)?;
         f.sync_all()?;
         Ok(())
     })();
     if let Err(e) = write_result {
-        if let Err(rm_err) = fs::remove_file(&tmp) {
-            if rm_err.kind() != std::io::ErrorKind::NotFound {
-                eprintln!(
-                    "[agentplug] failed to remove incomplete tmp file {}: {rm_err}",
-                    tmp.display()
-                );
+        if tmp_created {
+            if let Err(rm_err) = fs::remove_file(&tmp) {
+                if rm_err.kind() != std::io::ErrorKind::NotFound {
+                    eprintln!(
+                        "[agentplug] failed to remove incomplete tmp file {}: {rm_err}",
+                        tmp.display()
+                    );
+                }
             }
         }
         return Err(e);
     }
     fs::rename(&tmp, dest)?;
-    Ok(finalized)
+    Ok(())
 }
 
 struct PluginAssetSpec {
@@ -510,8 +519,8 @@ fn record_plugin_install(
 
 const RUNNER_BIN_REPO: &str = "AnEntrypoint/agentplug-bin";
 
-pub(crate) fn runner_asset_name() -> Option<&'static str> {
-    match (std::env::consts::OS, std::env::consts::ARCH) {
+fn runner_asset_name_for(os: &str, arch: &str) -> Option<&'static str> {
+    match (os, arch) {
         ("windows", "x86_64") => Some("agentplug-runner-windows-x64.exe"),
         ("windows", "aarch64") => Some("agentplug-runner-windows-arm64.exe"),
         ("macos", "x86_64") => Some("agentplug-runner-macos-x64"),
@@ -520,6 +529,10 @@ pub(crate) fn runner_asset_name() -> Option<&'static str> {
         ("linux", "aarch64") => Some("agentplug-runner-linux-arm64"),
         _ => None,
     }
+}
+
+pub(crate) fn runner_asset_name() -> Option<&'static str> {
+    runner_asset_name_for(std::env::consts::OS, std::env::consts::ARCH)
 }
 
 fn runner_version_path() -> PathBuf {
@@ -749,6 +762,14 @@ fn report_self_update_blocked(reason: &str) {
 }
 
 pub fn fetch_latest_runner_version() -> anyhow::Result<Option<String>> {
+    if runner_asset_name().is_none() {
+        eprintln!(
+            "[agentplug runner-update] self-update unsupported on {}-{}",
+            std::env::consts::OS,
+            std::env::consts::ARCH
+        );
+        return Ok(None);
+    }
     let url = format!("https://api.github.com/repos/{RUNNER_BIN_REPO}/releases/latest");
     match github_api_call(&url) {
         Ok(resp) => {
@@ -1433,5 +1454,55 @@ mod tests {
         assert_eq!(release_version_from_tag("1.2.3"), None);
         assert_eq!(release_version_from_tag("vv1.2.3"), None);
         assert_eq!(release_version_from_tag("v1.2"), None);
+    }
+
+    #[test]
+    fn runner_asset_matrix_accepts_only_published_host_targets() {
+        assert_eq!(
+            runner_asset_name_for("windows", "x86_64"),
+            Some("agentplug-runner-windows-x64.exe")
+        );
+        assert_eq!(
+            runner_asset_name_for("windows", "aarch64"),
+            Some("agentplug-runner-windows-arm64.exe")
+        );
+        assert_eq!(
+            runner_asset_name_for("macos", "x86_64"),
+            Some("agentplug-runner-macos-x64")
+        );
+        assert_eq!(
+            runner_asset_name_for("macos", "aarch64"),
+            Some("agentplug-runner-macos-arm64")
+        );
+        assert_eq!(
+            runner_asset_name_for("linux", "x86_64"),
+            Some("agentplug-runner-linux-x64")
+        );
+        assert_eq!(
+            runner_asset_name_for("linux", "aarch64"),
+            Some("agentplug-runner-linux-arm64")
+        );
+        assert_eq!(runner_asset_name_for("linux", "arm"), None);
+        assert_eq!(runner_asset_name_for("freebsd", "x86_64"), None);
+        assert_eq!(runner_asset_name_for("windows", "i686"), None);
+    }
+
+    #[test]
+    fn download_write_refuses_a_preexisting_tmp_path_without_touching_it() {
+        let root = std::env::temp_dir().join(format!(
+            "agentplug-download-test-{}-{}",
+            std::process::id(),
+            now_ms_for_marker()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let dest = root.join("runner");
+        let tmp = dest.with_extension(format!("tmp.{}", std::process::id()));
+        fs::write(&tmp, b"preserve").unwrap();
+
+        assert!(write_download_atomically(&dest, b"replacement").is_err());
+        assert_eq!(fs::read(&tmp).unwrap(), b"preserve");
+        assert!(!dest.exists());
+
+        fs::remove_dir_all(root).unwrap();
     }
 }
