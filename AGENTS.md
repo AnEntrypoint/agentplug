@@ -18,6 +18,10 @@ the `agentplug-host` imports, and `agentplug-trust`. Work on `main` as GitHub us
 - Keep signing material only in the protected CI environment. Bind each signature to the immutable
   source revision that built its artifact, and publish a release only after every expected asset and
   signature is present.
+- Canonical runner promotion atomically persists the staging receipt beside the promoted binary
+  and rechecks its artifact, version, bytes and signature before re-exec. Receipt or verification
+  failure keeps the permitted staged daemon serving. Preserve the authoritative checker’s explicit
+  `warn`/`off` policies; only `off` allows an absent receipt, never enforced signature mode.
 - A discovered same-user GitHub CLI credential directory is shared with Git and execution child
   processes through `GH_CONFIG_DIR`; an explicit inherited directory takes precedence. Git uses
   the transient `gh auth git-credential` helper. Never export, copy, print, or persist its token.
@@ -29,6 +33,26 @@ the `agentplug-host` imports, and `agentplug-trust`. Work on `main` as GitHub us
 
 ## Runtime invariants
 
+- `host_fs_readdir` returns zero on directory or entry-read failure, never a successful empty
+  or partial array. Structural indexing propagates that failure and refuses pruning or graph
+  evidence; legacy guest wrappers may explicitly retain their empty-list fallback.
+- Spawn and JavaScript adoption share process-instance checked monotonic IDs and never overwrite
+  occupied entries. Failed registration cleans up only the newly owned child and process group.
+  Task output first checks the live registry, then its private durable result store; missing handles
+  distinguish registry-instance mismatch from a missing current-instance task.
+- Runner handoff acquires execution admission before preserving completed results; active execution,
+  children, or pipe drains defer it. Acquire shared admission before a child can execute and retain
+  it through registration/adoption. Failed preparation or ownership transfer releases admission;
+  successful transfer closes it before the old host can start another child.
+- Completed results retain the last 64 KiB of each stream with explicit omitted-byte counts for
+  30 minutes after child exit. Private schema-checked atomic records are bounded to 1 MiB each,
+  512 entries and 64 MiB total; directory scans stop at 1024 entries or five seconds. Expiry and
+  explicit task-stop remove records; full or invalid stores refuse handoff without evicting
+  unexpired results. Default task-list does not persist; explicit `prepare_handoff:true` uses the
+  production preparation function and releases its guard without transferring ownership.
+  New and loaded records share validation; reversed wall-clock timestamps refuse preservation.
+  Unix result directories/files must be private and effective-user-owned. `libc::geteuid` has no
+  pointer inputs or failure mode; record reads reject symlinks with `O_NOFOLLOW`.
 - The spool daemon is a singleton per project. Requests are written atomically, claimed by rename,
   and identified by `(verb, session-id-task-number)`; preserve those properties when changing
   dispatch or recovery.
@@ -44,6 +68,9 @@ the `agentplug-host` imports, and `agentplug-trust`. Work on `main` as GitHub us
 - Every subprocess has a bounded wall-clock deadline and tree cleanup. Keep stdout/stderr draining
   concurrent with child execution, and keep oversized dispatch results in a spill file rather than
   an unbounded JSON reply.
+- Foreground execution waits at most 50 ms for both output drains after child exit, capped by the
+  remaining execution deadline. Unfinished readers transfer to task ownership; they do not prove a
+  descendant holds a pipe.
 - Default JavaScript results use the last sentinel candidate followed by a complete JSON line;
   remove only that validated frame. Sentinel text inside returned strings or ordinary stdout
   must remain data, including when stdout has no preceding newline.

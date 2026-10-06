@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::Read;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 const REQUIRE_SIGNATURE_ENV: &str = "AGENTPLUG_REQUIRE_RUNNER_SIGNATURE";
@@ -407,6 +408,62 @@ fn read_stage_record(staged: &Path) -> Option<serde_json::Value> {
 
 pub fn remove_stage_record(staged: &Path) {
     let _ = fs::remove_file(sidecar_path(staged));
+}
+
+pub fn preserve_promoted_runner_record(
+    staged: &Path,
+    canonical: &Path,
+    artifact: &str,
+    version: &str,
+) -> Result<(), String> {
+    staged_runner_permitted(staged, artifact, version)?;
+    let record = match fs::read(sidecar_path(staged)) {
+        Ok(record) => record,
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound && runner_trust().mode == Mode::Off =>
+        {
+            staged_runner_permitted(canonical, artifact, version)?;
+            return Ok(());
+        }
+        Err(error) => return Err(format!("cannot read runner stage receipt: {error}")),
+    };
+    let destination = sidecar_path(canonical);
+    let temporary = destination.with_extension(format!("verified.promote.{}", std::process::id()));
+    let mut owned_temporary = false;
+    let outcome = (|| -> Result<(), String> {
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options
+            .open(&temporary)
+            .map_err(|error| format!("cannot create promoted runner receipt: {error}"))?;
+        owned_temporary = true;
+        file.write_all(&record)
+            .and_then(|_| file.sync_all())
+            .map_err(|error| format!("cannot persist promoted runner receipt: {error}"))?;
+        drop(file);
+        fs::rename(&temporary, &destination)
+            .map_err(|error| format!("cannot publish promoted runner receipt: {error}"))?;
+        owned_temporary = false;
+        #[cfg(unix)]
+        if let Some(parent) = destination.parent() {
+            fs::File::open(parent)
+                .and_then(|directory| directory.sync_all())
+                .map_err(|error| {
+                    format!("cannot sync promoted runner receipt directory: {error}")
+                })?;
+        }
+        staged_runner_permitted(canonical, artifact, version)?;
+        Ok(())
+    })();
+    if owned_temporary {
+        let _ = fs::remove_file(&temporary);
+    }
+    outcome
 }
 
 pub fn staged_runner_permitted(
