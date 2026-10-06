@@ -27,7 +27,7 @@ fn compiled_default_capability_allowlist(caller_plugin: &str, callee_plugin: &st
     match caller_plugin {
         "gm" => matches!(
             callee_plugin,
-            "bert" | "libsql" | "treesitter" | "liqology" | "crux"
+            "bert" | "libsql" | "treesitter" | "crux"
         ),
         _ => false,
     }
