@@ -225,29 +225,147 @@ async function evaluateParkedSurvivingReconnect(sess, wrapped, timeoutMs) {
   }
 }
 
-async function navigateIfNeededThenEvaluateOverCdp(sess, script, startUrl, timeoutMs, keepNetworkEvents = false) {
+const NAV_SETTLE_POLL_MS = 100;
+const HASH_SETTLE_CAP_MS = 2000;
+const NAV_BUDGET_CAP_MS = 30000;
+
+const navSleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+function navBaseOf(url) {
+  const raw = String(url == null ? '' : url);
+  try {
+    const u = new URL(raw);
+    return `${u.origin}${u.pathname}${u.search}`;
+  } catch (_) {
+    return raw.split('#')[0];
+  }
+}
+
+function navHashOf(url) {
+  const raw = String(url == null ? '' : url);
+  try {
+    return new URL(raw).hash || '';
+  } catch (_) {
+    const i = raw.indexOf('#');
+    return i < 0 ? '' : raw.slice(i);
+  }
+}
+
+async function documentStateOf(sess) {
+  const res = await sess.send('Runtime.evaluate', {
+    expression: 'JSON.stringify({ url: String(location.href), readyState: String(document.readyState), blank: (function () { var b = document.body; if (!b) return true; return b.childElementCount === 0 && !String(b.textContent || "").trim(); })(), title: String(document.title || "") })',
+    returnByValue: true,
+  }).catch(() => null);
+  const raw = res && res.result && res.result.value;
+  if (typeof raw !== 'string') return null;
+  try {
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === 'object' ? parsed : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+// A url= dispatch must always end up evaluating a document that was really loaded for that url.
+// `Page.navigate` silently degrades to a same-document navigation when only the fragment differs
+// (or when it matches the current url exactly), which leaves the previous -- possibly blank --
+// document in place; `Page.reload` is what actually re-creates it. The load witnesses
+// (Page.loadEventFired vs Page.navigatedWithinDocument) are the protocol's own answer to "did a
+// new document exist", so a stale document is reported instead of being evaluated as if rendered.
+async function ensureDocumentForUrl(sess, startUrl, timeoutMs) {
+  const target = String(startUrl);
+  const budget = Math.min(Math.max(5000, Math.round(timeoutMs / 3)), NAV_BUDGET_CAP_MS);
+  const before = await documentStateOf(sess);
+  const kind = !before || !before.url || before.url === 'about:blank'
+    || navBaseOf(before.url) !== navBaseOf(target)
+    ? 'navigate'
+    : (navHashOf(before.url) !== navHashOf(target) ? 'hash' : 'reload');
+
+  let sawLoad = false;
+  let sawSameDocument = false;
   let navigationFailure = null;
-  if (startUrl) {
+  const failedDocumentLoadsByRequestId = new Map();
+  const prevOnIdLessNotification = sess.onIdLessNotification;
+  sess.onIdLessNotification = (msg) => {
+    if (prevOnIdLessNotification) prevOnIdLessNotification(msg);
+    const method = msg && msg.method;
+    if (method === 'Page.loadEventFired') sawLoad = true;
+    else if (method === 'Page.navigatedWithinDocument') sawSameDocument = true;
+    else if (method === 'Network.loadingFailed' && msg.params && msg.params.type === 'Document') {
+      failedDocumentLoadsByRequestId.set(msg.params.requestId, msg.params.errorText || 'loading failed');
+    }
+  };
+
+  let after = before;
+  try {
     await sess.send('Network.enable', {});
     await sess.send('Page.enable', {});
-    const prevOnIdLessNotification = sess.onIdLessNotification;
-    const failedDocumentLoadsByRequestId = new Map();
-    sess.onIdLessNotification = (msg) => {
-      if (prevOnIdLessNotification) prevOnIdLessNotification(msg);
-      if (msg.method === 'Network.loadingFailed' && msg.params && msg.params.type === 'Document') {
-        failedDocumentLoadsByRequestId.set(msg.params.requestId, msg.params.errorText || 'loading failed');
+    let navResult = null;
+    if (kind === 'navigate') {
+      navResult = await sess.send('Page.navigate', { url: target });
+    } else if (kind === 'reload') {
+      navResult = await sess.send('Page.reload', { ignoreCache: false });
+    } else {
+      await sess.send('Runtime.evaluate', { expression: `location.href = ${JSON.stringify(target)}` }).catch(() => {});
+    }
+    if (navResult && navResult.errorText) navigationFailure = navResult.errorText;
+    const ownLoaderId = navResult && navResult.loaderId;
+    if (!navigationFailure && ownLoaderId && failedDocumentLoadsByRequestId.has(ownLoaderId)) {
+      navigationFailure = failedDocumentLoadsByRequestId.get(ownLoaderId);
+    }
+
+    const settleDeadline = Date.now() + (kind === 'hash' ? Math.min(HASH_SETTLE_CAP_MS, budget) : budget);
+    for (;;) {
+      after = await documentStateOf(sess);
+      if (after) {
+        if (kind === 'hash') {
+          if (navHashOf(after.url) === navHashOf(target)) break;
+        } else if (sawSameDocument) {
+          break;
+        } else if (sawLoad && after.readyState === 'complete') {
+          break;
+        }
       }
-    };
-    const navResult = await sess.send('Page.navigate', { url: startUrl });
-    if (navResult && navResult.errorText) {
-      navigationFailure = navResult.errorText;
+      if (Date.now() >= settleDeadline) break;
+      await navSleep(NAV_SETTLE_POLL_MS);
     }
-    await new Promise((r) => setTimeout(r, 1200));
+
+    if (kind !== 'hash') {
+      if (!navigationFailure && sawSameDocument && !sawLoad) {
+        navigationFailure = `the browser treated ${target} as a same-document (fragment) navigation, so the previous document was reused instead of loading a new one`;
+      }
+      if (!navigationFailure && (!after || !after.readyState)) {
+        navigationFailure = `the page stopped answering document state after navigating to ${target} (the tab may have crashed)`;
+      }
+      if (!navigationFailure && after && after.readyState !== 'complete') {
+        navigationFailure = `the document at ${target} never reached readyState 'complete' within ${budget}ms (readyState='${after.readyState}')`;
+      }
+      if (!navigationFailure && /^(https?:|file:)/i.test(target) && after && after.blank) {
+        navigationFailure = `the document at ${target} loaded to readyState 'complete' but its body has no elements and no text -- the page did not render, so evaluating against it would report zero rows as if that were the rendered state`;
+      }
+    }
+  } finally {
     sess.onIdLessNotification = prevOnIdLessNotification;
-    const ownNavigationRequestId = navResult && navResult.loaderId;
-    if (!navigationFailure && ownNavigationRequestId && failedDocumentLoadsByRequestId.has(ownNavigationRequestId)) {
-      navigationFailure = failedDocumentLoadsByRequestId.get(ownNavigationRequestId);
-    }
+  }
+
+  return {
+    navigation: kind,
+    requested_url: target,
+    url: after ? after.url : null,
+    ready_state: after ? after.readyState : null,
+    blank_document: after ? !!after.blank : null,
+    title: after ? after.title : null,
+    loaded_new_document: kind === 'hash' ? false : (sawLoad && !sawSameDocument),
+    navigation_failure: navigationFailure,
+  };
+}
+
+async function navigateIfNeededThenEvaluateOverCdp(sess, script, startUrl, timeoutMs, keepNetworkEvents = false) {
+  let navigationFailure = null;
+  let documentTelemetry = null;
+  if (startUrl) {
+    documentTelemetry = await ensureDocumentForUrl(sess, startUrl, timeoutMs);
+    navigationFailure = documentTelemetry.navigation_failure;
     if (!keepNetworkEvents) await sess.send('Network.disable', {}).catch(() => {});
   }
   const trimmedScript = script.trim();
@@ -263,8 +381,25 @@ async function navigateIfNeededThenEvaluateOverCdp(sess, script, startUrl, timeo
   }
   const result = await evaluateParkedSurvivingReconnect(sess, wrapped, timeoutMs);
   result.statementBodyWithoutReturn = wrapped === stmtAttempt && !/\breturn\b/.test(trimmedScript);
-  if (navigationFailure && !result.exceptionDetails) {
-    result.exceptionDetails = { text: `page navigation failed: ${navigationFailure} (url=${startUrl})` };
+  if (!documentTelemetry) {
+    const state = await documentStateOf(sess);
+    documentTelemetry = {
+      navigation: 'none',
+      requested_url: null,
+      url: state ? state.url : null,
+      ready_state: state ? state.readyState : null,
+      blank_document: state ? !!state.blank : null,
+      title: state ? state.title : null,
+      loaded_new_document: false,
+      navigation_failure: null,
+    };
+  }
+  result.__document = documentTelemetry;
+  if (navigationFailure) {
+    const prior = result.exceptionDetails
+      ? `; the evaluation then reported: ${result.exceptionDetails.exception && result.exceptionDetails.exception.description ? result.exceptionDetails.exception.description : (result.exceptionDetails.text || 'evaluate exception')}`
+      : '';
+    result.exceptionDetails = { text: `page navigation failed: ${navigationFailure} (url=${startUrl})${prior}` };
   }
   return result;
 }
@@ -401,7 +536,7 @@ async function attachDebugCapture(sess, glCapture) {
     }).catch(() => null);
     let gl = { errors: [], drawCalls: {}, errorTotalCount: 0 };
     try { if (glRes && glRes.result && glRes.result.value) gl = JSON.parse(glRes.result.value); } catch (_) {}
-    return { ...boundedConsole(), pageErrors, ...boundedNetwork(), performance: performanceSnapshot, gl };
+    return { instrumented: true, ...boundedConsole(), pageErrors, ...boundedNetwork(), performance: performanceSnapshot, gl };
   };
 }
 
@@ -940,7 +1075,7 @@ async function main() {
     resultWritten = true;
     fs.writeFileSync(resultFile, JSON.stringify({ ...envelope, __targetId: target.id }));
   };
-  const HOST_KILL_MARGIN_MS = 1500;
+  const HOST_KILL_MARGIN_MS = Math.max(3000, Math.min(15000, Math.round(timeoutMs / 20)));
   const watchdogDeadline = Math.max(500, timeoutMs - HOST_KILL_MARGIN_MS);
   const watchdogTimer = setTimeout(() => {
     if (resultWritten) return;
@@ -961,7 +1096,17 @@ async function main() {
       process.exit(0);
     }
     if (mode === 'cdpraw') {
-      writeResult({ result: await runCdpRaw(sess, script, startedAt + watchdogDeadline, endpoint) });
+      let rawDocument = null;
+      if (startUrl) {
+        rawDocument = await ensureDocumentForUrl(sess, startUrl, timeoutMs);
+        if (rawDocument.navigation_failure) {
+          writeResult({ __cdpError: `page navigation failed: ${rawDocument.navigation_failure} (url=${startUrl})`, __document: rawDocument });
+          process.stderr.write(`cdp-eval: ${rawDocument.navigation_failure}\n`);
+          sess.close();
+          process.exit(1);
+        }
+      }
+      writeResult({ result: await runCdpRaw(sess, script, startedAt + watchdogDeadline, endpoint), __document: rawDocument });
       sess.close();
       process.exit(0);
     }
@@ -991,13 +1136,17 @@ async function main() {
       const debug = await collectDebug();
       if (res.exceptionDetails) {
         const msg = res.exceptionDetails.exception?.description || res.exceptionDetails.text || 'evaluate exception';
-        writeResult({ __cdpError: msg });
+        // The collected console/network/pageErrors used to be dropped on the exception path, so a
+        // failing `capture` dispatch reported `instrumented: false` and threw away the very page
+        // errors that explain the failure -- which is why capture looked nondeterministic: it
+        // "worked" exactly on the dispatches that succeeded.
+        writeResult({ __cdpError: msg, debug: await collectDebug(), __document: res.__document });
         process.stderr.write(`cdp-eval: exception ${msg}\n`);
         sess.close();
         process.exit(1);
       }
       const value = res.result && ('value' in res.result) ? res.result.value : null;
-      const envelope = { result: value === undefined ? null : value, result_note: resultNoteFor(res, value), debug };
+      const envelope = { result: value === undefined ? null : value, result_note: resultNoteFor(res, value), debug, __document: res.__document };
       writeResult(envelope);
       sess.close();
       process.exit(0);
@@ -1013,13 +1162,17 @@ async function main() {
       const debug = await collectDebug();
       if (res.exceptionDetails) {
         const msg = res.exceptionDetails.exception?.description || res.exceptionDetails.text || 'evaluate exception';
-        writeResult({ __cdpError: msg });
+        // The collected console/network/pageErrors used to be dropped on the exception path, so a
+        // failing `capture` dispatch reported `instrumented: false` and threw away the very page
+        // errors that explain the failure -- which is why capture looked nondeterministic: it
+        // "worked" exactly on the dispatches that succeeded.
+        writeResult({ __cdpError: msg, debug: await collectDebug(), __document: res.__document });
         process.stderr.write(`cdp-eval: exception ${msg}\n`);
         sess.close();
         process.exit(1);
       }
       const value = res.result && ('value' in res.result) ? res.result.value : null;
-      const envelope = { result: value === undefined ? null : value, profile: agg, debug };
+      const envelope = { result: value === undefined ? null : value, profile: agg, debug, __document: res.__document };
       writeResult(envelope);
       if (artifactFile) { try { fs.writeFileSync(artifactFile, JSON.stringify(stopRes && stopRes.profile || {})); } catch (_) {} }
       sess.close();
@@ -1035,14 +1188,18 @@ async function main() {
       const captured = await stopTraceRecordingToFile(sess, recording, flushDeadline, artifactFile);
       if (res.exceptionDetails) {
         const msg = res.exceptionDetails.exception?.description || res.exceptionDetails.text || 'evaluate exception';
-        writeResult({ __cdpError: msg });
+        // The collected console/network/pageErrors used to be dropped on the exception path, so a
+        // failing `capture` dispatch reported `instrumented: false` and threw away the very page
+        // errors that explain the failure -- which is why capture looked nondeterministic: it
+        // "worked" exactly on the dispatches that succeeded.
+        writeResult({ __cdpError: msg, debug: await collectDebug(), __document: res.__document });
         process.stderr.write(`cdp-eval: exception ${msg}\n`);
         sess.close();
         process.exit(1);
       }
       const value = res.result && ('value' in res.result) ? res.result.value : null;
       const debug = await collectDebug();
-      const envelope = { result: value === undefined ? null : value, trace: { wall_us: wallUs, ...summarizeTrace(captured) }, debug };
+      const envelope = { result: value === undefined ? null : value, trace: { wall_us: wallUs, ...summarizeTrace(captured) }, debug, __document: res.__document };
       writeResult(envelope);
       sess.close();
       process.exit(0);
@@ -1052,7 +1209,11 @@ async function main() {
       const res = await navigateIfNeededThenEvaluateOverCdp(sess, script, startUrl, timeoutMs);
       if (res.exceptionDetails) {
         const msg = res.exceptionDetails.exception?.description || res.exceptionDetails.text || 'evaluate exception';
-        writeResult({ __cdpError: msg });
+        // The collected console/network/pageErrors used to be dropped on the exception path, so a
+        // failing `capture` dispatch reported `instrumented: false` and threw away the very page
+        // errors that explain the failure -- which is why capture looked nondeterministic: it
+        // "worked" exactly on the dispatches that succeeded.
+        writeResult({ __cdpError: msg, debug: await collectDebug(), __document: res.__document });
         process.stderr.write(`cdp-eval: exception ${msg}\n`);
         sess.close();
         process.exit(1);
@@ -1070,7 +1231,7 @@ async function main() {
         screenshotError = String(e && e.message || e);
       }
       const debug = await collectDebug();
-      const envelope = { result: value === undefined ? null : value, screenshot_error: screenshotError, debug };
+      const envelope = { result: value === undefined ? null : value, screenshot_error: screenshotError, debug, __document: res.__document };
       writeResult(envelope);
       sess.close();
       process.exit(0);
@@ -1098,7 +1259,11 @@ async function main() {
       const res = await navigateIfNeededThenEvaluateOverCdp(sess, wrapped, startUrl, timeoutMs);
       if (res.exceptionDetails) {
         const msg = res.exceptionDetails.exception?.description || res.exceptionDetails.text || 'evaluate exception';
-        writeResult({ __cdpError: msg });
+        // The collected console/network/pageErrors used to be dropped on the exception path, so a
+        // failing `capture` dispatch reported `instrumented: false` and threw away the very page
+        // errors that explain the failure -- which is why capture looked nondeterministic: it
+        // "worked" exactly on the dispatches that succeeded.
+        writeResult({ __cdpError: msg, debug: await collectDebug(), __document: res.__document });
         process.stderr.write(`cdp-eval: exception ${msg}\n`);
         sess.close();
         process.exit(1);
@@ -1107,10 +1272,10 @@ async function main() {
       const debug = await collectDebug();
       let envelope;
       if (value && value.__domError) {
-        envelope = { match_count: 0, elements: [], error: value.__domError, debug };
+        envelope = { match_count: 0, elements: [], error: value.__domError, debug, __document: res.__document };
       } else {
         const elements = Array.isArray(value) ? value : [];
-        envelope = { match_count: elements.length, elements, debug };
+        envelope = { match_count: elements.length, elements, debug, __document: res.__document };
       }
       writeResult(envelope);
       sess.close();
@@ -1123,13 +1288,13 @@ async function main() {
       const msg = res.exceptionDetails.exception && res.exceptionDetails.exception.description
         ? res.exceptionDetails.exception.description
         : (res.exceptionDetails.text || 'evaluate exception');
-      writeResult({ __cdpError: msg, debug });
+      writeResult({ __cdpError: msg, debug, __document: res.__document });
       process.stderr.write(`cdp-eval: exception ${msg}\n`);
       sess.close();
       process.exit(1);
     }
     const value = res.result && ('value' in res.result) ? res.result.value : null;
-    writeResult({ result: value === undefined ? null : value, result_note: resultNoteFor(res, value), debug });
+    writeResult({ result: value === undefined ? null : value, result_note: resultNoteFor(res, value), debug, __document: res.__document });
     sess.close();
     process.exit(0);
   } catch (e) {
