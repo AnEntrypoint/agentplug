@@ -1492,6 +1492,14 @@ fn promote_staged_exe_to_canonical(version: &str, running_before: Option<&str>) 
     })();
     match promotion {
         Ok(()) => {
+            if let Err(error) = crate::update_trust::preserve_promoted_runner_record(
+                &staged, &canonical, asset, version,
+            ) {
+                eprintln!(
+                    "[agentplug daemon] takeover: canonical runner receipt propagation failed: {error} -- keeping the permitted staged daemon serving without canonical re-exec"
+                );
+                return false;
+            }
             record_completed_runner_swap(version);
             crate::update_trust::record_unverified_promotion(&staged, version, running_before);
             eprintln!("[agentplug daemon] takeover: promoted {version} onto canonical exe path {} (previous version kept at {})", canonical.display(), prev.display());
