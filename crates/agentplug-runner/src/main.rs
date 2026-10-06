@@ -1,4 +1,4 @@
-﻿mod build_info;
+mod build_info;
 mod daemon;
 mod download;
 mod update_trust;
@@ -37,13 +37,14 @@ fn reconcile_plugin_manifest(
             Err(_) => continue,
         };
         let content_hash = download::sha256_hex(&bytes);
-        let module = match agentplug_host::load_module_file_backed(engine, &wasm, name, &content_hash) {
-            Ok(m) => m,
-            Err(_) => {
-                advance_plugin_fiber(name, false, None);
-                continue;
-            }
-        };
+        let module =
+            match agentplug_host::load_module_file_backed(engine, &wasm, name, &content_hash) {
+                Ok(m) => m,
+                Err(_) => {
+                    advance_plugin_fiber(name, false, None);
+                    continue;
+                }
+            };
         let load_result = project.load_plugin(engine, name, &module, &content_hash);
         advance_plugin_fiber(name, load_result.is_ok(), Some(&content_hash));
         if load_result.is_ok() {
@@ -60,6 +61,23 @@ fn reconcile_plugin_manifest(
     Ok(reloaded)
 }
 
+fn release_bootstrap_status() -> serde_json::Value {
+    serde_json::json!({
+        "runner_version": env!("CARGO_PKG_VERSION"),
+        "local_source_promotion_supported": false,
+        "reason": "A checked-out source change is not an install artifact and cannot be promoted by the updater.",
+        "supported_route": [
+            "Publish the source through the normal repository release workflow.",
+            "Let CI build and publish the next release artifact.",
+            "Let the installed runner stage and verify that strictly newer artifact."
+        ],
+        "not_performed": [
+            "Reading, exporting, or copying GitHub credentials.",
+            "Replacing a runner binary or plugin from a local checkout."
+        ]
+    })
+}
+
 fn main() -> anyhow::Result<()> {
     agentplug_host::ensure_hidden_console();
     suppress_crash_dialogs();
@@ -69,7 +87,10 @@ fn main() -> anyhow::Result<()> {
             .location()
             .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
             .unwrap_or_else(|| "unknown".to_string());
-        eprintln!("[agentplug daemon] PANIC pid={} at {loc}: {info}", std::process::id());
+        eprintln!(
+            "[agentplug daemon] PANIC pid={} at {loc}: {info}",
+            std::process::id()
+        );
         agentplug_host::close_all_sessions();
         default_hook(info);
     }));
@@ -98,7 +119,10 @@ fn main() -> anyhow::Result<()> {
             std::fs::create_dir_all(&spool_dir)?;
 
             if !daemon::claim_spool_launcher_slot(&spool_dir) {
-                eprintln!("[agentplug] another spool launcher for {} is already live -- exiting", cwd.display());
+                eprintln!(
+                    "[agentplug] another spool launcher for {} is already live -- exiting",
+                    cwd.display()
+                );
                 return Ok(());
             }
             daemon::arm_spool_launcher_deadline();
@@ -143,16 +167,24 @@ fn main() -> anyhow::Result<()> {
         "daemon-guard" => daemon::run_daemon_guard(),
         "daemon" => daemon::run_daemon(),
         "sweep-spool" => {
-            let root = args.get(2).map(PathBuf::from).unwrap_or_else(|| std::env::current_dir().expect("cwd unavailable"));
+            let root = args
+                .get(2)
+                .map(PathBuf::from)
+                .unwrap_or_else(|| std::env::current_dir().expect("cwd unavailable"));
             daemon::sweep_orphaned_claims(&root);
             daemon::sweep_unconsumable_spool_files(&root);
             let reaped = daemon::reap_spool_out_files(&root, true);
-            println!("swept orphaned claims and unconsumable spool files under {} (reaped {reaped} answered out-file(s))", root.display());
+            println!(
+                "swept orphaned claims and unconsumable spool files under {} (reaped {reaped} answered out-file(s))",
+                root.display()
+            );
             Ok(())
         }
         "reap-orphans" => {
             let roots = daemon::read_registry();
-            agentplug_host::reap_idle_sessions_and_os_orphans_across_every_known_project_root(&roots);
+            agentplug_host::reap_idle_sessions_and_os_orphans_across_every_known_project_root(
+                &roots,
+            );
             println!("reaped idle sessions and orphaned chrome processes across {} registered project roots (plus the process-global headless-orphan sweep)", roots.len());
             Ok(())
         }
@@ -184,7 +216,8 @@ fn main() -> anyhow::Result<()> {
             let wasm = download::ensure_plugin_installed(&plugin, None)?;
             let content_hash = download::sha256_hex(&std::fs::read(&wasm)?);
             let engine = build_engine()?;
-            let module = agentplug_host::load_module_file_backed(&engine, &wasm, &plugin, &content_hash)?;
+            let module =
+                agentplug_host::load_module_file_backed(&engine, &wasm, &plugin, &content_hash)?;
             let mut project = ProjectPlugins::new(cwd);
             project.load_plugin(&engine, &plugin, &module, &content_hash)?;
             let siblings: Vec<(&str, Option<&str>)> = ["libsql", "bert", "treesitter"]
@@ -200,9 +233,18 @@ fn main() -> anyhow::Result<()> {
         }
         "update-runner" => {
             match download::stage_runner_self_update()? {
-                Some((staged, version)) => println!("staged verified runner {version} at {}", staged.display()),
+                Some((staged, version)) => {
+                    println!("staged verified runner {version} at {}", staged.display())
+                }
                 None => println!("no runner update to stage"),
             }
+            Ok(())
+        }
+        "release-bootstrap-status" => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&release_bootstrap_status())?
+            );
             Ok(())
         }
         "trust-status" => {
@@ -220,7 +262,9 @@ fn main() -> anyhow::Result<()> {
         }
         "unpin-local-build" => {
             download::unpin_local_build()?;
-            println!("cleared the local-build pin -- the auto-updater may replace this runner again");
+            println!(
+                "cleared the local-build pin -- the auto-updater may replace this runner again"
+            );
             Ok(())
         }
         "--version" | "version" => {
@@ -233,7 +277,7 @@ fn main() -> anyhow::Result<()> {
         "selfcheck-spool-claim" => selfcheck_spool_claim(),
         other => {
             eprintln!(
-                "agentplug-runner: unknown command '{other}'. Usage: agentplug-runner <plugin <name> [version]|spool|daemon|takeover <version>|dispatch [plugin] <verb> [body]|reap-orphans|sweep-spool [root]|update-runner|trust-status|build-info|pin-local-build|unpin-local-build|selfcheck-registry|selfcheck-inflight|version>"
+                "agentplug-runner: unknown command '{other}'. Usage: agentplug-runner <plugin <name> [version]|spool|daemon|takeover <version>|dispatch [plugin] <verb> [body]|reap-orphans|sweep-spool [root]|update-runner|release-bootstrap-status|trust-status|build-info|pin-local-build|unpin-local-build|selfcheck-registry|selfcheck-inflight|version>"
             );
             std::process::exit(1);
         }
@@ -249,47 +293,103 @@ const SELFCHECK_SUCCESS_WAT: &str = r#"(module
 )"#;
 
 fn selfcheck_registry() -> anyhow::Result<()> {
-    use agentplug_host::{note_shared_plugin_bytes_current, request_shared_store_swap, shared_plugin_slot_content_hashes, shared_plugin_swap_pending_hashes};
+    use agentplug_host::{
+        note_shared_plugin_bytes_current, request_shared_store_swap,
+        shared_plugin_slot_content_hashes, shared_plugin_swap_pending_hashes,
+    };
 
     let engine = build_engine()?;
     let module = Module::new(&engine, SELFCHECK_SUCCESS_WAT)?;
-    let root = std::env::temp_dir().join(format!("agentplug-selfcheck-registry-{}", std::process::id()));
+    let root = std::env::temp_dir().join(format!(
+        "agentplug-selfcheck-registry-{}",
+        std::process::id()
+    ));
     let mut project = ProjectPlugins::new(root.clone());
     project.load_plugin(&engine, "gm", &module, "hash-a")?;
     let out = project.dispatch("gm", "probe", "{}")?;
-    assert_eq!(out, "ok", "fresh slot must serve a real dispatch through the compiled module");
+    assert_eq!(
+        out, "ok",
+        "fresh slot must serve a real dispatch through the compiled module"
+    );
     println!("[selfcheck-registry] fresh gm slot dispatched and returned {out:?}");
 
     let gm_slot_count = shared_plugin_slot_content_hashes("gm").len();
     let (evicted_now, deferred) = request_shared_store_swap("gm", "hash-a");
     println!("[selfcheck-registry] swap request against {gm_slot_count} idle slot(s): evicted_now={evicted_now} deferred={deferred}");
-    assert_eq!((evicted_now, deferred), (gm_slot_count, 0), "every idle slot holding the old hash must be evicted immediately, nothing deferred");
-    assert!(shared_plugin_slot_content_hashes("gm").iter().all(|h| h.is_none()), "evicted slot must show no content hash");
+    assert_eq!(
+        (evicted_now, deferred),
+        (gm_slot_count, 0),
+        "every idle slot holding the old hash must be evicted immediately, nothing deferred"
+    );
+    assert!(
+        shared_plugin_slot_content_hashes("gm")
+            .iter()
+            .all(|h| h.is_none()),
+        "evicted slot must show no content hash"
+    );
 
     project.load_plugin(&engine, "gm", &module, "hash-b")?;
     let out2 = project.dispatch("gm", "probe", "{}")?;
-    assert_eq!(out2, "ok", "reinstantiated slot on the new hash must still serve real dispatches");
+    assert_eq!(
+        out2, "ok",
+        "reinstantiated slot on the new hash must still serve real dispatches"
+    );
     println!("[selfcheck-registry] slot reinstantiated on hash-b and served a second real dispatch: {out2:?}");
 
     note_shared_plugin_bytes_current("gm", "hash-b");
-    assert!(shared_plugin_swap_pending_hashes("gm").is_empty(), "marking hash-b current must leave no pending swap hashes");
-    println!("[selfcheck-registry] all invariants witnessed live through real wasmtime dispatch: PASS");
+    assert!(
+        shared_plugin_swap_pending_hashes("gm").is_empty(),
+        "marking hash-b current must leave no pending swap hashes"
+    );
+    println!(
+        "[selfcheck-registry] all invariants witnessed live through real wasmtime dispatch: PASS"
+    );
     Ok(())
 }
 
 fn selfcheck_pool_fairness() -> anyhow::Result<()> {
-    use agentplug_host::{cost_class_for_dispatch, cost_class_for_verb, DispatchCostClass, SharedPluginPool};
+    use agentplug_host::{
+        cost_class_for_dispatch, cost_class_for_verb, DispatchCostClass, SharedPluginPool,
+    };
     use std::sync::mpsc;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
-    assert_eq!(cost_class_for_verb("code_index"), DispatchCostClass::Heavy, "code_index must classify as heavy");
-    assert_eq!(cost_class_for_verb("recall"), DispatchCostClass::Heavy, "recall must classify as heavy");
-    assert_eq!(cost_class_for_verb("codesearch"), DispatchCostClass::Cheap, "the verb-only compatibility classifier must stay cheap");
-    assert_eq!(cost_class_for_dispatch("codesearch", r#"{"mode":"literal"}"#), DispatchCostClass::Cheap, "literal codesearch must preserve a slot for responsive tool work");
-    assert_eq!(cost_class_for_dispatch("codesearch", r#"{"mode":"regex"}"#), DispatchCostClass::Cheap, "regex codesearch must preserve a slot for responsive tool work");
-    assert_eq!(cost_class_for_dispatch("codesearch", r#"{"query":"semantic search"}"#), DispatchCostClass::Heavy, "default codesearch can rebuild and embed, so it must not consume the responsive slot");
-    assert_eq!(cost_class_for_verb("instruction"), DispatchCostClass::Cheap, "instruction must classify as cheap");
+    assert_eq!(
+        cost_class_for_verb("code_index"),
+        DispatchCostClass::Heavy,
+        "code_index must classify as heavy"
+    );
+    assert_eq!(
+        cost_class_for_verb("recall"),
+        DispatchCostClass::Heavy,
+        "recall must classify as heavy"
+    );
+    assert_eq!(
+        cost_class_for_verb("codesearch"),
+        DispatchCostClass::Cheap,
+        "the verb-only compatibility classifier must stay cheap"
+    );
+    assert_eq!(
+        cost_class_for_dispatch("codesearch", r#"{"mode":"literal"}"#),
+        DispatchCostClass::Cheap,
+        "literal codesearch must preserve a slot for responsive tool work"
+    );
+    assert_eq!(
+        cost_class_for_dispatch("codesearch", r#"{"mode":"regex"}"#),
+        DispatchCostClass::Cheap,
+        "regex codesearch must preserve a slot for responsive tool work"
+    );
+    assert_eq!(
+        cost_class_for_dispatch("codesearch", r#"{"query":"semantic search"}"#),
+        DispatchCostClass::Heavy,
+        "default codesearch can rebuild and embed, so it must not consume the responsive slot"
+    );
+    assert_eq!(
+        cost_class_for_verb("instruction"),
+        DispatchCostClass::Cheap,
+        "instruction must classify as cheap"
+    );
     println!("[selfcheck-pool-fairness] verb classification: code_index/recall heavy, codesearch/instruction cheap");
 
     const POOL_SIZE: usize = 4;
@@ -306,14 +406,21 @@ fn selfcheck_pool_fairness() -> anyhow::Result<()> {
         let release_rx = release_rx.clone();
         heavy_threads.push(std::thread::spawn(move || {
             let _admission = SharedPluginPool::admit(&pool, DispatchCostClass::Heavy);
-            let (_guard, _waited) = pool.acquire_within_for_class(SharedPluginPool::ACQUIRE_TIMEOUT_MS, DispatchCostClass::Heavy);
+            let (_guard, _waited) = pool.acquire_within_for_class(
+                SharedPluginPool::ACQUIRE_TIMEOUT_MS,
+                DispatchCostClass::Heavy,
+            );
             let _ = parked_tx.send(n);
             let _ = release_rx.lock().unwrap().recv();
         }));
     }
     for _ in 0..heavy_slots_expected {
-        let parked = parked_rx.recv_timeout(Duration::from_secs(10)).map_err(|e| anyhow::anyhow!("a heavy dispatch never acquired its slot: {e}"))?;
-        println!("[selfcheck-pool-fairness] heavy dispatch {parked} parked holding a real slot guard");
+        let parked = parked_rx
+            .recv_timeout(Duration::from_secs(10))
+            .map_err(|e| anyhow::anyhow!("a heavy dispatch never acquired its slot: {e}"))?;
+        println!(
+            "[selfcheck-pool-fairness] heavy dispatch {parked} parked holding a real slot guard"
+        );
     }
 
     let extra_heavy_pool = pool.clone();
@@ -330,7 +437,10 @@ fn selfcheck_pool_fairness() -> anyhow::Result<()> {
     println!("[selfcheck-pool-fairness] a further heavy dispatch is held at admission, so it cannot take the reserved slot");
 
     let cheap_start = Instant::now();
-    let (cheap_guard, cheap_waited_ms) = pool.acquire_within_for_class(SharedPluginPool::ACQUIRE_TIMEOUT_MS, DispatchCostClass::Cheap);
+    let (cheap_guard, cheap_waited_ms) = pool.acquire_within_for_class(
+        SharedPluginPool::ACQUIRE_TIMEOUT_MS,
+        DispatchCostClass::Cheap,
+    );
     let cheap_elapsed = cheap_start.elapsed();
     assert!(
         cheap_elapsed < Duration::from_millis(500),
@@ -355,7 +465,11 @@ fn selfcheck_inflight_cleanup() -> anyhow::Result<()> {
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
 
-    let root = std::env::temp_dir().join(format!("agentplug-selfcheck-inflight-{}-{}", std::process::id(), agentplug_host::now_ms()));
+    let root = std::env::temp_dir().join(format!(
+        "agentplug-selfcheck-inflight-{}-{}",
+        std::process::id(),
+        agentplug_host::now_ms()
+    ));
     let spool_dir = root.join(".gm").join("exec-spool");
     let out_dir = spool_dir.join("out");
     fs::create_dir_all(&out_dir)?;
@@ -366,11 +480,20 @@ fn selfcheck_inflight_cleanup() -> anyhow::Result<()> {
     daemon::in_flight_map()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .insert(key.clone(), daemon::InFlightHandle { detach: Arc::new(AtomicBool::new(false)) });
+        .insert(
+            key.clone(),
+            daemon::InFlightHandle {
+                detach: Arc::new(AtomicBool::new(false)),
+            },
+        );
 
     daemon::run_gm_dispatch_to_file(&root, &handle, "verbX", "taskY", "{}", &out_dir, 0, None);
 
-    let entry_remains = daemon::in_flight_map().lock().unwrap_or_else(|e| e.into_inner()).get(&key).is_some();
+    let entry_remains = daemon::in_flight_map()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&key)
+        .is_some();
     let out_written = out_dir.join("verbX-taskY.json").exists();
     println!("[selfcheck-inflight] entry_remains={entry_remains} out_written={out_written}");
     assert!(!entry_remains, "a completed dispatch must clear its own in-flight entry so the handoff/idle gates stop counting it");
@@ -385,7 +508,11 @@ fn selfcheck_spool_claim() -> anyhow::Result<()> {
     use std::fs;
 
     let in_dir = std::env::temp_dir()
-        .join(format!("agentplug-selfcheck-claim-{}-{}", std::process::id(), agentplug_host::now_ms()))
+        .join(format!(
+            "agentplug-selfcheck-claim-{}-{}",
+            std::process::id(),
+            agentplug_host::now_ms()
+        ))
         .join("codesearch");
     fs::create_dir_all(&in_dir)?;
     let txt = in_dir.join("s-1.txt");
@@ -407,7 +534,10 @@ fn selfcheck_spool_claim() -> anyhow::Result<()> {
 
 fn write_standalone_status(status_path: &std::path::Path, busy_until: Option<u64>) {
     use std::fs;
-    let mut payload = match fs::read_to_string(status_path).ok().and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok()) {
+    let mut payload = match fs::read_to_string(status_path)
+        .ok()
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+    {
         Some(serde_json::Value::Object(map)) => serde_json::Value::Object(map),
         _ => serde_json::json!({}),
     };
@@ -433,25 +563,39 @@ fn spawn_standalone_busy_ticker(
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-            write_standalone_status(&status_path, Some(agentplug_host::now_ms() + STANDALONE_BUSY_EXTEND_MS));
-            std::thread::sleep(std::time::Duration::from_millis(STANDALONE_BUSY_HEARTBEAT_MS));
+            write_standalone_status(
+                &status_path,
+                Some(agentplug_host::now_ms() + STANDALONE_BUSY_EXTEND_MS),
+            );
+            std::thread::sleep(std::time::Duration::from_millis(
+                STANDALONE_BUSY_HEARTBEAT_MS,
+            ));
         }
     })
 }
 
 fn clear_standalone_status(status_path: &std::path::Path) {
     use std::fs;
-    let Some(serde_json::Value::Object(mut map)) = fs::read_to_string(status_path).ok().and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok()) else {
+    let Some(serde_json::Value::Object(mut map)) = fs::read_to_string(status_path)
+        .ok()
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+    else {
         return;
     };
     map.remove("runtime");
     map.remove("daemon");
     map.remove("shared_process");
-    map.insert("ts".to_string(), serde_json::json!(agentplug_host::now_ms()));
+    map.insert(
+        "ts".to_string(),
+        serde_json::json!(agentplug_host::now_ms()),
+    );
     let _ = fs::write(status_path, serde_json::Value::Object(map).to_string());
 }
 
-fn run_spool_watcher_single_process(project: &mut ProjectPlugins, spool_dir: &std::path::Path) -> anyhow::Result<()> {
+fn run_spool_watcher_single_process(
+    project: &mut ProjectPlugins,
+    spool_dir: &std::path::Path,
+) -> anyhow::Result<()> {
     use std::fs;
     use std::time::Duration;
 
@@ -494,13 +638,17 @@ fn run_spool_watcher_single_process(project: &mut ProjectPlugins, spool_dir: &st
                 }
                 let verb = verb_entry.file_name().to_string_lossy().into_owned();
                 let verb_dir = verb_entry.path();
-                let Ok(files) = fs::read_dir(&verb_dir) else { continue };
+                let Ok(files) = fs::read_dir(&verb_dir) else {
+                    continue;
+                };
                 for file_entry in files.flatten() {
                     let path = file_entry.path();
                     if path.extension().and_then(|e| e.to_str()) != Some("txt") {
                         continue;
                     }
-                    let Some(claim_path) = daemon::claim_spool_request_in_place(&path) else { continue };
+                    let Some(claim_path) = daemon::claim_spool_request_in_place(&path) else {
+                        continue;
+                    };
                     let Ok(body) = fs::read_to_string(&claim_path) else {
                         let _ = fs::rename(&claim_path, &path);
                         continue;
@@ -509,18 +657,28 @@ fn run_spool_watcher_single_process(project: &mut ProjectPlugins, spool_dir: &st
                         let _ = fs::rename(&claim_path, &path);
                         continue;
                     }
-                    let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-                    let _dispatch_origin_scope = agentplug_host::enter_dispatch_origin_scope(&stem, &body, None);
+                    let stem = path
+                        .file_stem()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    let _dispatch_origin_scope =
+                        agentplug_host::enter_dispatch_origin_scope(&stem, &body, None);
 
                     let busy_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-                    let ticker = spawn_standalone_busy_ticker(status_path.clone(), busy_stop.clone());
-                    let result = project
-                        .dispatch("gm", &verb, &body)
-                        .unwrap_or_else(|e| serde_json::json!({"ok": false, "verb": verb, "error": e.to_string()}).to_string());
+                    let ticker =
+                        spawn_standalone_busy_ticker(status_path.clone(), busy_stop.clone());
+                    let result = project.dispatch("gm", &verb, &body).unwrap_or_else(|e| {
+                        serde_json::json!({"ok": false, "verb": verb, "error": e.to_string()})
+                            .to_string()
+                    });
                     busy_stop.store(true, std::sync::atomic::Ordering::Relaxed);
                     let _ = ticker.join();
 
-                    let out_confirmed = daemon::write_spool_out_confirmed(&out_dir, &format!("{verb}-{stem}.json"), &result);
+                    let out_confirmed = daemon::write_spool_out_confirmed(
+                        &out_dir,
+                        &format!("{verb}-{stem}.json"),
+                        &result,
+                    );
                     if out_confirmed {
                         let _ = fs::remove_file(&claim_path);
                     } else {

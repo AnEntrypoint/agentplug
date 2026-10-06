@@ -68,11 +68,27 @@ pub struct Trust {
 
 impl Trust {
     fn unconfigured(path: PathBuf) -> Trust {
-        Trust { path, configured: false, mode: Mode::Warn, threshold: 1, keys: Vec::new(), min_sequence: BTreeMap::new(), problem: None }
+        Trust {
+            path,
+            configured: false,
+            mode: Mode::Warn,
+            threshold: 1,
+            keys: Vec::new(),
+            min_sequence: BTreeMap::new(),
+            problem: None,
+        }
     }
 
     fn broken(path: PathBuf, problem: String) -> Trust {
-        Trust { path, configured: true, mode: Mode::Enforce, threshold: 1, keys: Vec::new(), min_sequence: BTreeMap::new(), problem: Some(problem) }
+        Trust {
+            path,
+            configured: true,
+            mode: Mode::Enforce,
+            threshold: 1,
+            keys: Vec::new(),
+            min_sequence: BTreeMap::new(),
+            problem: Some(problem),
+        }
     }
 
     pub fn key(&self, id: &str) -> Option<&TrustedKey> {
@@ -101,40 +117,83 @@ pub fn load(dir: &Path) -> Trust {
     let raw_text = match std::fs::read_to_string(&path) {
         Ok(text) => text,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Trust::unconfigured(path),
-        Err(e) => return Trust::broken(path.clone(), format!("{} exists but cannot be read: {e}", path.display())),
+        Err(e) => {
+            return Trust::broken(
+                path.clone(),
+                format!("{} exists but cannot be read: {e}", path.display()),
+            )
+        }
     };
     if let Some(problem) = writable_beyond_owner(&path) {
         return Trust::broken(path, problem);
     }
     let raw: RawTrust = match serde_json::from_str(raw_text.trim_start_matches('\u{feff}')) {
         Ok(raw) => raw,
-        Err(e) => return Trust::broken(path.clone(), format!("{} does not parse: {e}", path.display())),
+        Err(e) => {
+            return Trust::broken(
+                path.clone(),
+                format!("{} does not parse: {e}", path.display()),
+            )
+        }
     };
     let mode = match raw.mode.as_deref() {
         None => Mode::Enforce,
         Some(text) => match Mode::parse(text) {
             Some(mode) => mode,
-            None => return Trust::broken(path.clone(), format!("{} has unknown mode {text:?}; expected off, warn or enforce", path.display())),
+            None => {
+                return Trust::broken(
+                    path.clone(),
+                    format!(
+                        "{} has unknown mode {text:?}; expected off, warn or enforce",
+                        path.display()
+                    ),
+                )
+            }
         },
     };
     let mut keys = Vec::new();
     let mut ids = BTreeSet::new();
     for raw_key in &raw.keys {
         let Some(public) = hexutil::decode_fixed::<32>(&raw_key.public_key) else {
-            return Trust::broken(path.clone(), format!("{} key {:?} is not a 64-hex-digit ed25519 public key", path.display(), raw_key.id));
+            return Trust::broken(
+                path.clone(),
+                format!(
+                    "{} key {:?} is not a 64-hex-digit ed25519 public key",
+                    path.display(),
+                    raw_key.id
+                ),
+            );
         };
         if !ids.insert(raw_key.id.clone()) {
-            return Trust::broken(path.clone(), format!("{} lists key id {:?} twice", path.display(), raw_key.id));
+            return Trust::broken(
+                path.clone(),
+                format!("{} lists key id {:?} twice", path.display(), raw_key.id),
+            );
         }
-        keys.push(TrustedKey { id: raw_key.id.clone(), public });
+        keys.push(TrustedKey {
+            id: raw_key.id.clone(),
+            public,
+        });
     }
     let distinct_public: BTreeSet<[u8; 32]> = keys.iter().map(|k| k.public).collect();
     let threshold = raw.threshold.unwrap_or(1) as usize;
     if mode != Mode::Off && (threshold == 0 || threshold > distinct_public.len()) {
         return Trust::broken(
             path.clone(),
-            format!("{} threshold {threshold} cannot be met by {} distinct key(s)", path.display(), distinct_public.len()),
+            format!(
+                "{} threshold {threshold} cannot be met by {} distinct key(s)",
+                path.display(),
+                distinct_public.len()
+            ),
         );
     }
-    Trust { path, configured: true, mode, threshold, keys, min_sequence: raw.min_sequence, problem: None }
+    Trust {
+        path,
+        configured: true,
+        mode,
+        threshold,
+        keys,
+        min_sequence: raw.min_sequence,
+        problem: None,
+    }
 }

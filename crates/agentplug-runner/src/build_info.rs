@@ -25,7 +25,11 @@ pub fn parse(text: &str) -> Option<Reported> {
     let value: serde_json::Value = serde_json::from_str(text).ok()?;
     Some(Reported {
         version: value.get("version")?.as_str()?.to_string(),
-        commit: value.get("commit")?.as_str().unwrap_or("unknown").to_string(),
+        commit: value
+            .get("commit")?
+            .as_str()
+            .unwrap_or("unknown")
+            .to_string(),
         build_ts: value.get("build_ts")?.as_u64().unwrap_or(0),
         release_build: value.get("release_build")?.as_bool()?,
     })
