@@ -306,7 +306,24 @@ fn side_plugin_pool_size() -> usize {
 pub enum DispatchCostClass {
     Cheap,
     Heavy,
+    Short,
 }
+
+const SHORT_DISPATCH_VERBS: &[&str] = &[
+    "grep",
+    "fs_read",
+    "fs_readdir",
+    "fs_stat",
+    "env_get",
+    "kv_get",
+    "config_resolve",
+    "status",
+    "phase-status",
+    "prd-list",
+    "prd-status",
+    "mutable-list",
+    "ci-status",
+];
 
 const HEAVY_DISPATCH_VERBS: &[&str] = &[
     "code_index",
@@ -326,6 +343,8 @@ const HEAVY_DISPATCH_VERBS: &[&str] = &[
 pub fn cost_class_for_verb(verb: &str) -> DispatchCostClass {
     if HEAVY_DISPATCH_VERBS.contains(&verb) {
         DispatchCostClass::Heavy
+    } else if SHORT_DISPATCH_VERBS.contains(&verb) {
+        DispatchCostClass::Short
     } else {
         DispatchCostClass::Cheap
     }
@@ -390,7 +409,9 @@ impl ClassTicketQueue {
 struct TicketQueue {
     cheap: ClassTicketQueue,
     heavy: ClassTicketQueue,
+    short: ClassTicketQueue,
     heavy_inflight: usize,
+    non_short_inflight: usize,
     blocking_inflight: usize,
 }
 
@@ -399,12 +420,14 @@ impl TicketQueue {
         match class {
             DispatchCostClass::Cheap => &mut self.cheap,
             DispatchCostClass::Heavy => &mut self.heavy,
+            DispatchCostClass::Short => &mut self.short,
         }
     }
 }
 
 pub struct HeavyDispatchAdmission {
     pool: Option<Arc<SharedPluginPool>>,
+    class: DispatchCostClass,
 }
 
 impl Drop for HeavyDispatchAdmission {
@@ -412,7 +435,10 @@ impl Drop for HeavyDispatchAdmission {
         let Some(pool) = self.pool.take() else { return };
         {
             let mut q = pool.ticket_queue.lock().unwrap_or_else(|e| e.into_inner());
-            q.heavy_inflight = q.heavy_inflight.saturating_sub(1);
+            q.non_short_inflight = q.non_short_inflight.saturating_sub(1);
+            if self.class == DispatchCostClass::Heavy {
+                q.heavy_inflight = q.heavy_inflight.saturating_sub(1);
+            }
         }
         pool.slot_released.notify_all();
     }
@@ -529,7 +555,12 @@ impl SharedPluginPool {
                     next_ticket: 0,
                     now_serving: 0,
                 },
+                short: ClassTicketQueue {
+                    next_ticket: 0,
+                    now_serving: 0,
+                },
                 heavy_inflight: 0,
+                non_short_inflight: 0,
                 blocking_inflight: 0,
             }),
             slot_released: Condvar::new(),
@@ -537,6 +568,17 @@ impl SharedPluginPool {
     }
 
     pub const ACQUIRE_TIMEOUT_MS: u64 = 60_000;
+
+    fn short_reserved_slots(&self) -> usize {
+        (self.slots.len() / 4).max(1)
+    }
+
+    fn non_short_admission_limit(&self) -> usize {
+        self.slots
+            .len()
+            .saturating_sub(self.short_reserved_slots())
+            .max(1)
+    }
 
     fn heavy_admission_limit(&self) -> usize {
         self.slots
@@ -607,7 +649,10 @@ impl SharedPluginPool {
 
     pub fn admit(pool: &Arc<SharedPluginPool>, class: DispatchCostClass) -> HeavyDispatchAdmission {
         Self::admit_within(pool, class, Duration::from_secs(86_400))
-            .unwrap_or(HeavyDispatchAdmission { pool: None })
+            .unwrap_or(HeavyDispatchAdmission {
+                pool: None,
+                class,
+            })
     }
 
     pub fn admit_within(
@@ -615,20 +660,28 @@ impl SharedPluginPool {
         class: DispatchCostClass,
         max_wait: Duration,
     ) -> Result<HeavyDispatchAdmission, AdmissionWaitReport> {
-        if class != DispatchCostClass::Heavy || pool.slots.len() < 2 {
-            return Ok(HeavyDispatchAdmission { pool: None });
+        if class == DispatchCostClass::Short || pool.slots.len() < 2 {
+            return Ok(HeavyDispatchAdmission { pool: None, class });
         }
-        let limit = pool.heavy_admission_limit();
+        let is_heavy = class == DispatchCostClass::Heavy;
+        let kind: &'static str = if is_heavy { "heavy" } else { "cheap" };
+        let limit = pool.non_short_admission_limit();
+        let heavy_limit = pool.heavy_admission_limit();
         let start = Instant::now();
         let mut logged_at_ms = 0u64;
         loop {
             {
                 let mut q = pool.ticket_queue.lock().unwrap_or_else(|e| e.into_inner());
-                if q.heavy_inflight < limit {
-                    q.heavy_inflight += 1;
+                let heavy_ok = !is_heavy || q.heavy_inflight < heavy_limit;
+                if heavy_ok && q.non_short_inflight < limit {
+                    q.non_short_inflight += 1;
+                    if is_heavy {
+                        q.heavy_inflight += 1;
+                    }
                     clear_admission_wait();
                     return Ok(HeavyDispatchAdmission {
                         pool: Some(pool.clone()),
+                        class,
                     });
                 }
             }
@@ -637,26 +690,27 @@ impl SharedPluginPool {
                 .ticket_queue
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .heavy_inflight;
+                .non_short_inflight;
             if start.elapsed() >= max_wait {
                 clear_admission_wait();
                 return Err(AdmissionWaitReport {
-                    kind: "heavy",
+                    kind,
                     waited_ms,
                     limit,
                     in_flight,
                     slots: pool.slots.len(),
                 });
             }
-            mark_admission_wait("heavy", limit, in_flight);
+            mark_admission_wait(kind, limit, in_flight);
             if waited_ms > Self::ACQUIRE_TIMEOUT_MS
                 && waited_ms.saturating_sub(logged_at_ms) >= 5_000
             {
                 logged_at_ms = waited_ms;
                 eprintln!(
-                    "[agentplug registry] {} heavy-dispatch admission waiting {waited_ms}ms -- {limit} of {} slots already hold heavy work, one slot stays reserved for cheap verbs",
+                    "[agentplug registry] {} {kind}-dispatch admission waiting {waited_ms}ms -- {in_flight} of {} slots already hold non-short work, {} stay reserved for short verbs",
                     pool.plugin_name,
-                    pool.slots.len()
+                    pool.slots.len(),
+                    pool.short_reserved_slots(),
                 );
             }
             let guard = pool.ticket_queue.lock().unwrap_or_else(|e| e.into_inner());
@@ -712,12 +766,17 @@ impl SharedPluginPool {
                 .unwrap_or_else(|e| e.into_inner());
             let waited = start.elapsed().as_millis() as u64;
             if waited > timeout_ms && waited % 5_000 < 30 {
-                let (cheap_waiting, heavy_waiting, heavy_inflight) = {
+                let (cheap_waiting, heavy_waiting, short_waiting, heavy_inflight) = {
                     let q = self.ticket_queue.lock().unwrap_or_else(|e| e.into_inner());
-                    (q.cheap.waiting(), q.heavy.waiting(), q.heavy_inflight)
+                    (
+                        q.cheap.waiting(),
+                        q.heavy.waiting(),
+                        q.short.waiting(),
+                        q.heavy_inflight,
+                    )
                 };
                 eprintln!(
-                    "[agentplug registry] pool wait exceeded diagnostic threshold ({waited}ms > {timeout_ms}ms) -- still waiting, plugin={} class={class:?} ticket #{my_ticket}, slots={} heavy_inflight={heavy_inflight} waiting(cheap={cheap_waiting} heavy={heavy_waiting}), not denying",
+                    "[agentplug registry] pool wait exceeded diagnostic threshold ({waited}ms > {timeout_ms}ms) -- still waiting, plugin={} class={class:?} ticket #{my_ticket}, slots={} heavy_inflight={heavy_inflight} waiting(cheap={cheap_waiting} heavy={heavy_waiting} short={short_waiting}), not denying",
                     self.plugin_name,
                     self.slots.len()
                 );
@@ -1647,6 +1706,9 @@ const GIT_LANE_VERBS: &[&str] = &[
     "git_stash_pop",
     "git_stash_drop",
     "git_stash_list",
+    "git_worktree_add",
+    "git_worktree_remove",
+    "git_worktree_prune",
 ];
 
 const STORE_LANE_VERBS: &[&str] = &[
@@ -1689,7 +1751,10 @@ const TREE_SCAN_VERBS: &[&str] = &["grep", "codesearch"];
 
 fn tree_scan_without_indexing(verb: &str, body: &str) -> bool {
     TREE_SCAN_VERBS.contains(&verb)
-        && cost_class_for_dispatch(verb, body) == DispatchCostClass::Cheap
+        && matches!(
+            cost_class_for_dispatch(verb, body),
+            DispatchCostClass::Cheap | DispatchCostClass::Short
+        )
 }
 
 pub fn is_unserialized_dispatch(verb: &str, body: &str) -> bool {
