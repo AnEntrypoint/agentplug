@@ -387,10 +387,6 @@ fn builtin_plugin_asset_spec(plugin_name: &str) -> Option<PluginAssetSpec> {
             repo: "AnEntrypoint/agentplug-crux-bin".to_string(),
             asset_basename: "crux".to_string(),
         }),
-        "modlens" => Some(PluginAssetSpec {
-            repo: "AnEntrypoint/agentplug-modlens-bin".to_string(),
-            asset_basename: "modlens".to_string(),
-        }),
         _ => None,
     }
 }
