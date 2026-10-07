@@ -13,6 +13,22 @@ use crate::host_state::HostState;
 
 const HOST_FS_READ_EMPTY_SUCCESS: u64 = 1;
 
+const HOST_BINARY_READ_MAX_BYTES: u64 = 20 * 1024 * 1024;
+
+fn base64_encode(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+        out.push(ALPHABET[(n >> 18) as usize & 63] as char);
+        out.push(ALPHABET[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 { ALPHABET[(n >> 6) as usize & 63] as char } else { '=' });
+        out.push(if chunk.len() > 2 { ALPHABET[n as usize & 63] as char } else { '=' });
+    }
+    out
+}
+
 fn fetch_agent(timeout: Duration) -> ureq::Agent {
     crate::http_agent::build_agent(timeout)
 }
@@ -462,6 +478,35 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
 
     linker.func_wrap(
         "env",
+        "host_fs_read_base64",
+        |mut caller: Caller<'_, HostState>, path_ptr: u32, path_len: u32| -> u64 {
+            use std::io::Read;
+            let path = read_guest_string(&mut caller, path_ptr, path_len);
+            let extra_roots = caller.data().extra_readable_roots();
+            let Some(full) =
+                sandboxed_guest_path_with_extra_roots(&caller.data().cwd(), &path, &extra_roots)
+            else {
+                return 0;
+            };
+            let Ok(file) = fs::File::open(&full) else {
+                return 0;
+            };
+            let mut bytes = Vec::new();
+            if file
+                .take(HOST_BINARY_READ_MAX_BYTES + 1)
+                .read_to_end(&mut bytes)
+                .is_err()
+                || bytes.is_empty()
+                || bytes.len() as u64 > HOST_BINARY_READ_MAX_BYTES
+            {
+                return 0;
+            }
+            write_guest_bytes(&mut caller, base64_encode(&bytes).as_bytes())
+        },
+    )?;
+
+    linker.func_wrap(
+        "env",
         "host_fs_write",
         |mut caller: Caller<'_, HostState>,
          path_ptr: u32,
@@ -699,7 +744,23 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
                 Some(b) => req.send_string(b),
                 None => req.call(),
             };
+            let binary_response = opts.get("responseEncoding").and_then(|v| v.as_str()) == Some("base64");
             let result = match resp {
+                Ok(r) if binary_response => {
+                    use std::io::Read;
+                    let status = r.status();
+                    let content_type = r.header("content-type").unwrap_or("").to_string();
+                    let mut bytes = Vec::new();
+                    match r
+                        .into_reader()
+                        .take(HOST_BINARY_READ_MAX_BYTES + 1)
+                        .read_to_end(&mut bytes)
+                    {
+                        Ok(_) if bytes.len() as u64 > HOST_BINARY_READ_MAX_BYTES => serde_json::json!({"ok": false, "status": status, "error": "response_exceeds_binary_limit", "limit_bytes": HOST_BINARY_READ_MAX_BYTES}),
+                        Ok(_) => serde_json::json!({"ok": true, "status": status, "content_type": content_type, "body": base64_encode(&bytes), "encoding": "base64"}),
+                        Err(e) => serde_json::json!({"ok": false, "status": status, "error": e.to_string()}),
+                    }
+                }
                 Ok(r) => {
                     let status = r.status();
                     let text = r.into_string().unwrap_or_default();
