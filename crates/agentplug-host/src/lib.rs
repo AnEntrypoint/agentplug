@@ -1,6 +1,7 @@
 mod broker;
 mod browser;
 mod browser_engine;
+pub mod browser_profile_store;
 mod dispatch_origin;
 mod display;
 mod exec_js;

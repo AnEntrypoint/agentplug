@@ -54,6 +54,14 @@ pub(crate) struct BrowserRuntimeConfig {
     headless_disable_gpu: Option<bool>,
     #[serde(default)]
     uncapped: Option<bool>,
+    #[serde(default)]
+    profile_slots: Option<usize>,
+    #[serde(default)]
+    profile_max_idle_ms: Option<u64>,
+    #[serde(default)]
+    profile_max_total_bytes: Option<u64>,
+    #[serde(default)]
+    profile_max_count: Option<usize>,
 }
 
 type BrowserConfig = BrowserRuntimeConfig;
@@ -118,6 +126,27 @@ impl BrowserRuntimeConfig {
         self.chrome_max_concurrent
             .filter(|n| *n > 0)
             .unwrap_or(DEFAULT_CHROME_MAX_CONCURRENT) as usize
+    }
+    fn profile_policy(&self) -> crate::browser_profile_store::Policy {
+        crate::browser_profile_store::Policy {
+            slots: self
+                .profile_slots
+                .filter(|n| *n > 0)
+                .unwrap_or(crate::browser_profile_store::DEFAULT_SLOTS),
+            max_idle: Duration::from_millis(
+                self.profile_max_idle_ms
+                    .filter(|ms| *ms > 0)
+                    .unwrap_or(crate::browser_profile_store::DEFAULT_MAX_IDLE.as_millis() as u64),
+            ),
+            max_total_bytes: self
+                .profile_max_total_bytes
+                .filter(|b| *b > 0)
+                .unwrap_or(crate::browser_profile_store::DEFAULT_MAX_TOTAL_BYTES),
+            max_count: self
+                .profile_max_count
+                .filter(|n| *n > 0)
+                .unwrap_or(crate::browser_profile_store::DEFAULT_MAX_COUNT),
+        }
     }
 }
 
@@ -661,8 +690,45 @@ fn browser_profiles_dir(cwd: &Path) -> PathBuf {
 }
 
 fn browser_chrome_profile_dir(cwd: &Path, session_id: &str) -> PathBuf {
-    cwd.join(".gm")
-        .join(format!("browser-chrome-profile-{}", sanitize(session_id)))
+    crate::browser_profile_store::resolve(cwd, session_id)
+}
+
+fn assign_profile_dir(cwd: &Path, session_id: &str, cfg: &BrowserConfig) -> PathBuf {
+    let policy = cfg.profile_policy();
+    let claimed = claimed_profile_dirs(cwd);
+    let processes = list_chrome_processes();
+    let is_live = crate::browser_profile_store::is_live_closure(&claimed, &processes);
+    crate::browser_profile_store::assign(cwd, session_id, &policy, &is_live)
+}
+
+fn claimed_profile_dirs(cwd: &Path) -> std::collections::HashSet<PathBuf> {
+    sessions_map()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .values()
+        .filter(|s| s.cwd == cwd)
+        .map(|s| browser_chrome_profile_dir(&s.cwd, &s.session_id))
+        .collect()
+}
+
+fn reclaim_browser_profiles(cwd: &Path, cfg: &BrowserConfig, measure_bytes: bool) {
+    let policy = cfg.profile_policy();
+    let claimed = claimed_profile_dirs(cwd);
+    let processes = list_chrome_processes();
+    let is_live = crate::browser_profile_store::is_live_closure(&claimed, &processes);
+    let report = crate::browser_profile_store::reclaim(cwd, &policy, &is_live, measure_bytes);
+    if report.deleted.is_empty() {
+        return;
+    }
+    eprintln!(
+        "[agentplug browser] reclaimed {} chrome profile dir(s) under {} freeing {} bytes (kept {} dir(s) totalling {} bytes): {}",
+        report.deleted.len(),
+        cwd.display(),
+        report.freed_bytes,
+        report.kept,
+        report.kept_bytes,
+        report.deleted.join(", ")
+    );
 }
 
 struct BrowserSession {
@@ -862,7 +928,7 @@ fn port_sidecar_path(profile_dir: &Path) -> PathBuf {
     profile_dir.join("chrome.port")
 }
 
-fn session_id_sidecar_path(profile_dir: &Path) -> PathBuf {
+pub(crate) fn session_id_sidecar_path(profile_dir: &Path) -> PathBuf {
     profile_dir.join("chrome.session-id")
 }
 
@@ -1006,7 +1072,7 @@ fn try_adopt_remote_page(
     true
 }
 
-fn last_used_sidecar_path(profile_dir: &Path) -> PathBuf {
+pub(crate) fn last_used_sidecar_path(profile_dir: &Path) -> PathBuf {
     profile_dir.join("chrome.last-used")
 }
 
@@ -1139,7 +1205,7 @@ fn run_bounded_capturing_stdout(cmd: &mut Command) -> Option<Vec<u8>> {
 }
 
 #[cfg(windows)]
-fn pid_is_alive(pid: u32) -> bool {
+pub(crate) fn pid_is_alive(pid: u32) -> bool {
     let mut cmd = Command::new("tasklist");
     cmd.args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"]);
     crate::windowless::apply_windowless(&mut cmd);
@@ -1153,7 +1219,7 @@ fn pid_is_alive(pid: u32) -> bool {
 }
 
 #[cfg(not(windows))]
-fn pid_is_alive(pid: u32) -> bool {
+pub(crate) fn pid_is_alive(pid: u32) -> bool {
     Command::new("kill")
         .args(["-0", &pid.to_string()])
         .status()
@@ -1471,7 +1537,7 @@ fn parent_pid_of(pid: u32) -> Option<u32> {
     String::from_utf8_lossy(&output.stdout).trim().parse().ok()
 }
 
-fn chrome_singleton_lock_present(profile_dir: &Path) -> bool {
+pub(crate) fn chrome_singleton_lock_present(profile_dir: &Path) -> bool {
     let lock_name = if cfg!(windows) {
         "lockfile"
     } else {
@@ -1538,7 +1604,7 @@ pub fn project_root(path: &Path) -> PathBuf {
         .unwrap_or(canonical)
 }
 
-fn profile_dir_key(path: &str) -> String {
+pub(crate) fn profile_dir_key(path: &str) -> String {
     let unified = strip_windows_verbatim_prefix(path).replace('\\', "/");
     let trimmed = unified.trim_end_matches('/');
     if cfg!(windows) {
@@ -1557,7 +1623,7 @@ fn is_gm_owned_chrome_profile_dir(profile_key: &str) -> bool {
         && leaf.starts_with("browser-chrome-profile-")
 }
 
-fn cmdline_flag_value(cmdline: &str, flag: &str) -> Option<String> {
+pub(crate) fn cmdline_flag_value(cmdline: &str, flag: &str) -> Option<String> {
     let start = cmdline.find(flag)?;
     let whole_argument_quoted = cmdline[..start].ends_with('"');
     let rest = &cmdline[start + flag.len()..];
@@ -1685,6 +1751,7 @@ pub fn reap_idle_sessions_and_os_orphans_across_every_known_project_root(
         let cfg = BrowserConfig::load(root);
         reap_idle_sessions(root, &cfg);
         reap_os_orphans(root);
+        reclaim_browser_profiles(root, &cfg, true);
     }
     reap_sessions_for_deregistered_roots(&canonical_roots);
     reap_globally_orphaned_gm_chromes(&canonical_roots);
@@ -2559,7 +2626,8 @@ fn launch_chrome(
     }
     let chrome = find_chrome()
         .ok_or_else(|| "no Chrome found; install Google Chrome or Chromium".to_string())?;
-    let profile_dir = browser_chrome_profile_dir(cwd, session_id);
+    reclaim_browser_profiles(cwd, browser_cfg, true);
+    let profile_dir = assign_profile_dir(cwd, session_id, browser_cfg);
     let _ = std::fs::create_dir_all(&profile_dir);
     let log_path = chrome_launch_log_path(&profile_dir);
     let _ = std::fs::remove_file(&log_path);
@@ -2683,7 +2751,6 @@ pub fn run(body: &str, opts: &str, cwd_raw: &Path, session_id: &str) -> Value {
     }
     let inner_body: &str = &launch_normalized_body;
     let gpu_choice = launch_options.gpu;
-    let gpu_profile_dir = browser_chrome_profile_dir(cwd, session_id);
     let (session_command, after_session_command) = parse_session_command(inner_body);
     if let SessionCommand::Unknown(sub) = session_command {
         let problem = if sub.is_empty() {
@@ -2694,6 +2761,12 @@ pub fn run(body: &str, opts: &str, cwd_raw: &Path, session_id: &str) -> Value {
         return json!({"ok": false, "stdout": "", "exit_code": 1,
             "stderr": format!("{problem} -- supported: session new [gpu=<vendor>] [uncapped] | session list | session close [<id>] | session close-all | session reset <id>; no browser was launched")});
     }
+    let gpu_profile_dir = match session_command {
+        SessionCommand::List | SessionCommand::CloseAll | SessionCommand::Close(_) => {
+            browser_chrome_profile_dir(cwd, session_id)
+        }
+        _ => assign_profile_dir(cwd, session_id, &browser_cfg),
+    };
     let want_uncapped = launch_options.uncapped
         || (browser_cfg.uncapped() && matches!(session_command, SessionCommand::None));
     if gpu_choice.is_some() || want_uncapped {
