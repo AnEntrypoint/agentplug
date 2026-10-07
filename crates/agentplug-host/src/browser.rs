@@ -3082,9 +3082,6 @@ pub fn run(body: &str, opts: &str, cwd_raw: &Path, session_id: &str) -> Value {
     if let Some(doc) = result_value.get("__document").filter(|d| !d.is_null()) {
         out["document"] = doc.clone();
     }
-    // What this dispatch pinned on the session and re-applied after every navigation, so a caller
-    // comparing two sessions can see the viewport/device pixel ratio and input isolation they were
-    // asking for actually took effect instead of inferring it from the page's own reported metrics.
     if let Some(setup) = result_value.get("__session_setup").filter(|d| !d.is_null()) {
         out["session_setup"] = setup.clone();
     }
