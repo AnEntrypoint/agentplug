@@ -52,6 +52,20 @@ pub fn build_agent(timeout: std::time::Duration) -> ureq::Agent {
         .build()
 }
 
+/// An agent that hands every 3xx back to the caller instead of following it, so a
+/// caller that validates each hop can refuse a redirect into a private address.
+pub fn build_agent_without_redirects(timeout: std::time::Duration) -> ureq::Agent {
+    ensure_crypto_provider_installed();
+    let tls_config = rustls::ClientConfig::builder()
+        .with_root_certificates(build_root_store())
+        .with_no_client_auth();
+    ureq::AgentBuilder::new()
+        .tls_config(std::sync::Arc::new(tls_config))
+        .timeout(timeout)
+        .redirects(0)
+        .build()
+}
+
 pub fn shared_agent() -> &'static ureq::Agent {
     static AGENT: std::sync::OnceLock<ureq::Agent> = std::sync::OnceLock::new();
     AGENT.get_or_init(|| build_agent(std::time::Duration::from_secs(10)))
