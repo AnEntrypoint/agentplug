@@ -1638,6 +1638,7 @@ const GIT_LANE_VERBS: &[&str] = &[
     "git_push",
     "git_pull",
     "git_fetch",
+    "git_worktree",
     "git_checkout",
     "git_merge",
     "git_merge_abort",
