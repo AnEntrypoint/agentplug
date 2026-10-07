@@ -11,6 +11,8 @@ use wasmtime::{AsContextMut, Caller, Linker, Memory};
 
 use crate::host_state::HostState;
 
+const HOST_FS_READ_EMPTY_SUCCESS: u64 = 1;
+
 fn fetch_agent(timeout: Duration) -> ureq::Agent {
     crate::http_agent::build_agent(timeout)
 }
@@ -451,6 +453,7 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
                 return 0;
             };
             match fs::read_to_string(&full) {
+                Ok(content) if content.is_empty() => HOST_FS_READ_EMPTY_SUCCESS,
                 Ok(content) => write_guest_bytes(&mut caller, content.as_bytes()),
                 Err(_) => 0,
             }
@@ -997,6 +1000,7 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
             let mut guard = sibling_pool.acquire().expect("acquire() always returns Some -- FIFO wait never denies");
             if guard.is_none() {
                 drop(guard);
+                crate::registry::ensure_sibling_registered(&caller_root, &plugin, &caller_siblings);
                 let remaining_ms = acquire_timeout_ms.saturating_sub(acquire_start.elapsed().as_millis() as u64);
                 sibling_pool.any_instantiated_within(remaining_ms);
                 let remaining_ms = acquire_timeout_ms.saturating_sub(acquire_start.elapsed().as_millis() as u64);

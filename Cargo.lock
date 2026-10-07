@@ -19,7 +19,7 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
 name = "agentplug-host"
-version = "0.1.192"
+version = "0.1.203"
 dependencies = [
  "anyhow",
  "directories",
@@ -38,7 +38,7 @@ dependencies = [
 
 [[package]]
 name = "agentplug-runner"
-version = "0.1.192"
+version = "0.1.203"
 dependencies = [
  "agentplug-host",
  "agentplug-trust",
@@ -57,7 +57,7 @@ dependencies = [
 
 [[package]]
 name = "agentplug-trust"
-version = "0.1.192"
+version = "0.1.203"
 dependencies = [
  "ed25519-dalek",
  "getrandom 0.2.17",
@@ -95,9 +95,9 @@ checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
 name = "arbitrary"
-version = "1.4.2"
+version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c3d036a3c4ab069c7b410a2ce876bd74808d2d0888a82667669f8e783a898bf1"
+checksum = "3bc62ac97cc33321f50863d514c3bc38a453947a8f9e781137e47c7401020aed"
 
 [[package]]
 name = "async-trait"

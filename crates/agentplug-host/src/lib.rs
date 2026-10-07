@@ -5,6 +5,7 @@ mod dispatch_origin;
 mod display;
 mod exec_js;
 mod fs_prewarm;
+mod github_auth;
 mod gpu;
 mod host_state;
 mod http_agent;
@@ -31,6 +32,7 @@ pub use browser::{
     reap_idle_sessions_and_os_orphans_across_every_known_project_root, run as browser_run,
 };
 pub use dispatch_origin::{enter_dispatch_origin_scope, DispatchOriginScope};
+pub use github_auth::{github_cli_token, invalidate_github_cli_token};
 pub use host_state::HostState;
 pub use http_agent::{build_agent, shared_agent};
 pub use imports::{

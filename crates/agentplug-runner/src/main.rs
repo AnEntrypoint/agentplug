@@ -1,6 +1,7 @@
 mod build_info;
 mod daemon;
 mod download;
+mod dream_cycle;
 mod update_trust;
 
 use std::path::PathBuf;
@@ -627,7 +628,7 @@ fn run_spool_watcher_single_process(
                         .map(|s| s.to_string_lossy().into_owned())
                         .unwrap_or_default();
                     let _dispatch_origin_scope =
-                        agentplug_host::enter_dispatch_origin_scope(&stem, &body, None);
+                        agentplug_host::enter_dispatch_origin_scope(&verb, &stem, &body, None);
 
                     let busy_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
                     let ticker =
