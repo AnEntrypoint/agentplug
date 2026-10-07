@@ -540,7 +540,10 @@ pub(crate) fn strip_session_id_prefix(body: &str) -> (Option<String>, std::borro
             rest = after_mode;
             continue;
         }
-        let (viewport, after_viewport) = strip_viewport_width_height_scale_mobile_prefix(rest);
+        let Ok((viewport, after_viewport)) = strip_viewport_width_height_scale_mobile_prefix(rest)
+        else {
+            break;
+        };
         if viewport.is_some() {
             rest = after_viewport;
             continue;
@@ -557,31 +560,40 @@ pub(crate) fn strip_session_id_prefix(body: &str) -> (Option<String>, std::borro
 
 fn strip_viewport_width_height_scale_mobile_prefix(
     body: &str,
-) -> (Option<(u32, u32, f64, bool)>, &str) {
+) -> Result<(Option<(u32, u32, f64, bool)>, &str), String> {
     let trimmed = body.trim_start();
     let Some(rest) = trimmed.strip_prefix("viewport=") else {
-        return (None, body);
+        return Ok((None, body));
     };
-    let Some(nl) = rest.find('\n') else {
-        return (None, body);
+    let invalid = || {
+        "invalid viewport directive; use viewport=1280x900 followed by a newline and an expression, optionally viewport=1280x900@2!mobile; width and height must be positive integers and scale must be positive and finite".to_string()
     };
-    let (spec, remainder) = (&rest[..nl], &rest[nl + 1..]);
+    let Some((spec, remainder)) = rest.split_once('\n') else {
+        return Err(invalid());
+    };
+    let spec = spec.trim();
     let (dims_and_scale, mobile) = match spec.strip_suffix("!mobile") {
         Some(rest) => (rest, true),
         None => (spec, false),
     };
     let (dims, scale) = match dims_and_scale.split_once('@') {
-        Some((d, s)) => (d, s.trim().parse::<f64>().unwrap_or(1.0)),
+        Some((dims, scale)) => {
+            let scale = scale.trim().parse::<f64>().map_err(|_| invalid())?;
+            if !scale.is_finite() || scale <= 0.0 {
+                return Err(invalid());
+            }
+            (dims, scale)
+        }
         None => (dims_and_scale, 1.0),
     };
-    let Some((w, h)) = dims.trim().split_once('x') else {
-        return (None, body);
+    let Some((width, height)) = dims.trim().split_once('x') else {
+        return Err(invalid());
     };
-    match (w.trim().parse::<u32>(), h.trim().parse::<u32>()) {
+    match (width.trim().parse::<u32>(), height.trim().parse::<u32>()) {
         (Ok(width), Ok(height)) if width > 0 && height > 0 => {
-            (Some((width, height, scale, mobile)), remainder)
+            Ok((Some((width, height, scale, mobile)), remainder))
         }
-        _ => (None, body),
+        _ => Err(invalid()),
     }
 }
 
@@ -2760,7 +2772,12 @@ pub fn run(body: &str, opts: &str, cwd_raw: &Path, session_id: &str) -> Value {
             }
             continue;
         }
-        let (v, after_viewport) = strip_viewport_width_height_scale_mobile_prefix(rest);
+        let (v, after_viewport) = match strip_viewport_width_height_scale_mobile_prefix(rest) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                return json!({"ok": false, "stdout": "", "exit_code": 1, "stderr": error})
+            }
+        };
         if v.is_some() {
             viewport = v;
             rest = after_viewport;
