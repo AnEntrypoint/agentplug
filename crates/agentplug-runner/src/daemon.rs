@@ -2239,109 +2239,8 @@ fn spawn_project_heartbeat_ticker(interval: Duration) -> std::thread::JoinHandle
     })
 }
 
-static DREAM_RSI_LAST_CYCLE_DISPATCH_TS: OnceLock<Mutex<HashMap<PathBuf, u64>>> = OnceLock::new();
-
-fn dream_rsi_last_cycle_dispatch_ts() -> &'static Mutex<HashMap<PathBuf, u64>> {
-    DREAM_RSI_LAST_CYCLE_DISPATCH_TS.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-const DREAM_RSI_MIN_NEW_OBSERVATIONS_PER_CYCLE: u64 = 20;
-const DREAM_RSI_MIN_CYCLE_SPACING_MS: u64 = 15 * 60 * 1000;
-
-fn dream_rsi_count_observations(dream_rsi_dir: &Path) -> u64 {
-    let Ok(entries) = fs::read_dir(dream_rsi_dir) else {
-        return 0;
-    };
-    let mut total: u64 = 0;
-    for entry in entries.flatten() {
-        let obs_path = entry.path().join("observations.json");
-        let Ok(bytes) = fs::read(&obs_path) else {
-            continue;
-        };
-        if let Ok(serde_json::Value::Array(arr)) =
-            serde_json::from_slice::<serde_json::Value>(&bytes)
-        {
-            total += arr.len() as u64;
-        }
-    }
-    total
-}
-
-fn dream_rsi_maybe_dispatch_cycle(root: &Path, spool_dir: &Path) {
-    let dream_rsi_dir = root.join(".gm").join("dream-rsi");
-    if !dream_rsi_dir.exists() {
-        return;
-    }
-    let observation_count = dream_rsi_count_observations(&dream_rsi_dir);
-    let now = now_ms();
-
-    let mut last_ts_map = dream_rsi_last_cycle_dispatch_ts()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    let last_fired = last_ts_map.get(root).copied();
-    let cursor_path = dream_rsi_dir.join(".last-cycle-observation-count");
-    let baseline_count: u64 = fs::read_to_string(&cursor_path)
-        .ok()
-        .and_then(|s| s.trim().parse().ok())
-        .unwrap_or(0);
-
-    let spacing_ok = last_fired
-        .map(|ts| now.saturating_sub(ts) >= DREAM_RSI_MIN_CYCLE_SPACING_MS)
-        .unwrap_or(true);
-    let new_observations = observation_count.saturating_sub(baseline_count);
-    let data_threshold_met = new_observations >= DREAM_RSI_MIN_NEW_OBSERVATIONS_PER_CYCLE;
-
-    if !(spacing_ok && data_threshold_met) {
-        return;
-    }
-
-    let in_dir = spool_dir.join("in").join("dreamrsi-replay");
-    if fs::create_dir_all(&in_dir).is_err() {
-        return;
-    }
-    let session_id = format!("daemon-dreamrsi-tick-{now}");
-    let payload = serde_json::json!({
-        "SESSION_ID": session_id,
-        "trigger": "unattended-daemon-tick",
-        "new_observation_count": new_observations,
-        "total_observation_count": observation_count,
-        "authorization_note": "read-only replay/scoring; no unattended redeploy -- see .gm/next-step.md Grounded Dream-RSI replay",
-    })
-    .to_string();
-
-    let tmp_path = in_dir.join(format!(".tmp-{now}"));
-    let final_path = in_dir.join(format!("{session_id}-1.txt"));
-    if fs::write(&tmp_path, &payload).is_err() {
-        return;
-    }
-    if fs::rename(&tmp_path, &final_path).is_err() {
-        let _ = fs::remove_file(&tmp_path);
-        return;
-    }
-
-    last_ts_map.insert(root.to_path_buf(), now);
-    drop(last_ts_map);
-    let _ = fs::write(&cursor_path, observation_count.to_string());
-}
-
 fn spawn_dream_rsi_cycle_ticker(interval: Duration) -> std::thread::JoinHandle<()> {
-    std::thread::spawn(move || loop {
-        std::thread::sleep(interval);
-        if heartbeat_authority_lost() {
-            return;
-        }
-        let roots = known_project_roots()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
-        for root in roots {
-            let spool_dir = root.join(".gm").join("exec-spool");
-            if !spool_dir.exists() {
-                continue;
-            }
-            dream_rsi_maybe_dispatch_cycle(&root, &spool_dir);
-        }
-    })
+    crate::dream_cycle::spawn(interval, read_known_project_roots, heartbeat_authority_lost)
 }
 
 fn spool_dir_of(root: &Path) -> PathBuf {
@@ -4214,7 +4113,7 @@ pub(crate) fn run_gm_dispatch_to_file(
     };
     note_dispatch_stage(root, verb, task, DispatchStage::Running, lane);
     let _dispatch_origin_scope =
-        agentplug_host::enter_dispatch_origin_scope(task, body, submitted_at_ms);
+        agentplug_host::enter_dispatch_origin_scope(verb, task, body, submitted_at_ms);
     let dispatch_result = if plugin_name == "gm" {
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             handle.dispatch("gm", verb, body)
@@ -5362,7 +5261,6 @@ pub fn run_daemon() -> anyhow::Result<()> {
     }
 
     clear_wasted_daemon_start_backoff();
-    configure_github_cli_config_dir();
     runner_version_parity();
 
     let plugin_modules = PluginModules::new()?;
@@ -5473,6 +5371,7 @@ fn spawn_update_poll_worker(
 }
 
 fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
+    configure_github_cli_config_dir();
     HEARTBEAT_DAEMON_BOOT_TS.store(now_ms(), std::sync::atomic::Ordering::Relaxed);
     write_daemon_heartbeat(0, 0);
     let parity = runner_version_parity();

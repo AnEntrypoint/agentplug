@@ -1,12 +1,13 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
-fn git_head(manifest_dir: &Path) -> Option<String> {
+fn git_text(manifest_dir: &Path, args: &[&str]) -> Option<String> {
     let mut cmd = Command::new("git");
-    cmd.arg("-C").arg(manifest_dir).args(["rev-parse", "HEAD"]);
+    cmd.arg("-C").arg(manifest_dir).args(args);
     cmd.stdout(Stdio::piped())
         .stderr(Stdio::null())
         .stdin(Stdio::null());
@@ -20,10 +21,53 @@ fn git_head(manifest_dir: &Path) -> Option<String> {
         return None;
     }
     let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if text.is_empty() || !text.bytes().all(|b| b.is_ascii_hexdigit()) {
+    if text.is_empty() {
         return None;
     }
     Some(text)
+}
+
+fn git_head(manifest_dir: &Path) -> Option<String> {
+    git_text(manifest_dir, &["rev-parse", "HEAD"])
+        .filter(|text| text.bytes().all(|byte| byte.is_ascii_hexdigit()))
+}
+
+fn git_path(manifest_dir: &Path, name: &str) -> Option<PathBuf> {
+    let path = PathBuf::from(git_text(manifest_dir, &["rev-parse", "--git-path", name])?);
+    Some(if path.is_absolute() {
+        path
+    } else {
+        manifest_dir.join(path)
+    })
+}
+
+fn watch_existing_path(path: &Path) {
+    let mut watched = path.to_path_buf();
+    while !watched.exists() {
+        if !watched.pop() {
+            return;
+        }
+    }
+    println!("cargo:rerun-if-changed={}", watched.display());
+}
+
+fn watch_git_provenance(manifest_dir: &Path) {
+    let mut reference = "HEAD".to_string();
+    let mut seen = HashSet::new();
+    while seen.insert(reference.clone()) {
+        let Some(path) = git_path(manifest_dir, &reference) else {
+            break;
+        };
+        watch_existing_path(&path);
+        let Some(next) = git_text(manifest_dir, &["symbolic-ref", "--no-recurse", &reference])
+        else {
+            break;
+        };
+        reference = next;
+    }
+    if let Some(path) = git_path(manifest_dir, "packed-refs").filter(|path| path.exists()) {
+        watch_existing_path(&path);
+    }
 }
 
 fn release_build_requested() -> bool {
@@ -60,14 +104,5 @@ fn main() {
 
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=AGENTPLUG_RELEASE_BUILD");
-    let head = manifest_dir.join(".git").join("HEAD");
-    if let Ok(content) = std::fs::read_to_string(&head) {
-        println!("cargo:rerun-if-changed={}", head.display());
-        if let Some(reference) = content.strip_prefix("ref:") {
-            let resolved = manifest_dir.join(".git").join(reference.trim());
-            if resolved.exists() {
-                println!("cargo:rerun-if-changed={}", resolved.display());
-            }
-        }
-    }
+    watch_git_provenance(&manifest_dir);
 }
