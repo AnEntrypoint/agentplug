@@ -114,6 +114,10 @@ const GM_SPOOL_VERBS: &[&str] = &[
     "git_revert",
     "git_reset",
     "git_poll",
+    "git_worktree_add",
+    "git_worktree_list",
+    "git_worktree_remove",
+    "git_worktree_prune",
     "forget",
     "discipline",
 ];
@@ -4577,38 +4581,63 @@ impl IdleInDirWatch {
 
     const WAIT_CHUNK_HANDLES: usize = 64;
 
-    fn wait(&self, cap: Duration) -> Option<PathBuf> {
+    fn wait(&self, cap: Duration) -> Vec<PathBuf> {
         use windows_sys::Win32::Storage::FileSystem::FindNextChangeNotification;
         use windows_sys::Win32::System::Threading::WaitForMultipleObjects;
         if self.entries.is_empty() {
             std::thread::sleep(cap);
-            return None;
+            return Vec::new();
         }
         const WAIT_OBJECT_0: u32 = 0;
         let chunks: Vec<&[(PathBuf, PathBuf, windows_sys::Win32::Foundation::HANDLE)]> =
             self.entries.chunks(Self::WAIT_CHUNK_HANDLES).collect();
         let per_chunk_ms = (cap.as_millis() as u64 / chunks.len() as u64).max(1);
+        let deadline = Instant::now() + cap;
+        let mut changed: Vec<PathBuf> = Vec::new();
         for chunk in chunks {
+            let remaining_ms = deadline
+                .saturating_duration_since(Instant::now())
+                .as_millis() as u64;
+            if remaining_ms == 0 {
+                break;
+            }
             let handles: Vec<_> = chunk.iter().map(|(_, _, h)| *h).collect();
-            let rc = unsafe {
-                WaitForMultipleObjects(
-                    handles.len() as u32,
-                    handles.as_ptr(),
-                    0,
-                    per_chunk_ms as u32,
-                )
-            };
-            if (WAIT_OBJECT_0..WAIT_OBJECT_0 + handles.len() as u32).contains(&rc) {
-                let idx = (rc - WAIT_OBJECT_0) as usize;
+            let mut signaled: Vec<usize> = Vec::new();
+            loop {
+                let remaining_ms = deadline
+                    .saturating_duration_since(Instant::now())
+                    .as_millis() as u64;
+                if remaining_ms == 0 {
+                    break;
+                }
+                let rc = unsafe {
+                    WaitForMultipleObjects(
+                        handles.len() as u32,
+                        handles.as_ptr(),
+                        0,
+                        per_chunk_ms.min(remaining_ms) as u32,
+                    )
+                };
+                let Some(idx) = (WAIT_OBJECT_0..WAIT_OBJECT_0 + handles.len() as u32)
+                    .contains(&rc)
+                    .then(|| (rc - WAIT_OBJECT_0) as usize)
+                else {
+                    break;
+                };
                 if let Some((_, _, handle)) = chunk.get(idx) {
                     unsafe {
                         FindNextChangeNotification(*handle);
                     }
                 }
-                return chunk.get(idx).map(|(root, _, _)| root.clone());
+                signaled.push(idx);
+            }
+            for idx in signaled {
+                if let Some((root, _, _)) = chunk.get(idx) {
+                    changed.push(root.clone());
+                }
             }
         }
-        None
+        changed
     }
 }
 
@@ -4622,13 +4651,7 @@ impl Drop for IdleInDirWatch {
 #[cfg(windows)]
 fn wait_for_in_dir_change(watch: &mut IdleInDirWatch, roots: &[PathBuf], cap: Duration) {
     watch.sync(roots);
-    if roots
-        .iter()
-        .any(|root| project_has_pending_dispatch_work(root))
-    {
-        return;
-    }
-    if let Some(changed_root) = watch.wait(cap) {
+    for changed_root in watch.wait(cap) {
         mark_spool_dirty(&changed_root);
     }
 }
@@ -5512,6 +5535,7 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
     let mut cold_sweep_pending = false;
     let mut cold_sweep_walk = RegistryWalk { cursor: 0 };
     let mut project_round_robin_cursor = 0usize;
+    let mut background_round_robin_cursor = 0usize;
     let mut last_per_root_plugin_scan = Instant::now()
         .checked_sub(Duration::from_secs(60))
         .unwrap_or_else(Instant::now);
@@ -5823,6 +5847,11 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
             let len = active_projects.len();
             active_projects.rotate_left(project_round_robin_cursor % len);
             project_round_robin_cursor = (project_round_robin_cursor + worker_count) % len;
+        }
+        if !background_projects.is_empty() {
+            let len = background_projects.len();
+            background_projects.rotate_left(background_round_robin_cursor % len);
+            background_round_robin_cursor = (background_round_robin_cursor + worker_count) % len;
         }
         background_projects.extend(active_projects);
         let queue = std::sync::Mutex::new(background_projects);
