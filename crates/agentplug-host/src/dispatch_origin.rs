@@ -54,6 +54,7 @@ impl Drop for DispatchOriginScope {
 }
 
 pub fn enter_dispatch_origin_scope(
+    verb: &str,
     spool_task: &str,
     body: &str,
     submitted_at_ms: Option<u64>,
@@ -61,8 +62,10 @@ pub fn enter_dispatch_origin_scope(
     let mut origin = dispatch_origin_of(spool_task, body);
     origin.spool_task = Some(spool_task.to_string()).filter(|task| !task.is_empty());
     origin.submitted_at_ms = submitted_at_ms;
-    if let Some(gm_session) = origin.gm_session.as_deref() {
-        note_session_activity(gm_session);
+    if verb != "dream-replay-cycle" {
+        if let Some(gm_session) = origin.gm_session.as_deref() {
+            note_session_activity(gm_session);
+        }
     }
     let previous = CURRENT_DISPATCH_ORIGIN.with(|cell| cell.replace(Some(origin)));
     DispatchOriginScope { previous }

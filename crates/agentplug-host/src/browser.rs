@@ -520,50 +520,103 @@ fn strip_timeout_prefix(body: &str) -> (Option<u64>, &str) {
     }
 }
 
-pub(crate) fn strip_session_id_prefix(body: &str) -> (Option<String>, &str) {
-    let trimmed = body.trim_start();
-    let Some(rest) = trimmed.strip_prefix("sessionId=") else {
-        return (None, body);
-    };
-    let Some(nl) = rest.find('\n') else {
-        return (None, body);
-    };
-    let (id, remainder) = (&rest[..nl], &rest[nl + 1..]);
-    let id = id.trim();
-    if id.is_empty() {
-        (None, remainder)
-    } else {
-        (Some(id.to_string()), remainder)
+pub(crate) fn strip_session_id_prefix(body: &str) -> (Option<String>, std::borrow::Cow<'_, str>) {
+    let mut rest = body;
+    loop {
+        let trimmed = rest.trim_start();
+        if let Some(session) = trimmed.strip_prefix("sessionId=") {
+            let Some(nl) = session.find('\n') else {
+                return (None, std::borrow::Cow::Borrowed(body));
+            };
+            let id = session[..nl].trim();
+            let remainder = &session[nl + 1..];
+            let consumed = body.len() - rest.len();
+            let remaining_body = if consumed == 0 {
+                std::borrow::Cow::Borrowed(remainder)
+            } else {
+                std::borrow::Cow::Owned(format!("{}{}", &body[..consumed], remainder))
+            };
+            return (
+                if id.is_empty() {
+                    None
+                } else {
+                    Some(id.to_string())
+                },
+                remaining_body,
+            );
+        }
+        let (timeout, after_timeout) = strip_timeout_prefix(rest);
+        if timeout.is_some() {
+            rest = after_timeout;
+            continue;
+        }
+        let (quiet, after_quiet) = strip_debug_visibility_prefix(rest);
+        if quiet.is_some() {
+            rest = after_quiet;
+            continue;
+        }
+        let (mode, _, after_mode) = strip_mode_prefix(rest);
+        if mode == BrowserMode::CdpRaw {
+            break;
+        }
+        if mode != BrowserMode::Default {
+            rest = after_mode;
+            continue;
+        }
+        let Ok((viewport, after_viewport)) = strip_viewport_width_height_scale_mobile_prefix(rest)
+        else {
+            break;
+        };
+        if viewport.is_some() {
+            rest = after_viewport;
+            continue;
+        }
+        let (url, _, after_url) = strip_url_prefix(rest);
+        if url.is_some() {
+            rest = after_url;
+            continue;
+        }
+        break;
     }
+    (None, std::borrow::Cow::Borrowed(body))
 }
 
 fn strip_viewport_width_height_scale_mobile_prefix(
     body: &str,
-) -> (Option<(u32, u32, f64, bool)>, &str) {
+) -> Result<(Option<(u32, u32, f64, bool)>, &str), String> {
     let trimmed = body.trim_start();
     let Some(rest) = trimmed.strip_prefix("viewport=") else {
-        return (None, body);
+        return Ok((None, body));
     };
-    let Some(nl) = rest.find('\n') else {
-        return (None, body);
+    let invalid = || {
+        "invalid viewport directive; use viewport=1280x900 followed by a newline and an expression, optionally viewport=1280x900@2!mobile; width and height must be positive integers and scale must be positive and finite".to_string()
     };
-    let (spec, remainder) = (&rest[..nl], &rest[nl + 1..]);
+    let Some((spec, remainder)) = rest.split_once('\n') else {
+        return Err(invalid());
+    };
+    let spec = spec.trim();
     let (dims_and_scale, mobile) = match spec.strip_suffix("!mobile") {
         Some(rest) => (rest, true),
         None => (spec, false),
     };
     let (dims, scale) = match dims_and_scale.split_once('@') {
-        Some((d, s)) => (d, s.trim().parse::<f64>().unwrap_or(1.0)),
+        Some((dims, scale)) => {
+            let scale = scale.trim().parse::<f64>().map_err(|_| invalid())?;
+            if !scale.is_finite() || scale <= 0.0 {
+                return Err(invalid());
+            }
+            (dims, scale)
+        }
         None => (dims_and_scale, 1.0),
     };
-    let Some((w, h)) = dims.trim().split_once('x') else {
-        return (None, body);
+    let Some((width, height)) = dims.trim().split_once('x') else {
+        return Err(invalid());
     };
-    match (w.trim().parse::<u32>(), h.trim().parse::<u32>()) {
+    match (width.trim().parse::<u32>(), height.trim().parse::<u32>()) {
         (Ok(width), Ok(height)) if width > 0 && height > 0 => {
-            (Some((width, height, scale, mobile)), remainder)
+            Ok((Some((width, height, scale, mobile)), remainder))
         }
-        _ => (None, body),
+        _ => Err(invalid()),
     }
 }
 
@@ -671,6 +724,32 @@ fn session_cdp_endpoint_responds(endpoint: &str) -> bool {
             .map(|b| b.contains("webSocketDebuggerUrl"))
             .unwrap_or(false),
         Err(_) => false,
+    }
+}
+
+fn close_owned_remote_page(session: &BrowserSession) -> Result<(), String> {
+    let Some(target_id) = session.target_id.as_deref() else {
+        return Ok(());
+    };
+    if !target_id
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Err("remote page target id is not a safe endpoint path segment".to_string());
+    }
+    let url = format!(
+        "{}/json/close/{target_id}",
+        session.cdp_endpoint.trim_end_matches('/')
+    );
+    match crate::http_agent::shared_agent()
+        .get(&url)
+        .timeout(Duration::from_secs(2))
+        .call()
+    {
+        Ok(_) | Err(ureq::Error::Status(404, _)) => Ok(()),
+        Err(error) => Err(format!(
+            "could not close GM-owned remote page {target_id}: {error}; session retained for retry"
+        )),
     }
 }
 
@@ -809,7 +888,122 @@ fn target_id_sidecar_path(profile_dir: &Path) -> PathBuf {
 }
 
 fn write_target_id_sidecar(profile_dir: &Path, target_id: &str) {
-    let _ = std::fs::write(target_id_sidecar_path(profile_dir), target_id);
+    if std::fs::create_dir_all(profile_dir).is_ok() {
+        let _ = std::fs::write(target_id_sidecar_path(profile_dir), target_id);
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct RemotePageRecord {
+    version: u8,
+    session_id: String,
+    endpoint: String,
+    port: u16,
+    target_id: String,
+    engine: String,
+    owner_gm_session: Option<String>,
+}
+
+fn remote_page_sidecar_path(profile_dir: &Path) -> PathBuf {
+    profile_dir.join("chrome.remote-page.json")
+}
+
+fn configured_remote_endpoint(cwd: &Path, engine: crate::browser_engine::Engine) -> Option<String> {
+    match engine {
+        crate::browser_engine::Engine::RemoteChrome => {
+            crate::browser_engine::chrome_cdp_endpoint_override(cwd)
+        }
+        crate::browser_engine::Engine::Steel => crate::browser_engine::steel_endpoint_override(cwd),
+        _ => None,
+    }
+}
+
+fn write_remote_page_sidecar(session: &BrowserSession) -> Result<(), String> {
+    if session.owns_process {
+        return Ok(());
+    }
+    let Some(target_id) = session.target_id.as_ref() else {
+        return Ok(());
+    };
+    let profile_dir = browser_chrome_profile_dir(&session.cwd, &session.session_id);
+    let record = RemotePageRecord {
+        version: 1,
+        session_id: session.session_id.clone(),
+        endpoint: session.cdp_endpoint.clone(),
+        port: session.port,
+        target_id: target_id.clone(),
+        engine: format!("{:?}", session.engine),
+        owner_gm_session: session.owner_gm_session.clone(),
+    };
+    let path = remote_page_sidecar_path(&profile_dir);
+    let temporary = profile_dir.join(format!(
+        "chrome.remote-page-{}-{}.tmp",
+        std::process::id(),
+        unix_ms()
+    ));
+    let saved = (|| -> Result<(), Box<dyn std::error::Error>> {
+        std::fs::create_dir_all(&profile_dir)?;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
+        file.write_all(&serde_json::to_vec(&record)?)?;
+        file.sync_all()?;
+        std::fs::rename(&temporary, &path)?;
+        Ok(())
+    })();
+    let _ = std::fs::remove_file(&temporary);
+    saved.map_err(|error| {
+        format!(
+            "could not preserve remote page recovery identity at {}: {error}",
+            path.display()
+        )
+    })
+}
+
+fn try_adopt_remote_page(
+    cwd: &Path,
+    session_id: &str,
+    engine: crate::browser_engine::Engine,
+) -> bool {
+    let Some(endpoint) = configured_remote_endpoint(cwd, engine) else {
+        return false;
+    };
+    let profile_dir = browser_chrome_profile_dir(cwd, session_id);
+    let Some(record) = std::fs::read_to_string(remote_page_sidecar_path(&profile_dir))
+        .ok()
+        .and_then(|raw| serde_json::from_str::<RemotePageRecord>(&raw).ok())
+    else {
+        return false;
+    };
+    if record.version != 1
+        || record.session_id != session_id
+        || record.endpoint != endpoint
+        || record.engine != format!("{engine:?}")
+        || record.port == 0
+        || record.target_id.is_empty()
+    {
+        return false;
+    }
+    let mut map = sessions_map()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    map.entry(session_key(cwd, session_id))
+        .or_insert_with(|| BrowserSession {
+            cwd: cwd.to_path_buf(),
+            session_id: session_id.to_string(),
+            owner_gm_session: record.owner_gm_session,
+            child: None,
+            pid: 0,
+            port: record.port,
+            cdp_endpoint: record.endpoint,
+            last_used: last_used_recorded_in_sidecars(&profile_dir),
+            target_id: Some(record.target_id),
+            owns_process: false,
+            engine,
+            idle_reap: crate::idle_reap::recorded(&profile_dir),
+        });
+    true
 }
 
 fn last_used_sidecar_path(profile_dir: &Path) -> PathBuf {
@@ -892,7 +1086,7 @@ fn try_adopt_orphaned_session(
     {
         let mut map = sessions_map().lock().unwrap_or_else(|e| e.into_inner());
         if let Some(existing) = map.get_mut(&key) {
-            if session_is_alive(existing) {
+            if !existing.owns_process || session_is_alive(existing) {
                 return Some(session_id);
             }
             map.remove(&key);
@@ -1782,12 +1976,26 @@ fn session_new(
     let key = session_key(cwd, session_id);
     let lifecycle_lock = session_lifecycle_lock_for_key(&key);
     let _lifecycle_guard = lifecycle_lock.lock().unwrap_or_else(|e| e.into_inner());
-    {
-        let mut map = sessions_map().lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(existing) = map.remove(&key) {
-            kill_session_because(existing, "replaced_by_session_new", None);
+    try_adopt_remote_page(cwd, session_id, engine);
+    let existing = sessions_map()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&key);
+    if let Some(existing) = existing {
+        if !existing.owns_process {
+            if let Err(error) = close_owned_remote_page(&existing) {
+                sessions_map()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(key.clone(), existing);
+                return json!({"ok": false, "stdout": "", "exit_code": 1, "stderr": error});
+            }
         }
+        kill_session_because(existing, "replaced_by_session_new", None);
     }
+    let profile_dir = browser_chrome_profile_dir(cwd, session_id);
+    let _ = std::fs::remove_file(target_id_sidecar_path(&profile_dir));
+    let _ = std::fs::remove_file(remote_page_sidecar_path(&profile_dir));
     let _launch_slot = match reserve_chrome_launch_slot(cfg, engine, &key) {
         Ok(slot) => slot,
         Err(e) => return json!({"ok": false, "stdout": "", "exit_code": 1, "stderr": e}),
@@ -1842,7 +2050,7 @@ fn session_list(
     let mut out = Vec::new();
     for k in keys_for_cwd {
         let alive = map.get_mut(&k).map(session_is_alive).unwrap_or(false);
-        if !alive {
+        if !alive && map.get(&k).is_some_and(|session| session.owns_process) {
             map.remove(&k);
             continue;
         }
@@ -1862,7 +2070,7 @@ fn session_list(
                 "pid": s.pid,
                 "project": s.cwd.display().to_string(),
                 "owns_process": s.owns_process,
-                "alive": true,
+                "alive": alive,
                 "idle_ms": s.last_used.elapsed().as_millis() as u64,
                 "idle_seconds": s.last_used.elapsed().as_secs(),
                 "idle_reap": IdleReap::report(s.idle_reap),
@@ -1930,6 +2138,11 @@ fn session_close(cwd: &Path, target_session_id: &str, require_found: bool) -> Va
             .unwrap_or_else(|e| e.into_inner())
             .remove(&key)
     };
+    try_adopt_remote_page(
+        cwd,
+        target_session_id,
+        crate::browser_engine::select_engine(cwd, None),
+    );
     let removed = remove_tracked().or_else(|| {
         try_adopt_orphaned_session(
             cwd,
@@ -1939,11 +2152,21 @@ fn session_close(cwd: &Path, target_session_id: &str, require_found: bool) -> Va
         .filter(|adopted_id| adopted_id == target_session_id)
         .and_then(|_| remove_tracked())
     });
+    if let Some(session) = removed.as_ref().filter(|session| !session.owns_process) {
+        if let Err(error) = close_owned_remote_page(session) {
+            sessions_map()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(key, removed.unwrap());
+            return json!({"ok": false, "stdout": "", "exit_code": 1, "stderr": error, "session_id": target_session_id, "closed": false});
+        }
+    }
     crate::gpu::record_uncapped(&browser_chrome_profile_dir(cwd, target_session_id), false);
     crate::idle_reap::record(&browser_chrome_profile_dir(cwd, target_session_id), None);
     let profile_dir = browser_chrome_profile_dir(cwd, target_session_id);
     let _ = std::fs::remove_file(ended_sidecar_path(&profile_dir));
     let _ = std::fs::remove_file(target_id_sidecar_path(&profile_dir));
+    let _ = std::fs::remove_file(remote_page_sidecar_path(&profile_dir));
     match removed {
         Some(session) => {
             kill_session(session);
@@ -1978,6 +2201,21 @@ fn session_ids_owned_by(cwd: &Path, owner_gm_session: &str) -> Vec<String> {
             else {
                 continue;
             };
+            let remote_record = std::fs::read_to_string(remote_page_sidecar_path(&path))
+                .ok()
+                .and_then(|raw| serde_json::from_str::<RemotePageRecord>(&raw).ok());
+            if let Some(record) = remote_record
+                .filter(|record| record.owner_gm_session.as_deref() == Some(owner_gm_session))
+            {
+                if try_adopt_remote_page(
+                    cwd,
+                    &record.session_id,
+                    crate::browser_engine::select_engine(cwd, None),
+                ) {
+                    ids.push(record.session_id);
+                }
+                continue;
+            }
             let recorded_owner = std::fs::read_to_string(owner_gm_session_sidecar_path(&path)).ok();
             if recorded_owner.as_deref().map(str::trim) != Some(owner_gm_session) {
                 continue;
@@ -2305,6 +2543,20 @@ fn launch_chrome(
     session_id: &str,
     browser_cfg: &BrowserConfig,
 ) -> Result<(Child, u16), String> {
+    if cfg!(target_os = "linux")
+        && !browser_cfg.headless()
+        && !partition_chrome_extra_args(browser_cfg)
+            .0
+            .iter()
+            .any(|arg| arg == "--headless" || arg.starts_with("--headless="))
+        && ["DISPLAY", "WAYLAND_DISPLAY"]
+            .iter()
+            .all(|name| std::env::var_os(name).is_none_or(|value| value.is_empty()))
+    {
+        return Err(
+            "headed Chrome requires DISPLAY or WAYLAND_DISPLAY on Linux; set headless: true in .gm/browser-config.json, or set chrome_cdp_endpoint / GM_CHROME_CDP_ENDPOINT to an existing Chrome endpoint".to_string(),
+        );
+    }
     let chrome = find_chrome()
         .ok_or_else(|| "no Chrome found; install Google Chrome or Chromium".to_string())?;
     let profile_dir = browser_chrome_profile_dir(cwd, session_id);
@@ -2402,10 +2654,6 @@ pub fn run(body: &str, opts: &str, cwd_raw: &Path, session_id: &str) -> Value {
     reap_idle_sessions(cwd, &browser_cfg);
     reap_os_orphans(cwd);
 
-    // A body authored with CRLF line endings (or a directive line with trailing spaces) used to
-    // miss every `"<directive>\n"` prefix, so `capture` silently fell through to the default mode
-    // and reported `instrumented: false` with no visible cause. Normalize once, before any
-    // directive is parsed, so mode/quiet/timeout/sessionId/viewport/url all behave identically.
     let inner_body = if body.contains('\r') {
         body.replace("\r\n", "\n")
     } else {
@@ -2421,7 +2669,7 @@ pub fn run(body: &str, opts: &str, cwd_raw: &Path, session_id: &str) -> Value {
     let requested_cdp_endpoint = crate::browser_engine::chrome_cdp_endpoint_override(cwd);
 
     let (explicit_session_id, after_session_prefix) = strip_session_id_prefix(&inner_body);
-    let inner_body = after_session_prefix;
+    let inner_body = after_session_prefix.as_ref();
     let origin = crate::dispatch_origin::current_dispatch_origin();
     let owner_gm_session = origin.gm_session.clone();
     let caller_implicit_session = origin.implicit_page_session(session_id);
@@ -2627,7 +2875,12 @@ pub fn run(body: &str, opts: &str, cwd_raw: &Path, session_id: &str) -> Value {
             }
             continue;
         }
-        let (v, after_viewport) = strip_viewport_width_height_scale_mobile_prefix(rest);
+        let (v, after_viewport) = match strip_viewport_width_height_scale_mobile_prefix(rest) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                return json!({"ok": false, "stdout": "", "exit_code": 1, "stderr": error})
+            }
+        };
         if v.is_some() {
             viewport = v;
             rest = after_viewport;
@@ -2695,9 +2948,6 @@ pub fn run(body: &str, opts: &str, cwd_raw: &Path, session_id: &str) -> Value {
         Err(std::sync::TryLockError::Poisoned(poisoned)) => (Some(poisoned.into_inner()), None),
         Err(std::sync::TryLockError::WouldBlock) => {
             let queued_at = Instant::now();
-            // Bounded: an unbounded `lock()` here let a wedged holder keep every later dispatch
-            // on the same page waiting past the caller's own deadline, which is how the verb
-            // "hung" with no response at all. Give up and say so instead.
             let budget = Duration::from_millis(timeout_ms.max(1_000));
             let mut acquired = None;
             while acquired.is_none() && queued_at.elapsed() < budget {
@@ -2794,10 +3044,11 @@ pub fn run(body: &str, opts: &str, cwd_raw: &Path, session_id: &str) -> Value {
             kill_session_because(session, "engine_changed", None);
         }
     }
+    try_adopt_remote_page(cwd, session_id, engine);
     let candidate_port = {
         let mut map = sessions_map().lock().unwrap_or_else(|e| e.into_inner());
         let reuse_port = map.get_mut(&key).and_then(|s| {
-            if session_is_alive(s) {
+            if !s.owns_process || session_is_alive(s) {
                 Some(s.port)
             } else {
                 None
@@ -2812,7 +3063,32 @@ pub fn run(body: &str, opts: &str, cwd_raw: &Path, session_id: &str) -> Value {
     let mut launched_fresh_chrome = false;
     let session_had_prior_page =
         target_id_sidecar_path(&browser_chrome_profile_dir(cwd, session_id)).exists();
+    let remote_endpoint = sessions_map()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&key)
+        .filter(|session| !session.owns_process)
+        .map(|session| session.cdp_endpoint.clone());
+    if let Some(endpoint) = remote_endpoint.as_deref() {
+        if !cdp_endpoint_ready_probe(
+            endpoint,
+            Instant::now() + browser_cfg.chrome_ready_deadline(),
+            &browser_cfg,
+        ) {
+            cleanup(&[&helper_path, &script_path, &result_path]);
+            return annotate_queue_wait(
+                json!({"ok": false, "stdout": "", "exit_code": 1, "stderr": format!(
+                    "remote CDP endpoint '{endpoint}' did not respond within {}ms; session and owned page identity retained for retry",
+                    browser_cfg.chrome_ready_deadline().as_millis())}),
+                queued_behind_same_page_ms,
+                session_id,
+            );
+        }
+    }
     let port = match candidate_port.filter(|_| {
+        if remote_endpoint.is_some() {
+            return true;
+        }
         let map = sessions_map().lock().unwrap_or_else(|e| e.into_inner());
         map.get(&key)
             .is_some_and(|session| session_cdp_endpoint_responds(&session.cdp_endpoint))
@@ -2844,7 +3120,10 @@ pub fn run(body: &str, opts: &str, cwd_raw: &Path, session_id: &str) -> Value {
     let port = match port {
         Some(p) => p,
         None => {
-            let adopted_port = if engine == crate::browser_engine::Engine::Steel {
+            let adopted_port = if matches!(
+                engine,
+                crate::browser_engine::Engine::Steel | crate::browser_engine::Engine::RemoteChrome
+            ) {
                 None
             } else {
                 try_adopt_orphaned_session(
@@ -2929,7 +3208,7 @@ pub fn run(body: &str, opts: &str, cwd_raw: &Path, session_id: &str) -> Value {
         "cdpEndpoint": sessions_map().lock().unwrap_or_else(|e| e.into_inner()).get(&key).map(|session| session.cdp_endpoint.clone()).unwrap_or_else(|| format!("http://127.0.0.1:{port}")),
         "startUrl": start_url,
         "targetId": known_target_id,
-        "claimFreshTarget": engine == crate::browser_engine::Engine::Steel,
+        "claimFreshTarget": true,
         "glCapture": mode == BrowserMode::Capture && mode_name == "gl",
         "uncapped": uncapped,
         "gpuProbeFile": gpu_probe_path.as_ref().map(|p| p.to_string_lossy().into_owned()),
@@ -2955,8 +3234,6 @@ pub fn run(body: &str, opts: &str, cwd_raw: &Path, session_id: &str) -> Value {
         .arg(&helper_path)
         .arg(&cfg)
         .stdin(Stdio::null())
-        // Nothing ever reads the helper's stdout (results go to resultFile, diagnostics to
-        // stderr), so a piped stdout is only a 64KB write buffer the child can block on.
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
     #[cfg(windows)]
@@ -2977,10 +3254,6 @@ pub fn run(body: &str, opts: &str, cwd_raw: &Path, session_id: &str) -> Value {
         }
     };
 
-    // Kill inside the caller's own deadline, not after it: waiting `timeout_ms + grace` meant the
-    // response could only ever land once the caller had already given up, which reads as a wedged
-    // verb. The lead is always larger than the helper's pre-kill watchdog margin, so the helper's
-    // honest "did not settle" result is already on disk when we get here.
     let kill_lead = std::cmp::max(
         HOST_KILL_LEAD_MS,
         std::cmp::max(timeout_ms / 40, browser_cfg.eval_timeout_grace()),
@@ -3002,7 +3275,12 @@ pub fn run(body: &str, opts: &str, cwd_raw: &Path, session_id: &str) -> Value {
         .get(&key)
         .map(|session| session.cdp_endpoint.clone())
         .unwrap_or_else(|| format!("http://127.0.0.1:{port}"));
-    if timed_out && !session_liveness_recheck(port, &cdp_endpoint, &browser_cfg) {
+    let owns_process = sessions_map()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&key)
+        .is_some_and(|session| session.owns_process);
+    if timed_out && owns_process && !session_liveness_recheck(port, &cdp_endpoint, &browser_cfg) {
         eprintln!(
             "[agentplug browser] eval timeout AND page unresponsive to a follow-up probe -- session '{}' (port {}) is wedged, killing and evicting so the next dispatch gets a fresh Chrome",
             session_id, port
@@ -3031,6 +3309,14 @@ pub fn run(body: &str, opts: &str, cwd_raw: &Path, session_id: &str) -> Value {
         let mut map = sessions_map().lock().unwrap_or_else(|e| e.into_inner());
         if let Some(s) = map.get_mut(&key) {
             s.target_id = Some(resolved_target_id.to_string());
+            if let Err(error) = write_remote_page_sidecar(s) {
+                cleanup(&[&helper_path, &script_path, &result_path]);
+                return annotate_queue_wait(
+                    json!({"ok": false, "stdout": "", "exit_code": 1, "stderr": error}),
+                    queued_behind_same_page_ms,
+                    session_id,
+                );
+            }
         }
         write_target_id_sidecar(
             &browser_chrome_profile_dir(cwd, session_id),
@@ -3053,9 +3339,6 @@ pub fn run(body: &str, opts: &str, cwd_raw: &Path, session_id: &str) -> Value {
     );
     let shaped_debug = |raw: Option<&Value>| -> Value {
         let mut debug = raw.cloned().unwrap_or_else(default_debug);
-        // Authoritative and always present, so `capture` either clearly engaged or clearly did
-        // not: previously only the negative case carried a flag, which is what made the
-        // "instrumented: false" reports look like they had no pattern.
         if let Some(obj) = debug.as_object_mut() {
             obj.insert("instrumented".to_string(), json!(instrumented));
         }
@@ -3077,8 +3360,6 @@ pub fn run(body: &str, opts: &str, cwd_raw: &Path, session_id: &str) -> Value {
         "gm_session": owner_gm_session,
         "port": port,
     });
-    // The document the script actually ran in, plus how it got there. Without this a stale or
-    // blank document is indistinguishable from a rendered one in the caller's own output.
     if let Some(doc) = result_value.get("__document").filter(|d| !d.is_null()) {
         out["document"] = doc.clone();
     }

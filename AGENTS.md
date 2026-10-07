@@ -18,13 +18,22 @@ the `agentplug-host` imports, and `agentplug-trust`. Work on `main` as GitHub us
 - Keep signing material only in the protected CI environment. Bind each signature to the immutable
   source revision that built its artifact, and publish a release only after every expected asset and
   signature is present.
+- Build provenance watches Git-resolved HEAD, every symbolic ref, and packed refs across submodule
+  and worktree gitdirs. Missing loose refs watch their nearest existing parent; ordinary commits
+  must refresh embedded COMMIT without touching source or clearing Cargo caches.
 - Canonical runner promotion atomically persists the staging receipt beside the promoted binary
   and rechecks its artifact, version, bytes and signature before re-exec. Receipt or verification
   failure keeps the permitted staged daemon serving. Preserve the authoritative checker’s explicit
   `warn`/`off` policies; only `off` allows an absent receipt, never enforced signature mode.
-- A discovered same-user GitHub CLI credential directory is shared with Git and execution child
-  processes through `GH_CONFIG_DIR`; an explicit inherited directory takes precedence. Git uses
-  the transient `gh auth git-credential` helper. Never export, copy, print, or persist its token.
+- A discovered same-user GitHub CLI credential directory is shared with Git, execution children,
+  and updater API calls; fresh boot, takeover and canonical re-exec discover it before workers start.
+  Inherited `GH_CONFIG_DIR` takes precedence. Git uses transient
+  `gh auth git-credential`. The updater preserves the `GITHUB_TOKEN.or_else(GH_TOKEN)` selector:
+  an empty selected value falls back to system `gh auth token`, not the other environment name.
+  CLI retrieval is noninteractive with a 5s lookup/drain deadline and 8KiB output cap. Its
+  memory-only cache retains successes for 60s and misses for 10s, keyed by PATH, directory,
+  and cwd for relative PATH entries. CLI 401 invalidates that cache and in-flight refreshes;
+  explicit-token 401 does not rescue through CLI. Never export tokens or expose them in files/output.
 - Execution children inherit explicit `SHELL` and `XDG_RUNTIME_DIR`. On Unix, an absent `SHELL`
   selects the effective user’s account shell only when it is absolute, executable, root/user-owned,
   and not group/other-writable. One cached login probe captures only `PATH` and `XDG_RUNTIME_DIR`,
@@ -33,13 +42,34 @@ the `agentplug-host` imports, and `agentplug-trust`. Work on `main` as GitHub us
 
 ## Runtime invariants
 
+- Dream observation maintenance queues only registered `dream-replay-cycle` for the
+  actual owner through canonical `session_id`. Private atomic per-owner state is
+  persisted before its fixed pending request is published; recover that same request,
+  never advance the dispatch cursor on queueing or deferred/failed replies. Accept
+  acknowledgments only after its input/claim is gone, from a matching owner/cycle
+  response with new verified replay
+  evidence. Opaque dispatch IDs are compared for equality, not ordered. Missing
+  cursors in the capped observation window indicate partial coverage, not exact
+  counts. Replies and observations are bounded to 1 MiB; walks process at most 64
+  entries and check a cooperative 50 ms budget between entries. Rotate roots after
+  batches of eight entries; retain at most 256 root-directory cursors and remove
+  deregistered roots. Cache pressure explicitly defers discovery, never proves
+  complete coverage of an unbounded roster. Retry attempts have a durable
+  fifteen-minute cooldown; maintenance never evaluates or deploys policies.
+  Dispatch origin preserves its owner scoping but does not refresh session/browser
+  activity for this exact maintenance verb.
+
 - `host_fs_readdir` returns zero on directory or entry-read failure, never a successful empty
   or partial array. Structural indexing propagates that failure and refuses pruning or graph
   evidence; legacy guest wrappers may explicitly retain their empty-list fallback.
+- `host_fs_read` reserves packed value `1` for a successful empty UTF-8 read, without allocation.
+  Actual path, I/O and UTF-8 failures remain `0`; nonempty reads retain their pointer/length ABI.
+  Guests must recognize the empty marker before decoding a pointer; older guests still refuse it.
 - Spawn and JavaScript adoption share process-instance checked monotonic IDs and never overwrite
   occupied entries. Failed registration cleans up only the newly owned child and process group.
   Task output first checks the live registry, then its private durable result store; missing handles
   distinguish registry-instance mismatch from a missing current-instance task.
+  Adopted tasks expose raw captured streams, without decoding foreground JavaScript result frames.
 - Runner handoff acquires execution admission before preserving completed results; active execution,
   children, or pipe drains defer it. Acquire shared admission before a child can execute and retain
   it through registration/adoption. Failed preparation or ownership transfer releases admission;
@@ -61,6 +91,9 @@ the `agentplug-host` imports, and `agentplug-trust`. Work on `main` as GitHub us
   produce an out-file or be released for recovery.
 - `DispatchOrigin::page_session` is the only browser session resolver. Browser pages are keyed by
   project root and GM session; serialize work per page before writing its temporary files.
+  Chrome and Steel reuse only their remembered target; a missing target creates a fresh owned page,
+  never adopts another session's tab. Explicit `url=` reloads an identical URL; hash-only changes
+  retain the document. Preserve document telemetry and captured diagnostics on evaluation failure.
 - Acquire the browser page guard before global plugin admission. Waiting for the same page must
   not consume execution slots needed by unrelated commands; distinct page sessions stay parallel.
 - Kill only processes and browser profiles owned by this host. An adopted or externally supplied
@@ -71,10 +104,12 @@ the `agentplug-host` imports, and `agentplug-trust`. Work on `main` as GitHub us
 - Foreground execution waits at most 50 ms for both output drains after child exit, capped by the
   remaining execution deadline. Unfinished readers transfer to task ownership; they do not prove a
   descendant holds a pipe.
-- Default JavaScript results use the last sentinel candidate followed by a complete JSON line;
+- Foreground default JavaScript results use the last sentinel candidate followed by a complete JSON line;
   remove only that validated frame. Sentinel text inside returned strings or ordinary stdout
   must remain data, including when stdout has no preceding newline.
 - Plugin reload recovery must receive the current engine and module map at dispatch construction.
+  Nested calls reload registered empty sibling pools from that module map after shared-store eviction;
+  populated or busy pools retain their owners. Failed reloads remain failures, not indexed evidence.
   If poisoned-store recovery fails, capture the active module map and instantiation error before
   changing registry behavior.
 
