@@ -1580,7 +1580,7 @@ pub fn run_takeover(version: &str) -> anyhow::Result<()> {
     )?;
     eprintln!("[agentplug daemon] takeover: building engine for version {version}");
     let mut plugin_modules = PluginModules::new()?;
-    for plugin_name in ["gm", "bert", "libsql", "treesitter", "oxibrowser", "crux", "modlens"] {
+    for plugin_name in ["gm", "bert", "libsql", "treesitter", "oxibrowser", "crux"] {
         if let Err(e) = plugin_modules.get_or_compile(plugin_name) {
             eprintln!("[agentplug daemon] takeover: pre-warm of {plugin_name} failed (non-fatal, will lazy-compile on first use): {e}");
         }
@@ -3867,7 +3867,7 @@ pub fn reap_spool_out_files(root: &Path, force: bool) -> usize {
     reaped
 }
 
-const RAW_PLUGIN_SPOOL_VERBS: &[&str] = &["libsql", "bert", "modlens"];
+const RAW_PLUGIN_SPOOL_VERBS: &[&str] = &["libsql", "bert"];
 
 fn extract_session_id(body: &str) -> Option<String> {
     let value = serde_json::from_str::<serde_json::Value>(body).ok()?;
@@ -5640,7 +5640,7 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
             per_root_plugin_scan_pending = true;
             per_root_plugin_scan_walk.reset();
         }
-        for plugin_name in ["gm", "libsql", "bert", "treesitter", "oxibrowser", "crux", "modlens"] {
+        for plugin_name in ["gm", "libsql", "bert", "treesitter", "oxibrowser", "crux"] {
             if plugin_compile_in_backoff(plugin_name) {
                 continue;
             }
