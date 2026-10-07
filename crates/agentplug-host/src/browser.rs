@@ -317,6 +317,29 @@ fn starts_cdp_raw_body(trimmed: &str) -> bool {
     }
 }
 
+fn line_starts_raw_cdp_directive(line: &str) -> bool {
+    let mut words = line.split_whitespace();
+    match words.next() {
+        Some("cdp") => words.next().is_some(),
+        Some("events") => words.next().is_some_and(names_cdp_event),
+        Some("wait") => words
+            .next()
+            .is_some_and(|w| w.contains('.') || w.chars().any(|c| c.is_ascii_digit())),
+        _ => false,
+    }
+}
+
+fn stray_cdp_directive_line(body: &str) -> Option<(usize, String)> {
+    for (index, line) in body.lines().enumerate() {
+        let raw = line.trim_end();
+        if raw.starts_with(char::is_whitespace) || !line_starts_raw_cdp_directive(raw) {
+            continue;
+        }
+        return Some((index + 1, raw.chars().take(80).collect()));
+    }
+    None
+}
+
 fn strip_mode_prefix(body: &str) -> (BrowserMode, String, &str) {
     let trimmed = body.trim_start();
     let Some(nl) = trimmed.find('\n') else {
@@ -541,6 +564,42 @@ fn strip_viewport_width_height_scale_mobile_prefix(
             (Some((width, height, scale, mobile)), remainder)
         }
         _ => (None, body),
+    }
+}
+
+pub(crate) const INPUT_ISOLATION_HELP: &str =
+    "isolateInput or isolateInput=on|off (on drops every real host key/mouse event at the page, re-applied after every navigation and after every Page.navigate/Page.reload in a raw cdp body)";
+
+fn strip_input_isolation_prefix(body: &str) -> (Option<Result<bool, String>>, &str) {
+    let trimmed = body.trim_start();
+    let Some(rest) = trimmed.strip_prefix("isolateInput") else {
+        return (None, body);
+    };
+    let (spec, remainder) = match rest.find('\n') {
+        Some(nl) => (&rest[..nl], &rest[nl + 1..]),
+        None => (rest, ""),
+    };
+    let spec = spec.trim();
+    if spec.is_empty() {
+        return (Some(Ok(true)), remainder);
+    }
+    let Some(value) = spec.strip_prefix('=') else {
+        return (
+            Some(Err(format!(
+                "'isolateInput{spec}' is not an input isolation directive (expected {INPUT_ISOLATION_HELP})"
+            ))),
+            body,
+        );
+    };
+    match value.trim() {
+        "on" | "true" | "1" => (Some(Ok(true)), remainder),
+        "off" | "false" | "0" => (Some(Ok(false)), remainder),
+        other => (
+            Some(Err(format!(
+                "isolateInput={other} is not an accepted value (expected {INPUT_ISOLATION_HELP})"
+            ))),
+            body,
+        ),
     }
 }
 
@@ -2539,6 +2598,7 @@ pub fn run(body: &str, opts: &str, cwd_raw: &Path, session_id: &str) -> Value {
     let mut viewport = None;
     let mut start_url: Option<String> = None;
     let mut url_default_script = String::new();
+    let mut input_isolation: Option<bool> = None;
     let mut rest: &str = inner_body;
     if crate::gpu::is_gpu_query(inner_body) {
         mode = BrowserMode::Gpu;
@@ -2573,6 +2633,17 @@ pub fn run(body: &str, opts: &str, cwd_raw: &Path, session_id: &str) -> Value {
             rest = after_viewport;
             continue;
         }
+        match strip_input_isolation_prefix(rest) {
+            (Some(Ok(value)), after_isolation) => {
+                input_isolation = Some(value);
+                rest = after_isolation;
+                continue;
+            }
+            (Some(Err(message)), _) => {
+                return json!({"ok": false, "stdout": "", "exit_code": 1, "stderr": message});
+            }
+            (None, _) => {}
+        }
         if start_url.is_none() {
             let (u, default_script, after_url) = strip_url_prefix(rest);
             if u.is_some() {
@@ -2598,6 +2669,15 @@ pub fn run(body: &str, opts: &str, cwd_raw: &Path, session_id: &str) -> Value {
     } else {
         rest.to_string()
     };
+
+    if mode == BrowserMode::Default {
+        if let Some((line_no, line)) = stray_cdp_directive_line(&script) {
+            let first: String = script.lines().next().unwrap_or("").trim().chars().take(80).collect();
+            return json!({"ok": false, "stdout": "", "exit_code": 1,
+                "stderr": format!("line {line_no}: '{line}' is a raw cdp directive, but this body was read as JavaScript because its first line is '{first}' -- a raw cdp body must carry its directive on the FIRST line (only timeout=, quiet/debug=on, viewport=, isolateInput, url= and sessionId= prefixes may precede it), so refusing instead of sending the body to the page where it can only fail with a SyntaxError"),
+                "start_url": start_url});
+        }
+    }
 
     if mode != BrowserMode::Dom && script.trim().is_empty() {
         return json!({"ok": false, "stdout": "", "exit_code": 1,
@@ -2860,6 +2940,7 @@ pub fn run(body: &str, opts: &str, cwd_raw: &Path, session_id: &str) -> Value {
         "mode": mode_label(mode),
         "artifactFile": artifact_path.as_ref().map(|p| p.to_string_lossy().into_owned()),
         "domSelector": dom_selector,
+        "inputIsolation": input_isolation,
         "viewport": viewport.map(|(width, height, device_scale_factor, mobile)| json!({
             "width": width,
             "height": height,
@@ -3000,6 +3081,12 @@ pub fn run(body: &str, opts: &str, cwd_raw: &Path, session_id: &str) -> Value {
     // blank document is indistinguishable from a rendered one in the caller's own output.
     if let Some(doc) = result_value.get("__document").filter(|d| !d.is_null()) {
         out["document"] = doc.clone();
+    }
+    // What this dispatch pinned on the session and re-applied after every navigation, so a caller
+    // comparing two sessions can see the viewport/device pixel ratio and input isolation they were
+    // asking for actually took effect instead of inferring it from the page's own reported metrics.
+    if let Some(setup) = result_value.get("__session_setup").filter(|d| !d.is_null()) {
+        out["session_setup"] = setup.clone();
     }
     if session_created_by_this_dispatch {
         out["session_created"] = Value::Bool(true);
