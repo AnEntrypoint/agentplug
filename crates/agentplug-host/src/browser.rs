@@ -497,21 +497,62 @@ fn strip_timeout_prefix(body: &str) -> (Option<u64>, &str) {
     }
 }
 
-pub(crate) fn strip_session_id_prefix(body: &str) -> (Option<String>, &str) {
-    let trimmed = body.trim_start();
-    let Some(rest) = trimmed.strip_prefix("sessionId=") else {
-        return (None, body);
-    };
-    let Some(nl) = rest.find('\n') else {
-        return (None, body);
-    };
-    let (id, remainder) = (&rest[..nl], &rest[nl + 1..]);
-    let id = id.trim();
-    if id.is_empty() {
-        (None, remainder)
-    } else {
-        (Some(id.to_string()), remainder)
+pub(crate) fn strip_session_id_prefix(body: &str) -> (Option<String>, std::borrow::Cow<'_, str>) {
+    let mut rest = body;
+    loop {
+        let trimmed = rest.trim_start();
+        if let Some(session) = trimmed.strip_prefix("sessionId=") {
+            let Some(nl) = session.find('\n') else {
+                return (None, std::borrow::Cow::Borrowed(body));
+            };
+            let id = session[..nl].trim();
+            let remainder = &session[nl + 1..];
+            let consumed = body.len() - rest.len();
+            let remaining_body = if consumed == 0 {
+                std::borrow::Cow::Borrowed(remainder)
+            } else {
+                std::borrow::Cow::Owned(format!("{}{}", &body[..consumed], remainder))
+            };
+            return (
+                if id.is_empty() {
+                    None
+                } else {
+                    Some(id.to_string())
+                },
+                remaining_body,
+            );
+        }
+        let (timeout, after_timeout) = strip_timeout_prefix(rest);
+        if timeout.is_some() {
+            rest = after_timeout;
+            continue;
+        }
+        let (quiet, after_quiet) = strip_debug_visibility_prefix(rest);
+        if quiet.is_some() {
+            rest = after_quiet;
+            continue;
+        }
+        let (mode, _, after_mode) = strip_mode_prefix(rest);
+        if mode == BrowserMode::CdpRaw {
+            break;
+        }
+        if mode != BrowserMode::Default {
+            rest = after_mode;
+            continue;
+        }
+        let (viewport, after_viewport) = strip_viewport_width_height_scale_mobile_prefix(rest);
+        if viewport.is_some() {
+            rest = after_viewport;
+            continue;
+        }
+        let (url, _, after_url) = strip_url_prefix(rest);
+        if url.is_some() {
+            rest = after_url;
+            continue;
+        }
+        break;
     }
+    (None, std::borrow::Cow::Borrowed(body))
 }
 
 fn strip_viewport_width_height_scale_mobile_prefix(
@@ -2315,7 +2356,7 @@ pub fn run(body: &str, opts: &str, cwd_raw: &Path, session_id: &str) -> Value {
     let requested_cdp_endpoint = crate::browser_engine::chrome_cdp_endpoint_override(cwd);
 
     let (explicit_session_id, after_session_prefix) = strip_session_id_prefix(&inner_body);
-    let inner_body = after_session_prefix;
+    let inner_body = after_session_prefix.as_ref();
     let origin = crate::dispatch_origin::current_dispatch_origin();
     let owner_gm_session = origin.gm_session.clone();
     let caller_implicit_session = origin.implicit_page_session(session_id);
