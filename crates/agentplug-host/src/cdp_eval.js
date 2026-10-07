@@ -187,7 +187,7 @@ function resumableSession(endpoint, target, first) {
   const wrapper = {
     onIdLessNotification: null,
     send(method, params) {
-      if (method.endsWith('.enable') || method.startsWith('Emulation.set')) replayedSetup.set(method, params);
+      if (method.endsWith('.enable') || method.startsWith('Emulation.set') || method === 'Input.setIgnoreInputEvents') replayedSetup.set(method, params);
       if (method.endsWith('.disable')) replayedSetup.delete(method.replace(/\.disable$/, '.enable'));
       return live.send(method, params);
     },
@@ -251,6 +251,41 @@ function navHashOf(url) {
   }
 }
 
+function sessionSetupApplier(sess, viewport, inputIsolation) {
+  const applied = { viewport: null, input_isolation: null };
+  const wantsViewport = Boolean(viewport && viewport.width && viewport.height);
+  if (wantsViewport) {
+    applied.viewport = {
+      width: viewport.width,
+      height: viewport.height,
+      deviceScaleFactor: viewport.deviceScaleFactor || 1,
+      mobile: viewport.mobile !== false,
+    };
+  }
+  if (inputIsolation === true || inputIsolation === false) applied.input_isolation = inputIsolation;
+  const apply = async () => {
+    if (applied.viewport) {
+      await sess.send('Emulation.setDeviceMetricsOverride', {
+        width: applied.viewport.width,
+        height: applied.viewport.height,
+        deviceScaleFactor: applied.viewport.deviceScaleFactor,
+        mobile: applied.viewport.mobile,
+        screenWidth: applied.viewport.width,
+        screenHeight: applied.viewport.height,
+      });
+      if (applied.viewport.mobile) {
+        await sess.send('Emulation.setTouchEmulationEnabled', { enabled: true, maxTouchPoints: 5 }).catch(() => {});
+      }
+    }
+    if (applied.input_isolation !== null) {
+      await sess.send('Input.setIgnoreInputEvents', { ignore: applied.input_isolation });
+    }
+  };
+  return { applied, apply };
+}
+
+const NAVIGATING_RAW_METHODS = new Set(['Page.navigate', 'Page.reload']);
+
 async function documentStateOf(sess) {
   const res = await sess.send('Runtime.evaluate', {
     expression: 'JSON.stringify({ url: String(location.href), readyState: String(document.readyState), blank: (function () { var b = document.body; if (!b) return true; return b.childElementCount === 0 && !String(b.textContent || "").trim(); })(), title: String(document.title || "") })',
@@ -272,7 +307,7 @@ async function documentStateOf(sess) {
 // document in place; `Page.reload` is what actually re-creates it. The load witnesses
 // (Page.loadEventFired vs Page.navigatedWithinDocument) are the protocol's own answer to "did a
 // new document exist", so a stale document is reported instead of being evaluated as if rendered.
-async function ensureDocumentForUrl(sess, startUrl, timeoutMs) {
+async function ensureDocumentForUrl(sess, startUrl, timeoutMs, reapply) {
   const target = String(startUrl);
   const budget = Math.min(Math.max(5000, Math.round(timeoutMs / 3)), NAV_BUDGET_CAP_MS);
   const before = await documentStateOf(sess);
@@ -329,6 +364,7 @@ async function ensureDocumentForUrl(sess, startUrl, timeoutMs) {
       if (Date.now() >= settleDeadline) break;
       await navSleep(NAV_SETTLE_POLL_MS);
     }
+    if (reapply) await reapply();
 
     if (kind !== 'hash') {
       if (!navigationFailure && sawSameDocument && !sawLoad) {
@@ -360,11 +396,11 @@ async function ensureDocumentForUrl(sess, startUrl, timeoutMs) {
   };
 }
 
-async function navigateIfNeededThenEvaluateOverCdp(sess, script, startUrl, timeoutMs, keepNetworkEvents = false) {
+async function navigateIfNeededThenEvaluateOverCdp(sess, script, startUrl, timeoutMs, reapply = null, keepNetworkEvents = false) {
   let navigationFailure = null;
   let documentTelemetry = null;
   if (startUrl) {
-    documentTelemetry = await ensureDocumentForUrl(sess, startUrl, timeoutMs);
+    documentTelemetry = await ensureDocumentForUrl(sess, startUrl, timeoutMs, reapply);
     navigationFailure = documentTelemetry.navigation_failure;
     if (!keepNetworkEvents) await sess.send('Network.disable', {}).catch(() => {});
   }
@@ -835,7 +871,7 @@ function startRawStep(kind, rest, line) {
     const parsed = /^(\S+)(?:[ \t]+on[ \t]+(\S+))?(?:[ \t]+as[ \t]+(\S+))?$/.exec(rest);
     if (!parsed || !RAW_EVENT_NAME.test(parsed[1])) throw new Error(`line ${line}: expected \`cdp <Domain.method> [on <targetId|$ref>] [as <name>]\`, got 'cdp ${rest.slice(0, 80)}'`);
     if (parsed[3] && !RAW_BLOCK_NAME.test(parsed[3])) throw new Error(`line ${line}: block name '${parsed[3]}' must be a letter or underscore followed by letters, digits or underscores (a bare number already means block position)`);
-    return { kind, method: parsed[1], on: parsed[2] || null, name: parsed[3] || null, paramsText: '', line };
+    return { kind, method: parsed[1], on: parsed[2] || null, name: parsed[3] || null, paramsText: '', paramsLines: 0, paramsStartLine: 0, line };
   }
   const tokens = rest.split(/\s+/).filter(Boolean);
   if (kind === 'events') {
@@ -864,6 +900,11 @@ function parseRawBody(script) {
     }
     if (!text.trim()) return;
     if (!current || current.kind !== 'cdp') throw new Error(`line ${index + 1}: '${text.slice(0, 80)}' is not a cdp/events/wait directive and follows no \`cdp <Method>\` line`);
+    if (current.paramsLines === 0 && !/^\s*[[{]/.test(text)) {
+      throw new Error(`line ${index + 1}: '${text.slice(0, 80)}' follows \`cdp ${current.method}\` but is not the start of a JSON params object -- every line under a \`cdp <Method>\` up to the next directive is read as that command's one JSON params value, so a stray line here is a body-authoring fault, not a page fault`);
+    }
+    if (current.paramsLines === 0) current.paramsStartLine = index + 1;
+    current.paramsLines += 1;
     current.paramsText += `${text}\n`;
   });
   const named = new Set();
@@ -985,7 +1026,7 @@ function raceRawDeadline(promise, deadline) {
   return Promise.race([promise, expired]).finally(() => clearTimeout(timer));
 }
 
-async function runCdpRaw(sess, script, watchdogAt, endpoint) {
+async function runCdpRaw(sess, script, watchdogAt, endpoint, reapply) {
   const deadline = watchdogAt - RAW_DEADLINE_MARGIN_MS;
   const steps = parseRawBody(script);
   if (!steps.some((s) => s.kind === 'cdp')) throw new Error('the cdp raw body holds no `cdp <Domain.method>` block');
@@ -1023,7 +1064,7 @@ async function runCdpRaw(sess, script, watchdogAt, endpoint) {
         const where = `block ${index} (${step.method})`;
         let params = {};
         if (step.paramsText.trim()) {
-          try { params = JSON.parse(step.paramsText); } catch (e) { throw new Error(`${where}: params are not valid JSON: ${e.message}`); }
+          try { params = JSON.parse(step.paramsText); } catch (e) { throw new Error(`${where}: params starting on line ${step.paramsStartLine} are not valid JSON: ${e.message}`); }
         }
         params = resolveRawReferences(params, context, where);
         const targetId = step.on ? resolveRawReferences(step.on, context, where) : null;
@@ -1036,6 +1077,7 @@ async function runCdpRaw(sess, script, watchdogAt, endpoint) {
         const block = { index, method: step.method, name: step.name, result };
         context.byIndex[index] = block;
         if (step.name) context.byName.set(step.name, block);
+        if (reapply && NAVIGATING_RAW_METHODS.has(step.method)) await reapply();
       } else if (step.kind === 'sleep') {
         await new Promise((r) => setTimeout(r, Math.max(0, Math.min(step.ms, deadline - Date.now()))));
       } else if (step.kind === 'waitEvent') {
@@ -1060,7 +1102,7 @@ async function runCdpRaw(sess, script, watchdogAt, endpoint) {
 async function main() {
   const startedAt = Date.now();
   const cfg = JSON.parse(process.argv[2]);
-  const { port, cdpEndpoint, startUrl, targetId, scriptFile, resultFile, timeoutMs, mode, artifactFile, viewport, claimFreshTarget, glCapture, gpuProbeFile, wantGpu, uncapped } = cfg;
+  const { port, cdpEndpoint, startUrl, targetId, scriptFile, resultFile, timeoutMs, mode, artifactFile, viewport, claimFreshTarget, glCapture, gpuProbeFile, wantGpu, uncapped, inputIsolation } = cfg;
   const endpoint = cdpEndpoint || `http://127.0.0.1:${port}`;
   const script = fs.readFileSync(scriptFile, 'utf-8');
   const target = await pickPageTarget(endpoint, startUrl, targetId, Math.min(timeoutMs, 30000), claimFreshTarget === true);
@@ -1071,9 +1113,10 @@ async function main() {
   }
   fs.writeFileSync(resultFile, JSON.stringify({ __cdpError: 'cdp helper exited before the evaluation settled', __targetId: target.id }));
   let resultWritten = false;
+  let sessionSetup = null;
   const writeResult = (envelope) => {
     resultWritten = true;
-    fs.writeFileSync(resultFile, JSON.stringify({ ...envelope, __targetId: target.id }));
+    fs.writeFileSync(resultFile, JSON.stringify({ ...envelope, __session_setup: sessionSetup, __targetId: target.id }));
   };
   const HOST_KILL_MARGIN_MS = Math.max(3000, Math.min(15000, Math.round(timeoutMs / 20)));
   const watchdogDeadline = Math.max(500, timeoutMs - HOST_KILL_MARGIN_MS);
@@ -1088,6 +1131,10 @@ async function main() {
   watchdogTimer.unref();
   const sess = resumableSession(endpoint, target, target.__liveSession || await cdpSession(target.webSocketDebuggerUrl, timeoutMs));
   try {
+    const setup = sessionSetupApplier(sess, viewport, inputIsolation);
+    sessionSetup = setup.applied;
+    const reapplySetup = setup.apply;
+    if (mode !== 'gpu') await setup.apply();
     if (mode === 'gpu') {
       const report = await gpuReport(endpoint, fs.readFileSync(gpuProbeFile, 'utf-8'), wantGpu, uncapped === true);
       if (uncapped === true) await sess.send('Page.bringToFront', {}).catch(() => {});
@@ -1098,7 +1145,7 @@ async function main() {
     if (mode === 'cdpraw') {
       let rawDocument = null;
       if (startUrl) {
-        rawDocument = await ensureDocumentForUrl(sess, startUrl, timeoutMs);
+        rawDocument = await ensureDocumentForUrl(sess, startUrl, timeoutMs, reapplySetup);
         if (rawDocument.navigation_failure) {
           writeResult({ __cdpError: `page navigation failed: ${rawDocument.navigation_failure} (url=${startUrl})`, __document: rawDocument });
           process.stderr.write(`cdp-eval: ${rawDocument.navigation_failure}\n`);
@@ -1106,7 +1153,7 @@ async function main() {
           process.exit(1);
         }
       }
-      writeResult({ result: await runCdpRaw(sess, script, startedAt + watchdogDeadline, endpoint), __document: rawDocument });
+      writeResult({ result: await runCdpRaw(sess, script, startedAt + watchdogDeadline, endpoint, reapplySetup), __document: rawDocument });
       sess.close();
       process.exit(0);
     }
@@ -1117,22 +1164,8 @@ async function main() {
     if (uncapped === true) await sess.send('Page.bringToFront', {}).catch(() => {});
     const collectDebug = instrumented ? await attachDebugCapture(sess, glCapture === true) : async () => undefined;
 
-    if (viewport && viewport.width && viewport.height) {
-      await sess.send('Emulation.setDeviceMetricsOverride', {
-        width: viewport.width,
-        height: viewport.height,
-        deviceScaleFactor: viewport.deviceScaleFactor || 1,
-        mobile: viewport.mobile !== false,
-        screenWidth: viewport.width,
-        screenHeight: viewport.height,
-      });
-      if (viewport.mobile !== false) {
-        await sess.send('Emulation.setTouchEmulationEnabled', { enabled: true, maxTouchPoints: 5 }).catch(() => {});
-      }
-    }
-
     if (mode === 'capture') {
-      const res = await navigateIfNeededThenEvaluateOverCdp(sess, script, startUrl, timeoutMs, true);
+      const res = await navigateIfNeededThenEvaluateOverCdp(sess, script, startUrl, timeoutMs, reapplySetup, true);
       const debug = await collectDebug();
       if (res.exceptionDetails) {
         const msg = res.exceptionDetails.exception?.description || res.exceptionDetails.text || 'evaluate exception';
@@ -1156,7 +1189,7 @@ async function main() {
       await sess.send('Profiler.enable', {});
       await sess.send('Profiler.setSamplingInterval', { interval: 100 });
       await sess.send('Profiler.start', {});
-      const res = await navigateIfNeededThenEvaluateOverCdp(sess, script, startUrl, timeoutMs, true);
+      const res = await navigateIfNeededThenEvaluateOverCdp(sess, script, startUrl, timeoutMs, reapplySetup, true);
       const stopRes = await sess.send('Profiler.stop', {});
       const agg = aggregateCpuProfile(stopRes && stopRes.profile, 20);
       const debug = await collectDebug();
@@ -1182,7 +1215,7 @@ async function main() {
     if (mode === 'trace') {
       const recording = await startTraceRecording(sess);
       const w0 = Date.now();
-      const res = await navigateIfNeededThenEvaluateOverCdp(sess, script, startUrl, timeoutMs, true);
+      const res = await navigateIfNeededThenEvaluateOverCdp(sess, script, startUrl, timeoutMs, reapplySetup, true);
       const wallUs = (Date.now() - w0) * 1000;
       const flushDeadline = startedAt + watchdogDeadline - TRACE_FLUSH_WATCHDOG_MARGIN_MS;
       const captured = await stopTraceRecordingToFile(sess, recording, flushDeadline, artifactFile);
@@ -1206,7 +1239,7 @@ async function main() {
     }
 
     if (mode === 'screenshot') {
-      const res = await navigateIfNeededThenEvaluateOverCdp(sess, script, startUrl, timeoutMs);
+      const res = await navigateIfNeededThenEvaluateOverCdp(sess, script, startUrl, timeoutMs, reapplySetup);
       if (res.exceptionDetails) {
         const msg = res.exceptionDetails.exception?.description || res.exceptionDetails.text || 'evaluate exception';
         // The collected console/network/pageErrors used to be dropped on the exception path, so a
@@ -1256,7 +1289,7 @@ async function main() {
         });
       `;
       const wrapped = `(async () => { try { ${domScript} } catch (__e) { return { __domError: String(__e && __e.message || __e) }; } })()`;
-      const res = await navigateIfNeededThenEvaluateOverCdp(sess, wrapped, startUrl, timeoutMs);
+      const res = await navigateIfNeededThenEvaluateOverCdp(sess, wrapped, startUrl, timeoutMs, reapplySetup);
       if (res.exceptionDetails) {
         const msg = res.exceptionDetails.exception?.description || res.exceptionDetails.text || 'evaluate exception';
         // The collected console/network/pageErrors used to be dropped on the exception path, so a
@@ -1282,7 +1315,7 @@ async function main() {
       process.exit(0);
     }
 
-    const res = await navigateIfNeededThenEvaluateOverCdp(sess, script, startUrl, timeoutMs);
+    const res = await navigateIfNeededThenEvaluateOverCdp(sess, script, startUrl, timeoutMs, reapplySetup);
     const debug = await collectDebug();
     if (res.exceptionDetails) {
       const msg = res.exceptionDetails.exception && res.exceptionDetails.exception.description
