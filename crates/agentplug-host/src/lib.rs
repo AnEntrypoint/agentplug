@@ -1,21 +1,16 @@
 mod broker;
-mod browser;
-mod browser_engine;
 mod dispatch_origin;
-mod display;
 mod exec_js;
 mod fs_prewarm;
 mod github_auth;
-mod gpu;
 mod host_state;
 mod http_agent;
-mod idle_reap;
 mod imports;
 mod install;
 mod memory_pressure;
-mod oxibrowser_driver;
 mod precompiled;
 mod process_tree;
+mod project_root;
 mod registry;
 mod task;
 mod task_results;
@@ -26,10 +21,6 @@ pub use broker::{
     begin_rolling_update, reap_drained, register_provider, register_provider_with_weight, route,
     set_policy, shift_traffic, status as broker_status, unregister_provider, BrokerStatus,
     LoadBalancePolicy, ProviderStatus, RouteLease,
-};
-pub use browser::{
-    canonical_project_root, close_all_sessions, project_root,
-    reap_idle_sessions_and_os_orphans_across_every_known_project_root, run as browser_run,
 };
 pub use dispatch_origin::{enter_dispatch_origin_scope, DispatchOriginScope};
 pub use github_auth::{github_cli_token, invalidate_github_cli_token};
@@ -45,6 +36,7 @@ pub use memory_pressure::{
     reset_shared_dispatch_count, shared_dispatches_since_release,
 };
 pub use precompiled::{load_module_file_backed, precompiled_module_path};
+pub use project_root::{canonical_project_root, project_root};
 pub use registry::{
     admission_wait_state_for_thread, advance_plugin_fiber, cost_class_for_dispatch,
     cost_class_for_verb, dispatch_serial_lane, epoch_ticks_for_seconds, get_active_provider,
