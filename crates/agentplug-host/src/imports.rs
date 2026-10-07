@@ -730,7 +730,12 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
                 .and_then(|v| v.as_u64())
                 .map(Duration::from_millis)
                 .unwrap_or(Duration::from_secs(10));
-            let fetch_agent = fetch_agent(timeout);
+            let binary_response = opts.get("responseEncoding").and_then(|v| v.as_str()) == Some("base64");
+            let fetch_agent = if binary_response {
+                crate::http_agent::build_agent_without_redirects(timeout)
+            } else {
+                fetch_agent(timeout)
+            };
             let mut req = fetch_agent.request(&method, &url);
             if let Some(headers) = opts.get("headers").and_then(|v| v.as_object()) {
                 for (k, v) in headers {
@@ -744,12 +749,12 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
                 Some(b) => req.send_string(b),
                 None => req.call(),
             };
-            let binary_response = opts.get("responseEncoding").and_then(|v| v.as_str()) == Some("base64");
             let result = match resp {
                 Ok(r) if binary_response => {
                     use std::io::Read;
                     let status = r.status();
                     let content_type = r.header("content-type").unwrap_or("").to_string();
+                    let location = r.header("location").map(String::from);
                     let mut bytes = Vec::new();
                     match r
                         .into_reader()
@@ -757,7 +762,7 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
                         .read_to_end(&mut bytes)
                     {
                         Ok(_) if bytes.len() as u64 > HOST_BINARY_READ_MAX_BYTES => serde_json::json!({"ok": false, "status": status, "error": "response_exceeds_binary_limit", "limit_bytes": HOST_BINARY_READ_MAX_BYTES}),
-                        Ok(_) => serde_json::json!({"ok": true, "status": status, "content_type": content_type, "body": base64_encode(&bytes), "encoding": "base64"}),
+                        Ok(_) => serde_json::json!({"ok": true, "status": status, "content_type": content_type, "location": location, "body": base64_encode(&bytes), "encoding": "base64"}),
                         Err(e) => serde_json::json!({"ok": false, "status": status, "error": e.to_string()}),
                     }
                 }
@@ -767,8 +772,9 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
                     serde_json::json!({"ok": true, "status": status, "body": text})
                 }
                 Err(ureq::Error::Status(code, r)) => {
+                    let location = r.header("location").map(String::from);
                     let text = r.into_string().unwrap_or_default();
-                    serde_json::json!({"ok": false, "status": code, "body": text})
+                    serde_json::json!({"ok": false, "status": code, "body": text, "location": location})
                 }
                 Err(e) => serde_json::json!({"ok": false, "status": 0, "error": e.to_string()}),
             };
