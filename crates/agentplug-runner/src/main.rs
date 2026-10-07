@@ -52,7 +52,6 @@ fn main() -> anyhow::Result<()> {
             "[agentplug daemon] PANIC pid={} at {loc}: {info}",
             std::process::id()
         );
-        agentplug_host::close_all_sessions();
         default_hook(info);
     }));
 
@@ -149,14 +148,6 @@ fn main() -> anyhow::Result<()> {
             );
             Ok(())
         }
-        "reap-orphans" => {
-            let roots = daemon::read_registry();
-            agentplug_host::reap_idle_sessions_and_os_orphans_across_every_known_project_root(
-                &roots,
-            );
-            println!("reaped idle sessions and orphaned chrome processes across {} registered project roots (plus the process-global headless-orphan sweep)", roots.len());
-            Ok(())
-        }
         "takeover" => {
             let version = args.get(2).cloned().unwrap_or_default();
             if version.is_empty() {
@@ -248,7 +239,7 @@ fn main() -> anyhow::Result<()> {
         "selfcheck-spool-claim" => selfcheck_spool_claim(),
         other => {
             eprintln!(
-                "agentplug-runner: unknown command '{other}'. Usage: agentplug-runner <plugin <name> [version]|spool|daemon|takeover <version>|dispatch [plugin] <verb> [body]|reap-orphans|sweep-spool [root]|update-runner|release-bootstrap-status|embedded-release-root|trust-status|build-info|pin-local-build|unpin-local-build|selfcheck-registry|selfcheck-inflight|version>"
+                "agentplug-runner: unknown command '{other}'. Usage: agentplug-runner <plugin <name> [version]|spool|daemon|takeover <version>|dispatch [plugin] <verb> [body]|sweep-spool [root]|update-runner|release-bootstrap-status|embedded-release-root|trust-status|build-info|pin-local-build|unpin-local-build|selfcheck-registry|selfcheck-inflight|version>"
             );
             std::process::exit(1);
         }
@@ -628,7 +619,7 @@ fn run_spool_watcher_single_process(
                         .map(|s| s.to_string_lossy().into_owned())
                         .unwrap_or_default();
                     let _dispatch_origin_scope =
-                        agentplug_host::enter_dispatch_origin_scope(&verb, &stem, &body, None);
+                        agentplug_host::enter_dispatch_origin_scope(&stem, None);
 
                     let busy_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
                     let ticker =

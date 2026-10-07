@@ -48,9 +48,6 @@ const GM_SPOOL_VERBS: &[&str] = &[
     "kv_query",
     "exec_js",
     "lang",
-    "serp",
-    "browser",
-    "cdp",
     "health",
     "config_resolve",
     "config-sync-now",
@@ -1152,7 +1149,6 @@ fn hand_off_to_ready_successor() -> Option<(String, usize)> {
     }
     let claims = snapshot_in_flight_claims();
     write_handoff_inherited_claims(&version, &claims);
-    agentplug_host::close_all_sessions();
     release_ownership_for_handoff();
     task_handoff.commit();
     let requeued = requeue_claims_for_live_successor(&claims);
@@ -1580,7 +1576,7 @@ pub fn run_takeover(version: &str) -> anyhow::Result<()> {
     )?;
     eprintln!("[agentplug daemon] takeover: building engine for version {version}");
     let mut plugin_modules = PluginModules::new()?;
-    for plugin_name in ["gm", "bert", "libsql", "treesitter", "oxibrowser", "crux"] {
+    for plugin_name in ["gm", "bert", "libsql", "treesitter", "crux"] {
         if let Err(e) = plugin_modules.get_or_compile(plugin_name) {
             eprintln!("[agentplug daemon] takeover: pre-warm of {plugin_name} failed (non-fatal, will lazy-compile on first use): {e}");
         }
@@ -2031,7 +2027,7 @@ fn write_project_heartbeat_with_queue_info(
         .clone());
     payload["shared_store_recycle_limit_mb"] =
         serde_json::json!(SHARED_STORE_RECYCLE_LIMIT_MB.load(std::sync::atomic::Ordering::Relaxed));
-    payload["tool_serialization"] = serde_json::json!("fifo per plugin and verb for state-changing verbs, one dispatch per project lane (git, store, state); exec-family, browser, read-only verbs and tree-scan codesearch run unserialised");
+    payload["tool_serialization"] = serde_json::json!("fifo per plugin and verb for state-changing verbs, one dispatch per project lane (git, store, state); exec-family, read-only verbs and tree-scan codesearch run unserialised");
     payload["runner_version"] = serde_json::json!(env!("CARGO_PKG_VERSION"));
     payload["loaded_plugin_versions"] = serde_json::json!(loaded_plugin_versions()
         .lock()
@@ -2674,7 +2670,6 @@ fn spawn_heartbeat_ticker(heartbeat_interval: Duration) -> std::thread::JoinHand
                 "[agentplug daemon] heartbeat ticker: authority lost to another daemon -- the main loop only checks this flag between dispatch batches, which can be blocked indefinitely by in-flight work, so exiting the process directly here instead of merely signaling"
             );
             HEARTBEAT_AUTHORITY_LOST.store(true, std::sync::atomic::Ordering::Relaxed);
-            agentplug_host::close_all_sessions();
             let requeued = hand_claims_to_live_successor("heartbeat-authority-holder");
             eprintln!("[agentplug daemon] heartbeat ticker: re-queued {requeued} in-flight claim(s) for the daemon that holds authority -- exiting without orphaning them");
             std::process::exit(0);
@@ -4113,7 +4108,7 @@ pub(crate) fn run_gm_dispatch_to_file(
     };
     note_dispatch_stage(root, verb, task, DispatchStage::Running, lane);
     let _dispatch_origin_scope =
-        agentplug_host::enter_dispatch_origin_scope(verb, task, body, submitted_at_ms);
+        agentplug_host::enter_dispatch_origin_scope(task, submitted_at_ms);
     let dispatch_result = if plugin_name == "gm" {
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             handle.dispatch("gm", verb, body)
@@ -5455,7 +5450,6 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
     let staged_runner_rx = spawn_update_poll_worker(daemon_cfg.clone());
     #[cfg(windows)]
     let mut idle_in_dir_watch = IdleInDirWatch::new();
-    let browser_orphan_sweep_in_flight = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let mut pending_self_update: Option<(PathBuf, String)> = None;
     let mut pending_self_update_staged_at: Option<Instant> = None;
     const SELF_UPDATE_MAX_STARVED_MS: u64 = 10 * 60 * 1000;
@@ -5518,10 +5512,6 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
     let (instruction_source_sync_done_tx, instruction_source_sync_done_rx) =
         std::sync::mpsc::channel::<PathBuf>();
 
-    let mut last_browser_orphan_sweep = Instant::now()
-        .checked_sub(Duration::from_millis(5 * 60 * 1000))
-        .unwrap_or_else(Instant::now);
-
     let _heartbeat_ticker = spawn_heartbeat_ticker(heartbeat_interval);
     write_daemon_heartbeat(0, 0);
 
@@ -5535,7 +5525,6 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
 
     loop {
         if heartbeat_authority_lost() {
-            agentplug_host::close_all_sessions();
             let requeued = hand_claims_to_live_successor("heartbeat-authority-holder");
             sweep_orphaned_claims_across_roots(&known_roots);
             eprintln!("[agentplug daemon] heartbeat authority held by another daemon -- re-queued {requeued} in-flight claim(s) for it and exiting before serving further work");
@@ -5569,23 +5558,6 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
 
         while let Ok(root) = instruction_source_sync_done_rx.try_recv() {
             instruction_source_syncing.remove(&root);
-        }
-
-        const BROWSER_ORPHAN_SWEEP_INTERVAL_LONGER_THAN_REGISTRY_POLL_MS: u64 = 5 * 60 * 1000;
-        if last_browser_orphan_sweep.elapsed()
-            >= Duration::from_millis(BROWSER_ORPHAN_SWEEP_INTERVAL_LONGER_THAN_REGISTRY_POLL_MS)
-            && !browser_orphan_sweep_in_flight.load(std::sync::atomic::Ordering::SeqCst)
-        {
-            last_browser_orphan_sweep = Instant::now();
-            browser_orphan_sweep_in_flight.store(true, std::sync::atomic::Ordering::SeqCst);
-            let finished = browser_orphan_sweep_in_flight.clone();
-            let sweep_roots = known_roots.clone();
-            std::thread::spawn(move || {
-                agentplug_host::reap_idle_sessions_and_os_orphans_across_every_known_project_root(
-                    &sweep_roots,
-                );
-                finished.store(false, std::sync::atomic::Ordering::SeqCst);
-            });
         }
 
         let max_concurrent_projects = daemon_cfg.max_concurrent_projects();
@@ -5640,7 +5612,7 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
             per_root_plugin_scan_pending = true;
             per_root_plugin_scan_walk.reset();
         }
-        for plugin_name in ["gm", "libsql", "bert", "treesitter", "oxibrowser", "crux"] {
+        for plugin_name in ["gm", "libsql", "bert", "treesitter", "crux"] {
             if plugin_compile_in_backoff(plugin_name) {
                 continue;
             }
@@ -5801,7 +5773,6 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
             std::sync::atomic::Ordering::Relaxed,
         );
         if heartbeat_authority_lost() {
-            agentplug_host::close_all_sessions();
             eprintln!("[agentplug daemon] heartbeat authority held by another daemon -- exiting after finishing in-flight batch");
             mark_intentional_exit("heartbeat-authority-lost");
             return Ok(());
@@ -5909,7 +5880,6 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
                 }
                 if attempt_self_update_handoff(&staged, &version) {
                     task_handoff.commit();
-                    agentplug_host::close_all_sessions();
                     let requeued =
                         requeue_claims_for_live_successor(&claims_the_successor_inherits);
                     eprintln!(

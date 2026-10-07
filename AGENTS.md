@@ -56,8 +56,6 @@ the `agentplug-host` imports, and `agentplug-trust`. Work on `main` as GitHub us
   deregistered roots. Cache pressure explicitly defers discovery, never proves
   complete coverage of an unbounded roster. Retry attempts have a durable
   fifteen-minute cooldown; maintenance never evaluates or deploys policies.
-  Dispatch origin preserves its owner scoping but does not refresh session/browser
-  activity for this exact maintenance verb.
 
 - `host_fs_readdir` returns zero on directory or entry-read failure, never a successful empty
   or partial array. Structural indexing propagates that failure and refuses pruning or graph
@@ -89,15 +87,7 @@ the `agentplug-host` imports, and `agentplug-trust`. Work on `main` as GitHub us
 - Dispatch concurrency is intentionally lane-based: read-only work remains parallel while state,
   store, and Git mutations serialize only against their own lane. A claimed request must always
   produce an out-file or be released for recovery.
-- `DispatchOrigin::page_session` is the only browser session resolver. Browser pages are keyed by
-  project root and GM session; serialize work per page before writing its temporary files.
-  Chrome and Steel reuse only their remembered target; a missing target creates a fresh owned page,
-  never adopts another session's tab. Explicit `url=` reloads an identical URL; hash-only changes
-  retain the document. Preserve document telemetry and captured diagnostics on evaluation failure.
-- Acquire the browser page guard before global plugin admission. Waiting for the same page must
-  not consume execution slots needed by unrelated commands; distinct page sessions stay parallel.
-- Kill only processes and browser profiles owned by this host. An adopted or externally supplied
-  CDP/Steel endpoint is never treated as host-owned merely because its PID or profile resembles one.
+- Kill only processes owned by this host.
 - Every subprocess has a bounded wall-clock deadline and tree cleanup. Keep stdout/stderr draining
   concurrent with child execution, and keep oversized dispatch results in a spill file rather than
   an unbounded JSON reply.
@@ -117,8 +107,5 @@ the `agentplug-host` imports, and `agentplug-trust`. Work on `main` as GitHub us
 
 - `.agentplug/plugins.json` declares download specs; `.agentplug/plugins.txt` declares loaded
   plugins. A project declaration overrides built-ins of the same name.
-- The browser config is optional and unknown keys are ignored. Preserve explicit precedence: an
-  existing Chrome endpoint, then Steel endpoint, then configured engine. Invalid extra Chrome
-  arguments are rejected individually without invalidating the whole config.
 - Do not add tracked long generated paths: Windows release checkout has a practical path-length
   limit. `.agentplug-kv` is runtime index state and must not be committed.

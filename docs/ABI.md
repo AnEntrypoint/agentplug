@@ -36,8 +36,7 @@ copies the result back into the caller's linear memory.
 
 Identical set to `wasm_host.rs::register_env_imports` today
 (`host_fs_*`, `host_log`, `host_now_ms`, `host_env_get`, `host_fetch`,
-`host_kv_*`, `host_exec_js`, `host_browser_exec`, `host_git`) PLUS one new
-one:
+`host_kv_*`, `host_exec_js`, `host_git`) PLUS one new one:
 
 - `host_plugin_call(plugin_ptr, plugin_len, verb_ptr, verb_len, body_ptr, body_len) -> u64`
   routes to another loaded plugin's `plugin_call` export. `plugin` is the
