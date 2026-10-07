@@ -43,7 +43,7 @@ struct CapabilityAllowlistConfig {
 
 fn compiled_default_capability_allowlist(caller_plugin: &str, callee_plugin: &str) -> bool {
     match caller_plugin {
-        "gm" => matches!(callee_plugin, "bert" | "libsql" | "treesitter" | "crux" | "modlens"),
+        "gm" => matches!(callee_plugin, "bert" | "libsql" | "treesitter" | "crux"),
         _ => false,
     }
 }
