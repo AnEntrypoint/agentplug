@@ -113,6 +113,7 @@ const GM_SPOOL_VERBS: &[&str] = &[
     "git_rm",
     "git_revert",
     "git_reset",
+    "git_reset_head",
     "git_poll",
     "git_worktree_add",
     "git_worktree_list",
