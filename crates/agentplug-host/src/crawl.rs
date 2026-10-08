@@ -278,11 +278,13 @@ pub fn run_helper(
     target_id: Option<&str>,
     steps: &[Value],
     budget: Duration,
+    browser_session: bool,
 ) -> Result<HelperRun, String> {
     let node = find_on_path("node").ok_or("node is required on PATH to run the crawl helper")?;
     let config = json!({
         "port": port,
         "targetId": target_id,
+        "browserSession": browser_session,
         "steps": steps,
         "pageTimeoutMs": 30000,
         "textLimit": 20000,
@@ -456,7 +458,7 @@ pub fn crawl_cdp(cwd: &Path, body: &str) -> Value {
             ),
         );
     }
-    match run_helper(port, None, &parsed.steps, CDP_HELPER_BUDGET) {
+    match run_helper(port, None, &parsed.steps, CDP_HELPER_BUDGET, false) {
         Ok(run) => crawl_reply_from_run("cdp", false, started, run),
         Err(e) => crawl_error_reply("cdp", false, started, e),
     }

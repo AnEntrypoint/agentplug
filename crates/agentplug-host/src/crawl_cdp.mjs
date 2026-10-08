@@ -1,7 +1,9 @@
 // CDP crawl helper. Runs as `node --input-type=module` with this file on stdin.
 // Config arrives as JSON in the GM_CRAWL_CONFIG environment variable:
-//   { port, targetId?, steps: [{op:"goto",url}|{op:"wait",ms}|{op:"eval",code}],
+//   { port, targetId?, browserSession?, steps: [{op:"goto",url}|{op:"wait",ms}|{op:"eval",code}],
 //     pageTimeoutMs, textLimit }
+// browserSession selects the lightpanda protocol: targets are created and attached over
+// the browser websocket, because lightpanda serves no HTTP target endpoints.
 // It prints exactly one JSON object on stdout and exits 0 when every step ran.
 
 const cfg = JSON.parse(process.env.GM_CRAWL_CONFIG || '{}');
@@ -25,6 +27,18 @@ async function acquireTarget() {
   return created;
 }
 
+async function attachBrowserTarget(browser) {
+  if (cfg.targetId) {
+    try {
+      const attached = await browser.send('Target.attachToTarget', { targetId: cfg.targetId, flatten: true });
+      return { targetId: cfg.targetId, sessionId: attached.sessionId };
+    } catch (_) {}
+  }
+  const created = await browser.send('Target.createTarget', { url: 'about:blank' });
+  const attached = await browser.send('Target.attachToTarget', { targetId: created.targetId, flatten: true });
+  return { targetId: created.targetId, sessionId: attached.sessionId };
+}
+
 function openSession(wsUrl, timeoutMs) {
   return new Promise((resolve, reject) => {
     const ws = new WebSocket(wsUrl);
@@ -39,11 +53,13 @@ function openSession(wsUrl, timeoutMs) {
       pending.clear();
     };
     const session = {
-      send(method, params = {}) {
+      send(method, params = {}, sessionId) {
         const id = nextId++;
         return new Promise((res, rej) => {
           pending.set(id, { res, rej });
-          ws.send(JSON.stringify({ id, method, params }));
+          const message = { id, method, params };
+          if (sessionId) message.sessionId = sessionId;
+          ws.send(JSON.stringify(message));
         });
       },
       close() { try { ws.close(); } catch (_) {} },
@@ -108,10 +124,22 @@ async function main() {
   const started = Date.now();
   const out = { ok: false, targetId: null, pages: [], error: null };
   let session = null;
+  let close = () => {};
   try {
-    const target = await acquireTarget();
-    out.targetId = target.id;
-    session = await openSession(target.webSocketDebuggerUrl, 5000);
+    if (cfg.browserSession) {
+      const info = await getJson('/json/version');
+      const browser = await openSession(info.webSocketDebuggerUrl, 5000);
+      close = () => browser.close();
+      const attached = await attachBrowserTarget(browser);
+      out.targetId = attached.targetId;
+      session = { send: (method, params) => browser.send(method, params, attached.sessionId) };
+    } else {
+      const target = await acquireTarget();
+      out.targetId = target.id;
+      const page = await openSession(target.webSocketDebuggerUrl, 5000);
+      close = () => page.close();
+      session = page;
+    }
     for (const step of cfg.steps || []) {
       if (step.op === 'goto') {
         out.pages.push(await gotoStep(session, step.url));
@@ -129,7 +157,7 @@ async function main() {
   } catch (e) {
     out.error = String((e && e.message) || e);
   } finally {
-    if (session) session.close();
+    close();
   }
   out.duration_ms = Date.now() - started;
   process.stdout.write(JSON.stringify(out) + '\n');
