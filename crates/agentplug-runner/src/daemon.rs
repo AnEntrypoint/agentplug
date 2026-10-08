@@ -276,8 +276,6 @@ struct DaemonConfig {
     project_idle_evict_secs: Option<u64>,
     #[serde(default)]
     shared_plugin_release_idle_secs: Option<u64>,
-    #[serde(default)]
-    require_runner_signature: Option<bool>,
 }
 
 const DAEMON_CONFIG_EXAMPLE: &str = r#"{
@@ -286,8 +284,7 @@ const DAEMON_CONFIG_EXAMPLE: &str = r#"{
   "plugin_update_poll_interval_secs": 600,
   "plugin_update_poll_interval_secs_by_name": {},
   "runner_update_poll_interval_secs": 60,
-  "instruction_source_poll_interval_secs": 600,
-  "require_runner_signature": false
+  "instruction_source_poll_interval_secs": 600
 }
 "#;
 
@@ -333,7 +330,6 @@ impl DaemonConfig {
             shared_store_recycle_dispatches: None,
             project_idle_evict_secs: None,
             shared_plugin_release_idle_secs: None,
-            require_runner_signature: None,
         }
     }
     fn registry_poll_interval(&self) -> Duration {
@@ -409,13 +405,6 @@ impl DaemonConfig {
             .max(MIN_SECS)
             * 1000
     }
-    fn require_runner_signature(&self) -> bool {
-        self.require_runner_signature.unwrap_or(false)
-    }
-}
-
-pub(crate) fn daemon_requires_runner_signature() -> bool {
-    DaemonConfig::load().require_runner_signature()
 }
 
 fn shared_store_recycle_reason_independent_of_daemon_idle_state(
@@ -1342,24 +1331,8 @@ fn staged_binary_self_check(staged_exe: &Path, expected_version: &str) -> bool {
 }
 
 fn attempt_self_update_handoff(staged_exe: &Path, version: &str) -> bool {
-    let Some(asset) = crate::download::runner_asset_name() else {
-        return false;
-    };
-    if let Err(problem) = crate::update_trust::staged_runner_permitted(staged_exe, asset, version) {
-        let _ = fs::remove_file(staged_exe);
-        crate::update_trust::remove_stage_record(staged_exe);
-        eprintln!(
-            "[agentplug daemon] refusing to hand off to {version}: {problem} -- staged exe removed and the running version kept"
-        );
-        record_handoff_failure(
-            version,
-            format!("update-signature verification refused staged {version}: {problem}"),
-        );
-        return false;
-    }
     if !staged_binary_self_check(staged_exe, version) {
         let _ = fs::remove_file(staged_exe);
-        crate::update_trust::remove_stage_record(staged_exe);
         record_handoff_failure(
             version,
             format!("staged_binary_self_check failed for {version}, staged exe removed"),
@@ -1423,7 +1396,7 @@ fn path_is_cargo_build_output(path: &Path) -> bool {
     })
 }
 
-fn promote_staged_exe_to_canonical(version: &str, running_before: Option<&str>) -> bool {
+fn promote_staged_exe_to_canonical(version: &str) -> bool {
     let Some(canonical) = canonical_runner_exe_path() else {
         return false;
     };
@@ -1445,16 +1418,6 @@ fn promote_staged_exe_to_canonical(version: &str, running_before: Option<&str>) 
         return false;
     };
     if staged == canonical {
-        return false;
-    }
-    let Some(asset) = crate::download::runner_asset_name() else {
-        return false;
-    };
-    if let Err(problem) = crate::update_trust::staged_runner_permitted(&staged, asset, version) {
-        eprintln!(
-            "[agentplug daemon] takeover: refusing to promote {version} onto {} -- {problem}; this process keeps running from the staged copy instead of overwriting the canonical exe",
-            canonical.display()
-        );
         return false;
     }
     let prev = canonical.with_extension(
@@ -1493,16 +1456,7 @@ fn promote_staged_exe_to_canonical(version: &str, running_before: Option<&str>) 
     })();
     match promotion {
         Ok(()) => {
-            if let Err(error) = crate::update_trust::preserve_promoted_runner_record(
-                &staged, &canonical, asset, version,
-            ) {
-                eprintln!(
-                    "[agentplug daemon] takeover: canonical runner receipt propagation failed: {error} -- keeping the permitted staged daemon serving without canonical re-exec"
-                );
-                return false;
-            }
             record_completed_runner_swap(version);
-            crate::update_trust::record_unverified_promotion(&staged, version, running_before);
             eprintln!("[agentplug daemon] takeover: promoted {version} onto canonical exe path {} (previous version kept at {})", canonical.display(), prev.display());
             true
         }
@@ -1564,17 +1518,6 @@ fn reexec_from_canonical_and_exit(canonical: &std::path::Path) -> ! {
 }
 
 pub fn run_takeover(version: &str) -> anyhow::Result<()> {
-    let staged_exe = std::env::current_exe()?;
-    let asset = crate::download::runner_asset_name()
-        .ok_or_else(|| anyhow::anyhow!("takeover: no runner asset exists for this platform"))?;
-    crate::update_trust::staged_runner_permitted(&staged_exe, asset, version).map_err(
-        |problem| {
-            anyhow::anyhow!(
-                "takeover: refusing to announce unverified staged runner {}: {problem}",
-                staged_exe.display()
-            )
-        },
-    )?;
     eprintln!("[agentplug daemon] takeover: building engine for version {version}");
     let mut plugin_modules = PluginModules::new()?;
     for plugin_name in ["gm", "bert", "libsql", "treesitter", "crux", "lightpanda"] {
@@ -1583,18 +1526,17 @@ pub fn run_takeover(version: &str) -> anyhow::Result<()> {
         }
     }
     write_takeover_ready(version)?;
-    let running_before = crate::download::installed_runner_version();
     eprintln!("[agentplug daemon] takeover: readiness marker written, waiting for old daemon to release ownership");
     for _ in 0..480 {
         if read_owner_pid().is_none() && claim_ownership() {
             if let Err(error) = record_runner_version(version) {
                 eprintln!(
-                    "[agentplug daemon] takeover: could not record running version {version}: {error} -- continuing with the verified staged runner so the old daemon is not left without a successor; a later boot will reconcile the marker"
+                    "[agentplug daemon] takeover: could not record running version {version}: {error} -- continuing with the staged runner so the old daemon is not left without a successor; a later boot will reconcile the marker"
                 );
             } else {
                 crate::download::clear_all_known_bad_version_markers();
             }
-            let promoted = promote_staged_exe_to_canonical(version, running_before.as_deref());
+            let promoted = promote_staged_exe_to_canonical(version);
             if promoted {
                 if let Some(canonical) = canonical_runner_exe_path() {
                     release_ownership_for_handoff();
@@ -1722,9 +1664,6 @@ fn write_daemon_heartbeat(project_count: usize, plugin_module_count: usize) {
             "last_handoff_error": handoff_attempt.as_ref().and_then(|(_, err)| err.clone()),
             "last_completed_runner_swap": read_last_completed_runner_swap().unwrap_or(serde_json::Value::Null),
             "runner_version_parity": runner_version_parity_json(),
-            "runner_update_trust_mode": crate::update_trust::runner_mode_str(),
-            "runner_signature_required": crate::update_trust::strict_mode(),
-            "runner_unverified_update": crate::update_trust::unverified_promotion().unwrap_or(serde_json::Value::Null),
     })
     .to_string();
     let temp_path = status_path.with_extension(format!(
@@ -5822,7 +5761,6 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
         while let Ok((staged, version)) = staged_runner_rx.try_recv() {
             if handoff_backed_off(&version) {
                 let _ = fs::remove_file(&staged);
-                crate::update_trust::remove_stage_record(&staged);
                 eprintln!(
                     "[agentplug daemon] staged self-update to {version} is inside its {}s retry backoff after a failed handoff -- dropping it instead of retrying on every tick",
                     HANDOFF_RETRY_BACKOFF.as_secs()

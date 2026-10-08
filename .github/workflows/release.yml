@@ -143,47 +143,14 @@ jobs:
           path: release-assets/*
           retention-days: 1
 
-  sign:
+  publish:
     needs: [bump, build, build-host-linux-arm64]
     runs-on: ubuntu-latest
-    environment: runner-release-signing
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
-        with:
-          ref: ${{ needs.bump.outputs.commit }}
-          persist-credentials: false
-
-      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
-        with:
-          toolchain: stable
-
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
           path: release-assets
           merge-multiple: true
-
-      - name: Sign and verify release assets
-        shell: bash
-        env:
-          AGENTPLUG_RELEASE_SIGNING_KEY: ${{ secrets.AGENTPLUG_RELEASE_SIGNING_KEY }}
-          AGENTPLUG_RELEASE_SIGNING_KEY_ID: ${{ vars.AGENTPLUG_RELEASE_SIGNING_KEY_ID }}
-          CI: "true"
-        run: scripts/sign-release-assets.sh release-assets "${{ needs.bump.outputs.version }}" .
-
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        with:
-          name: signed-release-assets
-          path: release-assets/*
-          retention-days: 1
-
-  publish:
-    needs: [bump, sign]
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
-        with:
-          name: signed-release-assets
-          path: release-assets
 
       - name: Publish release
         env:
@@ -203,7 +170,7 @@ jobs:
           expected=$(for f in release-assets/*; do basename "$f"; done | sort)
           uploaded=$(gh release view "v$VER" --repo "$REPO" --json assets --jq '.assets[].name' | sort)
           if [ "$expected" != "$uploaded" ]; then
-            echo "::error::draft release v$VER does not contain exactly the signed asset set" >&2
+            echo "::error::draft release v$VER does not contain exactly the built asset set" >&2
             exit 1
           fi
           gh release edit "v$VER" --repo "$REPO" --draft=false
