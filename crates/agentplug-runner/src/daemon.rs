@@ -3148,7 +3148,22 @@ fn spool_in_file_write_has_settled(request_path: &Path) -> bool {
     let Ok(metadata) = fs::metadata(request_path) else {
         return false;
     };
-    metadata.len() > 0
+    metadata.len() > 0 && spool_in_file_has_no_writer(request_path)
+}
+
+#[cfg(windows)]
+fn spool_in_file_has_no_writer(request_path: &Path) -> bool {
+    use std::os::windows::fs::OpenOptionsExt;
+    fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0)
+        .open(request_path)
+        .is_ok()
+}
+
+#[cfg(not(windows))]
+fn spool_in_file_has_no_writer(_request_path: &Path) -> bool {
+    true
 }
 
 fn language_spool_extension(verb: &str) -> Option<&'static str> {
@@ -4882,6 +4897,9 @@ fn dispatch_project(
             for file_entry in files.flatten() {
                 let file_path = file_entry.path();
                 if file_path.extension().and_then(|e| e.to_str()) != Some("txt") {
+                    continue;
+                }
+                if !spool_in_file_write_has_settled(&file_path) {
                     continue;
                 }
                 let claim_path = plugin_dispatch_claim_path(&file_path);
