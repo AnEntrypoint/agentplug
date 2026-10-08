@@ -1,7 +1,7 @@
 # AGENTS.md
 
 AgentPlug is the native WebAssembly host used by gm. It contains the `agentplug-runner` daemon,
-the `agentplug-host` imports, and `agentplug-trust`. Work on `main` as GitHub user `lanmower`.
+and the `agentplug-host` imports. Work on `main` as GitHub user `lanmower`.
 
 ## Source and release boundaries
 
@@ -9,22 +9,16 @@ the `agentplug-host` imports, and `agentplug-trust`. Work on `main` as GitHub us
   language attributes and shell shebangs. Put non-derivable operational contracts here or in the
   relevant user documentation.
 - A push to `main` runs `.github/workflows/release.yml`: it bumps the patch version, builds every
-  runner target, signs release assets in protected CI, and publishes the release consumed by running
-  daemons. Do not install, copy, or execute a local source-built runner as an update path.
-- Runner updates fail closed without configured trust. `warn` and `off` are explicit operator
-  choices. The locally-built-runner guard, version monotonicity, SHA-256 check, signature
-  verification, and update-sequence floor are independent protections; do not weaken one to repair
-  another.
-- Keep signing material only in the protected CI environment. Bind each signature to the immutable
-  source revision that built its artifact, and publish a release only after every expected asset and
-  signature is present.
+  runner target, and publishes the release consumed by running daemons. Do not install, copy, or
+  execute a local source-built runner as an update path.
+- Runner and plugin updates install only bytes whose sha256 matches the published `.sha256` sidecar.
+  The locally-built-runner guard, version monotonicity, and the SHA-256 check are independent
+  protections; do not weaken one to repair another.
 - Build provenance watches Git-resolved HEAD, every symbolic ref, and packed refs across submodule
   and worktree gitdirs. Missing loose refs watch their nearest existing parent; ordinary commits
   must refresh embedded COMMIT without touching source or clearing Cargo caches.
-- Canonical runner promotion atomically persists the staging receipt beside the promoted binary
-  and rechecks its artifact, version, bytes and signature before re-exec. Receipt or verification
-  failure keeps the permitted staged daemon serving. Preserve the authoritative checker’s explicit
-  `warn`/`off` policies; only `off` allows an absent receipt, never enforced signature mode.
+- Canonical runner promotion rechecks the local-build guard before it replaces the installed binary
+  and re-execs from the canonical path. A refused promotion keeps the staged daemon serving.
 - A discovered same-user GitHub CLI credential directory is shared with Git, execution children,
   and updater API calls; fresh boot, takeover and canonical re-exec discover it before workers start.
   Inherited `GH_CONFIG_DIR` takes precedence. Git uses transient
