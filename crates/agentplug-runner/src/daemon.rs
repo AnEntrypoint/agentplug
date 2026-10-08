@@ -2055,6 +2055,8 @@ fn status_write_needed(
             for key in [
                 "ts",
                 "sweep_holder_ms",
+                "sweep_holder_phase",
+                "sweep_holder_root",
                 "runner_update_waiting_ms",
                 "queue_wait_ms",
             ] {
