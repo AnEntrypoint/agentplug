@@ -329,7 +329,7 @@ pub fn crawl(cwd: &Path, body: &str) -> Value {
         Ok(acquired) => acquired,
         Err(e) => return crawl_error_reply(ENGINE, true, started, e),
     };
-    let run = run_helper(port, target_id.as_deref(), &parsed.steps, HELPER_BUDGET);
+    let run = run_helper(port, target_id.as_deref(), &parsed.steps, HELPER_BUDGET, true);
     let remembered = run
         .as_ref()
         .ok()
