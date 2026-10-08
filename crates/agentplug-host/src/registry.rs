@@ -20,11 +20,13 @@ pub const DISPATCH_CALL_DEADLINE_SECS: u64 = 120;
 
 pub const BERT_DISPATCH_CALL_DEADLINE_SECS: u64 = 1200;
 
+pub const LIGHTPANDA_DISPATCH_CALL_DEADLINE_SECS: u64 = 360;
+
 fn dispatch_call_deadline_secs(plugin_name: &str) -> u64 {
-    if plugin_name == "bert" {
-        BERT_DISPATCH_CALL_DEADLINE_SECS
-    } else {
-        DISPATCH_CALL_DEADLINE_SECS
+    match plugin_name {
+        "bert" => BERT_DISPATCH_CALL_DEADLINE_SECS,
+        "lightpanda" => LIGHTPANDA_DISPATCH_CALL_DEADLINE_SECS,
+        _ => DISPATCH_CALL_DEADLINE_SECS,
     }
 }
 

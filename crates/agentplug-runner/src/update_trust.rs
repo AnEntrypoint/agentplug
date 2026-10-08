@@ -115,7 +115,10 @@ fn is_runner_artifact(artifact: &str) -> bool {
 }
 
 fn is_first_party_plugin_artifact(artifact: &str) -> bool {
-    matches!(artifact, "plugkit-slim.wasm" | "bert.wasm" | "crux.wasm")
+    matches!(
+        artifact,
+        "plugkit-slim.wasm" | "bert.wasm" | "crux.wasm" | "lightpanda.wasm"
+    )
 }
 
 fn embedded_runner_trust(path: PathBuf) -> Trust {

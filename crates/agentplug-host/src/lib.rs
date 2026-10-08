@@ -25,7 +25,8 @@ pub use broker::{
 };
 pub use crawl::{
     crawl_cdp, crawl_error_reply, crawl_reply_from_run, endpoint_ready, find_on_path,
-    free_local_port, parse_crawl_body, run_helper, HelperRun, ParsedCrawl,
+    free_local_port, lightpanda_crawl, parse_crawl_body, run_helper, set_lightpanda_engine,
+    HelperRun, LightpandaEngine, ParsedCrawl,
 };
 pub use dispatch_origin::{enter_dispatch_origin_scope, DispatchOriginScope};
 pub use github_auth::{github_cli_token, invalidate_github_cli_token};

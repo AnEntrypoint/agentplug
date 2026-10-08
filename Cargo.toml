@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/agentplug-host", "crates/agentplug-lightpanda", "crates/agentplug-runner", "crates/agentplug-trust"]
+members = ["crates/agentplug-host", "crates/agentplug-lightpanda", "crates/agentplug-lightpanda-wasm", "crates/agentplug-runner", "crates/agentplug-trust"]
 default-members = ["crates/agentplug-runner"]
 
 [workspace.package]

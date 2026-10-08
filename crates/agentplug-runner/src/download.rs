@@ -383,6 +383,10 @@ fn builtin_plugin_asset_spec(plugin_name: &str) -> Option<PluginAssetSpec> {
             repo: "AnEntrypoint/agentplug-crux-bin".to_string(),
             asset_basename: "crux".to_string(),
         }),
+        "lightpanda" => Some(PluginAssetSpec {
+            repo: "AnEntrypoint/agentplug-lightpanda-bin".to_string(),
+            asset_basename: "lightpanda".to_string(),
+        }),
         _ => None,
     }
 }

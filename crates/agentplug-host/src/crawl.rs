@@ -11,7 +11,7 @@ use crate::http_agent::shared_agent;
 const CRAWL_HELPER_JS: &str = include_str!("crawl_cdp.mjs");
 const CDP_READY_DEADLINE: Duration = Duration::from_secs(30);
 const CDP_POLL_INTERVAL: Duration = Duration::from_millis(100);
-const HELPER_BUDGET: Duration = Duration::from_secs(300);
+const CDP_HELPER_BUDGET: Duration = Duration::from_secs(100);
 const MAX_WAIT_MS: u64 = 60_000;
 const URL_SCHEMES: [&str; 5] = ["http://", "https://", "about:blank", "file://", "data:"];
 
@@ -165,6 +165,55 @@ pub fn endpoint_ready(port: u16, deadline: Instant, interval: Duration) -> bool 
     }
 }
 
+fn windows_chrome_candidates() -> Vec<PathBuf> {
+    let mut bases: Vec<PathBuf> = ["ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA"]
+        .iter()
+        .filter_map(|name| std::env::var_os(name).map(PathBuf::from))
+        .collect();
+    if bases.is_empty() {
+        bases.push(PathBuf::from(r"C:\Program Files"));
+    }
+    bases
+        .iter()
+        .flat_map(|base| {
+            [
+                base.join("Google").join("Chrome").join("Application").join("chrome.exe"),
+                base.join("Chromium").join("Application").join("chrome.exe"),
+            ]
+        })
+        .collect()
+}
+
+fn macos_chrome_candidates() -> Vec<PathBuf> {
+    let mut app_dirs = vec![PathBuf::from("/Applications")];
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        app_dirs.push(home.join("Applications"));
+    }
+    app_dirs
+        .iter()
+        .flat_map(|dir| {
+            [
+                dir.join("Google Chrome.app/Contents/MacOS/Google Chrome"),
+                dir.join("Chromium.app/Contents/MacOS/Chromium"),
+            ]
+        })
+        .collect()
+}
+
+fn linux_chrome_candidates() -> Vec<PathBuf> {
+    [
+        "/usr/bin/google-chrome-stable",
+        "/usr/bin/google-chrome",
+        "/opt/google/chrome/chrome",
+        "/usr/bin/chromium",
+        "/usr/bin/chromium-browser",
+        "/snap/bin/chromium",
+    ]
+    .iter()
+    .map(PathBuf::from)
+    .collect()
+}
+
 fn find_chrome() -> Option<PathBuf> {
     if let Some(p) = std::env::var_os("GM_BROWSER_CHROME_PATH")
         .or_else(|| std::env::var_os("CHROME_PATH"))
@@ -173,29 +222,44 @@ fn find_chrome() -> Option<PathBuf> {
     {
         return Some(p);
     }
-    let candidates: Vec<PathBuf> = if cfg!(windows) {
-        vec![
-            PathBuf::from(r"C:\Program Files\Google\Chrome\Application\chrome.exe"),
-            PathBuf::from(r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"),
-        ]
+    let candidates = if cfg!(windows) {
+        windows_chrome_candidates()
     } else if cfg!(target_os = "macos") {
-        vec![
-            PathBuf::from("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
-            PathBuf::from("/Applications/Chromium.app/Contents/MacOS/Chromium"),
-        ]
+        macos_chrome_candidates()
     } else {
-        vec![
-            PathBuf::from("/usr/bin/google-chrome"),
-            PathBuf::from("/usr/bin/chromium"),
-            PathBuf::from("/usr/bin/chromium-browser"),
-        ]
+        linux_chrome_candidates()
     };
     candidates
         .into_iter()
-        .find(|c| c.exists())
-        .or_else(|| find_on_path("chrome"))
-        .or_else(|| find_on_path("google-chrome"))
-        .or_else(|| find_on_path("chromium"))
+        .find(|c| c.is_file())
+        .or_else(|| {
+            ["chrome", "google-chrome", "google-chrome-stable", "chromium", "chromium-browser"]
+                .iter()
+                .find_map(|name| find_on_path(name))
+        })
+}
+
+pub type LightpandaEngine = fn(&Path, &str) -> Value;
+
+static LIGHTPANDA_ENGINE: std::sync::OnceLock<LightpandaEngine> = std::sync::OnceLock::new();
+
+/// Registers the native lightpanda engine that the `host_lightpanda_crawl`
+/// import calls. The runner registers it once at startup, because the engine
+/// crate depends on this crate and cannot be linked here.
+pub fn set_lightpanda_engine(engine: LightpandaEngine) {
+    let _ = LIGHTPANDA_ENGINE.set(engine);
+}
+
+pub fn lightpanda_crawl(cwd: &Path, body: &str) -> Value {
+    match LIGHTPANDA_ENGINE.get() {
+        Some(engine) => engine(cwd, body),
+        None => crawl_error_reply(
+            "lightpanda",
+            true,
+            Instant::now(),
+            "the lightpanda engine is not registered in this runner".to_string(),
+        ),
+    }
 }
 
 fn read_pipe<R: Read>(pipe: Option<R>) -> Vec<u8> {
@@ -392,7 +456,7 @@ pub fn crawl_cdp(cwd: &Path, body: &str) -> Value {
             ),
         );
     }
-    match run_helper(port, None, &parsed.steps, HELPER_BUDGET) {
+    match run_helper(port, None, &parsed.steps, CDP_HELPER_BUDGET) {
         Ok(run) => crawl_reply_from_run("cdp", false, started, run),
         Err(e) => crawl_error_reply("cdp", false, started, e),
     }

@@ -41,6 +41,7 @@ fn release_bootstrap_status() -> serde_json::Value {
 
 fn main() -> anyhow::Result<()> {
     agentplug_host::ensure_hidden_console();
+    agentplug_host::set_lightpanda_engine(agentplug_lightpanda::crawl);
     suppress_crash_dialogs();
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
