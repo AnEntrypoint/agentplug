@@ -2260,7 +2260,12 @@ const TICKER_BUSY_UNTIL_EXTEND_MS: u64 = 60_000;
 
 fn busy_until_for_project_ticker(root: &Path) -> Option<u64> {
     if project_in_flight_count(root) > 0 || spool_has_queued_work(root) {
-        return Some(now_ms() + TICKER_BUSY_UNTIL_EXTEND_MS);
+        let stored = read_status_busy_until_if_future(root);
+        let refresh_below = now_ms() + TICKER_BUSY_UNTIL_EXTEND_MS / 2;
+        return match stored {
+            Some(until) if until > refresh_below => Some(until),
+            _ => Some(now_ms() + TICKER_BUSY_UNTIL_EXTEND_MS),
+        };
     }
     read_status_busy_until_if_future(root)
 }
