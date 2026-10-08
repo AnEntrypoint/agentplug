@@ -3,7 +3,11 @@
 //! The process is started on the first crawl, kept across dispatches, and
 //! reaped after GM_LIGHTPANDA_IDLE_SECONDS (default 300) without a crawl. The
 //! CDP target id is remembered so repeat crawls reattach to the same page
-//! instead of creating a new one.
+//! instead of creating a new one. A Linux server carries PR_SET_PDEATHSIG and
+//! dies with the runner; macOS has no pdeathsig, so there the idle reap and
+//! `shutdown` are the only cleanup of a warm server whose runner was killed.
+//! PR_SET_PDEATHSIG fires when the spawning thread exits, so servers are spawned
+//! on one owner thread that lives as long as the runner (`spawn_owned`).
 //!
 //! Binary order: GM_LIGHTPANDA_PATH, then `<agentplug home>/bin/lightpanda-<arch>-<os>`
 //! (the lightpanda-io/browser release asset names), then `lightpanda` on PATH.
@@ -11,8 +15,10 @@
 //! through `wsl.exe --exec`, the path the upstream README documents.
 
 use std::collections::HashMap;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::mpsc;
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -50,6 +56,46 @@ struct Warm {
 
 static WARM: OnceLock<Mutex<HashMap<PathBuf, Warm>>> = OnceLock::new();
 static REAPER: OnceLock<()> = OnceLock::new();
+static SPAWNER: OnceLock<mpsc::Sender<SpawnJob>> = OnceLock::new();
+
+type SpawnJob = (Command, mpsc::Sender<io::Result<Child>>);
+
+fn spawn_owned(cmd: Command) -> io::Result<Child> {
+    let sender = SPAWNER.get_or_init(|| {
+        let (tx, rx) = mpsc::channel::<SpawnJob>();
+        std::thread::spawn(move || {
+            for (mut cmd, reply) in rx {
+                let _ = reply.send(cmd.spawn());
+            }
+        });
+        tx
+    });
+    let (reply_tx, reply_rx) = mpsc::channel();
+    sender
+        .send((cmd, reply_tx))
+        .map_err(|_| io::Error::other("lightpanda spawner thread is gone"))?;
+    reply_rx
+        .recv()
+        .map_err(|_| io::Error::other("lightpanda spawner thread dropped the spawn reply"))?
+}
+
+#[cfg(target_os = "linux")]
+fn die_with_runner(cmd: &mut Command, runner_pid: u32) {
+    use std::os::unix::process::CommandExt;
+    // SAFETY: the closure runs in the forked child before exec and calls only
+    // async-signal-safe libc functions (prctl, getppid, raise) on scalar values.
+    unsafe {
+        cmd.pre_exec(move || {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if libc::getppid() as u32 != runner_pid {
+                libc::raise(libc::SIGKILL);
+            }
+            Ok(())
+        });
+    }
+}
 
 fn warm_map() -> MutexGuard<'static, HashMap<PathBuf, Warm>> {
     WARM.get_or_init(|| Mutex::new(HashMap::new()))
@@ -132,6 +178,8 @@ fn serve_command(launch: &Launch, port: u16) -> Command {
         Launch::Native(binary) => {
             let mut cmd = Command::new(binary);
             cmd.args(["serve", "--host", "127.0.0.1", "--port", port_arg.as_str()]);
+            #[cfg(target_os = "linux")]
+            die_with_runner(&mut cmd, std::process::id());
             cmd
         }
         Launch::Wsl {
@@ -192,8 +240,7 @@ fn start_warm(key: &Path) -> Result<Warm, String> {
         .stdout(Stdio::from(log))
         .stderr(Stdio::from(log_err));
     apply_windowless(&mut cmd);
-    let child = cmd
-        .spawn()
+    let child = spawn_owned(cmd)
         .map_err(|e| format!("lightpanda launch failed ({}): {e}", describe(&launch)))?;
     let mut warm = Warm {
         child,
