@@ -292,6 +292,9 @@ fn atomic_write_locked(full: &Path, data: &str) -> std::io::Result<()> {
 }
 
 fn atomic_write_under_held_lock(full: &Path, data: &str) -> std::io::Result<()> {
+    if fs::read(full).is_ok_and(|existing| existing == data.as_bytes()) {
+        return Ok(());
+    }
     let tmp = full.with_extension(format!(
         "{}.tmp-{}",
         full.extension().and_then(|e| e.to_str()).unwrap_or(""),

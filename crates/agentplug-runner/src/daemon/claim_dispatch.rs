@@ -1870,7 +1870,7 @@ pub(super) fn dispatch_project(
     if fs::create_dir_all(&in_dir).is_err() || fs::create_dir_all(&out_dir).is_err() {
         return did_work;
     }
-    write_project_heartbeat(root, read_status_busy_until_if_future(root));
+    write_project_heartbeat_rate_limited(root, read_status_busy_until_if_future(root));
 
     let requested_plugins = {
         let mut list = vec!["gm".to_string()];
