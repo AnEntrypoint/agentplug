@@ -484,9 +484,9 @@ impl SharedPluginPool {
     }
 
     fn heavy_admission_limit(&self) -> usize {
-        self.slots
-            .len()
+        self.non_short_admission_limit()
             .saturating_sub(1)
+            .min(self.slots.len().saturating_sub(1))
             .min(MAX_CONCURRENT_HEAVY_DISPATCHES)
             .max(1)
     }
