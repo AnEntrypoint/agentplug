@@ -9,7 +9,13 @@ use serde_json::Value;
 pub(crate) struct DispatchOrigin {
     pub gm_session: Option<String>,
     pub named_page_session: Option<String>,
+    pub spool_task: Option<String>,
+    pub submitted_at_ms: Option<u64>,
 }
+
+const DISPATCH_ENV_SUBMITTED_AT_MS: &str = "AGENTPLUG_DISPATCH_SUBMITTED_AT_MS";
+const DISPATCH_ENV_TASK: &str = "AGENTPLUG_DISPATCH_TASK";
+const DISPATCH_ENV_PREFIX: &str = "AGENTPLUG_DISPATCH_";
 
 pub(crate) const UNATTRIBUTED_DISPATCH_SESSION: &str = "default";
 
@@ -43,8 +49,10 @@ impl Drop for DispatchOriginScope {
     }
 }
 
-pub fn enter_dispatch_origin_scope(spool_task: &str, body: &str) -> DispatchOriginScope {
-    let origin = dispatch_origin_of(spool_task, body);
+pub fn enter_dispatch_origin_scope(spool_task: &str, body: &str, submitted_at_ms: Option<u64>) -> DispatchOriginScope {
+    let mut origin = dispatch_origin_of(spool_task, body);
+    origin.spool_task = Some(spool_task.to_string()).filter(|task| !task.is_empty());
+    origin.submitted_at_ms = submitted_at_ms;
     if let Some(gm_session) = origin.gm_session.as_deref() {
         note_session_activity(gm_session);
     }
@@ -78,6 +86,18 @@ pub(crate) fn session_activity_elapsed(session_id: &str) -> Option<Duration> {
     map.get(session_id).map(|t| t.elapsed())
 }
 
+pub(crate) fn dispatch_env_value(key: &str) -> Option<Option<String>> {
+    if !key.starts_with(DISPATCH_ENV_PREFIX) {
+        return None;
+    }
+    let origin = current_dispatch_origin();
+    Some(match key {
+        DISPATCH_ENV_SUBMITTED_AT_MS => origin.submitted_at_ms.map(|ms| ms.to_string()),
+        DISPATCH_ENV_TASK => origin.spool_task,
+        _ => None,
+    })
+}
+
 pub(crate) fn current_dispatch_origin() -> DispatchOrigin {
     CURRENT_DISPATCH_ORIGIN.with(|cell| cell.borrow().clone()).unwrap_or_default()
 }
@@ -96,6 +116,8 @@ fn dispatch_origin_of(spool_task: &str, body: &str) -> DispatchOrigin {
     DispatchOrigin {
         gm_session: envelope_field("session_id").or_else(|| envelope_field("SESSION_ID")).or_else(|| gm_session_from_spool_task(spool_task)),
         named_page_session: envelope_field("sessionId"),
+        spool_task: None,
+        submitted_at_ms: None,
     }
 }
 

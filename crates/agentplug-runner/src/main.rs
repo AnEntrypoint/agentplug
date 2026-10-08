@@ -332,7 +332,7 @@ fn selfcheck_inflight_cleanup() -> anyhow::Result<()> {
         .unwrap_or_else(|e| e.into_inner())
         .insert(key.clone(), daemon::InFlightHandle { detach: Arc::new(AtomicBool::new(false)) });
 
-    daemon::run_gm_dispatch_to_file(&root, &handle, "verbX", "taskY", "{}", &out_dir, 0);
+    daemon::run_gm_dispatch_to_file(&root, &handle, "verbX", "taskY", "{}", &out_dir, 0, None);
 
     let entry_remains = daemon::in_flight_map().lock().unwrap_or_else(|e| e.into_inner()).get(&key).is_some();
     let out_written = out_dir.join("verbX-taskY.json").exists();
@@ -461,7 +461,7 @@ fn run_spool_watcher_single_process(project: &mut ProjectPlugins, spool_dir: &st
                         continue;
                     }
                     let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-                    let _dispatch_origin_scope = agentplug_host::enter_dispatch_origin_scope(&stem, &body);
+                    let _dispatch_origin_scope = agentplug_host::enter_dispatch_origin_scope(&stem, &body, None);
 
                     let busy_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
                     let ticker = spawn_standalone_busy_ticker(status_path.clone(), busy_stop.clone());

@@ -475,6 +475,12 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
         "host_env_get",
         |mut caller: Caller<'_, HostState>, key_ptr: u32, key_len: u32| -> u64 {
             let key = read_guest_string(&mut caller, key_ptr, key_len);
+            if let Some(dispatch_value) = crate::dispatch_origin::dispatch_env_value(&key) {
+                return match dispatch_value {
+                    Some(val) => write_guest_bytes(&mut caller, val.as_bytes()),
+                    None => 0,
+                };
+            }
             match std::env::var(&key) {
                 Ok(val) => write_guest_bytes(&mut caller, val.as_bytes()),
                 Err(_) => 0,
