@@ -1,0 +1,12 @@
+[package]
+name = "agentplug-lightpanda"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "agentplug_lightpanda"
+path = "src/lib.rs"
+
+[dependencies]
+agentplug-host = { path = "../agentplug-host" }
+serde_json = "1"
