@@ -3391,16 +3391,16 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
             background_projects.rotate_left(background_round_robin_cursor % len);
             background_round_robin_cursor = (background_round_robin_cursor + worker_count) % len;
         }
-        let pool_size = worker_count.min(active_projects.len());
-        let queue = std::sync::Mutex::new(active_projects);
+        background_projects.extend(active_projects);
+        let queue = std::sync::Mutex::new(background_projects);
         let done = std::sync::Mutex::new(Vec::<(PathBuf, ProjectPlugins, bool)>::new());
         {
             let plugin_modules_ref: &PluginModules = &plugin_modules;
             let queue_ref = &queue;
             let done_ref = &done;
             std::thread::scope(|scope| {
-                let mut handles = Vec::with_capacity(pool_size);
-                for _ in 0..pool_size {
+                let mut handles = Vec::with_capacity(worker_count);
+                for _ in 0..worker_count {
                     handles.push(scope.spawn(move || loop {
                         let next = { queue_ref.lock().unwrap_or_else(|e| e.into_inner()).pop() };
                         let Some((root, mut project)) = next else {
@@ -3413,14 +3413,6 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
                             .unwrap_or_else(|e| e.into_inner())
                             .push((root, project, did_work));
                     }));
-                }
-                for (root, mut project) in background_projects {
-                    let did_work =
-                        dispatch_project(root.as_path(), &mut project, plugin_modules_ref);
-                    done_ref
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .push((root, project, did_work));
                 }
                 for h in handles {
                     let _ = h.join();
