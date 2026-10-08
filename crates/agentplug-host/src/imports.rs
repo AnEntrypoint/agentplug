@@ -178,7 +178,40 @@ fn is_inherited_git_config_key(key: &std::ffi::OsStr) -> bool {
         || key.starts_with("GIT_CONFIG_VALUE_")
 }
 
-fn configure_github_git_credentials(command: &mut std::process::Command) {
+const GIT_SUBCOMMANDS_APPLYING_CONTENT_FILTERS: &[&str] = &["add", "status", "diff", "checkout"];
+
+const GIT_GLOBAL_OPTIONS_TAKING_A_VALUE: &[&str] = &[
+    "-c",
+    "-C",
+    "--git-dir",
+    "--work-tree",
+    "--namespace",
+    "--super-prefix",
+    "--config-env",
+    "--exec-path",
+];
+
+fn git_argv_subcommand(argv: &[String]) -> Option<&str> {
+    let mut tokens = argv.iter().map(String::as_str);
+    while let Some(token) = tokens.next() {
+        if GIT_GLOBAL_OPTIONS_TAKING_A_VALUE.contains(&token) {
+            tokens.next();
+            continue;
+        }
+        if token.starts_with('-') {
+            continue;
+        }
+        return Some(token);
+    }
+    None
+}
+
+fn git_argv_applies_content_filters(argv: &[String]) -> bool {
+    git_argv_subcommand(argv)
+        .is_some_and(|subcommand| GIT_SUBCOMMANDS_APPLYING_CONTENT_FILTERS.contains(&subcommand))
+}
+
+fn configure_github_git_credentials(command: &mut std::process::Command, argv: &[String]) {
     for (key, _) in std::env::vars_os() {
         if is_inherited_git_config_key(&key) {
             command.env_remove(key);
@@ -188,8 +221,6 @@ fn configure_github_git_credentials(command: &mut std::process::Command) {
         command.env("GH_CONFIG_DIR", directory);
     }
     command
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", EMPTY_GIT_CONFIG_OR_HOOK_PATH)
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GCM_INTERACTIVE", "Never")
         .env("GIT_CONFIG_COUNT", "2")
@@ -197,6 +228,12 @@ fn configure_github_git_credentials(command: &mut std::process::Command) {
         .env("GIT_CONFIG_VALUE_0", EMPTY_GIT_CONFIG_OR_HOOK_PATH)
         .env("GIT_CONFIG_KEY_1", "credential.https://github.com.helper")
         .env("GIT_CONFIG_VALUE_1", "!gh auth git-credential");
+    if git_argv_applies_content_filters(argv) {
+        return;
+    }
+    command
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", EMPTY_GIT_CONFIG_OR_HOOK_PATH);
 }
 
 fn user_gm_root() -> Option<PathBuf> {
@@ -1139,7 +1176,7 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
                 }
                     let mut git_cmd = std::process::Command::new("git");
                     git_cmd.args(&argv).current_dir(&cwd).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
-                    configure_github_git_credentials(&mut git_cmd);
+                    configure_github_git_credentials(&mut git_cmd, &argv);
                 #[cfg(unix)]
                 {
                     use std::os::unix::process::CommandExt;
@@ -1264,7 +1301,7 @@ mod tests {
         let credential_dir = PathBuf::from("/tmp/agentplug-gh-config");
         set_github_cli_config_dir(Some(credential_dir.clone()));
         let mut command = std::process::Command::new("git");
-        configure_github_git_credentials(&mut command);
+        configure_github_git_credentials(&mut command, &["push".to_string()]);
         let envs: HashMap<_, _> = command.get_envs().collect();
         assert_eq!(
             envs.get(std::ffi::OsStr::new("GH_CONFIG_DIR"))
