@@ -69,19 +69,26 @@ a host-level failure.
 
 ## Crawl contract (host side)
 
-Two engines serve one request shape. Neither is a wasm plugin: both run as
-host-side Rust, so `crawl_cdp` lives in `agentplug-host` and the lightpanda
-plugin (`crates/agentplug-lightpanda`) depends on it.
+Two engines serve one request shape. `crawl_cdp` is host-side Rust in
+`agentplug-host`, imported by the guest as `env.crawl_cdp`. The lightpanda engine
+is the wasm sibling `lightpanda.wasm` (`crates/agentplug-lightpanda-wasm`): its
+`crawl` verb calls the import `env.host_lightpanda_crawl`, which the runner
+answers with `agentplug_lightpanda::crawl`, the warm native server.
 
 Entry points:
 
 - `agentplug_host::crawl_cdp(cwd, body) -> Value` -- headful Chrome over CDP.
   One Chrome per call, killed when the call returns. Chrome comes from
-  GM_BROWSER_CHROME_PATH, then CHROME_PATH, then the platform install paths and
-  PATH.
-- `agentplug_lightpanda::plugin_call(cwd, "crawl", body) -> Value` -- headless
-  lightpanda. Any other verb answers `{"ok":false,"error":"unknown_verb"}`.
-  `agentplug_lightpanda::crawl(cwd, body)` is the same call without the verb.
+  GM_BROWSER_CHROME_PATH, then CHROME_PATH, then the per-platform install paths
+  (Windows install roots, macOS `.app` bundles, Linux packages) and PATH.
+- `agentplug_host::set_lightpanda_engine(agentplug_lightpanda::crawl)` -- the
+  runner registers the native engine at startup; the import is refused until then.
+- `agentplug_lightpanda::crawl(cwd, body)` -- headless lightpanda, one warm
+  `serve` per project root, reaped after GM_LIGHTPANDA_IDLE_SECONDS. The binary
+  is GM_LIGHTPANDA_PATH, then `<home>/.agentplug/bin/lightpanda-<arch>-<os>`
+  (the lightpanda-io/browser release asset names), then PATH. Windows has no
+  native lightpanda build; the server runs in WSL2 through `wsl.exe --exec`
+  (GM_LIGHTPANDA_WSL_DISTRO, GM_LIGHTPANDA_WSL_BINARY).
   `agentplug_lightpanda::shutdown()` kills every warm process.
 
 Body (UTF-8 text, one step per line):
