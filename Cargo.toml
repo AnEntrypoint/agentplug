@@ -5,7 +5,7 @@ default-members = ["crates/agentplug-runner"]
 
 [workspace.package]
 edition = "2021"
-version = "0.1.220"
+version = "0.1.221"
 
 [profile.release]
 strip = true
