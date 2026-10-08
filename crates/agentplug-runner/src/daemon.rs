@@ -1529,6 +1529,7 @@ pub fn run_takeover(version: &str) -> anyhow::Result<()> {
     eprintln!("[agentplug daemon] takeover: readiness marker written, waiting for old daemon to release ownership");
     for _ in 0..480 {
         if read_owner_pid().is_none() && claim_ownership() {
+            let _ = fs::remove_file(takeover_ready_path());
             if let Err(error) = record_runner_version(version) {
                 eprintln!(
                     "[agentplug daemon] takeover: could not record running version {version}: {error} -- continuing with the staged runner so the old daemon is not left without a successor; a later boot will reconcile the marker"
@@ -1926,6 +1927,29 @@ fn cached_staged_runner() -> Option<(u64, u64)> {
 
 fn write_project_heartbeat(root: &Path, busy_until: Option<u64>) {
     write_project_heartbeat_with_queue_info(root, busy_until, None);
+}
+
+const DISPATCH_HEARTBEAT_MIN_GAP: Duration = Duration::from_secs(1);
+
+fn dispatch_heartbeat_last_write() -> &'static Mutex<HashMap<PathBuf, Instant>> {
+    static SLOT: OnceLock<Mutex<HashMap<PathBuf, Instant>>> = OnceLock::new();
+    SLOT.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn write_project_heartbeat_rate_limited(root: &Path, busy_until: Option<u64>) {
+    let now = Instant::now();
+    {
+        let mut last_writes = dispatch_heartbeat_last_write()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(at) = last_writes.get(root) {
+            if now.saturating_duration_since(*at) < DISPATCH_HEARTBEAT_MIN_GAP {
+                return;
+            }
+        }
+        last_writes.insert(root.to_path_buf(), now);
+    }
+    write_project_heartbeat(root, busy_until);
 }
 
 fn write_project_heartbeat_with_queue_info(
@@ -3108,6 +3132,7 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
 
     const IDLE_WAIT_MIN_MS: u64 = 25;
     const IDLE_WAIT_MAX_MS: u64 = 1_000;
+    const PENDING_UNCLAIMED_IDLE_WAIT_MAX_MS: u64 = 250;
     let mut idle_wait_ms = IDLE_WAIT_MIN_MS;
 
     let shared_plugin_release_idle_ms = daemon_cfg.shared_plugin_release_idle_ms();
@@ -3624,26 +3649,27 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
         let pending_work_exists_before_idle_wait = known_roots
             .iter()
             .any(|root| project_has_pending_dispatch_work(root));
-        if any_work || pending_work_exists_before_idle_wait {
+        // Work that was claimed resets the wait to the minimum. Queued files that
+        // stay unclaimable (unsettled, unreadable, or stale) must not pin the loop
+        // at the minimum, so their wait backs off to a short cap instead.
+        if any_work {
             idle_wait_ms = IDLE_WAIT_MIN_MS;
-            #[cfg(windows)]
-            wait_for_in_dir_change(
-                &mut idle_in_dir_watch,
-                &known_roots,
-                Duration::from_millis(idle_wait_ms),
-            );
-            #[cfg(not(windows))]
-            std::thread::sleep(Duration::from_millis(idle_wait_ms));
-        } else {
-            #[cfg(windows)]
-            wait_for_in_dir_change(
-                &mut idle_in_dir_watch,
-                &known_roots,
-                Duration::from_millis(idle_wait_ms),
-            );
-            #[cfg(not(windows))]
-            std::thread::sleep(Duration::from_millis(idle_wait_ms));
-            idle_wait_ms = (idle_wait_ms.saturating_mul(2)).min(IDLE_WAIT_MAX_MS);
+        }
+        #[cfg(windows)]
+        wait_for_in_dir_change(
+            &mut idle_in_dir_watch,
+            &known_roots,
+            Duration::from_millis(idle_wait_ms),
+        );
+        #[cfg(not(windows))]
+        std::thread::sleep(Duration::from_millis(idle_wait_ms));
+        if !any_work {
+            let cap_ms = if pending_work_exists_before_idle_wait {
+                PENDING_UNCLAIMED_IDLE_WAIT_MAX_MS
+            } else {
+                IDLE_WAIT_MAX_MS
+            };
+            idle_wait_ms = (idle_wait_ms.saturating_mul(2)).min(cap_ms);
         }
     }
 }
