@@ -344,7 +344,7 @@ fn selfcheck_pool_fairness() -> anyhow::Result<()> {
 
     const POOL_SIZE: usize = 4;
     let pool = Arc::new(SharedPluginPool::new("gm", POOL_SIZE));
-    let heavy_slots_expected = POOL_SIZE - 1;
+    let heavy_slots_expected = POOL_SIZE - 2;
 
     let (parked_tx, parked_rx) = mpsc::channel::<usize>();
     let (release_tx, release_rx) = mpsc::channel::<()>();
@@ -381,12 +381,26 @@ fn selfcheck_pool_fairness() -> anyhow::Result<()> {
     });
     assert!(
         extra_admitted_rx.recv_timeout(Duration::from_millis(1500)).is_err(),
-        "a {}th heavy dispatch must NOT be admitted into a {POOL_SIZE}-slot pool -- one slot stays reserved for cheap verbs",
+        "a {}th heavy dispatch must NOT be admitted into a {POOL_SIZE}-slot pool -- the cheap admission budget stays reserved for responsive verbs",
         heavy_slots_expected + 1
     );
     println!("[selfcheck-pool-fairness] a further heavy dispatch is held at admission, so it cannot take the reserved slot");
 
     let cheap_start = Instant::now();
+    let cheap_admission = SharedPluginPool::admit_within(
+        &pool,
+        DispatchCostClass::Cheap,
+        Duration::from_millis(500),
+    )
+    .map_err(|report| {
+        anyhow::anyhow!(
+            "a cheap dispatch was refused admission behind parked heavy work: kind={} waited_ms={} limit={} in_flight={}",
+            report.kind,
+            report.waited_ms,
+            report.limit,
+            report.in_flight
+        )
+    })?;
     let (cheap_guard, cheap_waited_ms) = pool.acquire_within_for_class(
         SharedPluginPool::ACQUIRE_TIMEOUT_MS,
         DispatchCostClass::Cheap,
@@ -396,8 +410,9 @@ fn selfcheck_pool_fairness() -> anyhow::Result<()> {
         cheap_elapsed < Duration::from_millis(500),
         "a cheap dispatch waited {cheap_elapsed:?} behind parked heavy work -- the reserved slot was not honored"
     );
-    println!("[selfcheck-pool-fairness] cheap dispatch acquired the reserved slot in {cheap_waited_ms}ms while {heavy_slots_expected} heavy dispatches stayed parked");
+    println!("[selfcheck-pool-fairness] cheap dispatch admitted and acquired the reserved slot in {cheap_waited_ms}ms while {heavy_slots_expected} heavy dispatches stayed parked");
     drop(cheap_guard);
+    drop(cheap_admission);
 
     for _ in 0..heavy_slots_expected {
         let _ = release_tx.send(());
