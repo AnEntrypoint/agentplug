@@ -1706,6 +1706,7 @@ const GIT_LANE_VERBS: &[&str] = &[
     "git_rm",
     "git_revert",
     "git_reset",
+    "git_reset_head",
     "git_stash",
     "git_stash_pop",
     "git_stash_drop",

@@ -178,7 +178,9 @@ fn is_inherited_git_config_key(key: &std::ffi::OsStr) -> bool {
         || key.starts_with("GIT_CONFIG_VALUE_")
 }
 
-const GIT_SUBCOMMANDS_APPLYING_CONTENT_FILTERS: &[&str] = &["add", "status", "diff", "checkout"];
+const GIT_SUBCOMMANDS_APPLYING_CONTENT_FILTERS: &[&str] = &[
+    "add", "status", "diff", "checkout", "commit", "stash",
+];
 
 const GIT_GLOBAL_OPTIONS_TAKING_A_VALUE: &[&str] = &[
     "-c",
