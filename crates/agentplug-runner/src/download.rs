@@ -285,7 +285,7 @@ fn describe_github_api_error(url: &str, err: ureq::Error) -> anyhow::Error {
 }
 
 pub fn download_and_verify(url: &str, dest: &Path, expected_sha256_hex: &str) -> anyhow::Result<()> {
-    let resp = agentplug_host::shared_agent().get(url).call()?;
+    let resp = agentplug_host::download_agent().get(url).call()?;
     let mut reader = resp.into_reader();
     let mut bytes = Vec::new();
     let mut buf = [0u8; 65536];

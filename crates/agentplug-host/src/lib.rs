@@ -31,7 +31,7 @@ pub use crawl::{
 pub use dispatch_origin::{enter_dispatch_origin_scope, DispatchOriginScope};
 pub use github_auth::{github_cli_token, invalidate_github_cli_token};
 pub use host_state::HostState;
-pub use http_agent::{build_agent, shared_agent};
+pub use http_agent::{build_agent, download_agent, shared_agent};
 pub use imports::{
     git_subprocess_timeout_ms, github_cli_config_dir, register_env_imports, register_wasi,
     set_github_cli_config_dir,

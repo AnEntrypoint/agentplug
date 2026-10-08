@@ -70,3 +70,11 @@ pub fn shared_agent() -> &'static ureq::Agent {
     static AGENT: std::sync::OnceLock<ureq::Agent> = std::sync::OnceLock::new();
     AGENT.get_or_init(|| build_agent(std::time::Duration::from_secs(10)))
 }
+
+// The 10 s budget of shared_agent is for small API replies. A release binary is
+// 14 MB and a plugin wasm is far larger; on a slow link the whole body must fit
+// inside the request timeout, so downloads get their own agent.
+pub fn download_agent() -> &'static ureq::Agent {
+    static AGENT: std::sync::OnceLock<ureq::Agent> = std::sync::OnceLock::new();
+    AGENT.get_or_init(|| build_agent(std::time::Duration::from_secs(900)))
+}
