@@ -750,11 +750,53 @@ pub fn sweep_unconsumable_spool_files(root: &Path) {
             let dest = quarantine_dir.join(format!("{verb}__{file_name}"));
             if fs::rename(&path, &dest).is_ok() {
                 eprintln!(
-                    "[agentplug daemon] quarantined unconsumable spool file in/{verb}/{file_name} to {} -- the spool ABI is in/<verb>/<session-id>-<local-counter>.<ext>, so a non-conforming name is never claimed by the dispatch loop and would otherwise sit invisibly forever",
+                    "[agentplug daemon] quarantined unconsumable spool file in/{verb}/{file_name} to {} -- the spool ABI is in/<verb>/<session-id>-<local-counter>.<ext>, so a non-conforming name is never claimed by the dispatch loop",
                     dest.display()
                 );
+                answer_quarantined_spool_request(&spool_dir.join("out"), &verb, &path, &dest);
             }
         }
+    }
+}
+
+fn answer_quarantined_spool_request(out_dir: &Path, verb: &str, request_path: &Path, quarantined_to: &Path) {
+    let file_name = request_path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let Some(task) = request_path
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .filter(|s| !s.is_empty())
+    else {
+        return;
+    };
+    let out_name = format!("{verb}-{task}.json");
+    if out_dir.join(&out_name).exists() {
+        return;
+    }
+    let mut accepted = accepted_spool_request_extensions(verb).to_vec();
+    accepted.dedup();
+    let accepted_form = format!(
+        "in/{verb}/<session-id>-<counter>.<{}>",
+        accepted.join("|")
+    );
+    let out_body = serde_json::json!({
+        "ok": false,
+        "verb": verb,
+        "task": task,
+        "error_code": "spool_filename_rejected",
+        "error": format!(
+            "request in/{verb}/{file_name} was never executed: its name is not an accepted spool request form. Write the request as {accepted_form}; a plain numeric name or another extension is quarantined, never claimed."
+        ),
+        "accepted_form": accepted_form,
+        "accepted_extensions": accepted,
+        "quarantined_to": quarantined_to.to_string_lossy(),
+    })
+    .to_string();
+    let _ = fs::create_dir_all(out_dir);
+    if !write_spool_out_confirmed(out_dir, &out_name, &out_body) {
+        eprintln!("[agentplug daemon] could not write the spool_filename_rejected out-file for {verb}/{task}");
     }
 }
 
