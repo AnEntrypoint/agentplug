@@ -11,7 +11,6 @@ path = "src/main.rs"
 [dependencies]
 agentplug-host = { path = "../agentplug-host" }
 agentplug-lightpanda = { path = "../agentplug-lightpanda" }
-agentplug-trust = { path = "../agentplug-trust", default-features = false }
 wasmtime = { version = "46", features = ["cache"] }
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }

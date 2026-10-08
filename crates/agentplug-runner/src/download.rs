@@ -6,8 +6,6 @@ use std::time::Duration;
 
 use agentplug_host::install_dir;
 
-use crate::update_trust::{self, AssetIdentity, UpdateRejected};
-
 pub fn sha256_hex(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
@@ -214,16 +212,9 @@ fn try_ensure_plugin_installed_via_direct_release_latest(
         .to_string();
 
     let wasm_url = format!("{base}/{}.wasm", spec.asset_basename);
-    let artifact = format!("{}.wasm", spec.asset_basename);
-    let running = installed_plugin_version_from_file(version_file);
-    let identity = AssetIdentity {
-        artifact: &artifact,
-        version: &version,
-        running: running.as_deref(),
-    };
     snapshot_prev_wasm_and_version(dest, version_file)?;
-    let finalized = download_and_verify(&wasm_url, dest, &expected_sha, &identity)?;
-    record_plugin_install(dest, version_file, &version, &identity, &finalized)?;
+    download_and_verify(&wasm_url, dest, &expected_sha)?;
+    record_plugin_install(dest, version_file, &version)?;
     eprintln!(
         "[agentplug] {} installed via direct release-asset download {wasm_url} (api.github.com path failed or was blocked)",
         spec.asset_basename
@@ -293,13 +284,7 @@ fn describe_github_api_error(url: &str, err: ureq::Error) -> anyhow::Error {
     }
 }
 
-pub fn download_and_verify(
-    url: &str,
-    dest: &Path,
-    expected_sha256_hex: &str,
-    identity: &AssetIdentity,
-) -> anyhow::Result<update_trust::Finalized> {
-    let preflight = update_trust::preflight(identity, &format!("{url}.sig"))?;
+pub fn download_and_verify(url: &str, dest: &Path, expected_sha256_hex: &str) -> anyhow::Result<()> {
     let resp = agentplug_host::shared_agent().get(url).call()?;
     let mut reader = resp.into_reader();
     let mut bytes = Vec::new();
@@ -317,9 +302,8 @@ pub fn download_and_verify(
             "sha256 mismatch downloading {url}: expected {expected_sha256_hex}, got {actual}"
         );
     }
-    let finalized = update_trust::finalize(identity, &preflight, &bytes)?;
     write_download_atomically(dest, &bytes)?;
-    Ok(finalized)
+    Ok(())
 }
 
 fn write_download_atomically(dest: &Path, bytes: &[u8]) -> anyhow::Result<()> {
@@ -470,13 +454,6 @@ fn plugin_version_path(plugin_name: &str) -> PathBuf {
         .join(format!("{plugin_name}.version"))
 }
 
-fn installed_plugin_version_from_file(version_file: &Path) -> Option<String> {
-    fs::read_to_string(version_file)
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-}
-
 fn snapshot_prev_wasm_and_version(dest: &Path, version_file: &Path) -> anyhow::Result<()> {
     if dest.exists() {
         fs::copy(dest, dest.with_extension("wasm.prev"))?;
@@ -507,13 +484,7 @@ fn restore_plugin_snapshot(dest: &Path, version_file: &Path) -> anyhow::Result<(
     Ok(())
 }
 
-fn record_plugin_install(
-    dest: &Path,
-    version_file: &Path,
-    version: &str,
-    identity: &AssetIdentity,
-    finalized: &update_trust::Finalized,
-) -> anyhow::Result<()> {
+fn record_plugin_install(dest: &Path, version_file: &Path, version: &str) -> anyhow::Result<()> {
     if let Err(write_error) = fs::write(version_file, version) {
         return match restore_plugin_snapshot(dest, version_file) {
             Ok(()) => Err(anyhow::anyhow!(
@@ -524,15 +495,10 @@ fn record_plugin_install(
             )),
         };
     }
-    update_trust::installed(identity, finalized);
     Ok(())
 }
 
 const RUNNER_BIN_REPO: &str = "AnEntrypoint/agentplug-bin";
-
-pub fn runner_signature_url(asset: &str, version: &str) -> String {
-    format!("https://github.com/{RUNNER_BIN_REPO}/releases/download/v{version}/{asset}.sig")
-}
 
 fn runner_asset_name_for(os: &str, arch: &str) -> Option<&'static str> {
     match (os, arch) {
@@ -869,19 +835,7 @@ pub fn stage_runner_self_update() -> anyhow::Result<Option<(PathBuf, String)>> {
         .next()
         .ok_or_else(|| anyhow::anyhow!("empty sha256 sidecar for {asset} at {base}"))?
         .to_string();
-    let identity = AssetIdentity {
-        artifact: asset,
-        version: &latest,
-        running: Some(env!("CARGO_PKG_VERSION")),
-    };
-    let finalized = download_and_verify(
-        &format!("{base}/{asset}"),
-        &staged,
-        &expected_sha,
-        &identity,
-    )?;
-    update_trust::record_stage_outcome(&staged, &identity, &finalized);
-    update_trust::installed(&identity, &finalized);
+    download_and_verify(&format!("{base}/{asset}"), &staged, &expected_sha)?;
     #[cfg(not(windows))]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -1312,7 +1266,6 @@ pub fn ensure_plugin_installed(
 
     let result = match ensure_plugin_installed_via_github(plugin_name, explicit_version, &spec, &dest, &version_file) {
         Ok(path) => Ok(path),
-        Err(github_api_err) if github_api_err.downcast_ref::<UpdateRejected>().is_some() => Err(github_api_err),
         Err(github_api_err) if explicit_version.is_none() => match try_ensure_plugin_installed_via_direct_release_latest(&spec, &dest, &version_file) {
             Ok(path) => Ok(path),
             Err(direct_err) => Err(anyhow::anyhow!(
@@ -1385,16 +1338,9 @@ fn ensure_plugin_installed_via_github(
         .ok_or_else(|| anyhow::anyhow!("empty sha256 sidecar for {effective_basename} at {base}"))?
         .to_string();
 
-    let artifact = format!("{effective_basename}.wasm");
-    let running = installed_plugin_version_from_file(version_file);
-    let identity = AssetIdentity {
-        artifact: &artifact,
-        version: &version,
-        running: running.as_deref(),
-    };
     snapshot_prev_wasm_and_version(dest, version_file)?;
-    let finalized = download_and_verify(&wasm_url, dest, &expected_sha, &identity)?;
-    record_plugin_install(dest, version_file, &version, &identity, &finalized)?;
+    download_and_verify(&wasm_url, dest, &expected_sha)?;
+    record_plugin_install(dest, version_file, &version)?;
     Ok(dest.to_path_buf())
 }
 
