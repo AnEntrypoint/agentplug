@@ -38,15 +38,16 @@ dependencies = [
 
 [[package]]
 name = "agentplug-lightpanda"
-version = "0.1.208"
+version = "0.1.209"
 dependencies = [
  "agentplug-host",
+ "libc",
  "serde_json",
 ]
 
 [[package]]
 name = "agentplug-lightpanda-wasm"
-version = "0.1.208"
+version = "0.1.0"
 dependencies = [
  "serde_json",
 ]
