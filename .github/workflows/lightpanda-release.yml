@@ -1,0 +1,27 @@
+name: lightpanda-release
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'crates/agentplug-lightpanda-wasm/**'
+      - '.github/workflows/lightpanda-release.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: agentplug-lightpanda-release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  release:
+    uses: AnEntrypoint/rs-plugkit/.github/workflows/wasm-plugin-release.yml@main
+    with:
+      wasm_artifact_name: lightpanda.wasm
+      published_asset_basename: lightpanda
+      release_repo: AnEntrypoint/agentplug-lightpanda-bin
+      release_title_prefix: agentplug-lightpanda
+      source_repository: AnEntrypoint/agentplug
+      crate_dir: crates/agentplug-lightpanda-wasm
+      build_command: cargo build --release --target wasm32-wasip1 --lib --target-dir target
+    secrets:
+      publisher_token: ${{ secrets.PUBLISHER_TOKEN }}
