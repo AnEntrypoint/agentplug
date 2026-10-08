@@ -12,6 +12,15 @@ use wasmtime::{AsContextMut, Caller, Linker, Memory};
 use crate::host_state::HostState;
 
 const HOST_FS_READ_EMPTY_SUCCESS: u64 = 1;
+/// The file exists and is readable, but another process holds it with no share-read: on Windows
+/// that is ERROR_SHARING_VIOLATION (32) or ERROR_LOCK_VIOLATION (33). A run's .err looks exactly
+/// like this for the whole run, and it must not be reported as "not found or empty".
+const HOST_FS_READ_LOCKED: u64 = 2;
+const HOST_FS_READ_NOT_UTF8: u64 = 3;
+
+fn is_sharing_violation(error: &std::io::Error) -> bool {
+    matches!(error.raw_os_error(), Some(32) | Some(33))
+}
 
 fn fetch_agent(timeout: Duration) -> ureq::Agent {
     crate::http_agent::build_agent(timeout)
@@ -494,7 +503,18 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
             match fs::read_to_string(&full) {
                 Ok(content) if content.is_empty() => HOST_FS_READ_EMPTY_SUCCESS,
                 Ok(content) => write_guest_bytes(&mut caller, content.as_bytes()),
-                Err(_) => 0,
+                // A caller that gets `None` can only say "not found or empty" unless the reason
+                // travels back, and the three reasons here need three different answers: wait and
+                // retry, decode bytes instead of text, or stop looking.
+                Err(e) => {
+                    if e.kind() == std::io::ErrorKind::InvalidData {
+                        HOST_FS_READ_NOT_UTF8
+                    } else if is_sharing_violation(&e) {
+                        HOST_FS_READ_LOCKED
+                    } else {
+                        0
+                    }
+                }
             }
         },
     )?;
