@@ -1970,6 +1970,7 @@ fn write_project_heartbeat_with_queue_info(
         Some(serde_json::Value::Object(map)) => serde_json::Value::Object(map),
         _ => serde_json::json!({}),
     };
+    let previous = payload.clone();
     payload["pid"] = serde_json::json!(std::process::id());
     payload["ts"] = serde_json::json!(now_ms());
     payload["daemon"] = serde_json::json!(true);
@@ -2035,7 +2036,44 @@ fn write_project_heartbeat_with_queue_info(
     } else {
         payload["plugin_compile_failures"] = serde_json::json!(failures);
     }
+    if !status_write_needed(&status_path, &previous, &payload) {
+        return;
+    }
     let _ = fs::write(&status_path, payload.to_string());
+}
+
+const STATUS_LIVENESS_REFRESH: Duration = Duration::from_secs(60);
+
+fn status_write_needed(
+    status_path: &Path,
+    previous: &serde_json::Value,
+    next: &serde_json::Value,
+) -> bool {
+    fn without_volatile_fields(value: &serde_json::Value) -> serde_json::Value {
+        let mut copy = value.clone();
+        if let Some(map) = copy.as_object_mut() {
+            for key in [
+                "ts",
+                "sweep_holder_ms",
+                "runner_update_waiting_ms",
+                "queue_wait_ms",
+            ] {
+                map.remove(key);
+            }
+        }
+        copy
+    }
+    if without_volatile_fields(previous) != without_volatile_fields(next) {
+        return true;
+    }
+    let last_written_age = fs::metadata(status_path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.elapsed().ok());
+    match last_written_age {
+        Some(age) => age >= STATUS_LIVENESS_REFRESH,
+        None => true,
+    }
 }
 
 fn known_project_roots() -> &'static Mutex<Vec<PathBuf>> {
