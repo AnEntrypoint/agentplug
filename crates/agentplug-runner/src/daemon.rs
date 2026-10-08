@@ -1967,7 +1967,7 @@ fn write_project_heartbeat_with_queue_info(
         .clone());
     payload["shared_store_recycle_limit_mb"] =
         serde_json::json!(SHARED_STORE_RECYCLE_LIMIT_MB.load(std::sync::atomic::Ordering::Relaxed));
-    payload["tool_serialization"] = serde_json::json!("fifo per plugin and verb for state-changing verbs, one dispatch per project lane (git, store, state); exec-family, read-only verbs and tree-scan codesearch run unserialised");
+    payload["tool_serialization"] = serde_json::json!("fifo per plugin and verb for state-changing verbs, one dispatch per project lane (git, read, store, state); exec-family, read-only verbs and tree-scan codesearch run unserialised");
     payload["runner_version"] = serde_json::json!(env!("CARGO_PKG_VERSION"));
     payload["loaded_plugin_versions"] = serde_json::json!(loaded_plugin_versions()
         .lock()

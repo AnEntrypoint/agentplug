@@ -1597,15 +1597,15 @@ const GIT_LANE_VERBS: &[&str] = &[
     "git_worktree_prune",
 ];
 
+const READ_LANE_VERBS: &[&str] = &["health", "recall"];
+
 const STORE_LANE_VERBS: &[&str] = &[
     "scan_deps",
-    "health",
     "memorize",
     "memorize-fire",
     "memorize-prune",
     "memorize-vacuum",
     "memorize-retention",
-    "recall",
     "forget",
     "codeinsight_index",
     "code_index",
@@ -1652,6 +1652,8 @@ fn serial_lane_for_dispatch(verb: &str, body: &str) -> Option<&'static str> {
         None
     } else if GIT_LANE_VERBS.contains(&verb) {
         Some("git")
+    } else if READ_LANE_VERBS.contains(&verb) {
+        Some("read")
     } else if STORE_LANE_VERBS.contains(&verb) || verb == "codesearch" {
         Some("store")
     } else {
