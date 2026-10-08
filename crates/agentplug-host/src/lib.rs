@@ -1,4 +1,5 @@
 mod broker;
+mod crawl;
 mod dispatch_origin;
 mod exec_js;
 mod fs_prewarm;
@@ -21,6 +22,10 @@ pub use broker::{
     begin_rolling_update, reap_drained, register_provider, register_provider_with_weight, route,
     set_policy, shift_traffic, status as broker_status, unregister_provider, BrokerStatus,
     LoadBalancePolicy, ProviderStatus, RouteLease,
+};
+pub use crawl::{
+    crawl_cdp, crawl_error_reply, crawl_reply_from_run, endpoint_ready, find_on_path,
+    free_local_port, parse_crawl_body, run_helper, HelperRun, ParsedCrawl,
 };
 pub use dispatch_origin::{enter_dispatch_origin_scope, DispatchOriginScope};
 pub use github_auth::{github_cli_token, invalidate_github_cli_token};

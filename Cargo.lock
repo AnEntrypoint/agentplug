@@ -37,6 +37,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "agentplug-lightpanda"
+version = "0.1.208"
+dependencies = [
+ "agentplug-host",
+ "serde_json",
+]
+
+[[package]]
 name = "agentplug-runner"
 version = "0.1.209"
 dependencies = [

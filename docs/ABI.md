@@ -67,6 +67,54 @@ those; a `plugin_call` naming an unregistered verb returns
 `{"ok":false,"error":"unknown_verb"}` from that plugin's own dispatch, not
 a host-level failure.
 
+## Crawl contract (host side)
+
+Two engines serve one request shape. Neither is a wasm plugin: both run as
+host-side Rust, so `crawl_cdp` lives in `agentplug-host` and the lightpanda
+plugin (`crates/agentplug-lightpanda`) depends on it.
+
+Entry points:
+
+- `agentplug_host::crawl_cdp(cwd, body) -> Value` -- headful Chrome over CDP.
+  One Chrome per call, killed when the call returns. Chrome comes from
+  GM_BROWSER_CHROME_PATH, then CHROME_PATH, then the platform install paths and
+  PATH.
+- `agentplug_lightpanda::plugin_call(cwd, "crawl", body) -> Value` -- headless
+  lightpanda. Any other verb answers `{"ok":false,"error":"unknown_verb"}`.
+  `agentplug_lightpanda::crawl(cwd, body)` is the same call without the verb.
+  `agentplug_lightpanda::shutdown()` kills every warm process.
+
+Body (UTF-8 text, one step per line):
+
+- First non-blank line may be `engine=cdp` or `engine=lightpanda`. Absent means
+  cdp for `crawl_cdp` and lightpanda for the lightpanda plugin. The other name
+  is refused.
+- `url=<url>` or a bare line starting `http://`, `https://`, `file://`,
+  `data:` or `about:blank`: navigate and wait for `document.readyState`
+  `complete`. The page record carries the final URL, title and body text
+  (capped at 20000 characters).
+- `wait=<ms>`: sleep, at most 60000.
+- `eval=<js expression>`: evaluate on the current page; the value is returned
+  by value.
+- Blank lines and lines starting `#` are ignored. At least one step is required.
+
+Reply (one JSON object):
+
+`ok` (bool), `engine` (`"cdp"` or `"lightpanda"`), `headless` (false for cdp,
+true for lightpanda), `stdout` and `stderr` (the Node helper's raw output),
+`exit_code` (int or null), `duration_ms`, `timed_out` (bool), `target_id`
+(CDP target id, or null), `pages` (array of `{op:"goto",url,title,text}`,
+`{op:"wait",ms}`, `{op:"eval",code,value}` in step order), `error` (null or a
+string naming the failing step or precondition).
+
+Lightpanda lifecycle: binary from GM_LIGHTPANDA_PATH, then PATH; nothing is
+downloaded. `lightpanda serve --host 127.0.0.1 --port <p>` starts once per
+project root, readiness is polled every 100 ms for up to 15 s, and the process
+is reaped after GM_LIGHTPANDA_IDLE_SECONDS (default 300) without a crawl. The
+remembered CDP target is reattached on the next crawl. A crawl that is already
+running for the project makes a second crawl answer `ok:false` immediately.
+Lightpanda has no native Windows build.
+
 ## Versioning
 
 No cross-plugin ABI version negotiation in v1 -- all plugins in one
