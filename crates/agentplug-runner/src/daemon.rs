@@ -3731,6 +3731,8 @@ pub fn reap_spool_out_files(root: &Path, force: bool) -> usize {
     let mut total_entries = 0usize;
     let mut stat_fallbacks = 0usize;
     let mut stale_tmp = 0usize;
+    let mut json_names: HashSet<String> = HashSet::new();
+    let mut ready_markers: Vec<(PathBuf, String)> = Vec::new();
     for entry in entries.flatten() {
         total_entries += 1;
         let name = entry.file_name().to_string_lossy().into_owned();
@@ -3745,9 +3747,16 @@ pub fn reap_spool_out_files(root: &Path, force: bool) -> usize {
             }
             continue;
         }
+        if let Some(answer_name) = name.strip_suffix(".ready") {
+            if answer_name.ends_with(".json") {
+                ready_markers.push((entry.path(), answer_name.to_string()));
+            }
+            continue;
+        }
         if !name.ends_with(".json") {
             continue;
         }
+        json_names.insert(name.clone());
         let stem = entry
             .path()
             .file_stem()
@@ -3774,12 +3783,23 @@ pub fn reap_spool_out_files(root: &Path, force: bool) -> usize {
     rows.sort_by_key(|row| row.stamp_ms);
     let max_files = spool_out_max_files();
     let max_age_ms = spool_out_max_age_ms();
-    let keep_json = if total_entries > max_files && !rows.is_empty() {
-        ((max_files * rows.len()) / total_entries).clamp(1, rows.len())
-    } else {
-        rows.len()
-    };
-    let over_cap = rows.len().saturating_sub(keep_json);
+    let over_cap = rows.len().saturating_sub(max_files);
+    let mut orphan_markers = 0usize;
+    for (marker_path, answer_name) in &ready_markers {
+        if orphan_markers >= SPOOL_OUT_MAX_REAP_PER_PASS {
+            break;
+        }
+        if json_names.contains(answer_name) {
+            continue;
+        }
+        let age_ms = fs::metadata(marker_path)
+            .ok()
+            .map(|m| out_file_age_ms(&m, now))
+            .unwrap_or(0);
+        if age_ms >= SPOOL_OUT_MIN_AGE_MS && fs::remove_file(marker_path).is_ok() {
+            orphan_markers += 1;
+        }
+    }
     let mut reaped = 0usize;
     for (index, row) in rows.iter().enumerate() {
         if reaped >= SPOOL_OUT_MAX_REAP_PER_PASS {
@@ -3800,10 +3820,11 @@ pub fn reap_spool_out_files(root: &Path, force: bool) -> usize {
         remove_out_file_and_markers(&row.path);
         reaped += 1;
     }
-    if reaped > 0 || stale_tmp > 0 {
+    if reaped > 0 || stale_tmp > 0 || orphan_markers > 0 {
         eprintln!(
-            "[agentplug daemon] reaped {} answered out-file(s) and {} stale tmp file(s) under {} -- out/ had {} entries ({} json, {} needed a stat), capped at {} files / {}h, {} dispatches still live",
+            "[agentplug daemon] reaped {} answered out-file(s), {} orphaned .ready marker(s) and {} stale tmp file(s) under {} -- out/ had {} entries ({} json, {} needed a stat), capped at {} files / {}h, {} dispatches still live",
             reaped,
+            orphan_markers,
             stale_tmp,
             out_dir.display(),
             total_entries,
