@@ -2042,7 +2042,7 @@ fn write_project_heartbeat_with_queue_info(
     let _ = fs::write(&status_path, payload.to_string());
 }
 
-const STATUS_LIVENESS_REFRESH: Duration = Duration::from_secs(60);
+const STATUS_LIVENESS_REFRESH: Duration = Duration::from_secs(600);
 
 fn status_write_needed(
     status_path: &Path,
