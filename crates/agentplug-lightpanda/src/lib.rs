@@ -4,6 +4,11 @@
 //! reaped after GM_LIGHTPANDA_IDLE_SECONDS (default 300) without a crawl. The
 //! CDP target id is remembered so repeat crawls reattach to the same page
 //! instead of creating a new one.
+//!
+//! Binary order: GM_LIGHTPANDA_PATH, then `<agentplug home>/bin/lightpanda-<arch>-<os>`
+//! (the lightpanda-io/browser release asset names), then `lightpanda` on PATH.
+//! lightpanda has no native Windows build; on Windows the server runs inside WSL2
+//! through `wsl.exe --exec`, the path the upstream README documents.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -13,7 +18,7 @@ use std::time::{Duration, Instant};
 
 use agentplug_host::{
     apply_windowless, canonical_project_root, crawl_error_reply, crawl_reply_from_run,
-    endpoint_ready, find_on_path, free_local_port, parse_crawl_body, run_helper,
+    endpoint_ready, find_on_path, free_local_port, install_dir, parse_crawl_body, run_helper,
 };
 use serde_json::{json, Value};
 
@@ -21,12 +26,23 @@ const ENGINE: &str = "lightpanda";
 const DEFAULT_IDLE_SECONDS: u64 = 300;
 const REAPER_TICK: Duration = Duration::from_secs(5);
 const READY_DEADLINE: Duration = Duration::from_secs(15);
+const WSL_READY_DEADLINE: Duration = Duration::from_secs(45);
 const READY_POLL: Duration = Duration::from_millis(100);
 const HELPER_BUDGET: Duration = Duration::from_secs(300);
+
+enum Launch {
+    Native(PathBuf),
+    Wsl {
+        wsl: PathBuf,
+        distro: Option<String>,
+        binary: String,
+    },
+}
 
 struct Warm {
     child: Child,
     port: u16,
+    launch: Launch,
     target_id: Option<String>,
     last_used: Instant,
     busy: bool,
@@ -50,8 +66,24 @@ fn idle_ttl() -> Duration {
     Duration::from_secs(seconds)
 }
 
-fn resolve_binary() -> Result<PathBuf, String> {
-    if let Some(raw) = std::env::var_os("GM_LIGHTPANDA_PATH").filter(|v| !v.is_empty()) {
+fn env_value(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+fn platform_asset_name() -> Option<String> {
+    let os = match std::env::consts::OS {
+        "linux" => "linux",
+        "macos" => "macos",
+        _ => return None,
+    };
+    Some(format!("lightpanda-{}-{os}", std::env::consts::ARCH))
+}
+
+fn resolve_native_binary() -> Result<PathBuf, String> {
+    if let Some(raw) = env_value("GM_LIGHTPANDA_PATH") {
         let path = PathBuf::from(raw);
         return if path.is_file() {
             Ok(path)
@@ -62,9 +94,67 @@ fn resolve_binary() -> Result<PathBuf, String> {
             ))
         };
     }
+    let installed = platform_asset_name().map(|name| install_dir().join("bin").join(name));
+    if let Some(path) = installed.as_ref().filter(|p| p.is_file()) {
+        return Ok(path.clone());
+    }
     find_on_path("lightpanda").ok_or_else(|| {
-        "lightpanda binary not found: set GM_LIGHTPANDA_PATH to the lightpanda binary, or put lightpanda on PATH (lightpanda-io/browser); nothing is downloaded".to_string()
+        let expected = installed
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| format!("(no release asset for {})", std::env::consts::OS));
+        format!(
+            "lightpanda binary not found: set GM_LIGHTPANDA_PATH, install the official lightpanda-io/browser release asset at {expected}, or put lightpanda on PATH; nothing is downloaded"
+        )
     })
+}
+
+fn wsl_launch() -> Result<Launch, String> {
+    let wsl = find_on_path("wsl").ok_or_else(|| {
+        "lightpanda has no native Windows build: the documented path is WSL2 -- run `wsl --install`, install the Linux lightpanda release inside WSL, and make it reachable as GM_LIGHTPANDA_WSL_BINARY (default `lightpanda` on the WSL PATH); wsl.exe was not found".to_string()
+    })?;
+    Ok(Launch::Wsl {
+        wsl,
+        distro: env_value("GM_LIGHTPANDA_WSL_DISTRO"),
+        binary: env_value("GM_LIGHTPANDA_WSL_BINARY").unwrap_or_else(|| "lightpanda".to_string()),
+    })
+}
+
+fn describe(launch: &Launch) -> String {
+    match launch {
+        Launch::Native(binary) => binary.display().to_string(),
+        Launch::Wsl { binary, .. } => format!("wsl.exe --exec {binary}"),
+    }
+}
+
+fn serve_command(launch: &Launch, port: u16) -> Command {
+    let port_arg = port.to_string();
+    match launch {
+        Launch::Native(binary) => {
+            let mut cmd = Command::new(binary);
+            cmd.args(["serve", "--host", "127.0.0.1", "--port", port_arg.as_str()]);
+            cmd
+        }
+        Launch::Wsl {
+            wsl,
+            distro,
+            binary,
+        } => {
+            let mut cmd = Command::new(wsl);
+            if let Some(distro) = distro {
+                cmd.args(["--distribution", distro.as_str()]);
+            }
+            cmd.args([
+                "--exec",
+                binary.as_str(),
+                "serve",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                port_arg.as_str(),
+            ]);
+            cmd
+        }
+    }
 }
 
 fn log_tail(path: &Path) -> String {
@@ -79,10 +169,11 @@ fn log_tail(path: &Path) -> String {
 }
 
 fn start_warm(key: &Path) -> Result<Warm, String> {
-    if cfg!(windows) {
-        return Err("lightpanda has no native Windows build; run it under WSL2 and point GM_LIGHTPANDA_PATH at a wrapper script".to_string());
-    }
-    let binary = resolve_binary()?;
+    let launch = if cfg!(windows) {
+        wsl_launch()?
+    } else {
+        Launch::Native(resolve_native_binary()?)
+    };
     let port = free_local_port()?;
     let dir = key.join(".gm").join("lightpanda");
     std::fs::create_dir_all(&dir)
@@ -96,32 +187,62 @@ fn start_warm(key: &Path) -> Result<Warm, String> {
     let log_err = log
         .try_clone()
         .map_err(|e| format!("could not clone the lightpanda log handle: {e}"))?;
-    let port_arg = port.to_string();
-    let mut cmd = Command::new(&binary);
-    cmd.args(["serve", "--host", "127.0.0.1", "--port", port_arg.as_str()])
-        .stdin(Stdio::null())
+    let mut cmd = serve_command(&launch, port);
+    cmd.stdin(Stdio::null())
         .stdout(Stdio::from(log))
         .stderr(Stdio::from(log_err));
     apply_windowless(&mut cmd);
-    let mut child = cmd
+    let child = cmd
         .spawn()
-        .map_err(|e| format!("lightpanda launch failed ({}): {e}", binary.display()))?;
-    if !endpoint_ready(port, Instant::now() + READY_DEADLINE, READY_POLL) {
-        let _ = child.kill();
-        let _ = child.wait();
-        return Err(format!(
-            "lightpanda CDP endpoint on port {port} did not become ready within {}ms (recent output: {})",
-            READY_DEADLINE.as_millis(),
-            log_tail(&log_path)
-        ));
-    }
-    Ok(Warm {
+        .map_err(|e| format!("lightpanda launch failed ({}): {e}", describe(&launch)))?;
+    let mut warm = Warm {
         child,
         port,
+        launch,
         target_id: None,
         last_used: Instant::now(),
         busy: false,
-    })
+    };
+    let ready_deadline = if cfg!(windows) {
+        WSL_READY_DEADLINE
+    } else {
+        READY_DEADLINE
+    };
+    if !endpoint_ready(port, Instant::now() + ready_deadline, READY_POLL) {
+        let tail = log_tail(&log_path);
+        stop(&mut warm);
+        return Err(format!(
+            "lightpanda CDP endpoint on port {port} did not become ready within {}ms (recent output: {tail})",
+            ready_deadline.as_millis()
+        ));
+    }
+    Ok(warm)
+}
+
+/// Kills the serve process. Under WSL the Linux-side server is a separate
+/// process that wsl.exe does not own, so it is also matched and killed inside
+/// the distribution.
+fn stop(warm: &mut Warm) {
+    let _ = warm.child.kill();
+    let _ = warm.child.wait();
+    if let Launch::Wsl {
+        wsl,
+        distro,
+        binary,
+    } = &warm.launch
+    {
+        let pattern = format!("{binary} serve --host 127.0.0.1 --port {}", warm.port);
+        let mut cmd = Command::new(wsl);
+        if let Some(distro) = distro {
+            cmd.args(["--distribution", distro.as_str()]);
+        }
+        cmd.args(["--exec", "pkill", "-f", pattern.as_str()])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        apply_windowless(&mut cmd);
+        let _ = cmd.status();
+    }
 }
 
 /// Returns the warm port and remembered target for `key`, starting the process
@@ -141,8 +262,7 @@ fn acquire(key: &Path) -> Result<(u16, Option<String>), String> {
         }
     }
     if let Some(mut stale) = map.remove(key) {
-        let _ = stale.child.kill();
-        let _ = stale.child.wait();
+        stop(&mut stale);
     }
     let mut warm = start_warm(key)?;
     warm.busy = true;
@@ -181,8 +301,7 @@ fn start_reaper() {
             .collect();
         for key in expired {
             if let Some(mut warm) = map.remove(&key) {
-                let _ = warm.child.kill();
-                let _ = warm.child.wait();
+                stop(&mut warm);
             }
         }
     });
@@ -237,7 +356,6 @@ pub fn plugin_call(cwd: &Path, verb: &str, body: &str) -> Value {
 /// Kills every warm lightpanda process. Call at runner shutdown.
 pub fn shutdown() {
     for (_, mut warm) in warm_map().drain() {
-        let _ = warm.child.kill();
-        let _ = warm.child.wait();
+        stop(&mut warm);
     }
 }
