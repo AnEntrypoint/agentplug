@@ -279,10 +279,12 @@ pub fn process_owner(root: &Path, owner: &str) -> io::Result<()> {
             }
         }
     }
-    let observations: Value = serde_json::from_slice(&read_bounded(
-        &owner_dir.join("observations.json"),
-        MAX_FILE_BYTES,
-    )?)?;
+    let observations_bytes = match read_bounded(&owner_dir.join("observations.json"), MAX_FILE_BYTES) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    let observations: Value = serde_json::from_slice(&observations_bytes)?;
     let rows = observations
         .as_array()
         .ok_or_else(|| io::Error::other("cycle observations are not an array"))?;
