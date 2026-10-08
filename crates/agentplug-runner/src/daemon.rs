@@ -1929,14 +1929,18 @@ fn write_project_heartbeat(root: &Path, busy_until: Option<u64>) {
     write_project_heartbeat_with_queue_info(root, busy_until, None);
 }
 
-const DISPATCH_HEARTBEAT_MIN_GAP: Duration = Duration::from_secs(1);
+const DISPATCH_HEARTBEAT_MIN_GAP: Duration = Duration::from_secs(3);
 
 fn dispatch_heartbeat_last_write() -> &'static Mutex<HashMap<PathBuf, Instant>> {
     static SLOT: OnceLock<Mutex<HashMap<PathBuf, Instant>>> = OnceLock::new();
     SLOT.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn write_project_heartbeat_rate_limited(root: &Path, busy_until: Option<u64>) {
+fn write_project_heartbeat_rate_limited(
+    root: &Path,
+    busy_until: Option<u64>,
+    queue_info: Option<(usize, usize)>,
+) {
     let now = Instant::now();
     {
         let mut last_writes = dispatch_heartbeat_last_write()
@@ -1949,7 +1953,7 @@ fn write_project_heartbeat_rate_limited(root: &Path, busy_until: Option<u64>) {
         }
         last_writes.insert(root.to_path_buf(), now);
     }
-    write_project_heartbeat(root, busy_until);
+    write_project_heartbeat_with_queue_info(root, busy_until, queue_info);
 }
 
 fn write_project_heartbeat_with_queue_info(
@@ -3389,7 +3393,7 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
             for (position, (_, root)) in active_roots.iter().enumerate() {
                 let spool_dir = root.join(".gm").join("exec-spool");
                 if fs::create_dir_all(&spool_dir).is_ok() {
-                    write_project_heartbeat_with_queue_info(
+                    write_project_heartbeat_rate_limited(
                         root,
                         read_status_busy_until_if_future(root),
                         Some((position, reported_queue_total)),
@@ -3450,7 +3454,7 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
             if reported_queue_total > worker_count {
                 let spool_dir = root.join(".gm").join("exec-spool");
                 if fs::create_dir_all(&spool_dir).is_ok() {
-                    write_project_heartbeat_with_queue_info(
+                    write_project_heartbeat_rate_limited(
                         root.as_path(),
                         read_status_busy_until_if_future(root.as_path()),
                         Some((0, 0)),
