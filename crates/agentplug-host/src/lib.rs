@@ -26,11 +26,11 @@ pub use broker::{
 };
 pub use crawl::{
     crawl_cdp, crawl_error_reply, crawl_reply_from_run, endpoint_ready, find_on_path,
-    free_local_port, lightpanda_crawl, parse_crawl_body, run_helper, set_lightpanda_engine,
-    HelperRun, LightpandaEngine, ParsedCrawl,
+    free_local_port, lightpanda_crawl, parse_cdp_crawl_body, parse_crawl_body, run_helper,
+    set_lightpanda_engine, CdpCrawl, HelperRun, LightpandaEngine, ParsedCrawl,
 };
 pub use crawl_lease::{
-    lease_reply, shutdown_shared_browsers, spawn_housekeeping_timer, SHARED_BROWSER_IDLE_CLOSE,
+    lease_reply, shutdown_shared_browsers, spawn_housekeeping_timer,
 };
 pub use dispatch_origin::{enter_dispatch_origin_scope, DispatchOriginScope};
 pub use github_auth::{github_cli_token, invalidate_github_cli_token};
@@ -54,7 +54,9 @@ pub use registry::{
     release_shared_plugin, request_shared_store_swap, set_gm_pool_size, set_sibling_reload_source,
     set_side_plugin_pool_size, shared_plugin_slot_content_hashes,
     shared_plugin_slot_snapshot_without_blocking, shared_plugin_swap_pending_hashes,
-    DispatchCostClass, DispatchHandle, GmFairnessGuard, LaneWaitReport, PluginDispatchError,
+    AbandonedLaneOwner, AdmissionBand, AdmissionRecord, DispatchCostClass, DispatchHandle,
+    GmFairnessGuard, LaneWaitReport, PluginDispatchError, release_abandoned_lane_owners,
+    take_last_admission,
     PluginFiberLifecycle, ProjectPlugins, SharedPluginPool, SlotContentSnapshot, ToolDispatchGuard,
     ToolQueueWaitReport, EPOCH_TICK_INTERVAL_MS, PLUGIN_IDLE_EVICT_MS, RELEASABLE_SHARED_PLUGINS,
 };

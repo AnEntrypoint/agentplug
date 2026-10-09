@@ -599,11 +599,26 @@ pub(super) fn read_handoff_inherited_claims() -> HashSet<AbandonedClaim> {
         .unwrap_or_default()
 }
 
+pub(crate) fn release_abandoned_project_lanes() {
+    let live_roots = read_registry();
+    let min_held_ms = env_ms_or("AGENTPLUG_LANE_RELEASE_MIN_AGE_MS", MIN_ORPHAN_CLAIM_AGE_MS);
+    for owner in agentplug_host::release_abandoned_lane_owners(&live_roots, min_held_ms) {
+        eprintln!(
+            "[agentplug daemon] released the {} lane of {} held by task {} for {}ms -- its requester has no live lease, so the lane no longer waits on it; the dispatch itself keeps running",
+            owner.lane,
+            owner.root.display(),
+            owner.task,
+            owner.held_ms
+        );
+    }
+}
+
 pub fn sweep_orphaned_claims(root: &Path) {
     sweep_orphaned_claims_distinguishing_handoff_from_crash(root, &read_handoff_inherited_claims());
 }
 
 pub fn sweep_orphaned_claims_across_roots(roots: &[PathBuf]) {
+    release_abandoned_project_lanes();
     let inherited = read_handoff_inherited_claims();
     for root in roots {
         sweep_orphaned_claims_distinguishing_handoff_from_crash(root, &inherited);
@@ -1099,6 +1114,36 @@ pub(crate) fn last_measured_dispatch_queue_wait_ms() -> u64 {
     LAST_MEASURED_DISPATCH_QUEUE_WAIT_MS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+pub(super) const ADMISSION_ANNOTATION_MAX_BYTES: usize = 1024 * 1024;
+
+pub(crate) fn annotate_admission_on_reply(
+    out_body: String,
+    admission: Option<agentplug_host::AdmissionRecord>,
+) -> String {
+    let Some(record) = admission else {
+        return out_body;
+    };
+    if out_body.len() > ADMISSION_ANNOTATION_MAX_BYTES {
+        return out_body;
+    }
+    let Ok(mut reply) = serde_json::from_str::<serde_json::Value>(&out_body) else {
+        return out_body;
+    };
+    let Some(fields) = reply.as_object_mut() else {
+        return out_body;
+    };
+    fields.insert("admission_decision".to_string(), serde_json::json!("admitted"));
+    fields.insert(
+        "admission_band".to_string(),
+        serde_json::json!(record.band.as_str()),
+    );
+    fields.insert(
+        "admission_waited_ms".to_string(),
+        serde_json::json!(record.waited_ms),
+    );
+    reply.to_string()
+}
+
 pub(super) fn admission_starved_answer(
     root: &Path,
     verb: &str,
@@ -1323,6 +1368,7 @@ pub(crate) fn run_gm_dispatch_to_file(
             handle.dispatch(plugin_name, &inner_verb_owned, body)
         }))
     };
+    let admission = agentplug_host::take_last_admission();
     let out_body = match dispatch_result {
         Ok(Ok(s)) if !s.is_empty() => s,
         Ok(Ok(_)) => serde_json::json!({"ok": false, "error": "empty dispatch result", "verb": verb}).to_string(),
@@ -1346,6 +1392,7 @@ pub(crate) fn run_gm_dispatch_to_file(
             serde_json::json!({"ok": false, "error": format!("dispatch panicked: {msg}"), "verb": verb}).to_string()
         }
     };
+    let out_body = annotate_admission_on_reply(out_body, admission);
     let out_body = patch_update_available_from_escalation(plugin_name, verb, out_body);
     let out_body = spill_large_exec_output_to_text_sibling(out_dir, verb, task, out_body);
     let out_name = format!("{verb}-{task}.json");
