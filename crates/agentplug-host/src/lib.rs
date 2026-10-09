@@ -30,7 +30,7 @@ pub use crawl::{
     HelperRun, LightpandaEngine, ParsedCrawl,
 };
 pub use crawl_lease::{
-    shutdown_shared_browsers, spawn_housekeeping_timer, SHARED_BROWSER_IDLE_CLOSE,
+    lease_reply, shutdown_shared_browsers, spawn_housekeeping_timer, SHARED_BROWSER_IDLE_CLOSE,
 };
 pub use dispatch_origin::{enter_dispatch_origin_scope, DispatchOriginScope};
 pub use github_auth::{github_cli_token, invalidate_github_cli_token};

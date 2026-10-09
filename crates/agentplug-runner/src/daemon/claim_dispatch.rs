@@ -1895,6 +1895,7 @@ pub(super) fn dispatch_project(
     let mut gm_requests: Vec<ClaimedRequest> = Vec::with_capacity(claimed.len());
     let mut bg_convert_requests: Vec<ClaimedRequest> = Vec::new();
     let mut plugin_refresh_requests: Vec<ClaimedRequest> = Vec::new();
+    let mut lease_requests: Vec<ClaimedRequest> = Vec::new();
     for req in claimed {
         if let Some(out_body) = session_id_task_mismatch_rejection(&req.verb, &req.task, &req.body)
         {
@@ -1905,9 +1906,16 @@ pub(super) fn dispatch_project(
             bg_convert_requests.push(req);
         } else if req.verb == "plugin-refresh" {
             plugin_refresh_requests.push(req);
+        } else if req.verb.starts_with("browser_lease_") {
+            lease_requests.push(req);
         } else {
             gm_requests.push(req);
         }
+    }
+    for req in lease_requests {
+        let out_body = agentplug_host::lease_reply(&req.verb, root, &req.body);
+        write_spool_out_and_release_claim(&out_dir, &in_dir, &req.verb, &req.task, &out_body);
+        did_work = true;
     }
 
     let answer_bg_converts = |reqs: Vec<ClaimedRequest>| {
