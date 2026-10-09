@@ -3182,7 +3182,7 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
 
     crate::download::gc_stale_tmp_files(Duration::from_secs(60 * 60));
 
-    const COLD_PROJECT_SWEEP_INTERVAL: Duration = Duration::from_secs(30);
+    const COLD_PROJECT_SWEEP_INTERVAL: Duration = Duration::from_secs(600);
 
     let mut projects: HashMap<PathBuf, ProjectPlugins> = HashMap::new();
     let mut last_registry_poll = Instant::now();
