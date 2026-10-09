@@ -2097,6 +2097,29 @@ pub fn read_known_project_roots() -> Vec<PathBuf> {
 }
 
 const IDLE_PROJECT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
+const IDLE_PROJECT_SCAN_INTERVAL: Duration = Duration::from_secs(600);
+
+fn project_scan_state() -> &'static Mutex<HashMap<PathBuf, (Instant, bool)>> {
+    static SLOT: OnceLock<Mutex<HashMap<PathBuf, (Instant, bool)>>> = OnceLock::new();
+    SLOT.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn project_scan_due(root: &Path) -> bool {
+    let state = project_scan_state()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    match state.get(root) {
+        Some((at, had_work)) => *had_work || at.elapsed() >= IDLE_PROJECT_SCAN_INTERVAL,
+        None => true,
+    }
+}
+
+fn record_project_scan(root: &Path, has_work: bool) {
+    project_scan_state()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(root.to_path_buf(), (Instant::now(), has_work));
+}
 
 fn project_heartbeat_last_write() -> &'static Mutex<HashMap<PathBuf, Instant>> {
     static SLOT: OnceLock<Mutex<HashMap<PathBuf, Instant>>> = OnceLock::new();
@@ -2222,12 +2245,16 @@ fn spawn_project_heartbeat_ticker(interval: Duration) -> std::thread::JoinHandle
             let index = (begin + offset) % roots.len();
             let root = &roots[index];
             next = (index + 1) % roots.len();
+            if !project_scan_due(root) {
+                continue;
+            }
             let spool_dir = spool_dir_of(root);
             if !spool_dir.exists() {
                 continue;
             }
             set_sweep_holder("project-heartbeat", root);
             let (queued, claimed) = spool_step_counts(root);
+            record_project_scan(root, queued + claimed > 0);
             if !project_heartbeat_due(root, queued + claimed > 0) {
                 continue;
             }
