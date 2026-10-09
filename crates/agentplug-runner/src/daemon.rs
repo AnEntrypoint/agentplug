@@ -118,6 +118,9 @@ const GM_SPOOL_VERBS: &[&str] = &[
     "git_worktree_prune",
     "forget",
     "discipline",
+    "browser_lease_acquire",
+    "browser_lease_release",
+    "browser_lease_status",
 ];
 
 fn provision_gm_spool_verb_dirs(cwd: &Path) -> anyhow::Result<()> {

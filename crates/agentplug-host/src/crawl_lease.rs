@@ -57,11 +57,11 @@ pub fn next_agent_id() -> String {
     )
 }
 
-fn write_lease(root: &Path, agent: &str, port: u16) -> Result<(), String> {
+fn write_lease(root: &Path, agent: &str, port: u16, chrome_pid: u32) -> Result<(), String> {
     let dir = lease_dir(root);
     std::fs::create_dir_all(&dir)
         .map_err(|e| format!("could not create {}: {e}", dir.display()))?;
-    let body = json!({"agent": agent, "port": port, "pid": std::process::id(), "ts": now_ms()});
+    let body = json!({"agent": agent, "port": port, "chrome_pid": chrome_pid, "pid": std::process::id(), "ts": now_ms()});
     let path = lease_path(root, agent);
     std::fs::write(&path, body.to_string())
         .map_err(|e| format!("could not write lease {}: {e}", path.display()))
@@ -139,7 +139,7 @@ fn close_browser(browser: &mut SharedBrowser) {
 
 /// Attaches `agent` to the shared Chrome for `root`, starting it on first use,
 /// and returns its DevTools port. Pair every successful call with `release`.
-pub fn acquire(root: &Path, agent: &str) -> Result<u16, String> {
+pub fn acquire(root: &Path, agent: &str) -> Result<(u16, u32), String> {
     let mut map = browsers();
     let alive = match map.get_mut(root) {
         Some(browser) => matches!(browser.child.try_wait(), Ok(None)),
@@ -159,11 +159,12 @@ pub fn acquire(root: &Path, agent: &str) -> Result<u16, String> {
     browser.active.insert(agent.to_string());
     browser.idle_since = None;
     let port = browser.port;
-    if let Err(e) = write_lease(root, agent, port) {
+    let chrome_pid = browser.child.id();
+    if let Err(e) = write_lease(root, agent, port, chrome_pid) {
         browser.active.remove(agent);
         return Err(e);
     }
-    Ok(port)
+    Ok((port, chrome_pid))
 }
 
 /// Detaches `agent`, deletes its lease file, and starts the idle clock when no
@@ -176,6 +177,88 @@ pub fn release(root: &Path, agent: &str) {
         }
     }
     let _ = std::fs::remove_file(lease_path(root, agent));
+}
+
+/// Shared-browser state for `root`: liveness, port, pid, held leases, and the
+/// epoch-ms deadline at which the idle close fires (null while leases remain).
+pub fn status(root: &Path) -> serde_json::Value {
+    let mut map = browsers();
+    let Some(browser) = map.get_mut(root) else {
+        return json!({
+            "root": root.display().to_string(),
+            "alive": false,
+            "lease_count": 0,
+            "leases": [],
+            "close_deadline_ms": null,
+        });
+    };
+    let alive = matches!(browser.child.try_wait(), Ok(None));
+    let mut leases: Vec<String> = browser.active.iter().cloned().collect();
+    leases.sort();
+    let close_deadline_ms = match (browser.active.is_empty(), browser.idle_since) {
+        (true, Some(since)) => {
+            let remaining =
+                (since + SHARED_BROWSER_IDLE_CLOSE).saturating_duration_since(Instant::now());
+            json!(now_ms() + remaining.as_millis() as u64)
+        }
+        _ => json!(null),
+    };
+    json!({
+        "root": root.display().to_string(),
+        "alive": alive,
+        "port": browser.port,
+        "chrome_pid": browser.child.id(),
+        "lease_count": leases.len(),
+        "leases": leases,
+        "close_deadline_ms": close_deadline_ms,
+    })
+}
+
+/// Serves the runner-native verbs `browser_lease_acquire`, `browser_lease_release`
+/// and `browser_lease_status`. Body: `{root, agent}`; `root` defaults to the
+/// dispatching project root, and `agent` is required by acquire and release.
+pub fn lease_reply(verb: &str, dispatch_root: &Path, body: &str) -> String {
+    #[derive(serde::Deserialize)]
+    struct Req {
+        root: Option<PathBuf>,
+        agent: Option<String>,
+    }
+    let req: Req = match serde_json::from_str(body) {
+        Ok(req) => req,
+        Err(e) => {
+            return json!({"ok": false, "error": format!("{verb} body must be {{root, agent}}: {e}")})
+                .to_string()
+        }
+    };
+    let root = req.root.unwrap_or_else(|| dispatch_root.to_path_buf());
+    let reply = match (verb, req.agent.as_deref()) {
+        ("browser_lease_acquire", None) | ("browser_lease_release", None) => {
+            json!({"ok": false, "error": format!("{verb} needs an agent")})
+        }
+        ("browser_lease_acquire", Some(agent)) => match acquire(&root, agent) {
+            Ok((port, chrome_pid)) => json!({
+                "ok": true,
+                "port": port,
+                "chrome_pid": chrome_pid,
+                "lease_file": lease_path(&root, agent).display().to_string(),
+            }),
+            Err(e) => json!({"ok": false, "error": e}),
+        },
+        ("browser_lease_release", Some(agent)) => {
+            release(&root, agent);
+            let mut state = status(&root);
+            state["released"] = json!(agent);
+            state["ok"] = json!(true);
+            state
+        }
+        ("browser_lease_status", _) => {
+            let mut state = status(&root);
+            state["ok"] = json!(true);
+            state
+        }
+        _ => json!({"ok": false, "error": format!("{verb} is not a browser lease verb")}),
+    };
+    reply.to_string()
 }
 
 /// Closes a shared Chrome that has died or has had zero leases for

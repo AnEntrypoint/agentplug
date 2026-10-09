@@ -442,8 +442,8 @@ pub fn crawl_cdp(cwd: &Path, body: &str) -> Value {
         );
     }
     let agent = crawl_lease::next_agent_id();
-    let port = match crawl_lease::acquire(cwd, &agent) {
-        Ok(port) => port,
+    let (port, _) = match crawl_lease::acquire(cwd, &agent) {
+        Ok(attached) => attached,
         Err(e) => return crawl_error_reply("cdp", false, started, e),
     };
     let run = run_helper(port, None, &parsed.steps, CDP_HELPER_BUDGET, false);
