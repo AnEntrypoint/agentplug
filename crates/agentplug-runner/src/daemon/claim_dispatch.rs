@@ -800,7 +800,7 @@ fn answer_quarantined_spool_request(out_dir: &Path, verb: &str, request_path: &P
     }
 }
 
-pub(super) const SPOOL_OUT_REAP_INTERVAL_MS: u64 = 60 * 1000;
+pub(super) const SPOOL_OUT_REAP_INTERVAL_MS: u64 = 10 * 60 * 1000;
 pub(super) const SPOOL_OUT_MIN_AGE_MS: u64 = 10 * 60 * 1000;
 pub(super) const SPOOL_OUT_DEFAULT_MAX_FILES: usize = 3000;
 pub(super) const SPOOL_OUT_DEFAULT_MAX_AGE_MS: u64 = 24 * 60 * 60 * 1000;
