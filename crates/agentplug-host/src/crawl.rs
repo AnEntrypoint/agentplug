@@ -6,11 +6,12 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 use wait_timeout::ChildExt;
 
+use crate::crawl_lease;
 use crate::http_agent::shared_agent;
 
 const CRAWL_HELPER_JS: &str = include_str!("crawl_cdp.mjs");
-const CDP_READY_DEADLINE: Duration = Duration::from_secs(30);
-const CDP_POLL_INTERVAL: Duration = Duration::from_millis(100);
+pub(crate) const CDP_READY_DEADLINE: Duration = Duration::from_secs(30);
+pub(crate) const CDP_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const CDP_HELPER_BUDGET: Duration = Duration::from_secs(100);
 const MAX_WAIT_MS: u64 = 60_000;
 const URL_SCHEMES: [&str; 5] = ["http://", "https://", "about:blank", "file://", "data:"];
@@ -38,7 +39,7 @@ impl Drop for KillOnDrop {
     }
 }
 
-fn kill_process_tree(pid: u32) {
+pub(crate) fn kill_process_tree(pid: u32) {
     if cfg!(windows) {
         let mut cmd = Command::new("taskkill");
         cmd.args(["/PID", &pid.to_string(), "/T", "/F"])
@@ -52,7 +53,7 @@ fn kill_process_tree(pid: u32) {
 
 /// Closes every Chrome left running on the gm-owned crawl profile by an earlier
 /// call. The profile path is the marker: user Chrome never carries it.
-fn reap_stale_crawl_browsers(profile: &Path) {
+pub(crate) fn reap_stale_crawl_browsers(profile: &Path) {
     let marker = profile.display().to_string();
     if cfg!(windows) {
         let quoted = marker.replace('\'', "''");
@@ -253,7 +254,7 @@ fn linux_chrome_candidates() -> Vec<PathBuf> {
     .collect()
 }
 
-fn find_chrome() -> Option<PathBuf> {
+pub(crate) fn find_chrome() -> Option<PathBuf> {
     if let Some(p) = std::env::var_os("GM_BROWSER_CHROME_PATH")
         .or_else(|| std::env::var_os("CHROME_PATH"))
         .map(PathBuf::from)
@@ -423,7 +424,8 @@ pub fn crawl_reply_from_run(
     })
 }
 
-/// Headful Chrome over CDP: one Chrome per call, killed when the call returns.
+/// Headful Chrome over CDP on the single browser shared by this project root.
+/// The call holds a lease on it and releases the lease on return.
 pub fn crawl_cdp(cwd: &Path, body: &str) -> Value {
     let started = Instant::now();
     let parsed = match parse_crawl_body(body) {
@@ -439,66 +441,14 @@ pub fn crawl_cdp(cwd: &Path, body: &str) -> Value {
                 .to_string(),
         );
     }
-    let Some(chrome) = find_chrome() else {
-        return crawl_error_reply(
-            "cdp",
-            false,
-            started,
-            "no Chrome found: set GM_BROWSER_CHROME_PATH or CHROME_PATH, or install Google Chrome or Chromium"
-                .to_string(),
-        );
-    };
-    let port = match free_local_port() {
+    let agent = crawl_lease::next_agent_id();
+    let port = match crawl_lease::acquire(cwd, &agent) {
         Ok(port) => port,
         Err(e) => return crawl_error_reply("cdp", false, started, e),
     };
-    let profile = cwd.join(".gm").join("crawl-cdp-profile");
-    reap_stale_crawl_browsers(&profile);
-    let _ = std::fs::remove_dir_all(&profile);
-    if let Err(e) = std::fs::create_dir_all(&profile) {
-        return crawl_error_reply(
-            "cdp",
-            false,
-            started,
-            format!("could not create Chrome profile {}: {e}", profile.display()),
-        );
-    }
-    let mut cmd = Command::new(&chrome);
-    cmd.arg(format!("--remote-debugging-port={port}"))
-        .arg(format!("--user-data-dir={}", profile.display()))
-        .args([
-            "--no-first-run",
-            "--no-default-browser-check",
-            "--disable-default-apps",
-            "about:blank",
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    crate::windowless::apply_windowless(&mut cmd);
-    let _chrome = match cmd.spawn() {
-        Ok(child) => KillOnDrop(child),
-        Err(e) => {
-            return crawl_error_reply(
-                "cdp",
-                false,
-                started,
-                format!("Chrome launch failed ({}): {e}", chrome.display()),
-            )
-        }
-    };
-    if !endpoint_ready(port, Instant::now() + CDP_READY_DEADLINE, CDP_POLL_INTERVAL) {
-        return crawl_error_reply(
-            "cdp",
-            false,
-            started,
-            format!(
-                "Chrome CDP endpoint on port {port} did not become ready within {}ms (Chrome must be able to open a window: check DISPLAY on Linux)",
-                CDP_READY_DEADLINE.as_millis()
-            ),
-        );
-    }
-    match run_helper(port, None, &parsed.steps, CDP_HELPER_BUDGET, false) {
+    let run = run_helper(port, None, &parsed.steps, CDP_HELPER_BUDGET, false);
+    crawl_lease::release(cwd, &agent);
+    match run {
         Ok(run) => crawl_reply_from_run("cdp", false, started, run),
         Err(e) => crawl_error_reply("cdp", false, started, e),
     }

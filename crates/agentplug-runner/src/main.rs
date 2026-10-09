@@ -41,6 +41,7 @@ fn release_bootstrap_status() -> serde_json::Value {
 fn main() -> anyhow::Result<()> {
     agentplug_host::ensure_hidden_console();
     agentplug_host::set_lightpanda_engine(agentplug_lightpanda::crawl);
+    agentplug_host::spawn_housekeeping_timer();
     suppress_crash_dialogs();
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -58,7 +59,7 @@ fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let cmd = args.get(1).map(|s| s.as_str()).unwrap_or("");
 
-    match cmd {
+    let outcome = match cmd {
         "plugin" => {
             let name = args.get(2).cloned().unwrap_or_default();
             if name.is_empty() {
@@ -231,7 +232,9 @@ fn main() -> anyhow::Result<()> {
             );
             std::process::exit(1);
         }
-    }
+    };
+    agentplug_host::shutdown_shared_browsers();
+    outcome
 }
 
 const SELFCHECK_SUCCESS_WAT: &str = r#"(module

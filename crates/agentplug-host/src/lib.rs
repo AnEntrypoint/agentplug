@@ -1,5 +1,6 @@
 mod broker;
 mod crawl;
+mod crawl_lease;
 mod dispatch_origin;
 mod exec_js;
 mod fs_prewarm;
@@ -27,6 +28,9 @@ pub use crawl::{
     crawl_cdp, crawl_error_reply, crawl_reply_from_run, endpoint_ready, find_on_path,
     free_local_port, lightpanda_crawl, parse_crawl_body, run_helper, set_lightpanda_engine,
     HelperRun, LightpandaEngine, ParsedCrawl,
+};
+pub use crawl_lease::{
+    shutdown_shared_browsers, spawn_housekeeping_timer, SHARED_BROWSER_IDLE_CLOSE,
 };
 pub use dispatch_origin::{enter_dispatch_origin_scope, DispatchOriginScope};
 pub use github_auth::{github_cli_token, invalidate_github_cli_token};
