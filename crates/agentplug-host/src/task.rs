@@ -251,7 +251,7 @@ fn registry_instance() -> &'static str {
 fn next_id() -> Result<String, String> {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let sequence = COUNTER
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
             value.checked_add(1)
         })
         .map_err(|_| "task registry ID space exhausted".to_string())?;
