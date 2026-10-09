@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use serde_json::{json, Value};
+use serde_json::json;
 
 use crate::crawl::{
     endpoint_ready, find_chrome, free_local_port, kill_process_tree, reap_stale_crawl_browsers,
@@ -141,7 +141,10 @@ fn close_browser(browser: &mut SharedBrowser) {
 /// and returns its DevTools port. Pair every successful call with `release`.
 pub fn acquire(root: &Path, agent: &str) -> Result<u16, String> {
     let mut map = browsers();
-    let alive = matches!(map.get_mut(root), Some(b) if matches!(b.child.try_wait(), Ok(None)));
+    let alive = match map.get_mut(root) {
+        Some(browser) => matches!(browser.child.try_wait(), Ok(None)),
+        None => false,
+    };
     if !alive {
         if let Some(mut dead) = map.remove(root) {
             close_browser(&mut dead);
