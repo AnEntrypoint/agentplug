@@ -15,6 +15,7 @@ pub(crate) fn in_flight_map() -> &'static Mutex<HashMap<InFlightKey, InFlightHan
 pub(super) const MAX_CLAIMED_DISPATCHES_PER_PROJECT: usize = 32;
 
 pub(super) const LANE_WAIT_MAX_MS_DEFAULT: u64 = 120_000;
+pub(super) const CODESEARCH_LANE_WAIT_MAX_MS: u64 = 5_000;
 pub(super) const DISPATCH_WAIT_LEDGER_FILE: &str = ".dispatch-wait.json";
 pub(super) const LEDGER_REFRESH_MIN_INTERVAL_MS: u64 = 250;
 
@@ -1151,7 +1152,10 @@ pub(super) fn spool_dir_of_root(root: &Path) -> PathBuf {
     root.join(".gm").join("exec-spool")
 }
 
-pub(super) fn lane_wait_max() -> Duration {
+pub(super) fn lane_wait_max(verb: &str) -> Duration {
+    if verb == "codesearch" {
+        return Duration::from_millis(CODESEARCH_LANE_WAIT_MAX_MS);
+    }
     Duration::from_millis(env_ms_or(
         "AGENTPLUG_LANE_WAIT_MAX_MS",
         LANE_WAIT_MAX_MS_DEFAULT,
@@ -1271,7 +1275,7 @@ pub(crate) fn run_gm_dispatch_to_file(
         tool_verb,
         body,
         task,
-        lane_wait_max(),
+        lane_wait_max(tool_verb),
     ) {
         Ok(guard) => guard,
         Err(report) => {
@@ -1292,7 +1296,7 @@ pub(crate) fn run_gm_dispatch_to_file(
         tool_verb,
         body,
         task,
-        lane_wait_max(),
+        lane_wait_max(tool_verb),
     ) {
         Ok(guard) => guard,
         Err(report) => {
