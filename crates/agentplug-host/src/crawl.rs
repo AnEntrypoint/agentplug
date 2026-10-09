@@ -32,8 +32,47 @@ struct KillOnDrop(Child);
 
 impl Drop for KillOnDrop {
     fn drop(&mut self) {
+        kill_process_tree(self.0.id());
         let _ = self.0.kill();
         let _ = self.0.wait();
+    }
+}
+
+fn kill_process_tree(pid: u32) {
+    if cfg!(windows) {
+        let mut cmd = Command::new("taskkill");
+        cmd.args(["/PID", &pid.to_string(), "/T", "/F"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        crate::windowless::apply_windowless(&mut cmd);
+        let _ = cmd.status();
+    }
+}
+
+/// Closes every Chrome left running on the gm-owned crawl profile by an earlier
+/// call. The profile path is the marker: user Chrome never carries it.
+fn reap_stale_crawl_browsers(profile: &Path) {
+    let marker = profile.display().to_string();
+    if cfg!(windows) {
+        let quoted = marker.replace('\'', "''");
+        let script = format!(
+            "Get-CimInstance Win32_Process -Filter \"Name='chrome.exe'\" | Where-Object {{ $_.CommandLine -like '*{quoted}*' -and $_.CommandLine -notlike '*--type=*' }} | ForEach-Object {{ $_.ProcessId }}"
+        );
+        let mut cmd = Command::new("powershell");
+        cmd.args(["-NoProfile", "-Command", &script]).stderr(Stdio::null());
+        crate::windowless::apply_windowless(&mut cmd);
+        let Ok(output) = cmd.output() else { return };
+        for pid in String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| line.trim().parse::<u32>().ok())
+        {
+            kill_process_tree(pid);
+        }
+    } else {
+        let mut cmd = Command::new("pkill");
+        cmd.args(["-f", &format!("--user-data-dir={marker}")]);
+        let _ = cmd.status();
     }
 }
 
@@ -414,6 +453,7 @@ pub fn crawl_cdp(cwd: &Path, body: &str) -> Value {
         Err(e) => return crawl_error_reply("cdp", false, started, e),
     };
     let profile = cwd.join(".gm").join("crawl-cdp-profile");
+    reap_stale_crawl_browsers(&profile);
     let _ = std::fs::remove_dir_all(&profile);
     if let Err(e) = std::fs::create_dir_all(&profile) {
         return crawl_error_reply(
