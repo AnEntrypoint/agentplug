@@ -153,41 +153,73 @@ pub fn register_project(cwd: &Path) -> anyhow::Result<()> {
     let cwd_str = agentplug_host::canonical_project_root(&cwd)
         .to_string_lossy()
         .to_string();
+    let lease_pid: u64 = std::env::var("AGENTPLUG_LEASE_PID")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(LEASE_PINNED_PID);
 
-    let mut live: Vec<String> = Vec::new();
-    let mut dropped = 0usize;
-    let mut respelled = false;
+    let mut leases: Vec<(String, Vec<u64>)> = Vec::new();
+    let mut pruned = 0usize;
     for line in existing.lines() {
-        let entry = line.trim();
-        if entry.is_empty() {
+        let Some((entry, pids)) = parse_registry_line(line) else {
+            if !line.trim().is_empty() {
+                pruned += 1;
+            }
+            continue;
+        };
+        let live_pids: Vec<u64> = pids
+            .into_iter()
+            .filter(|&pid| pid == LEASE_PINNED_PID || pid_is_alive(pid))
+            .collect();
+        if live_pids.is_empty() || !Path::new(&entry).exists() {
+            pruned += 1;
             continue;
         }
-        if !Path::new(entry).exists() {
-            dropped += 1;
-            continue;
+        let canonical = cached_project_root(&entry).to_string_lossy().to_string();
+        let existing_index = leases.iter().position(|(path, _)| path == &canonical);
+        if let Some(index) = existing_index {
+            for pid in live_pids {
+                if !leases[index].1.contains(&pid) {
+                    leases[index].1.push(pid);
+                }
+            }
+        } else {
+            leases.push((canonical, live_pids));
         }
-        let canonical = cached_project_root(entry).to_string_lossy().to_string();
-        respelled |= canonical != entry;
-        if live.iter().any(|e| e == &canonical) {
-            respelled = true;
-            continue;
-        }
-        live.push(canonical);
     }
 
-    let already_present = live.iter().any(|e| e == &cwd_str);
-    if already_present && dropped == 0 && !respelled {
+    let mut attached = false;
+    let own_index = leases.iter().position(|(path, _)| path == &cwd_str);
+    if let Some(index) = own_index {
+        if !leases[index].1.contains(&lease_pid) {
+            leases[index].1.push(lease_pid);
+            attached = true;
+        }
+    } else {
+        leases.push((cwd_str.clone(), vec![lease_pid]));
+        attached = true;
+    }
+
+    let body: String = leases
+        .iter()
+        .map(|(path, pids)| {
+            let pid_list: Vec<String> = pids.iter().map(u64::to_string).collect();
+            format!("{path}\t{}\n", pid_list.join(","))
+        })
+        .collect();
+    if body == existing {
         return Ok(());
     }
-    if !already_present {
-        live.push(cwd_str);
-    }
-
-    let mut body = live.join("\n");
-    body.push('\n');
     let tmp = path.with_extension("txt.tmp");
     fs::write(&tmp, &body)?;
     fs::rename(&tmp, &path)?;
+    eprintln!(
+        "[agentplug registry] lease {} for {} (pid {lease_pid}); pruned {pruned} dead/legacy entr{}; {} leased project(s)",
+        if attached { "attached" } else { "rewritten" },
+        cwd_str,
+        if pruned == 1 { "y" } else { "ies" },
+        leases.len()
+    );
     Ok(())
 }
 
@@ -221,17 +253,43 @@ fn cached_project_root(entry: &str) -> PathBuf {
     root
 }
 
+const LEASE_PINNED_PID: u64 = 0;
+
+fn parse_registry_line(line: &str) -> Option<(String, Vec<u64>)> {
+    let line = line.trim();
+    if line.is_empty() {
+        return None;
+    }
+    let (path, pids) = line.split_once('\t')?;
+    let pids: Vec<u64> = pids
+        .split(',')
+        .filter_map(|p| p.trim().parse::<u64>().ok())
+        .collect();
+    let path = path.trim().to_string();
+    if path.is_empty() {
+        return None;
+    }
+    Some((path, pids))
+}
+
+fn lease_is_live(pids: &[u64]) -> bool {
+    pids.iter()
+        .any(|&pid| pid == LEASE_PINNED_PID || pid_is_alive(pid))
+}
+
 pub(crate) fn read_registry() -> Vec<PathBuf> {
     let mut roots: Vec<PathBuf> = Vec::new();
-    for entry in fs::read_to_string(registry_path())
+    for line in fs::read_to_string(registry_path())
         .unwrap_or_default()
         .lines()
-        .map(str::trim)
     {
-        if entry.is_empty() || !Path::new(entry).exists() {
+        let Some((entry, pids)) = parse_registry_line(line) else {
+            continue;
+        };
+        if !lease_is_live(&pids) || !Path::new(&entry).exists() {
             continue;
         }
-        let canonical = cached_project_root(entry);
+        let canonical = cached_project_root(&entry);
         if !roots.contains(&canonical) {
             roots.push(canonical);
         }
@@ -3321,6 +3379,22 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
                 .collect();
             for root in &roots_new_this_registry_poll {
                 mark_spool_dirty(root);
+                eprintln!(
+                    "[agentplug daemon] lease attached: serving {} ({} leased project(s))",
+                    root.display(),
+                    known_roots.len()
+                );
+            }
+            for root in previous_roots.iter().filter(|r| !known_roots.contains(*r)) {
+                eprintln!(
+                    "[agentplug daemon] lease released: no live agent on {} -- no longer watching it ({} leased project(s) remain)",
+                    root.display(),
+                    known_roots.len()
+                );
+            }
+            if !roots_new_this_registry_poll.is_empty() {
+                cold_sweep_pending = true;
+                cold_sweep_walk.reset();
             }
             set_known_project_roots(&known_roots);
             if sweep_orphans_left_by_whatever_daemon_died_before_answering {
@@ -3380,12 +3454,10 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
                 last_per_root_plugin_scan = Instant::now();
             }
         }
-        if !per_root_plugin_scan_pending
-            && (!roots_new_this_registry_poll.is_empty()
-                || last_per_root_plugin_scan.elapsed() >= PER_ROOT_PLUGIN_SCAN_INTERVAL)
-        {
+        if !per_root_plugin_scan_pending && !roots_new_this_registry_poll.is_empty() {
             per_root_plugin_scan_pending = true;
             per_root_plugin_scan_walk.reset();
+            roots_new_this_registry_poll.clear();
         }
         for plugin_name in ["gm", "libsql", "bert", "treesitter", "crux", "lightpanda"] {
             if plugin_compile_in_backoff(plugin_name) {
@@ -3426,12 +3498,6 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
                 cold_sweep_pending = false;
                 last_cold_project_sweep = Instant::now();
             }
-        }
-        if !cold_sweep_pending
-            && last_cold_project_sweep.elapsed() >= COLD_PROJECT_SWEEP_INTERVAL
-        {
-            cold_sweep_pending = true;
-            cold_sweep_walk.reset();
         }
         let mut all_projects: Vec<(PathBuf, ProjectPlugins)> =
             Vec::with_capacity(known_roots.len());
