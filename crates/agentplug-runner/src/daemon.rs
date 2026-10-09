@@ -2043,6 +2043,7 @@ fn write_project_heartbeat_with_queue_info(
 }
 
 const STATUS_LIVENESS_REFRESH: Duration = Duration::from_secs(600);
+const STATUS_MIN_WRITE_INTERVAL: Duration = Duration::from_secs(60);
 
 fn status_write_needed(
     status_path: &Path,
@@ -2065,17 +2066,23 @@ fn status_write_needed(
         }
         copy
     }
-    if without_volatile_fields(previous) != without_volatile_fields(next) {
-        return true;
-    }
     let last_written_age = fs::metadata(status_path)
         .and_then(|m| m.modified())
         .ok()
         .and_then(|t| t.elapsed().ok());
-    match last_written_age {
-        Some(age) => age >= STATUS_LIVENESS_REFRESH,
-        None => true,
+    if previous.get("pid") != next.get("pid") {
+        return true;
     }
+    let Some(age) = last_written_age else {
+        return true;
+    };
+    if age < STATUS_MIN_WRITE_INTERVAL {
+        return false;
+    }
+    if without_volatile_fields(previous) != without_volatile_fields(next) {
+        return true;
+    }
+    age >= STATUS_LIVENESS_REFRESH
 }
 
 fn known_project_roots() -> &'static Mutex<Vec<PathBuf>> {
