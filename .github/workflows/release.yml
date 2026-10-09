@@ -3,13 +3,18 @@ name: release
 on:
   push:
     branches: [main]
+    paths:
+      - 'crates/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/release.yml'
 
 permissions:
   contents: read
 
 concurrency:
   group: agentplug-release
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   bump:
@@ -199,3 +204,9 @@ jobs:
             fi
           done
           echo "[ok] all $(ls release-assets | wc -l) release assets confirmed fetchable at $base"
+
+      - name: Ask gm to advance its submodule pins
+        env:
+          GH_TOKEN: ${{ secrets.PUBLISHER_TOKEN }}
+        shell: bash
+        run: gh api repos/AnEntrypoint/gm/dispatches -f event_type=submodule-released || echo "::warning::gm dispatch failed; bump-pins will pick this up on its next schedule"
