@@ -2277,7 +2277,17 @@ fn read_status_busy_until_if_future(root: &Path) -> Option<u64> {
 
 const TICKER_BUSY_UNTIL_EXTEND_MS: u64 = 60_000;
 
-const SPOOL_SCAN_BACKSTOP_TTL: Duration = Duration::from_secs(30);
+const SPOOL_SCAN_BACKSTOP_TTL: Duration = Duration::from_secs(120);
+
+fn spool_scan_scheduled_at(root: &Path) -> Instant {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    root.hash(&mut hasher);
+    let phase_ms = hasher.finish() % (SPOOL_SCAN_BACKSTOP_TTL.as_millis() as u64 / 2);
+    Instant::now()
+        .checked_sub(Duration::from_millis(phase_ms))
+        .unwrap_or_else(Instant::now)
+}
 
 struct RootScan {
     at: Instant,
@@ -2285,6 +2295,7 @@ struct RootScan {
     has_queued_work: bool,
     queued_steps: usize,
     claimed_steps: usize,
+    in_dir_exists: bool,
 }
 
 fn spool_dirty_roots() -> &'static Mutex<HashSet<PathBuf>> {
@@ -2360,11 +2371,12 @@ fn cached_root_scan(root: &Path) -> (bool, bool, usize, usize) {
     let queued_work = project_has_queued_spool_work(root);
     let counted = count_spool_steps(root);
     let scan = RootScan {
-        at: Instant::now(),
+        at: spool_scan_scheduled_at(root),
         claimable: queued_work,
         has_queued_work: counted.0,
         queued_steps: counted.1,
         claimed_steps: counted.2,
+        in_dir_exists: spool_dir_of(root).join("in").is_dir(),
     };
     let result = (
         scan.claimable,
@@ -2384,6 +2396,15 @@ fn cached_root_scan(root: &Path) -> (bool, bool, usize, usize) {
 fn spool_step_counts(root: &Path) -> (usize, usize) {
     let (_, _, queued, claimed) = cached_root_scan(root);
     (queued, claimed)
+}
+
+fn root_in_dir_exists_cached(root: &Path) -> bool {
+    let _ = cached_root_scan(root);
+    root_scan_cache()
+        .lock()
+        .ok()
+        .and_then(|cache| cache.get(root).map(|scan| scan.in_dir_exists))
+        .unwrap_or(false)
 }
 
 static HEARTBEAT_PROJECT_COUNT: std::sync::atomic::AtomicUsize =

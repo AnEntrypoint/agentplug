@@ -1617,8 +1617,18 @@ pub(super) fn verb_dir_has_claimable_request(verb_dir: &Path, verb: &str, langua
 }
 
 #[cfg(windows)]
+fn spool_inbox_dirs_of(root: &Path) -> [PathBuf; 2] {
+    [
+        spool_dir_of(root).join("in"),
+        root.join(".agentplug").join("plugin-dispatch").join("in"),
+    ]
+}
+
+#[cfg(windows)]
 pub(super) struct IdleInDirWatch {
     entries: Vec<(PathBuf, PathBuf, windows_sys::Win32::Foundation::HANDLE)>,
+    unwatched: Vec<PathBuf>,
+    wanted_dirs: Vec<PathBuf>,
 }
 
 #[cfg(windows)]
@@ -1626,6 +1636,8 @@ impl IdleInDirWatch {
     pub(super) fn new() -> Self {
         Self {
             entries: Vec::new(),
+            unwatched: Vec::new(),
+            wanted_dirs: Vec::new(),
         }
     }
 
@@ -1647,18 +1659,19 @@ impl IdleInDirWatch {
         };
         let wanted: Vec<(PathBuf, PathBuf)> = roots
             .iter()
-            .map(|root| (root.clone(), spool_dir_of(root).join("in")))
+            .flat_map(|root| {
+                spool_inbox_dirs_of(root)
+                    .into_iter()
+                    .map(move |dir| (root.clone(), dir))
+            })
             .filter(|(_, dir)| dir.is_dir())
             .collect();
-        if self
-            .entries
-            .iter()
-            .map(|(_, dir, _)| dir)
-            .eq(wanted.iter().map(|(_, dir)| dir))
-        {
+        if self.wanted_dirs.iter().eq(wanted.iter().map(|(_, dir)| dir)) {
             return;
         }
         self.close_all();
+        self.unwatched.clear();
+        self.wanted_dirs = wanted.iter().map(|(_, dir)| dir.clone()).collect();
         for (root, dir) in wanted {
             let mut wide: Vec<u16> = dir.as_os_str().encode_wide().collect();
             wide.push(0);
@@ -1674,6 +1687,8 @@ impl IdleInDirWatch {
             if handle != INVALID_HANDLE_VALUE {
                 mark_spool_dirty(&root);
                 self.entries.push((root, dir, handle));
+            } else {
+                self.unwatched.push(root);
             }
         }
     }
@@ -1750,6 +1765,9 @@ impl Drop for IdleInDirWatch {
 #[cfg(windows)]
 pub(super) fn wait_for_in_dir_change(watch: &mut IdleInDirWatch, roots: &[PathBuf], cap: Duration) {
     watch.sync(roots);
+    for unwatched_root in &watch.unwatched {
+        mark_spool_dirty(unwatched_root);
+    }
     for changed_root in watch.wait(cap) {
         mark_spool_dirty(&changed_root);
     }
@@ -1790,7 +1808,9 @@ pub(super) fn dispatch_project(
     plugin_modules: &PluginModules,
 ) -> bool {
     let mut did_work = false;
-    mark_spool_dirty(root);
+    if cfg!(not(windows)) {
+        mark_spool_dirty(root);
+    }
 
     let spool_dir = root.join(".gm").join("exec-spool");
     let in_dir = spool_dir.join("in");
@@ -1803,10 +1823,14 @@ pub(super) fn dispatch_project(
         submitted_at_ms: Option<u64>,
     }
     let mut claimed: Vec<ClaimedRequest> = Vec::new();
-    let in_dir_scan = fs::read_dir(&in_dir);
-    let in_dir_existed = in_dir_scan.is_ok();
+    let queued_now = project_has_queued_spool_work_cached(root);
+    let in_dir_scan = queued_now.then(|| fs::read_dir(&in_dir));
+    let in_dir_existed = match &in_dir_scan {
+        Some(scan) => scan.is_ok(),
+        None => root_in_dir_exists_cached(root),
+    };
     let mut claimable: Vec<(std::time::SystemTime, String, PathBuf)> = Vec::new();
-    if let (true, Ok(entries)) = (project_has_queued_spool_work_cached(root), in_dir_scan) {
+    if let Some(Ok(entries)) = in_dir_scan {
         for verb_entry in entries.flatten() {
             if !verb_entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
                 continue;
@@ -1873,10 +1897,16 @@ pub(super) fn dispatch_project(
         });
     }
 
+    if !claimed.is_empty() {
+        mark_spool_dirty(root);
+    }
     if claimed.is_empty() && in_dir_existed && !project_has_pending_dispatch_work(root) {
         return did_work;
     }
 
+    if !in_dir_existed {
+        mark_spool_dirty(root);
+    }
     if fs::create_dir_all(&in_dir).is_err() || fs::create_dir_all(&out_dir).is_err() {
         return did_work;
     }
