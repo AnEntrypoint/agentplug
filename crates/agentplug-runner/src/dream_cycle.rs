@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::fs::{self, File, OpenOptions, ReadDir};
+use std::fs::{self, OpenOptions, ReadDir};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -88,7 +88,7 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
         file.sync_all()?;
         fs::rename(&temporary, path)?;
         #[cfg(unix)]
-        File::open(
+        std::fs::File::open(
             path.parent()
                 .ok_or_else(|| io::Error::other("cycle path lacks parent"))?,
         )?

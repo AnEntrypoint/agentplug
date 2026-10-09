@@ -35,8 +35,8 @@ jobs:
           GH_TOKEN: ${{ secrets.PUBLISHER_TOKEN }}
         run: |
           set -euo pipefail
-          git config user.name "agentplug-bot"
-          git config user.email "noreply@github.com"
+          git config user.name "lanmower"
+          git config user.email "lanmower@users.noreply.github.com"
           git config url."https://${GH_TOKEN}:x-oauth-basic@github.com/".insteadOf "https://github.com/"
           CURRENT=$(grep '^version' Cargo.toml | head -1 | sed 's/.*= *"//;s/"//')
           IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT"

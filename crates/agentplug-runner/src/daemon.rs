@@ -3247,24 +3247,16 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
 
     crate::download::gc_stale_tmp_files(Duration::from_secs(60 * 60));
 
-    const COLD_PROJECT_SWEEP_INTERVAL: Duration = Duration::from_secs(600);
-
     let mut projects: HashMap<PathBuf, ProjectPlugins> = HashMap::new();
     let mut last_registry_poll = Instant::now();
     let mut first_registry_poll_pending = true;
     let mut known_roots: Vec<PathBuf> = Vec::new();
     let mut roots_new_this_registry_poll: std::collections::HashSet<PathBuf> =
         std::collections::HashSet::new();
-    let mut last_cold_project_sweep = Instant::now()
-        .checked_sub(COLD_PROJECT_SWEEP_INTERVAL)
-        .unwrap_or_else(Instant::now);
     let mut cold_sweep_pending = false;
     let mut cold_sweep_walk = RegistryWalk { cursor: 0 };
     let mut project_round_robin_cursor = 0usize;
     let mut background_round_robin_cursor = 0usize;
-    let mut last_per_root_plugin_scan = Instant::now()
-        .checked_sub(Duration::from_secs(60))
-        .unwrap_or_else(Instant::now);
     let mut per_root_plugin_scan_pending = false;
     let mut per_root_plugin_scan_walk = RegistryWalk { cursor: 0 };
 
@@ -3411,7 +3403,6 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
 
         let max_concurrent_projects = daemon_cfg.max_concurrent_projects();
 
-        const PER_ROOT_PLUGIN_SCAN_INTERVAL: Duration = Duration::from_secs(5);
         const PER_ROOT_PASS_BUDGET: Duration = Duration::from_millis(250);
         if per_root_plugin_scan_pending {
             let completed = per_root_plugin_scan_walk.walk(
@@ -3451,7 +3442,6 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
             );
             if completed {
                 per_root_plugin_scan_pending = false;
-                last_per_root_plugin_scan = Instant::now();
             }
         }
         if !per_root_plugin_scan_pending && !roots_new_this_registry_poll.is_empty() {
@@ -3496,7 +3486,6 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
             );
             if completed {
                 cold_sweep_pending = false;
-                last_cold_project_sweep = Instant::now();
             }
         }
         let mut all_projects: Vec<(PathBuf, ProjectPlugins)> =
