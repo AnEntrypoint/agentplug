@@ -145,11 +145,6 @@ pub fn register_project(cwd: &Path) -> anyhow::Result<()> {
         );
     }
     provision_gm_spool_verb_dirs(&cwd)?;
-    let path = registry_path();
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let existing = fs::read_to_string(&path).unwrap_or_default();
     let cwd_str = agentplug_host::canonical_project_root(&cwd)
         .to_string_lossy()
         .to_string();
@@ -157,69 +152,96 @@ pub fn register_project(cwd: &Path) -> anyhow::Result<()> {
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
         .unwrap_or(LEASE_PINNED_PID);
+    write_lease_file(&cwd_str, lease_pid)
+}
 
-    let mut leases: Vec<(String, Vec<u64>)> = Vec::new();
-    let mut pruned = 0usize;
-    for line in existing.lines() {
-        let Some((entry, pids)) = parse_registry_line(line) else {
-            if !line.trim().is_empty() {
-                pruned += 1;
-            }
-            continue;
-        };
-        let live_pids: Vec<u64> = pids
-            .into_iter()
-            .filter(|&pid| pid == LEASE_PINNED_PID || pid_is_alive(pid))
+fn leases_dir() -> PathBuf {
+    install_dir().join("leases")
+}
+
+#[cfg(windows)]
+fn lease_dir_changed() -> bool {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::{HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FindFirstChangeNotificationW, FindNextChangeNotification, FILE_NOTIFY_CHANGE_FILE_NAME,
+        FILE_NOTIFY_CHANGE_LAST_WRITE,
+    };
+    use windows_sys::Win32::System::Threading::WaitForSingleObject;
+
+    struct Watch(HANDLE);
+    unsafe impl Send for Watch {}
+    unsafe impl Sync for Watch {}
+    static WATCH: OnceLock<Option<Watch>> = OnceLock::new();
+
+    let watch = WATCH.get_or_init(|| {
+        let dir = leases_dir();
+        let _ = fs::create_dir_all(&dir);
+        let wide: Vec<u16> = dir
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
             .collect();
-        if live_pids.is_empty() || !Path::new(&entry).exists() {
-            pruned += 1;
-            continue;
-        }
-        let canonical = cached_project_root(&entry).to_string_lossy().to_string();
-        let existing_index = leases.iter().position(|(path, _)| path == &canonical);
-        if let Some(index) = existing_index {
-            for pid in live_pids {
-                if !leases[index].1.contains(&pid) {
-                    leases[index].1.push(pid);
-                }
-            }
+        let handle = unsafe {
+            FindFirstChangeNotificationW(
+                wide.as_ptr(),
+                0,
+                FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_LAST_WRITE,
+            )
+        };
+        if handle == INVALID_HANDLE_VALUE || (handle as usize) == 0 {
+            eprintln!(
+                "[agentplug lease] directory change notification unavailable for {} -- falling back to timed rechecks",
+                dir.display()
+            );
+            None
         } else {
-            leases.push((canonical, live_pids));
+            eprintln!(
+                "[agentplug lease] watching {} for lease changes (event-driven, no polling)",
+                dir.display()
+            );
+            Some(Watch(handle))
+        }
+    });
+    let Some(watch) = watch else {
+        return false;
+    };
+    let signaled = unsafe { WaitForSingleObject(watch.0, 0) } == WAIT_OBJECT_0;
+    if signaled {
+        unsafe {
+            FindNextChangeNotification(watch.0);
         }
     }
+    signaled
+}
 
-    let mut attached = false;
-    let own_index = leases.iter().position(|(path, _)| path == &cwd_str);
-    if let Some(index) = own_index {
-        if !leases[index].1.contains(&lease_pid) {
-            leases[index].1.push(lease_pid);
-            attached = true;
-        }
-    } else {
-        leases.push((cwd_str.clone(), vec![lease_pid]));
-        attached = true;
-    }
+#[cfg(not(windows))]
+fn lease_dir_changed() -> bool {
+    false
+}
 
-    let body: String = leases
-        .iter()
-        .map(|(path, pids)| {
-            let pid_list: Vec<String> = pids.iter().map(u64::to_string).collect();
-            format!("{path}\t{}\n", pid_list.join(","))
-        })
-        .collect();
-    if body == existing {
+#[cfg(windows)]
+const LEASE_RECHECK_INTERVAL: Duration = Duration::from_secs(60);
+#[cfg(not(windows))]
+const LEASE_RECHECK_INTERVAL: Duration = Duration::from_secs(5);
+
+fn lease_file_key(root: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(root.to_lowercase().as_bytes());
+    digest.iter().take(8).map(|b| format!("{b:02x}")).collect()
+}
+
+fn write_lease_file(root: &str, pid: u64) -> anyhow::Result<()> {
+    let dir = leases_dir();
+    fs::create_dir_all(&dir)?;
+    let file = dir.join(format!("{}.{pid}.lease", lease_file_key(root)));
+    if fs::read_to_string(&file).map(|t| t.trim() == root).unwrap_or(false) {
         return Ok(());
     }
-    let tmp = path.with_extension("txt.tmp");
-    fs::write(&tmp, &body)?;
-    fs::rename(&tmp, &path)?;
-    eprintln!(
-        "[agentplug registry] lease {} for {} (pid {lease_pid}); pruned {pruned} dead/legacy entr{}; {} leased project(s)",
-        if attached { "attached" } else { "rewritten" },
-        cwd_str,
-        if pruned == 1 { "y" } else { "ies" },
-        leases.len()
-    );
+    let tmp = dir.join(format!("{}.{pid}.lease.tmp", lease_file_key(root)));
+    fs::write(&tmp, root)?;
+    fs::rename(&tmp, &file)?;
+    eprintln!("[agentplug lease] attached {root} for pid {pid}");
     Ok(())
 }
 
@@ -255,48 +277,48 @@ fn cached_project_root(entry: &str) -> PathBuf {
 
 const LEASE_PINNED_PID: u64 = 0;
 
-fn parse_registry_line(line: &str) -> Option<(String, Vec<u64>)> {
-    let line = line.trim();
-    if line.is_empty() {
-        return None;
-    }
-    let (path, pids) = line.split_once('\t')?;
-    let pids: Vec<u64> = pids
-        .split(',')
-        .filter_map(|p| p.trim().parse::<u64>().ok())
-        .collect();
-    let path = path.trim().to_string();
-    if path.is_empty() {
-        return None;
-    }
-    Some((path, pids))
-}
-
-fn lease_is_live(pids: &[u64]) -> bool {
-    pids.iter()
-        .any(|&pid| pid == LEASE_PINNED_PID || pid_is_alive(pid))
+fn lease_is_live(pid: u64) -> bool {
+    pid == LEASE_PINNED_PID || pid_is_alive(pid)
 }
 
 pub(crate) fn read_registry() -> Vec<PathBuf> {
+    let legacy = registry_path();
+    if legacy.exists() && fs::remove_file(&legacy).is_ok() {
+        eprintln!("[agentplug lease] removed the legacy registry file {} -- leases now live one file per agent in {}", legacy.display(), leases_dir().display());
+    }
     let mut roots: Vec<PathBuf> = Vec::new();
-    for line in fs::read_to_string(registry_path())
-        .unwrap_or_default()
-        .lines()
-    {
-        let Some((entry, pids)) = parse_registry_line(line) else {
+    let Ok(entries) = fs::read_dir(leases_dir()) else {
+        return roots;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some(stem) = name.strip_suffix(".lease") else {
             continue;
         };
-        if !lease_is_live(&pids) || !Path::new(&entry).exists() {
+        let Some((_, pid_text)) = stem.rsplit_once('.') else {
+            continue;
+        };
+        let Ok(pid) = pid_text.parse::<u64>() else {
+            continue;
+        };
+        let path = entry.path();
+        let root_text = fs::read_to_string(&path).unwrap_or_default();
+        let root_text = root_text.trim();
+        if !lease_is_live(pid) {
+            let _ = fs::remove_file(&path);
+            eprintln!("[agentplug lease] expired: agent pid {pid} is gone -- removed lease for {root_text}");
             continue;
         }
-        let canonical = cached_project_root(&entry);
+        if root_text.is_empty() || !Path::new(root_text).exists() {
+            continue;
+        }
+        let canonical = cached_project_root(root_text);
         if !roots.contains(&canonical) {
             roots.push(canonical);
         }
     }
     roots
 }
-
 fn host_available_parallelism() -> usize {
     std::thread::available_parallelism()
         .map(std::num::NonZeroUsize::get)
@@ -3352,7 +3374,10 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
             return Ok(());
         }
 
-        if first_registry_poll_pending || last_registry_poll.elapsed() >= registry_poll_interval {
+        if first_registry_poll_pending
+            || lease_dir_changed()
+            || last_registry_poll.elapsed() >= LEASE_RECHECK_INTERVAL.max(registry_poll_interval)
+        {
             let sweep_orphans_left_by_whatever_daemon_died_before_answering =
                 first_registry_poll_pending;
             first_registry_poll_pending = false;
