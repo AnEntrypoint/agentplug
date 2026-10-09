@@ -9,6 +9,6 @@ version = "0.1.242"
 
 [profile.release]
 strip = true
-lto = "thin"
+lto = false
 codegen-units = 16
 opt-level = "z"

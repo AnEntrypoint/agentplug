@@ -83,10 +83,9 @@ jobs:
           ref: ${{ needs.bump.outputs.commit }}
           persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
-        with:
-          toolchain: stable
-          targets: ${{ matrix.target }}
+      - name: Add target (the runner image already ships rustup and stable)
+        shell: bash
+        run: rustup target add ${{ matrix.target }}
 
       - uses: Swatinem/rust-cache@63fed3e2fecf6f7b51dc6f043341b79ef82a9ae7
         with:
@@ -128,10 +127,8 @@ jobs:
           ref: ${{ needs.bump.outputs.commit }}
           persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
-        with:
-          toolchain: stable
-          targets: aarch64-unknown-linux-gnu
+      - name: Add target (the runner image already ships rustup and stable)
+        run: rustup target add aarch64-unknown-linux-gnu
 
       - uses: Swatinem/rust-cache@63fed3e2fecf6f7b51dc6f043341b79ef82a9ae7
         with:
