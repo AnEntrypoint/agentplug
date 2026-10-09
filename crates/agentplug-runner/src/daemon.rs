@@ -3183,7 +3183,7 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
     let mut idle_in_dir_watch = IdleInDirWatch::new();
     let mut pending_self_update: Option<(PathBuf, String)> = None;
     let mut pending_self_update_staged_at: Option<Instant> = None;
-    const SELF_UPDATE_MAX_STARVED_MS: u64 = 10 * 60 * 1000;
+    const SELF_UPDATE_MAX_STARVED_MS: u64 = 60 * 1000;
 
     if let Some((staged_at_ms, _len)) = staged_runner_awaiting_handoff() {
         if let Some(staged_path) = canonical_runner_exe_path().map(|c| {
