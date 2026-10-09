@@ -3340,10 +3340,6 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
     let _heartbeat_ticker = spawn_heartbeat_ticker(heartbeat_interval);
     write_daemon_heartbeat(0, 0);
 
-    const PROJECT_HEARTBEAT_TICK_INTERVAL_MS: u64 = 3_000;
-    let _project_heartbeat_ticker =
-        spawn_project_heartbeat_ticker(Duration::from_millis(PROJECT_HEARTBEAT_TICK_INTERVAL_MS));
-
     const DREAM_RSI_CYCLE_TICK_INTERVAL_MS: u64 = 60_000;
     let _dream_rsi_cycle_ticker =
         spawn_dream_rsi_cycle_ticker(Duration::from_millis(DREAM_RSI_CYCLE_TICK_INTERVAL_MS));
@@ -3371,6 +3367,7 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
                 .collect();
             for root in &roots_new_this_registry_poll {
                 mark_spool_dirty(root);
+                write_project_heartbeat(root, None);
                 eprintln!(
                     "[agentplug daemon] lease attached: serving {} ({} leased project(s))",
                     root.display(),
