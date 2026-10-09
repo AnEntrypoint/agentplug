@@ -2183,52 +2183,6 @@ pub fn read_known_project_roots() -> Vec<PathBuf> {
         .clone()
 }
 
-const IDLE_PROJECT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
-const IDLE_PROJECT_SCAN_INTERVAL: Duration = Duration::from_secs(600);
-
-fn project_scan_state() -> &'static Mutex<HashMap<PathBuf, (Instant, bool)>> {
-    static SLOT: OnceLock<Mutex<HashMap<PathBuf, (Instant, bool)>>> = OnceLock::new();
-    SLOT.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-fn project_scan_due(root: &Path) -> bool {
-    let state = project_scan_state()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    match state.get(root) {
-        Some((at, had_work)) => *had_work || at.elapsed() >= IDLE_PROJECT_SCAN_INTERVAL,
-        None => true,
-    }
-}
-
-fn record_project_scan(root: &Path, has_work: bool) {
-    project_scan_state()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert(root.to_path_buf(), (Instant::now(), has_work));
-}
-
-fn project_heartbeat_last_write() -> &'static Mutex<HashMap<PathBuf, Instant>> {
-    static SLOT: OnceLock<Mutex<HashMap<PathBuf, Instant>>> = OnceLock::new();
-    SLOT.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-fn project_heartbeat_due(root: &Path, has_queued_work: bool) -> bool {
-    let now = Instant::now();
-    let mut last_writes = project_heartbeat_last_write()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    let due = has_queued_work
-        || match last_writes.get(root) {
-            Some(at) => now.saturating_duration_since(*at) >= IDLE_PROJECT_HEARTBEAT_INTERVAL,
-            None => true,
-        };
-    if due {
-        last_writes.insert(root.to_path_buf(), now);
-    }
-    due
-}
-
 struct SweepHolder {
     phase: &'static str,
     root: String,
@@ -2303,60 +2257,6 @@ impl RegistryWalk {
     }
 }
 
-fn project_heartbeat_cursor() -> &'static Mutex<usize> {
-    static SLOT: OnceLock<Mutex<usize>> = OnceLock::new();
-    SLOT.get_or_init(|| Mutex::new(0))
-}
-
-const PROJECT_HEARTBEAT_PASS_BUDGET: Duration = Duration::from_millis(4_000);
-
-fn spawn_project_heartbeat_ticker(interval: Duration) -> std::thread::JoinHandle<()> {
-    std::thread::spawn(move || loop {
-        std::thread::sleep(interval);
-        if heartbeat_authority_lost() {
-            return;
-        }
-        let roots = known_project_roots()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
-        if roots.is_empty() {
-            continue;
-        }
-        let started = Instant::now();
-        let begin = *project_heartbeat_cursor()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let mut next = begin;
-        for offset in 0..roots.len() {
-            let index = (begin + offset) % roots.len();
-            let root = &roots[index];
-            next = (index + 1) % roots.len();
-            if !project_scan_due(root) {
-                continue;
-            }
-            let spool_dir = spool_dir_of(root);
-            if !spool_dir.exists() {
-                continue;
-            }
-            set_sweep_holder("project-heartbeat", root);
-            let (queued, claimed) = spool_step_counts(root);
-            record_project_scan(root, queued + claimed > 0);
-            if !project_heartbeat_due(root, queued + claimed > 0) {
-                continue;
-            }
-            write_project_heartbeat(root, busy_until_for_project_ticker(root));
-            if started.elapsed() >= PROJECT_HEARTBEAT_PASS_BUDGET {
-                break;
-            }
-        }
-        *project_heartbeat_cursor()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()) = next;
-        clear_sweep_holder();
-    })
-}
-
 fn spawn_dream_rsi_cycle_ticker(interval: Duration) -> std::thread::JoinHandle<()> {
     crate::dream_cycle::spawn(interval, read_known_project_roots, heartbeat_authority_lost)
 }
@@ -2373,18 +2273,6 @@ fn read_status_busy_until_if_future(root: &Path) -> Option<u64> {
 }
 
 const TICKER_BUSY_UNTIL_EXTEND_MS: u64 = 60_000;
-
-fn busy_until_for_project_ticker(root: &Path) -> Option<u64> {
-    if project_in_flight_count(root) > 0 || spool_has_queued_work(root) {
-        let stored = read_status_busy_until_if_future(root);
-        let refresh_below = now_ms() + TICKER_BUSY_UNTIL_EXTEND_MS / 2;
-        return match stored {
-            Some(until) if until > refresh_below => Some(until),
-            _ => Some(now_ms() + TICKER_BUSY_UNTIL_EXTEND_MS),
-        };
-    }
-    read_status_busy_until_if_future(root)
-}
 
 const SPOOL_SCAN_BACKSTOP_TTL: Duration = Duration::from_secs(30);
 
@@ -2488,10 +2376,6 @@ fn cached_root_scan(root: &Path) -> (bool, bool, usize, usize) {
         dirty.remove(root);
     }
     result
-}
-
-fn spool_has_queued_work(root: &Path) -> bool {
-    cached_root_scan(root).1
 }
 
 fn spool_step_counts(root: &Path) -> (usize, usize) {
