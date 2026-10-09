@@ -83,6 +83,10 @@ jobs:
           toolchain: stable
           targets: ${{ matrix.target }}
 
+      - uses: Swatinem/rust-cache@63fed3e2fecf6f7b51dc6f043341b79ef82a9ae7
+        with:
+          key: ${{ matrix.target }}
+
       - name: Build
         shell: bash
         env:
@@ -123,6 +127,10 @@ jobs:
         with:
           toolchain: stable
           targets: aarch64-unknown-linux-gnu
+
+      - uses: Swatinem/rust-cache@63fed3e2fecf6f7b51dc6f043341b79ef82a9ae7
+        with:
+          key: host-linux-arm64
 
       - name: Build host runner
         env:
