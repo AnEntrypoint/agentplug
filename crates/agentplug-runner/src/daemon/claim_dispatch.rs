@@ -1154,6 +1154,7 @@ pub(super) fn admission_starved_answer(
     limit: usize,
     in_flight: usize,
     slots: usize,
+    holders: &str,
 ) -> String {
     let spool_dir = spool_dir_of_root(root);
     let (request_path, claim_path, out_path) = unanswered_spool_paths(&spool_dir, verb, task);
@@ -1167,6 +1168,7 @@ pub(super) fn admission_starved_answer(
         "admission_in_flight": in_flight,
         "admission_limit": limit,
         "plugin_slots": slots,
+        "admission_holders": holders,
         "waited_ms": waited_ms,
         "daemon_pid": std::process::id(),
         "request_path": request_path.to_string_lossy(),
@@ -1176,8 +1178,8 @@ pub(super) fn admission_starved_answer(
         "executed": false,
         "re_dispatch_safe": true,
         "error": format!(
-            "verb {} (task {}) was claimed by daemon pid {} but never entered the {} admission gate within {}ms -- {} dispatches already hold the {} admitted slots of {}, so it was NOT executed and re-dispatching is safe. Live state for every unanswered request is in {}.",
-            verb, task, std::process::id(), kind, waited_ms, in_flight, limit, slots,
+            "verb {} (task {}) was claimed by daemon pid {} but never entered the {} admission gate within {}ms -- {} dispatches already hold the {} admitted slots of {} (holders, oldest first: {}), so it was NOT executed and re-dispatching is safe. Live state for every unanswered request is in {}.",
+            verb, task, std::process::id(), kind, waited_ms, in_flight, limit, slots, holders,
             spool_dir.join(DISPATCH_WAIT_LEDGER_FILE).display()
         ),
     })
@@ -1373,12 +1375,12 @@ pub(crate) fn run_gm_dispatch_to_file(
         Ok(Ok(s)) if !s.is_empty() => s,
         Ok(Ok(_)) => serde_json::json!({"ok": false, "error": "empty dispatch result", "verb": verb}).to_string(),
         Ok(Err(e)) => match e.downcast_ref::<agentplug_host::PluginDispatchError>() {
-            Some(agentplug_host::PluginDispatchError::AdmissionStarved { kind, waited_ms, limit, in_flight, slots }) => {
+            Some(agentplug_host::PluginDispatchError::AdmissionStarved { kind, waited_ms, limit, in_flight, slots, holders }) => {
                 eprintln!(
-                    "[agentplug daemon] {verb}/{task} for {} was claimed but never entered the {kind} admission gate within {waited_ms}ms -- answered dispatch_starved_waiting_for_admission; the verb did not run",
+                    "[agentplug daemon] {verb}/{task} for {} was claimed but never entered the {kind} admission gate within {waited_ms}ms (holders: {holders}) -- answered dispatch_starved_waiting_for_admission; the verb did not run",
                     root.display()
                 );
-                admission_starved_answer(root, verb, task, lane, *kind, *waited_ms, *limit, *in_flight, *slots)
+                admission_starved_answer(root, verb, task, lane, *kind, *waited_ms, *limit, *in_flight, *slots, holders)
             }
             _ => serde_json::json!({"ok": false, "error": describe_dispatch_error_naming_wasm_trap_kind_distinctly_from_a_guest_logic_error(&e), "verb": verb}).to_string(),
         },
