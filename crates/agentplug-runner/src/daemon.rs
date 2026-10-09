@@ -211,7 +211,7 @@ impl DaemonConfig {
     }
     fn registry_poll_interval(&self) -> Duration { Duration::from_secs(self.registry_poll_interval_secs.unwrap_or(5)) }
     fn heartbeat_interval(&self) -> Duration { Duration::from_secs(self.heartbeat_interval_secs.unwrap_or(10)) }
-    fn plugin_update_poll_interval(&self) -> Duration { Duration::from_secs(self.plugin_update_poll_interval_secs.unwrap_or(600)) }
+    fn plugin_update_poll_interval(&self) -> Duration { Duration::from_secs(self.plugin_update_poll_interval_secs.unwrap_or(60)) }
     fn plugin_update_poll_interval_for(&self, plugin_name: &str) -> Duration {
         match self.plugin_update_poll_interval_secs_by_name.get(plugin_name) {
             Some(secs) => Duration::from_secs(*secs),
@@ -219,7 +219,7 @@ impl DaemonConfig {
         }
     }
     fn runner_update_poll_interval(&self) -> Duration { Duration::from_secs(self.runner_update_poll_interval_secs.unwrap_or(60)) }
-    fn instruction_source_poll_interval(&self) -> Duration { Duration::from_secs(self.instruction_source_poll_interval_secs.unwrap_or(600)) }
+    fn instruction_source_poll_interval(&self) -> Duration { Duration::from_secs(self.instruction_source_poll_interval_secs.unwrap_or(15)) }
     fn max_concurrent_projects(&self) -> usize { 4 }
     fn gm_concurrency(&self) -> usize { self.gm_concurrency.unwrap_or_else(|| self.max_concurrent_projects()).max(1) }
     fn gm_pool_size(&self) -> usize {
@@ -1919,10 +1919,44 @@ fn dir_has_any_verb_subdir_with_claimable_txt(base: &Path) -> bool {
         if !verb_entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
             continue;
         }
-        let Ok(files) = fs::read_dir(verb_entry.path()) else { continue };
-        for file_entry in files.flatten() {
-            if file_entry.path().extension().and_then(|e| e.to_str()) == Some("txt") {
-                return true;
+        if verb_dir_has_claimable_txt(&verb_entry.path()) {
+            return true;
+        }
+    }
+    false
+}
+
+const EMPTY_VERB_DIR_VERDICT_MIN_AGE: Duration = Duration::from_secs(2);
+
+fn empty_verb_dir_verdicts() -> &'static Mutex<HashMap<PathBuf, std::time::SystemTime>> {
+    static SLOT: OnceLock<Mutex<HashMap<PathBuf, std::time::SystemTime>>> = OnceLock::new();
+    SLOT.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn verb_dir_has_claimable_txt(verb_dir: &Path) -> bool {
+    let modified = fs::metadata(verb_dir).and_then(|metadata| metadata.modified()).ok();
+    if let Some(modified) = modified {
+        let unchanged_since_empty_verdict = empty_verb_dir_verdicts()
+            .lock()
+            .ok()
+            .is_some_and(|verdicts| verdicts.get(verb_dir) == Some(&modified));
+        if unchanged_since_empty_verdict {
+            return false;
+        }
+    }
+    let Ok(files) = fs::read_dir(verb_dir) else { return false };
+    for file_entry in files.flatten() {
+        if file_entry.path().extension().and_then(|e| e.to_str()) == Some("txt") {
+            return true;
+        }
+    }
+    if let Some(modified) = modified {
+        let settled = std::time::SystemTime::now()
+            .duration_since(modified)
+            .is_ok_and(|age| age >= EMPTY_VERB_DIR_VERDICT_MIN_AGE);
+        if settled {
+            if let Ok(mut verdicts) = empty_verb_dir_verdicts().lock() {
+                verdicts.insert(verb_dir.to_path_buf(), modified);
             }
         }
     }
@@ -2054,6 +2088,9 @@ fn dispatch_project(root: &Path, project: &mut ProjectPlugins, plugin_modules: &
             }
             let verb = verb_entry.file_name().to_string_lossy().into_owned();
             let verb_dir = verb_entry.path();
+            if !verb_dir_has_claimable_txt(&verb_dir) {
+                continue;
+            }
             let Ok(files) = fs::read_dir(&verb_dir) else { continue };
             for file_entry in files.flatten() {
                 let file_path = file_entry.path();
