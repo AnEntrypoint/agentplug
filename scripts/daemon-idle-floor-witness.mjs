@@ -13,7 +13,10 @@
 //     --liveness 3  --liveness-max-ms 3000  --home <dir>  --live-home <dir>  --keep
 //
 // --live-home is read only: its default plugins and precompiled cache are copied into the
-// isolated home so the daemon never downloads and never writes outside --home.
+// isolated home so the daemon never downloads and never writes outside --home. The runner is
+// copied into <home>/bin and run from there with AGENTPLUG_NO_SELF_UPDATE=1 and a frozen marker,
+// so a staged or released runner in the shared install directory is never adopted or swapped in.
+// The shared installed runner must be unchanged by the run, or the run is invalid.
 // Exit 0 on PASS, 1 on FAIL, 2 on a usage or setup error.
 
 import { spawn, spawnSync } from 'node:child_process';
@@ -93,6 +96,8 @@ function launchDaemon(runner, home, logFile) {
   const userHome = path.join(home, 'userhome');
   const env = { ...process.env, AGENTPLUG_HOME: home, HOME: userHome, USERPROFILE: userHome };
   delete env.AGENTPLUG_NO_DAEMON;
+  delete env.AGENTPLUG_ALLOW_UPDATE_OVER_LOCAL_BUILD;
+  env.AGENTPLUG_NO_SELF_UPDATE = '1';
   const child = spawn(runner, ['daemon'], { env, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
   const log = fs.createWriteStream(logFile);
   child.stdout.pipe(log, { end: false });
@@ -187,6 +192,31 @@ async function stopDaemon(child, state) {
   for (let i = 0; i < 100 && !state.exit; i++) await sleep(100);
 }
 
+function isolateRunner(runner, home) {
+  const binDir = path.join(home, 'bin');
+  fs.mkdirSync(binDir, { recursive: true });
+  const copy = path.join(binDir, path.basename(runner));
+  fs.copyFileSync(runner, copy);
+  fs.writeFileSync(path.join(home, 'agentplug-runner.no-self-update'), 'frozen by daemon-idle-floor-witness: the isolated runner never self-updates\n');
+  return copy;
+}
+
+function sharedInstallStamp() {
+  try {
+    const st = fs.statSync(path.join(os.homedir(), '.gm-tools', 'agentplug-runner.exe'));
+    return `${st.size}@${st.mtimeMs}`;
+  } catch {
+    return 'absent';
+  }
+}
+
+function killIsolatedProcesses(home) {
+  if (process.platform !== 'win32') return;
+  const prefix = `${path.resolve(home)}\\`.replace(/'/g, "''");
+  const script = `Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -and $_.ExecutablePath.StartsWith('${prefix}', [StringComparison]::OrdinalIgnoreCase) } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }`;
+  spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], { windowsHide: true, encoding: 'utf8' });
+}
+
 async function main() {
   const opts = parseArgs(process.argv.slice(2));
   const runner = path.resolve(opts.runner);
@@ -196,17 +226,19 @@ async function main() {
   if (home === liveHome || home.startsWith(liveHome + path.sep)) {
     throw new UsageError('--home must not be the live AGENTPLUG_HOME or inside it');
   }
-  const version = spawnSync(runner, ['--version'], { encoding: 'utf8', windowsHide: true }).stdout.trim();
   const roots = prepareHome(home, liveHome, opts);
+  const isolatedRunner = isolateRunner(runner, home);
+  const version = spawnSync(isolatedRunner, ['--version'], { encoding: 'utf8', windowsHide: true }).stdout.trim();
+  const sharedBefore = sharedInstallStamp();
   const logFile = path.join(home, 'witness-daemon.stderr.log');
-  const { child, state, log } = launchDaemon(runner, home, logFile);
+  const { child, state, log } = launchDaemon(isolatedRunner, home, logFile);
   const reasons = [];
   let summary = null;
   let liveness = [];
   let attachedLines = 0;
   let handoffLines = 0;
   try {
-    console.log(`runner=${runner} version=${version} home=${home} roots=${roots.length} verbs=${SPOOL_VERBS.length} pid=${child.pid}`);
+    console.log(`runner=${runner} isolated=${isolatedRunner} version=${version} home=${home} roots=${roots.length} verbs=${SPOOL_VERBS.length} pid=${child.pid}`);
     const warmupEnd = Date.now() + opts.warmupMs;
     while (Date.now() < warmupEnd && !state.exit) await sleep(250);
     if (state.exit) throw new Error(`daemon exited during warm-up: ${JSON.stringify(state.exit)}`);
@@ -219,6 +251,9 @@ async function main() {
     reasons.push(err instanceof Error ? err.message : String(err));
   } finally {
     await stopDaemon(child, state);
+    killIsolatedProcesses(home);
+    await sleep(1500);
+    killIsolatedProcesses(home);
     log.end();
     await new Promise((resolve) => log.once('finish', resolve));
     const text = fs.existsSync(logFile) ? fs.readFileSync(logFile, 'utf8') : '';
@@ -237,12 +272,20 @@ async function main() {
   console.log(`attached_roots_logged=${attachedLines} handoff_markers=${handoffLines} log=${logFile}`);
   if (attachedLines < roots.length) reasons.push(`only ${attachedLines}/${roots.length} synthetic roots were attached`);
   if (handoffLines > 0) reasons.push('a runner self-update or handoff fired during the measurement, so the run is invalid');
+  const sharedAfter = sharedInstallStamp();
+  if (sharedAfter !== sharedBefore) {
+    reasons.push(`the shared installed runner changed during the run (${sharedBefore} -> ${sharedAfter}), so isolation was breached and the run is invalid`);
+  }
   const verdict = reasons.length === 0 ? 'PASS' : 'FAIL';
   for (const reason of reasons) console.log(`reason: ${reason}`);
   if (!opts.keep) {
     const kept = path.join(os.tmpdir(), `agentplug-idle-floor-${Date.now()}.stderr.log`);
     if (fs.existsSync(logFile)) fs.copyFileSync(logFile, kept);
-    fs.rmSync(home, { recursive: true, force: true });
+    try {
+      fs.rmSync(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 500 });
+    } catch (err) {
+      console.log(`warning: could not remove ${home}: ${err.message}`);
+    }
     console.log(`daemon log kept at ${kept}`);
   }
   console.log(`RESULT: ${verdict}`);

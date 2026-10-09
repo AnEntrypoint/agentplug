@@ -502,6 +502,54 @@ fn record_plugin_install(dest: &Path, version_file: &Path, version: &str) -> any
     Ok(())
 }
 
+fn plugin_build_record_path(plugin_name: &str) -> PathBuf {
+    install_dir()
+        .join("plugins")
+        .join(format!("{plugin_name}.build.json"))
+}
+
+// Names the installed plugin build and the commit it was built from, so
+// plugins/<name>.build.json tracks the bytes the daemon loaded. The release body
+// carries that commit as `source-head: <sha>`. A failure here is reported and
+// never fails an install that already succeeded.
+fn write_plugin_build_record(plugin_name: &str, repo: &str, version: &str, dest: &Path) {
+    let bytes = match fs::read(dest) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            eprintln!(
+                "[agentplug daemon] plugin {plugin_name} build record skipped: cannot read {}: {error}",
+                dest.display()
+            );
+            return;
+        }
+    };
+    let record = serde_json::json!({
+        "plugin": plugin_name,
+        "version": version,
+        "source_sha": release_source_head(repo, version),
+        "wasm_sha256": sha256_hex(&bytes),
+        "wasm_bytes": bytes.len(),
+        "installed_at_ms": now_ms_for_marker(),
+        "origin": "release",
+    });
+    if let Err(error) = fs::write(plugin_build_record_path(plugin_name), record.to_string()) {
+        eprintln!("[agentplug daemon] plugin {plugin_name} build record not written: {error}");
+    }
+}
+
+fn release_source_head(repo: &str, version: &str) -> Option<String> {
+    let url = format!("https://api.github.com/repos/{repo}/releases/tags/v{version}");
+    let text = github_api_call(&url).ok()?.into_string().ok()?;
+    let release: serde_json::Value = serde_json::from_str(&text).ok()?;
+    release
+        .get("body")?
+        .as_str()?
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("source-head:"))
+        .map(|sha| sha.trim().to_ascii_lowercase())
+        .filter(|sha| (7..=40).contains(&sha.len()) && sha.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
 const RUNNER_BIN_REPO: &str = "AnEntrypoint/agentplug-bin";
 
 fn runner_asset_name_for(os: &str, arch: &str) -> Option<&'static str> {
@@ -564,12 +612,20 @@ pub fn update_over_local_build_allowed() -> bool {
     env_flag_enabled(ALLOW_UPDATE_OVER_LOCAL_BUILD_ENV)
 }
 
+// Staged copies are named `<exe>.new`, `<exe>.new2`, and chains of those such as
+// `<exe>.new2.new2.new`; the canonical install is the bare `<exe>`.
+fn is_staged_runner_suffix(extension: &str) -> bool {
+    extension
+        .to_ascii_lowercase()
+        .strip_prefix("new")
+        .is_some_and(|digits| digits.bytes().all(|b| b.is_ascii_digit()))
+}
+
 pub fn canonical_runner_exe() -> Option<PathBuf> {
     let mut path = std::env::current_exe().ok()?;
     while path
         .extension()
-        .map(|e| e.to_string_lossy().to_ascii_lowercase())
-        .map(|e| e == "new" || e == "new2")
+        .map(|e| is_staged_runner_suffix(&e.to_string_lossy()))
         .unwrap_or(false)
     {
         path = path.with_extension("");
@@ -1345,6 +1401,7 @@ fn ensure_plugin_installed_via_github(
     snapshot_prev_wasm_and_version(dest, version_file)?;
     download_and_verify(&wasm_url, dest, &expected_sha)?;
     record_plugin_install(dest, version_file, &version)?;
+    write_plugin_build_record(plugin_name, &spec.repo, &version, dest);
     Ok(dest.to_path_buf())
 }
 

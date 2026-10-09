@@ -1933,16 +1933,10 @@ fn runner_version_parity_json() -> serde_json::Value {
     runner_version_parity().json()
 }
 
+// One definition of the canonical install path, shared with the self-update
+// staging names, so the parity probe and the swap record name the same file.
 fn canonical_runner_exe_path() -> Option<PathBuf> {
-    let mut path = std::env::current_exe().ok()?;
-    while path
-        .extension()
-        .map(|e| e.eq_ignore_ascii_case("new"))
-        .unwrap_or(false)
-    {
-        path = path.with_extension("");
-    }
-    Some(path)
+    crate::download::canonical_runner_exe()
 }
 
 fn staged_matches_running(canonical: &Path, staged: &Path) -> bool {
