@@ -399,7 +399,13 @@ pub fn write_spool_out_confirmed(out_dir: &Path, out_name: &str, out_body: &str)
     let tmp = out_dir.join(format!("{out_name}.tmp.{}", std::process::id()));
     if fs::write(&tmp, out_body).is_ok() && fs::rename(&tmp, &dest).is_ok() {
         let _ = fs::write(out_dir.join(format!("{out_name}.ready")), b"");
-        return dest.exists();
+        let confirmed = dest.exists();
+        if confirmed {
+            if let Some(root) = out_dir.ancestors().nth(3) {
+                reap_spool_out_files(root, false);
+            }
+        }
+        return confirmed;
     }
     let _ = fs::remove_file(&tmp);
     dest.exists()
