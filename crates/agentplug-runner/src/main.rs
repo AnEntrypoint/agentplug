@@ -225,6 +225,8 @@ fn main() -> anyhow::Result<()> {
         "selfcheck-registry" => selfcheck_registry(),
         "selfcheck-inflight" => selfcheck_inflight_cleanup(),
         "selfcheck-pool-fairness" => selfcheck_pool_fairness(),
+        "selfcheck-git-admission" => selfcheck_git_admission(),
+        "selfcheck-lane-release" => selfcheck_lane_release(),
         "selfcheck-spool-claim" => selfcheck_spool_claim(),
         other => {
             eprintln!(
@@ -426,6 +428,223 @@ fn selfcheck_pool_fairness() -> anyhow::Result<()> {
     let _ = extra_heavy.join();
     println!("[selfcheck-pool-fairness] witnessed live against the real SharedPluginPool: PASS");
     Ok(())
+}
+
+fn selfcheck_fail(name: &str, reason: &str) -> anyhow::Result<()> {
+    println!("RESULT: FAIL {reason}");
+    anyhow::bail!("{name}: {reason}")
+}
+
+fn selfcheck_git_admission() -> anyhow::Result<()> {
+    use agentplug_host::{AdmissionBand, DispatchCostClass, SharedPluginPool};
+    use std::sync::{mpsc, Arc};
+    use std::time::{Duration, Instant};
+
+    const NAME: &str = "selfcheck-git-admission";
+    const POOL_SLOTS: usize = 8;
+    const GIT_BOUND: Duration = Duration::from_secs(10);
+    let general_limit = POOL_SLOTS - (POOL_SLOTS / 4).max(1);
+    let pool = Arc::new(SharedPluginPool::new("gm", POOL_SLOTS));
+    let mut parked = Vec::new();
+    for _ in 0..general_limit {
+        let (ready_tx, ready_rx) = mpsc::channel::<bool>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let held = pool.clone();
+        let handle = std::thread::spawn(move || {
+            let Ok(admission) = SharedPluginPool::admit_within(
+                &held,
+                DispatchCostClass::Cheap,
+                Duration::from_secs(5),
+            ) else {
+                let _ = ready_tx.send(false);
+                return;
+            };
+            let (slot, _) = held.acquire_within_for_class(
+                SharedPluginPool::ACQUIRE_TIMEOUT_MS,
+                DispatchCostClass::Cheap,
+            );
+            let _ = ready_tx.send(true);
+            let _ = release_rx.recv();
+            drop(slot);
+            drop(admission);
+        });
+        parked.push((ready_rx, release_tx, handle));
+    }
+    let outcome = (|| -> Result<String, String> {
+        let mut all_parked = true;
+        for (ready_rx, _, _) in &parked {
+            all_parked &= ready_rx.recv_timeout(Duration::from_secs(10)).unwrap_or(false);
+        }
+        if !all_parked {
+            return Err(format!(
+                "only part of the {general_limit} general cheap dispatches could be parked"
+            ));
+        }
+        if SharedPluginPool::admit_within(&pool, DispatchCostClass::Cheap, Duration::from_millis(300))
+            .is_ok()
+        {
+            return Err(format!(
+                "the general band admitted more than {general_limit} cheap dispatches"
+            ));
+        }
+        let started = Instant::now();
+        let git = SharedPluginPool::admit_within_lane(
+            &pool,
+            DispatchCostClass::Cheap,
+            Some("git"),
+            GIT_BOUND,
+        );
+        let git_ms = started.elapsed().as_millis();
+        let git = match git {
+            Ok(admission) => admission,
+            Err(report) => {
+                return Err(format!(
+                    "git-lane cheap dispatch refused admission after {}ms behind {} of {} general admissions",
+                    report.waited_ms, report.in_flight, report.limit
+                ))
+            }
+        };
+        let record = agentplug_host::take_last_admission();
+        let band = record.map(|record| record.band);
+        let band_label = band.map_or("none", AdmissionBand::as_str);
+        if band != Some(AdmissionBand::GitBand) {
+            return Err(format!(
+                "git-lane cheap dispatch was admitted through the {band_label} band, not the git band"
+            ));
+        }
+        let annotated = daemon::annotate_admission_on_reply(
+            r#"{"ok":true,"verb":"git_branch"}"#.to_string(),
+            record,
+        );
+        let reply: serde_json::Value =
+            serde_json::from_str(&annotated).unwrap_or(serde_json::Value::Null);
+        if reply["admission_decision"] != "admitted"
+            || reply["admission_band"] != "git-band"
+            || !reply["admission_waited_ms"].is_u64()
+        {
+            return Err(format!(
+                "the git reply did not name its admission decision, band and wait: {annotated}"
+            ));
+        }
+        let (git_slot, _) = pool.acquire_within_for_class(
+            SharedPluginPool::ACQUIRE_TIMEOUT_MS,
+            DispatchCostClass::Cheap,
+        );
+        let short_started = Instant::now();
+        let (short_slot, _) = pool.acquire_within_for_class(
+            SharedPluginPool::ACQUIRE_TIMEOUT_MS,
+            DispatchCostClass::Short,
+        );
+        let short_ms = short_started.elapsed().as_millis();
+        if short_ms >= 2_000 {
+            return Err(format!(
+                "a short verb waited {short_ms}ms for a physical slot behind the git dispatch"
+            ));
+        }
+        drop(short_slot);
+        if SharedPluginPool::admit_within_lane(
+            &pool,
+            DispatchCostClass::Cheap,
+            Some("git"),
+            Duration::from_millis(300),
+        )
+        .is_ok()
+        {
+            return Err("the git band admitted a second git-lane dispatch".into());
+        }
+        drop(git_slot);
+        drop(git);
+        if SharedPluginPool::admit_within_lane(&pool, DispatchCostClass::Cheap, Some("git"), GIT_BOUND)
+            .is_err()
+        {
+            return Err("the git band did not free its slot after the first git dispatch".into());
+        }
+        Ok(format!(
+            "git-lane cheap dispatch admitted via the {band_label} admission in {git_ms}ms while {general_limit} general cheap dispatches hold the band; a short verb got a slot in {short_ms}ms; a second git dispatch was refused within its bound"
+        ))
+    })();
+    for (_, release_tx, handle) in parked {
+        let _ = release_tx.send(());
+        let _ = handle.join();
+    }
+    match outcome {
+        Ok(detail) => {
+            println!("[{NAME}] {detail}");
+            println!("[{NAME}] witnessed live against the real SharedPluginPool: PASS");
+            println!("RESULT: PASS");
+            Ok(())
+        }
+        Err(reason) => selfcheck_fail(NAME, &reason),
+    }
+}
+
+fn selfcheck_lane_release() -> anyhow::Result<()> {
+    use agentplug_host::GmFairnessGuard;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    const NAME: &str = "selfcheck-lane-release";
+    std::env::set_var("AGENTPLUG_LANE_RELEASE_MIN_AGE_MS", "200");
+    let root = std::env::temp_dir().join(format!(
+        "agentplug-selfcheck-lane-{}-{}",
+        std::process::id(),
+        agentplug_host::now_ms()
+    ));
+    std::fs::create_dir_all(&root)?;
+    let (held_tx, held_rx) = mpsc::channel::<bool>();
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    let holder_root = root.clone();
+    let holder = std::thread::spawn(move || {
+        let guard = GmFairnessGuard::acquire_within(
+            &holder_root,
+            "prd-add",
+            "{}",
+            "task-dead",
+            Duration::from_secs(5),
+        );
+        let _ = held_tx.send(guard.is_ok());
+        let _ = release_rx.recv();
+        drop(guard);
+    });
+    let outcome = (|| -> Result<String, String> {
+        if !held_rx.recv_timeout(Duration::from_secs(10)).unwrap_or(false) {
+            return Err("the abandoned holder could not take the project lane".into());
+        }
+        match GmFairnessGuard::acquire_within(&root, "prd-add", "{}", "task-2", Duration::from_millis(500)) {
+            Ok(_) => return Err("the lane was free while task-dead still held it".into()),
+            Err(report) if report.lane_holder_task.as_deref() != Some("task-dead") => {
+                return Err(format!(
+                    "the waiter was refused without naming the holder (holder {:?})",
+                    report.lane_holder_task
+                ))
+            }
+            Err(_) => {}
+        }
+        std::thread::sleep(Duration::from_millis(250));
+        daemon::release_abandoned_project_lanes();
+        match GmFairnessGuard::acquire_within(&root, "prd-add", "{}", "task-3", Duration::from_secs(2)) {
+            Ok(guard) => {
+                drop(guard);
+                Ok("orphan sweep released the lane held by task-dead".into())
+            }
+            Err(report) => Err(format!(
+                "the orphan sweep left the lane held by {:?} although its requester has no live lease",
+                report.lane_holder_task
+            )),
+        }
+    })();
+    let _ = release_tx.send(());
+    let _ = holder.join();
+    let _ = std::fs::remove_dir_all(&root);
+    match outcome {
+        Ok(detail) => {
+            println!("[{NAME}] {detail}");
+            println!("[{NAME}] witnessed live against the real GmFairnessGuard: PASS");
+            println!("RESULT: PASS");
+            Ok(())
+        }
+        Err(reason) => selfcheck_fail(NAME, &reason),
+    }
 }
 
 fn selfcheck_inflight_cleanup() -> anyhow::Result<()> {

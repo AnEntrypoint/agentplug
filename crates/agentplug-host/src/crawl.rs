@@ -9,7 +9,11 @@ use wait_timeout::ChildExt;
 use crate::crawl_lease;
 use crate::http_agent::shared_agent;
 
-const CRAWL_HELPER_JS: &str = include_str!("crawl_cdp.mjs");
+const CRAWL_HELPER_JS: &str = concat!(
+    include_str!("crawl_cdp_tools.mjs"),
+    "\n",
+    include_str!("crawl_cdp.mjs")
+);
 pub(crate) const CDP_READY_DEADLINE: Duration = Duration::from_secs(30);
 pub(crate) const CDP_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const CDP_HELPER_BUDGET: Duration = Duration::from_secs(100);
@@ -103,9 +107,19 @@ pub fn parse_crawl_body(body: &str) -> Result<ParsedCrawl, String> {
                 continue;
             }
         }
+        if is_headless_request(line) {
+            return Err(format!(
+                "line {number}: headless is not a lightpanda step: engine=lightpanda is headless already, so remove the headless line"
+            ));
+        }
         steps.push(parse_step(line).map_err(|e| format!("line {number}: {e}"))?);
     }
     finish(engine, steps)
+}
+
+fn is_headless_request(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    lower == "headless" || lower.starts_with("headless=") || lower.starts_with("--headless")
 }
 
 fn finish(engine: Option<String>, steps: Vec<Value>) -> Result<ParsedCrawl, String> {
@@ -155,6 +169,196 @@ fn goto_step(url: &str) -> Result<Value, String> {
         ));
     }
     Ok(json!({"op": "goto", "url": url}))
+}
+
+pub struct CdpCrawl {
+    pub session: Option<String>,
+    pub steps: Vec<Value>,
+}
+
+const TOOL_STEP_GRAMMAR: &str = "snapshot, click=<uid>, dblclick=<uid>, hover=<uid>, click_at=<x>,<y>, fill=<uid> <value>, type=<text>, press=<key>, press_uid=<uid> <key>, upload=<uid> <path>[;<path>], wait_for=<text>, reload, back, forward, console, network[=<reqid>], dialog=accept|dismiss, screenshot=<path>, screenshot_full=<path>, screenshot_uid=<uid> <path>, trace_start, trace_stop[=<path>]";
+
+pub fn parse_cdp_crawl_body(body: &str) -> Result<CdpCrawl, String> {
+    let mut session = None;
+    let mut steps = Vec::new();
+    for (index, raw) in body.lines().enumerate() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let number = index + 1;
+        if is_headless_request(line) {
+            return Err(format!(
+                "line {number}: headless is refused: engine=cdp always drives a visible Chrome, and headless is available only as engine=lightpanda; remove the headless line"
+            ));
+        }
+        if steps.is_empty() {
+            if let Some(value) = line.strip_prefix("engine=") {
+                if value.trim() != "cdp" {
+                    return Err(format!(
+                        "line {number}: engine must be cdp here, got '{}'",
+                        value.trim()
+                    ));
+                }
+                continue;
+            }
+            if let Some(value) = line.strip_prefix("session=") {
+                if session.is_some() {
+                    return Err(format!("line {number}: session= is given twice"));
+                }
+                session =
+                    Some(session_name(value.trim()).map_err(|e| format!("line {number}: {e}"))?);
+                continue;
+            }
+        }
+        steps.push(parse_cdp_step(line).map_err(|e| format!("line {number}: {e}"))?);
+    }
+    if steps.is_empty() {
+        return Err(
+            "crawl body has no steps: give at least one URL, url=<url>, wait=<ms>, eval=<js> or a browser step"
+                .to_string(),
+        );
+    }
+    Ok(CdpCrawl { session, steps })
+}
+
+fn session_name(name: &str) -> Result<String, String> {
+    let valid = !name.is_empty()
+        && name.len() <= 64
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+    if valid {
+        Ok(name.to_string())
+    } else {
+        Err(format!(
+            "session name must be 1-64 letters, digits, '-' or '_', got '{name}'"
+        ))
+    }
+}
+
+fn parse_cdp_step(line: &str) -> Result<Value, String> {
+    let legacy = line.starts_with("url=")
+        || line.starts_with("wait=")
+        || line.starts_with("eval=")
+        || URL_SCHEMES.iter().any(|scheme| line.starts_with(scheme));
+    if legacy {
+        return parse_step(line);
+    }
+    parse_tool_step(line)
+}
+
+fn parse_tool_step(line: &str) -> Result<Value, String> {
+    let (name, arg) = match line.split_once('=') {
+        Some((name, arg)) => (name.trim(), Some(arg.trim())),
+        None => (line.trim(), None),
+    };
+    let step = match (name, arg) {
+        ("snapshot" | "console" | "reload" | "back" | "forward" | "trace_start", None) => {
+            json!({ "op": name })
+        }
+        ("network", None) => json!({ "op": "network" }),
+        ("network", Some(id)) => json!({ "op": "network", "reqid": require_number(id, "reqid")? }),
+        ("trace_stop", None) => json!({ "op": "trace_stop" }),
+        ("trace_stop", Some(path)) => {
+            json!({ "op": "trace_stop", "path": non_empty(path, "trace_stop path")? })
+        }
+        ("click" | "dblclick" | "hover", Some(uid)) => {
+            json!({ "op": name, "uid": require_uid(uid)? })
+        }
+        ("click_at", Some(point)) => {
+            let (x, y) = point
+                .split_once(',')
+                .ok_or_else(|| "click_at needs x,y in CSS pixels".to_string())?;
+            json!({ "op": "click_at", "x": require_coordinate(x)?, "y": require_coordinate(y)? })
+        }
+        ("fill", Some(rest)) => {
+            let (uid, value) = split_first_word(rest);
+            json!({ "op": "fill", "uid": require_uid(uid)?, "value": value })
+        }
+        ("type", Some(text)) => json!({ "op": "type", "text": non_empty(text, "type text")? }),
+        ("press", Some(key)) => json!({ "op": "press", "key": non_empty(key, "press key")? }),
+        ("press_uid", Some(rest)) => {
+            let (uid, key) = split_first_word(rest);
+            json!({ "op": "press", "uid": require_uid(uid)?, "key": non_empty(key, "press key")? })
+        }
+        ("upload", Some(rest)) => {
+            let (uid, paths) = split_first_word(rest);
+            let files: Vec<String> = paths
+                .split(';')
+                .map(str::trim)
+                .filter(|p| !p.is_empty())
+                .map(String::from)
+                .collect();
+            if files.is_empty() {
+                return Err("upload needs a file path after the uid".to_string());
+            }
+            json!({ "op": "upload", "uid": require_uid(uid)?, "paths": files })
+        }
+        ("wait_for", Some(text)) => {
+            json!({ "op": "wait_for", "text": non_empty(text, "wait_for text")? })
+        }
+        ("dialog", Some(action)) if action == "accept" || action == "dismiss" => {
+            json!({ "op": "dialog", "action": action })
+        }
+        ("screenshot", Some(path)) => {
+            json!({ "op": "screenshot", "path": non_empty(path, "screenshot path")? })
+        }
+        ("screenshot_full", Some(path)) => {
+            json!({ "op": "screenshot", "path": non_empty(path, "screenshot path")?, "full": true })
+        }
+        ("screenshot_uid", Some(rest)) => {
+            let (uid, path) = split_first_word(rest);
+            json!({ "op": "screenshot", "uid": require_uid(uid)?, "path": non_empty(path, "screenshot path")? })
+        }
+        _ => {
+            return Err(format!(
+                "unrecognized crawl step '{}' (expected url=<url>, a bare URL, wait=<ms>, eval=<js>, or one of: {TOOL_STEP_GRAMMAR})",
+                line.chars().take(80).collect::<String>()
+            ))
+        }
+    };
+    Ok(step)
+}
+
+fn split_first_word(rest: &str) -> (&str, &str) {
+    match rest.split_once(char::is_whitespace) {
+        Some((head, tail)) => (head, tail.trim_start()),
+        None => (rest, ""),
+    }
+}
+
+fn require_uid(uid: &str) -> Result<String, String> {
+    if !uid.is_empty() && uid.bytes().all(|b| b.is_ascii_digit()) {
+        Ok(uid.to_string())
+    } else {
+        Err(format!(
+            "uid must be the number printed in a snapshot line, got '{uid}'"
+        ))
+    }
+}
+
+fn require_number(value: &str, what: &str) -> Result<u64, String> {
+    value
+        .parse::<u64>()
+        .map_err(|_| format!("{what} must be a whole number, got '{value}'"))
+}
+
+fn require_coordinate(value: &str) -> Result<f64, String> {
+    match value.trim().parse::<f64>() {
+        Ok(number) if number.is_finite() => Ok(number),
+        _ => Err(format!(
+            "click_at coordinates must be numbers, got '{value}'"
+        )),
+    }
+}
+
+fn non_empty(value: &str, what: &str) -> Result<String, String> {
+    if value.is_empty() {
+        Err(format!("{what} is empty"))
+    } else {
+        Ok(value.to_string())
+    }
 }
 
 pub fn find_on_path(name: &str) -> Option<PathBuf> {
@@ -320,8 +524,19 @@ pub fn run_helper(
     budget: Duration,
     browser_session: bool,
 ) -> Result<HelperRun, String> {
+    run_helper_with(port, target_id, steps, budget, browser_session, json!({}))
+}
+
+fn run_helper_with(
+    port: u16,
+    target_id: Option<&str>,
+    steps: &[Value],
+    budget: Duration,
+    browser_session: bool,
+    extra: Value,
+) -> Result<HelperRun, String> {
     let node = find_on_path("node").ok_or("node is required on PATH to run the crawl helper")?;
-    let config = json!({
+    let mut config = json!({
         "port": port,
         "targetId": target_id,
         "browserSession": browser_session,
@@ -329,6 +544,11 @@ pub fn run_helper(
         "pageTimeoutMs": 30000,
         "textLimit": 20000,
     });
+    if let (Some(base), Some(extra)) = (config.as_object_mut(), extra.as_object()) {
+        for (key, value) in extra {
+            base.insert(key.clone(), value.clone());
+        }
+    }
     let mut cmd = Command::new(node);
     cmd.arg("--input-type=module")
         .env("GM_CRAWL_CONFIG", config.to_string())
@@ -428,28 +648,41 @@ pub fn crawl_reply_from_run(
 /// The call holds a lease on it and releases the lease on return.
 pub fn crawl_cdp(cwd: &Path, body: &str) -> Value {
     let started = Instant::now();
-    let parsed = match parse_crawl_body(body) {
+    let parsed = match parse_cdp_crawl_body(body) {
         Ok(parsed) => parsed,
         Err(e) => return crawl_error_reply("cdp", false, started, e),
     };
-    if parsed.engine.as_deref() == Some("lightpanda") {
-        return crawl_error_reply(
-            "cdp",
-            false,
-            started,
-            "engine=lightpanda is served by the agentplug-lightpanda plugin, not crawl_cdp"
-                .to_string(),
-        );
-    }
     let agent = crawl_lease::next_agent_id();
     let (port, _) = match crawl_lease::acquire(cwd, &agent) {
         Ok(attached) => attached,
         Err(e) => return crawl_error_reply("cdp", false, started, e),
     };
-    let run = run_helper(port, None, &parsed.steps, CDP_HELPER_BUDGET, false);
+    let run = run_helper_with(
+        port,
+        None,
+        &parsed.steps,
+        CDP_HELPER_BUDGET,
+        false,
+        cdp_run_config(cwd, parsed.session.as_deref()),
+    );
     crawl_lease::release(cwd, &agent);
     match run {
         Ok(run) => crawl_reply_from_run("cdp", false, started, run),
         Err(e) => crawl_error_reply("cdp", false, started, e),
     }
+}
+
+fn cdp_run_config(cwd: &Path, session: Option<&str>) -> Value {
+    let mut config = json!({
+        "cwd": cwd.display().to_string(),
+        "watchdogMs": CDP_HELPER_BUDGET.as_millis() as u64 - 10_000,
+    });
+    if let Some(name) = session {
+        let file = cwd
+            .join(".gm")
+            .join("crawl-cdp-sessions")
+            .join(format!("{name}.json"));
+        config["session"] = json!({ "name": name, "file": file.display().to_string() });
+    }
+    config
 }

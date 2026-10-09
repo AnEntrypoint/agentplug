@@ -13,14 +13,12 @@ use crate::crawl::{
 };
 use crate::windowless::apply_windowless;
 
-pub const SHARED_BROWSER_IDLE_CLOSE: Duration = Duration::from_secs(15 * 60);
 pub const HOUSEKEEPING_TICK: Duration = Duration::from_secs(30);
 
 struct SharedBrowser {
     child: Child,
     port: u16,
     active: HashSet<String>,
-    idle_since: Option<Instant>,
 }
 
 static BROWSERS: OnceLock<Mutex<HashMap<PathBuf, SharedBrowser>>> = OnceLock::new();
@@ -93,6 +91,12 @@ fn launch(root: &Path) -> Result<SharedBrowser, String> {
         "no Chrome found: set GM_BROWSER_CHROME_PATH or CHROME_PATH, or install Google Chrome or Chromium"
             .to_string()
     })?;
+    if is_headless_shell(&chrome) {
+        return Err(format!(
+            "{} is a headless shell, and the cdp engine needs a headful Chrome: point GM_BROWSER_CHROME_PATH or CHROME_PATH at chrome.exe",
+            chrome.display()
+        ));
+    }
     let port = free_local_port()?;
     let profile = root.join(".gm").join("crawl-cdp-profile");
     reap_stale_crawl_browsers(&profile);
@@ -119,7 +123,6 @@ fn launch(root: &Path) -> Result<SharedBrowser, String> {
         child,
         port,
         active: HashSet::new(),
-        idle_since: Some(Instant::now()),
     };
     if !endpoint_ready(port, Instant::now() + CDP_READY_DEADLINE, CDP_POLL_INTERVAL) {
         close_browser(&mut browser);
@@ -129,6 +132,15 @@ fn launch(root: &Path) -> Result<SharedBrowser, String> {
         ));
     }
     Ok(browser)
+}
+
+/// A headless shell is Chrome without a window. The cdp engine never runs one,
+/// so the binary is refused by name before any process starts.
+fn is_headless_shell(chrome: &Path) -> bool {
+    chrome
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.to_ascii_lowercase().contains("headless"))
 }
 
 fn close_browser(browser: &mut SharedBrowser) {
@@ -157,30 +169,42 @@ pub fn acquire(root: &Path, agent: &str) -> Result<(u16, u32), String> {
     };
     sweep_stale_leases(root, &browser.active);
     browser.active.insert(agent.to_string());
-    browser.idle_since = None;
     let port = browser.port;
     let chrome_pid = browser.child.id();
     if let Err(e) = write_lease(root, agent, port, chrome_pid) {
-        browser.active.remove(agent);
+        let unused = browser.active.remove(agent) && browser.active.is_empty();
+        if unused {
+            if let Some(mut idle) = map.remove(root) {
+                close_browser(&mut idle);
+            }
+        }
         return Err(e);
     }
     Ok((port, chrome_pid))
 }
 
-/// Detaches `agent`, deletes its lease file, and starts the idle clock when no
-/// lease remains.
+/// Detaches `agent` and deletes its lease file. When the last lease goes, the
+/// shared Chrome closes with it: the run that opened the window closes it.
 pub fn release(root: &Path, agent: &str) {
-    if let Some(browser) = browsers().get_mut(root) {
-        browser.active.remove(agent);
-        if browser.active.is_empty() {
-            browser.idle_since = Some(Instant::now());
+    let mut map = browsers();
+    let last_lease_gone = match map.get_mut(root) {
+        Some(browser) => {
+            browser.active.remove(agent);
+            browser.active.is_empty()
+        }
+        None => false,
+    };
+    if last_lease_gone {
+        if let Some(mut browser) = map.remove(root) {
+            close_browser(&mut browser);
         }
     }
     let _ = std::fs::remove_file(lease_path(root, agent));
 }
 
-/// Shared-browser state for `root`: liveness, port, pid, held leases, and the
-/// epoch-ms deadline at which the idle close fires (null while leases remain).
+/// Shared-browser state for `root`: liveness, port, pid and held leases.
+/// `close_deadline_ms` is always null because the browser closes as soon as
+/// its last lease releases.
 pub fn status(root: &Path) -> serde_json::Value {
     let mut map = browsers();
     let Some(browser) = map.get_mut(root) else {
@@ -195,14 +219,6 @@ pub fn status(root: &Path) -> serde_json::Value {
     let alive = matches!(browser.child.try_wait(), Ok(None));
     let mut leases: Vec<String> = browser.active.iter().cloned().collect();
     leases.sort();
-    let close_deadline_ms = match (browser.active.is_empty(), browser.idle_since) {
-        (true, Some(since)) => {
-            let remaining =
-                (since + SHARED_BROWSER_IDLE_CLOSE).saturating_duration_since(Instant::now());
-            json!(now_ms() + remaining.as_millis() as u64)
-        }
-        _ => json!(null),
-    };
     json!({
         "root": root.display().to_string(),
         "alive": alive,
@@ -210,7 +226,7 @@ pub fn status(root: &Path) -> serde_json::Value {
         "chrome_pid": browser.child.id(),
         "lease_count": leases.len(),
         "leases": leases,
-        "close_deadline_ms": close_deadline_ms,
+        "close_deadline_ms": null,
     })
 }
 
@@ -261,19 +277,13 @@ pub fn lease_reply(verb: &str, dispatch_root: &Path, body: &str) -> String {
     reply.to_string()
 }
 
-/// Closes a shared Chrome that has died or has had zero leases for
-/// `SHARED_BROWSER_IDLE_CLOSE`, and sweeps leases no live agent owns.
-pub fn housekeeping(now: Instant) {
+/// Closes a shared Chrome that has died, and sweeps leases no live agent owns.
+pub fn housekeeping(_now: Instant) {
     let mut map = browsers();
     let mut closing: Vec<PathBuf> = Vec::new();
     for (root, browser) in map.iter_mut() {
         sweep_stale_leases(root, &browser.active);
-        let dead = !matches!(browser.child.try_wait(), Ok(None));
-        let idle_expired = browser.active.is_empty()
-            && browser
-                .idle_since
-                .is_some_and(|since| now.duration_since(since) >= SHARED_BROWSER_IDLE_CLOSE);
-        if dead || idle_expired {
+        if !matches!(browser.child.try_wait(), Ok(None)) {
             closing.push(root.clone());
         }
     }

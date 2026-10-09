@@ -1,9 +1,10 @@
-// CDP crawl helper. Runs as `node --input-type=module` with this file on stdin.
-// Config arrives as JSON in the GM_CRAWL_CONFIG environment variable:
-//   { port, targetId?, browserSession?, steps: [{op:"goto",url}|{op:"wait",ms}|{op:"eval",code}],
-//     pageTimeoutMs, textLimit }
+// CDP crawl helper. The host concatenates crawl_cdp_tools.mjs ahead of this file and
+// runs the result as `node --input-type=module` on stdin. Config arrives as JSON in the
+// GM_CRAWL_CONFIG environment variable:
+//   { port, targetId?, browserSession?, cwd?, session?: {name, file}, steps, pageTimeoutMs, textLimit }
 // browserSession selects the lightpanda protocol: targets are created and attached over
 // the browser websocket, because lightpanda serves no HTTP target endpoints.
+// A session keeps its tab and its uid map across calls; its file is written atomically.
 // It prints exactly one JSON object on stdout and exits 0 when every step ran.
 
 const cfg = JSON.parse(process.env.GM_CRAWL_CONFIG || '{}');
@@ -16,10 +17,10 @@ async function getJson(path, method = 'GET') {
   return res.json();
 }
 
-async function acquireTarget() {
-  if (cfg.targetId) {
+async function acquireTarget(targetId) {
+  if (targetId) {
     const list = await getJson('/json/list');
-    const same = Array.isArray(list) && list.find((t) => t.id === cfg.targetId && t.webSocketDebuggerUrl);
+    const same = Array.isArray(list) && list.find((t) => t.id === targetId && t.webSocketDebuggerUrl);
     if (same) return same;
   }
   const created = await getJson('/json/new?about:blank', 'PUT');
@@ -43,6 +44,7 @@ function openSession(wsUrl, timeoutMs) {
   return new Promise((resolve, reject) => {
     const ws = new WebSocket(wsUrl);
     const pending = new Map();
+    const listeners = new Map();
     let nextId = 1;
     const timer = setTimeout(() => {
       try { ws.close(); } catch (_) {}
@@ -62,12 +64,25 @@ function openSession(wsUrl, timeoutMs) {
           ws.send(JSON.stringify(message));
         });
       },
+      on(method, handler) {
+        listeners.set(method, [...(listeners.get(method) || []), handler]);
+      },
       close() { try { ws.close(); } catch (_) {} },
     };
     ws.addEventListener('open', () => { clearTimeout(timer); resolve(session); });
     ws.addEventListener('message', (ev) => {
       let msg;
       try { msg = JSON.parse(ev.data); } catch (_) { return; }
+      if (msg.method) {
+        for (const handler of listeners.get(msg.method) || []) {
+          try {
+            handler(msg.params || {}, msg.sessionId);
+          } catch (error) {
+            listenerFaults.push(`${msg.method}: ${error.message}`);
+          }
+        }
+        return;
+      }
       if (!msg.id || !pending.has(msg.id)) return;
       const { res, rej } = pending.get(msg.id);
       pending.delete(msg.id);
@@ -108,7 +123,7 @@ async function waitForComplete(session, timeoutMs) {
 
 async function gotoStep(session, url) {
   await session.send('Page.enable');
-  const nav = await session.send('Page.navigate', { url });
+  const nav = await withDeadline(session.send('Page.navigate', { url }), cfg.pageTimeoutMs || 30000, `navigation to ${url}`);
   if (nav.errorText) throw new Error(`navigation to ${url} failed: ${nav.errorText}`);
   await waitForComplete(session, cfg.pageTimeoutMs || 30000);
   const limit = cfg.textLimit || 20000;
@@ -123,24 +138,57 @@ async function gotoStep(session, url) {
 async function main() {
   const started = Date.now();
   const out = { ok: false, targetId: null, pages: [], error: null };
+  const watchdog = cfg.watchdogMs
+    ? setTimeout(() => {
+      out.ok = false;
+      out.error = out.error || `crawl helper ran past its ${cfg.watchdogMs}ms budget`;
+      process.stdout.write(JSON.stringify(out) + '\n');
+      process.exit(1);
+    }, cfg.watchdogMs)
+    : null;
+  const steps = cfg.steps || [];
   let session = null;
   let close = () => {};
+  let ctx = null;
+  let unlock = () => {};
+  let persisted = null;
   try {
+    if (cfg.session) {
+      unlock = await lockSession(cfg.session.file, cfg.lockWaitMs || SESSION_LOCK_WAIT_MS);
+      persisted = readSessionFile(cfg.session.file);
+    }
     if (cfg.browserSession) {
       const info = await getJson('/json/version');
       const browser = await openSession(info.webSocketDebuggerUrl, 5000);
       close = () => browser.close();
       const attached = await attachBrowserTarget(browser);
       out.targetId = attached.targetId;
-      session = { send: (method, params) => browser.send(method, params, attached.sessionId) };
+      session = {
+        send: (method, params) => browser.send(method, params, attached.sessionId),
+        on: (method, handler) => browser.on(method, (params, sessionId) => {
+          if (sessionId === attached.sessionId) handler(params);
+        }),
+      };
     } else {
-      const target = await acquireTarget();
+      const target = await acquireTarget((persisted && persisted.targetId) || cfg.targetId);
       out.targetId = target.id;
       const page = await openSession(target.webSocketDebuggerUrl, 5000);
       close = () => page.close();
       session = page;
     }
-    for (const step of cfg.steps || []) {
+    ctx = createToolContext({
+      session,
+      host: { evaluate, waitForComplete, sleep },
+      cwd: cfg.cwd || process.cwd(),
+      timeoutMs: cfg.pageTimeoutMs || 30000,
+      textLimit: cfg.textLimit || 20000,
+    });
+    if (persisted) {
+      if (persisted.targetId === out.targetId) restoreUidState(ctx, persisted);
+      else ctx.nextUid = persisted.nextUid || 0;
+    }
+    await attachCapture(ctx, steps);
+    for (const step of steps) {
       if (step.op === 'goto') {
         out.pages.push(await gotoStep(session, step.url));
       } else if (step.op === 'wait') {
@@ -149,6 +197,8 @@ async function main() {
       } else if (step.op === 'eval') {
         const value = await evaluate(session, step.code);
         out.pages.push({ op: 'eval', code: step.code, value });
+      } else if (TOOL_OPS.has(step.op)) {
+        out.pages.push(await runToolStep(ctx, step));
       } else {
         throw new Error(`unknown crawl step op '${step.op}'`);
       }
@@ -157,8 +207,22 @@ async function main() {
   } catch (e) {
     out.error = String((e && e.message) || e);
   } finally {
+    if (cfg.session && ctx && out.targetId) {
+      try {
+        writeSessionFile(cfg.session.file, { version: SESSION_VERSION, targetId: out.targetId, ...snapshotUidState(ctx) });
+      } catch (e) {
+        out.ok = false;
+        out.error = out.error || `session state was not saved: ${e.message}`;
+      }
+    }
     close();
+    unlock();
+    if (!cfg.browserSession && !cfg.session && out.targetId) {
+      await fetch(`${endpoint}/json/close/${out.targetId}`, { signal: AbortSignal.timeout(3000) }).catch(() => {});
+    }
   }
+  if (watchdog) clearTimeout(watchdog);
+  if (listenerFaults.length) out.listenerFaults = listenerFaults;
   out.duration_ms = Date.now() - started;
   process.stdout.write(JSON.stringify(out) + '\n');
   process.exitCode = out.ok ? 0 : 1;

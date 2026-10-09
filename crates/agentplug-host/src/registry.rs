@@ -316,6 +316,7 @@ struct TicketQueue {
     heavy_inflight: usize,
     non_short_inflight: usize,
     blocking_inflight: usize,
+    git_band_inflight: usize,
 }
 
 impl TicketQueue {
@@ -328,9 +329,49 @@ impl TicketQueue {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AdmissionBand {
+    General,
+    GitBand,
+    Unmetered,
+}
+
+impl AdmissionBand {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AdmissionBand::General => "general",
+            AdmissionBand::GitBand => "git-band",
+            AdmissionBand::Unmetered => "unmetered",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct AdmissionRecord {
+    pub band: AdmissionBand,
+    pub waited_ms: u64,
+    pub limit: usize,
+    pub in_flight: usize,
+}
+
+thread_local! {
+    static LAST_ADMISSION: std::cell::Cell<Option<AdmissionRecord>> =
+        const { std::cell::Cell::new(None) };
+}
+
+fn record_admission(record: AdmissionRecord) {
+    LAST_ADMISSION.with(|slot| slot.set(Some(record)));
+}
+
+/// The admission decision this thread last took; reading it clears it.
+pub fn take_last_admission() -> Option<AdmissionRecord> {
+    LAST_ADMISSION.with(|slot| slot.take())
+}
+
 pub struct HeavyDispatchAdmission {
     pool: Option<Arc<SharedPluginPool>>,
     class: DispatchCostClass,
+    band: AdmissionBand,
 }
 
 impl Drop for HeavyDispatchAdmission {
@@ -338,9 +379,13 @@ impl Drop for HeavyDispatchAdmission {
         let Some(pool) = self.pool.take() else { return };
         {
             let mut q = pool.ticket_queue.lock().unwrap_or_else(|e| e.into_inner());
-            q.non_short_inflight = q.non_short_inflight.saturating_sub(1);
-            if self.class == DispatchCostClass::Heavy {
-                q.heavy_inflight = q.heavy_inflight.saturating_sub(1);
+            if self.band == AdmissionBand::GitBand {
+                q.git_band_inflight = q.git_band_inflight.saturating_sub(1);
+            } else {
+                q.non_short_inflight = q.non_short_inflight.saturating_sub(1);
+                if self.class == DispatchCostClass::Heavy {
+                    q.heavy_inflight = q.heavy_inflight.saturating_sub(1);
+                }
             }
         }
         pool.slot_released.notify_all();
@@ -465,6 +510,7 @@ impl SharedPluginPool {
                 heavy_inflight: 0,
                 non_short_inflight: 0,
                 blocking_inflight: 0,
+                git_band_inflight: 0,
             }),
             slot_released: Condvar::new(),
         }
@@ -497,6 +543,10 @@ impl SharedPluginPool {
             .len()
             .saturating_sub(reserved_for_short_verbs)
             .max(1)
+    }
+
+    fn git_band_admission_limit(&self) -> usize {
+        self.short_reserved_slots().saturating_sub(1)
     }
 
     pub fn admit_blocking(pool: &Arc<SharedPluginPool>, verb: &str) -> BlockingDispatchAdmission {
@@ -555,6 +605,7 @@ impl SharedPluginPool {
             .unwrap_or(HeavyDispatchAdmission {
                 pool: None,
                 class,
+                band: AdmissionBand::Unmetered,
             })
     }
 
@@ -563,13 +614,37 @@ impl SharedPluginPool {
         class: DispatchCostClass,
         max_wait: Duration,
     ) -> Result<HeavyDispatchAdmission, AdmissionWaitReport> {
+        Self::admit_within_lane(pool, class, None, max_wait)
+    }
+
+    /// Admission for one dispatch. A cheap dispatch on the git lane that finds the general band
+    /// full may take the git band instead: the single slot that the short-verb reserve leaves
+    /// free, so a quick git verb is not queued behind unrelated long work from other projects.
+    pub fn admit_within_lane(
+        pool: &Arc<SharedPluginPool>,
+        class: DispatchCostClass,
+        lane: Option<&'static str>,
+        max_wait: Duration,
+    ) -> Result<HeavyDispatchAdmission, AdmissionWaitReport> {
         if class == DispatchCostClass::Short || pool.slots.len() < 2 {
-            return Ok(HeavyDispatchAdmission { pool: None, class });
+            record_admission(AdmissionRecord {
+                band: AdmissionBand::Unmetered,
+                waited_ms: 0,
+                limit: 0,
+                in_flight: 0,
+            });
+            return Ok(HeavyDispatchAdmission {
+                pool: None,
+                class,
+                band: AdmissionBand::Unmetered,
+            });
         }
         let is_heavy = class == DispatchCostClass::Heavy;
+        let is_git_lane = !is_heavy && lane == Some("git");
         let kind: &'static str = if is_heavy { "heavy" } else { "cheap" };
         let limit = pool.non_short_admission_limit();
         let heavy_limit = pool.heavy_admission_limit();
+        let git_band_limit = pool.git_band_admission_limit();
         let start = Instant::now();
         let mut logged_at_ms = 0u64;
         loop {
@@ -582,9 +657,31 @@ impl SharedPluginPool {
                         q.heavy_inflight += 1;
                     }
                     clear_admission_wait();
+                    record_admission(AdmissionRecord {
+                        band: AdmissionBand::General,
+                        waited_ms: start.elapsed().as_millis() as u64,
+                        limit,
+                        in_flight: q.non_short_inflight,
+                    });
                     return Ok(HeavyDispatchAdmission {
                         pool: Some(pool.clone()),
                         class,
+                        band: AdmissionBand::General,
+                    });
+                }
+                if is_git_lane && q.git_band_inflight < git_band_limit {
+                    q.git_band_inflight += 1;
+                    clear_admission_wait();
+                    record_admission(AdmissionRecord {
+                        band: AdmissionBand::GitBand,
+                        waited_ms: start.elapsed().as_millis() as u64,
+                        limit: git_band_limit,
+                        in_flight: q.git_band_inflight,
+                    });
+                    return Ok(HeavyDispatchAdmission {
+                        pool: Some(pool.clone()),
+                        class,
+                        band: AdmissionBand::GitBand,
                     });
                 }
             }
@@ -1456,9 +1553,6 @@ fn dispatch_and_evict_on_error(
     result
 }
 
-static GM_INFLIGHT_BY_PROJECT: OnceLock<Mutex<HashMap<(PathBuf, &'static str), usize>>> =
-    OnceLock::new();
-
 static GM_PROJECT_STEP_RELEASED: OnceLock<Condvar> = OnceLock::new();
 
 struct ToolQueue {
@@ -1471,8 +1565,19 @@ static TOOL_INFLIGHT: OnceLock<Mutex<HashMap<String, ToolQueue>>> = OnceLock::ne
 
 static TOOL_STEP_RELEASED: OnceLock<Condvar> = OnceLock::new();
 
-fn gm_inflight_map() -> &'static Mutex<HashMap<(PathBuf, &'static str), usize>> {
-    GM_INFLIGHT_BY_PROJECT.get_or_init(|| Mutex::new(HashMap::new()))
+struct LaneOwner {
+    token: u64,
+    task: String,
+    acquired_ms: u64,
+}
+
+static GM_LANE_OWNERS: OnceLock<Mutex<HashMap<(PathBuf, &'static str), LaneOwner>>> =
+    OnceLock::new();
+
+static NEXT_LANE_TOKEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn gm_lane_owners() -> &'static Mutex<HashMap<(PathBuf, &'static str), LaneOwner>> {
+    GM_LANE_OWNERS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 fn gm_project_step_released() -> &'static Condvar {
@@ -1670,11 +1775,6 @@ fn gm_lane_waiters() -> &'static Mutex<HashMap<(PathBuf, &'static str), usize>> 
     WAITERS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn gm_lane_holders() -> &'static Mutex<HashMap<(PathBuf, &'static str), String>> {
-    static HOLDERS: OnceLock<Mutex<HashMap<(PathBuf, &'static str), String>>> = OnceLock::new();
-    HOLDERS.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
 fn tool_queue_holders() -> &'static Mutex<HashMap<String, String>> {
     static HOLDERS: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
     HOLDERS.get_or_init(|| Mutex::new(HashMap::new()))
@@ -1697,26 +1797,58 @@ pub struct ToolQueueWaitReport {
 pub struct GmFairnessGuard {
     root: PathBuf,
     lane: Option<&'static str>,
+    token: u64,
+}
+
+fn next_lane_token() -> u64 {
+    NEXT_LANE_TOKEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+fn lane_root_identity(root: &Path) -> String {
+    root.to_string_lossy()
+        .replace('\\', "/")
+        .trim_end_matches('/')
+        .to_ascii_lowercase()
+}
+
+pub struct AbandonedLaneOwner {
+    pub root: PathBuf,
+    pub lane: &'static str,
+    pub task: String,
+    pub held_ms: u64,
 }
 
 impl GmFairnessGuard {
     pub fn acquire(root: &Path, verb: &str, body: &str) -> Self {
         let root = root.to_path_buf();
         let Some(lane) = serial_lane_for_dispatch(verb, body) else {
-            return Self { root, lane: None };
+            return Self {
+                root,
+                lane: None,
+                token: 0,
+            };
         };
-        let mut map = gm_inflight_map().lock().unwrap_or_else(|e| e.into_inner());
+        let token = next_lane_token();
+        let mut owners = gm_lane_owners().lock().unwrap_or_else(|e| e.into_inner());
         loop {
-            let count = map.entry((root.clone(), lane)).or_insert(0);
-            if *count == 0 {
-                *count = 1;
+            let key = (root.clone(), lane);
+            if !owners.contains_key(&key) {
+                owners.insert(
+                    key,
+                    LaneOwner {
+                        token,
+                        task: String::new(),
+                        acquired_ms: crate::now_ms(),
+                    },
+                );
                 return Self {
                     root,
                     lane: Some(lane),
+                    token,
                 };
             }
-            map = gm_project_step_released()
-                .wait(map)
+            owners = gm_project_step_released()
+                .wait(owners)
                 .unwrap_or_else(|e| e.into_inner());
         }
     }
@@ -1733,6 +1865,7 @@ impl GmFairnessGuard {
             return Ok(Self {
                 root: owned_root,
                 lane: None,
+                token: 0,
             });
         };
         let started = Instant::now();
@@ -1740,26 +1873,31 @@ impl GmFairnessGuard {
             let mut waiters = gm_lane_waiters().lock().unwrap_or_else(|e| e.into_inner());
             *waiters.entry((owned_root.clone(), lane)).or_insert(0) += 1;
         }
-        let mut map = gm_inflight_map().lock().unwrap_or_else(|e| e.into_inner());
+        let token = next_lane_token();
+        let mut owners = gm_lane_owners().lock().unwrap_or_else(|e| e.into_inner());
         let acquired = loop {
-            let count = map.entry((owned_root.clone(), lane)).or_insert(0);
-            if *count == 0 {
-                *count = 1;
+            let key = (owned_root.clone(), lane);
+            if !owners.contains_key(&key) {
+                owners.insert(
+                    key,
+                    LaneOwner {
+                        token,
+                        task: task.to_string(),
+                        acquired_ms: crate::now_ms(),
+                    },
+                );
                 break true;
             }
             let remaining = max_wait.saturating_sub(started.elapsed());
             if remaining.is_zero() {
                 break false;
             }
-            let (next, timed_out) = gm_project_step_released()
-                .wait_timeout(map, remaining)
+            let (next, _) = gm_project_step_released()
+                .wait_timeout(owners, remaining)
                 .unwrap_or_else(|e| e.into_inner());
-            map = next;
-            if timed_out.timed_out() {
-                break false;
-            }
+            owners = next;
         };
-        drop(map);
+        drop(owners);
         let waiters = {
             let mut waiters = gm_lane_waiters().lock().unwrap_or_else(|e| e.into_inner());
             let key = (owned_root.clone(), lane);
@@ -1772,11 +1910,12 @@ impl GmFairnessGuard {
             remaining
         };
         if !acquired {
-            let lane_holder_task = gm_lane_holders()
+            let lane_holder_task = gm_lane_owners()
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .get(&(owned_root.clone(), lane))
-                .cloned();
+                .map(|owner| owner.task.clone())
+                .filter(|holder| !holder.is_empty());
             gm_project_step_released().notify_all();
             return Err(LaneWaitReport {
                 lane,
@@ -1785,13 +1924,10 @@ impl GmFairnessGuard {
                 lane_holder_task,
             });
         }
-        gm_lane_holders()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert((owned_root.clone(), lane), task.to_string());
         Ok(Self {
             root: owned_root,
             lane: Some(lane),
+            token,
         })
     }
 }
@@ -1802,20 +1938,56 @@ impl Drop for GmFairnessGuard {
             return;
         };
         let key = (self.root.clone(), lane);
-        gm_lane_holders()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&key);
-        let mut map = gm_inflight_map().lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(count) = map.get_mut(&key) {
-            *count = count.saturating_sub(1);
-            if *count == 0 {
-                map.remove(&key);
-            }
+        let mut owners = gm_lane_owners().lock().unwrap_or_else(|e| e.into_inner());
+        if owners.get(&key).map(|owner| owner.token) == Some(self.token) {
+            owners.remove(&key);
         }
-        drop(map);
+        drop(owners);
         gm_project_step_released().notify_all();
     }
+}
+
+/// Frees each project lane whose owner has no live requester and has held the lane for at least
+/// `min_held_ms`. The owning dispatch keeps running; its guard then finds a different token (or
+/// none) on drop and leaves the lane alone.
+pub fn release_abandoned_lane_owners(
+    live_roots: &[PathBuf],
+    min_held_ms: u64,
+) -> Vec<AbandonedLaneOwner> {
+    let now = crate::now_ms();
+    let live: std::collections::HashSet<String> = live_roots
+        .iter()
+        .map(|root| lane_root_identity(root))
+        .collect();
+    let candidates: Vec<((PathBuf, &'static str), u64)> = gm_lane_owners()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .filter(|(_, owner)| now.saturating_sub(owner.acquired_ms) >= min_held_ms)
+        .map(|(key, owner)| (key.clone(), owner.token))
+        .collect();
+    let mut released = Vec::new();
+    for (key, token) in candidates {
+        if live.contains(&lane_root_identity(&key.0)) {
+            continue;
+        }
+        let mut owners = gm_lane_owners().lock().unwrap_or_else(|e| e.into_inner());
+        if owners.get(&key).map(|owner| owner.token) != Some(token) {
+            continue;
+        }
+        if let Some(owner) = owners.remove(&key) {
+            released.push(AbandonedLaneOwner {
+                root: key.0.clone(),
+                lane: key.1,
+                task: owner.task,
+                held_ms: now.saturating_sub(owner.acquired_ms),
+            });
+        }
+    }
+    if !released.is_empty() {
+        gm_project_step_released().notify_all();
+    }
+    released
 }
 
 pub struct ToolDispatchGuard {
