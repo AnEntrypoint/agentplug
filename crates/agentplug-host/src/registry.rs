@@ -1420,12 +1420,11 @@ impl ProjectPlugins {
         let (mut guard, _waited_ms) =
             pool.acquire_within_for_class(SharedPluginPool::ACQUIRE_TIMEOUT_MS, cost_class);
         if guard.is_none() {
-            let source = reload_entry(None, plugin_name);
             if let Err(detail) =
-                reinstantiate_evicted_slot_once(&mut guard, &self.root, plugin_name, verb, source)
+                refill_evicted_slot(&mut guard, None, &self.root, plugin_name, verb)
             {
-                eprintln!("[agentplug registry] plugin {plugin_name} slot was evicted for verb {verb} and its one in-place reinstantiation failed -- {detail}");
-                log_poisoned_store_eviction_event(&self.root, plugin_name, verb, false, &format!("in-place reinstantiation failed: {detail}"));
+                eprintln!("[agentplug registry] plugin {plugin_name} slot was evicted for verb {verb} and its refill did not repopulate it -- {detail}");
+                log_poisoned_store_eviction_event(&self.root, plugin_name, verb, false, &format!("empty-slot refill failed: {detail}"));
                 return Err(PluginDispatchError::EvictedOrPoisoned {
                     plugin_name: plugin_name.to_string(),
                 }
@@ -1440,6 +1439,7 @@ impl ProjectPlugins {
             &self.root,
             &self.siblings,
             plugin_name,
+            None,
         )
     }
 
@@ -1565,12 +1565,15 @@ impl DispatchHandle {
         let (mut guard, _waited_ms) =
             pool.acquire_within_for_class(SharedPluginPool::ACQUIRE_TIMEOUT_MS, cost_class);
         if guard.is_none() {
-            let source = reload_entry(self.reload_source.as_ref(), plugin_name);
-            if let Err(detail) =
-                reinstantiate_evicted_slot_once(&mut guard, &self.root, plugin_name, verb, source)
-            {
-                eprintln!("[agentplug registry] plugin {plugin_name} slot was evicted for verb {verb} and its one in-place reinstantiation failed -- {detail}");
-                log_poisoned_store_eviction_event(&self.root, plugin_name, verb, false, &format!("in-place reinstantiation failed: {detail}"));
+            if let Err(detail) = refill_evicted_slot(
+                &mut guard,
+                self.reload_source.as_ref(),
+                &self.root,
+                plugin_name,
+                verb,
+            ) {
+                eprintln!("[agentplug registry] plugin {plugin_name} slot was evicted for verb {verb} and its refill did not repopulate it -- {detail}");
+                log_poisoned_store_eviction_event(&self.root, plugin_name, verb, false, &format!("empty-slot refill failed: {detail}"));
                 return Err(PluginDispatchError::EvictedOrPoisoned {
                     plugin_name: plugin_name.to_string(),
                 }
@@ -1585,6 +1588,7 @@ impl DispatchHandle {
             &self.root,
             &self.siblings,
             plugin_name,
+            self.reload_source.as_ref(),
         )
     }
 }
@@ -1640,6 +1644,37 @@ fn reinstantiate_evicted_slot_once(
     Ok(())
 }
 
+const EVICTED_SLOT_REFILL_ATTEMPTS: usize = 3;
+const EVICTED_SLOT_REFILL_BACKOFF_MS: u64 = 150;
+
+fn refill_evicted_slot(
+    guard: &mut std::sync::MutexGuard<'_, Option<SiblingHandle>>,
+    local: Option<&SiblingReloadSource>,
+    root: &Path,
+    plugin_name: &str,
+    verb: &str,
+) -> Result<(), String> {
+    let mut last = String::from("no reload source holds this plugin");
+    for attempt in 0..EVICTED_SLOT_REFILL_ATTEMPTS {
+        let source = reload_entry(local, plugin_name);
+        match reinstantiate_evicted_slot_once(guard, root, plugin_name, verb, source) {
+            Ok(()) if guard.is_some() => return Ok(()),
+            Ok(()) => {
+                last = "reload reported success but the slot is still empty".to_string();
+            }
+            Err(detail) => last = detail,
+        }
+        if attempt + 1 < EVICTED_SLOT_REFILL_ATTEMPTS && EVICTED_SLOT_REFILL_BACKOFF_MS > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(
+                EVICTED_SLOT_REFILL_BACKOFF_MS,
+            ));
+        }
+    }
+    Err(format!(
+        "reload did not repopulate the slot after {EVICTED_SLOT_REFILL_ATTEMPTS} attempts: {last}"
+    ))
+}
+
 fn dispatch_and_evict_on_error(
     guard: &mut std::sync::MutexGuard<'_, Option<SiblingHandle>>,
     pool: &Arc<SharedPluginPool>,
@@ -1648,6 +1683,7 @@ fn dispatch_and_evict_on_error(
     root: &Path,
     siblings: &Arc<Mutex<HashMap<String, Arc<SharedPluginPool>>>>,
     plugin_name: &str,
+    local: Option<&SiblingReloadSource>,
 ) -> anyhow::Result<String> {
     let handle = guard.as_mut().ok_or_else(|| {
         eprintln!("[agentplug registry] plugin {plugin_name} slot empty at dispatch of verb {verb} -- previously evicted for a poisoned Store, reload did not repopulate it");
@@ -1664,14 +1700,20 @@ fn dispatch_and_evict_on_error(
     );
     if let Err(poisoning_error) = &result {
         eprintln!("[agentplug registry] evicting plugin {plugin_name} slot -- verb {verb} poisoned its Store: {poisoning_error}");
-        log_poisoned_store_eviction_event(
-            root,
-            plugin_name,
-            verb,
-            true,
-            &poisoning_error.to_string(),
-        );
         **guard = None;
+        match refill_evicted_slot(guard, local, root, plugin_name, verb) {
+            Ok(()) => log_poisoned_store_eviction_event(
+                root,
+                plugin_name,
+                verb,
+                true,
+                &poisoning_error.to_string(),
+            ),
+            Err(detail) => {
+                eprintln!("[agentplug registry] plugin {plugin_name} slot could not be refilled in place after verb {verb} poisoned its Store -- {detail}");
+                log_poisoned_store_eviction_event(root, plugin_name, verb, false, &detail);
+            }
+        }
     } else {
         pool.evict_if_swap_pending(guard);
     }
