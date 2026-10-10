@@ -1020,6 +1020,13 @@ pub(super) const SPOOL_OUT_MIN_AGE_MS: u64 = 10 * 60 * 1000;
 pub(super) const SPOOL_OUT_DEFAULT_MAX_FILES: usize = 3000;
 pub(super) const SPOOL_OUT_DEFAULT_MAX_AGE_MS: u64 = 24 * 60 * 60 * 1000;
 pub(super) const SPOOL_OUT_MAX_REAP_PER_PASS: usize = 1500;
+/// An answered out-file is kept at least this long after it was written, whatever the file count: a
+/// witness is cited against its dispatch id within two hours, and once the 500-entry dispatch ledger
+/// has aged that id out, the out-file is the only copy of the answer.
+pub(super) const SPOOL_OUT_WITNESS_HORIZON_MS: u64 = 2 * 60 * 60 * 1000;
+/// Disk safety valve for a request flood: above this many out-files the oldest are trimmed even
+/// inside the witness horizon.
+pub(super) const SPOOL_OUT_HARD_MAX_FILES: usize = 20_000;
 
 pub(super) fn spool_out_env_usize(name: &str, default: usize) -> usize {
     std::env::var(name)
@@ -1067,19 +1074,6 @@ pub(super) fn out_meta_stamp_ms(metadata: &fs::Metadata, now: u64) -> u64 {
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|d| d.as_millis() as u64)
         .unwrap_or(now)
-}
-
-pub(super) fn out_stamp_ms(stem: &str) -> Option<u64> {
-    let mut tail = stem.rsplitn(3, '-');
-    let seq = tail.next().unwrap_or_default();
-    let stamp = tail.next().unwrap_or_default();
-    if seq.is_empty() || !seq.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    if stamp.len() < 12 || !stamp.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    stamp.parse::<u64>().ok()
 }
 
 pub(super) fn remove_out_file_and_markers(path: &Path) {
@@ -1163,7 +1157,6 @@ pub fn reap_spool_out_files(root: &Path, force: bool) -> usize {
     }
     let mut rows: Vec<OutRow> = Vec::new();
     let mut total_entries = 0usize;
-    let mut stat_fallbacks = 0usize;
     let mut stale_tmp = 0usize;
     let mut json_names: HashSet<String> = HashSet::new();
     let mut ready_markers: Vec<(PathBuf, String)> = Vec::new();
@@ -1196,17 +1189,11 @@ pub fn reap_spool_out_files(root: &Path, force: bool) -> usize {
             .file_stem()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_default();
-        let stamp_ms = match out_stamp_ms(&stem) {
-            Some(ms) => ms,
-            None => {
-                stat_fallbacks += 1;
-                entry
-                    .metadata()
-                    .ok()
-                    .map(|m| out_meta_stamp_ms(&m, now))
-                    .unwrap_or(now)
-            }
-        };
+        let stamp_ms = entry
+            .metadata()
+            .ok()
+            .map(|m| out_meta_stamp_ms(&m, now))
+            .unwrap_or(now);
         rows.push(OutRow {
             path: entry.path(),
             stem,
@@ -1234,6 +1221,7 @@ pub fn reap_spool_out_files(root: &Path, force: bool) -> usize {
             orphan_markers += 1;
         }
     }
+    let hard_excess = rows.len().saturating_sub(SPOOL_OUT_HARD_MAX_FILES);
     let mut reaped = 0usize;
     for (index, row) in rows.iter().enumerate() {
         if reaped >= SPOOL_OUT_MAX_REAP_PER_PASS {
@@ -1246,9 +1234,11 @@ pub fn reap_spool_out_files(root: &Path, force: bool) -> usize {
         if live.contains(&row.stem) {
             continue;
         }
-        let over_count_cap = index < over_cap;
-        let expired_by_age = age_ms >= max_age_ms;
-        if !(over_count_cap || expired_by_age) {
+        let past_horizon = age_ms >= SPOOL_OUT_WITNESS_HORIZON_MS;
+        let over_count_cap = past_horizon && index < over_cap;
+        let expired_by_age = past_horizon && age_ms >= max_age_ms;
+        let over_hard_cap = index < hard_excess;
+        if !(over_count_cap || expired_by_age || over_hard_cap) {
             continue;
         }
         remove_out_file_and_markers(&row.path);
@@ -1256,16 +1246,16 @@ pub fn reap_spool_out_files(root: &Path, force: bool) -> usize {
     }
     if reaped > 0 || stale_tmp > 0 || orphan_markers > 0 {
         eprintln!(
-            "[agentplug daemon] reaped {} answered out-file(s), {} orphaned .ready marker(s) and {} stale tmp file(s) under {} -- out/ had {} entries ({} json, {} needed a stat), capped at {} files / {}h, {} dispatches still live",
+            "[agentplug daemon] reaped {} answered out-file(s), {} orphaned .ready marker(s) and {} stale tmp file(s) under {} -- out/ had {} entries ({} json), kept at least {}h, capped at {} files past that horizon (hard ceiling {}), {} dispatches still live",
             reaped,
             orphan_markers,
             stale_tmp,
             out_dir.display(),
             total_entries,
             rows.len(),
-            stat_fallbacks,
+            SPOOL_OUT_WITNESS_HORIZON_MS / (60 * 60 * 1000),
             max_files,
-            max_age_ms / (60 * 60 * 1000),
+            SPOOL_OUT_HARD_MAX_FILES,
             live.len()
         );
     }
