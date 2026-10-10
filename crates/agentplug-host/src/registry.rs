@@ -123,6 +123,7 @@ pub enum PluginDispatchError {
     },
     EvictedOrPoisoned {
         plugin_name: String,
+        detail: String,
     },
     AdmissionStarved {
         kind: &'static str,
@@ -140,8 +141,8 @@ impl std::fmt::Display for PluginDispatchError {
             PluginDispatchError::NotRegistered { plugin_name } => {
                 write!(f, "plugin {plugin_name} is not registered for this project (no plugin pool exists -- check .agentplug/plugins.txt and daemon startup logs for a compile/install failure)")
             }
-            PluginDispatchError::EvictedOrPoisoned { plugin_name } => {
-                write!(f, "plugin {plugin_name} slot was evicted after a prior dispatch error (poisoned Store) and could not be reinstantiated -- retry will attempt to reload it")
+            PluginDispatchError::EvictedOrPoisoned { plugin_name, detail } => {
+                write!(f, "plugin {plugin_name} slot is unusable: {detail}")
             }
             PluginDispatchError::AdmissionStarved {
                 kind,
@@ -183,6 +184,24 @@ fn log_poisoned_store_eviction_event(
         "verb": verb,
         "reinstantiation_succeeded": reinstantiation_succeeded,
         "prior_dispatch_error": prior_dispatch_error,
+        "ts": crate::now_ms(),
+    });
+    crate::watcher_log::append_watcher_line(root, &format!("evt: {line}"));
+}
+
+fn log_poisoned_store_recovery_event(
+    root: &Path,
+    plugin_name: &str,
+    verb: &str,
+    recovered_in_place: bool,
+    detail: &str,
+) {
+    let line = serde_json::json!({
+        "event": "plugin_poisoned_store_recovered",
+        "plugin": plugin_name,
+        "verb": verb,
+        "recovered_in_place": recovered_in_place,
+        "detail": detail,
         "ts": crate::now_ms(),
     });
     crate::watcher_log::append_watcher_line(root, &format!("evt: {line}"));
@@ -297,7 +316,7 @@ pub struct SharedPluginPool {
     slots: Vec<Arc<Mutex<Option<SiblingHandle>>>>,
     last_observed_slot_hashes: Mutex<Vec<Option<String>>>,
     hashes_to_evict_when_their_in_flight_dispatch_completes:
-        Mutex<std::collections::HashSet<String>>,
+        Mutex<std::collections::HashMap<String, usize>>,
     ticket_queue: Mutex<TicketQueue>,
     slot_released: Condvar,
 }
@@ -554,7 +573,7 @@ impl SharedPluginPool {
             slots: (0..size).map(|_| Arc::new(Mutex::new(None))).collect(),
             last_observed_slot_hashes: Mutex::new(vec![None; size]),
             hashes_to_evict_when_their_in_flight_dispatch_completes: Mutex::new(
-                std::collections::HashSet::new(),
+                std::collections::HashMap::new(),
             ),
             ticket_queue: Mutex::new(TicketQueue {
                 cheap: ClassTicketQueue {
@@ -977,10 +996,12 @@ impl SharedPluginPool {
             }
         }
         if deferred > 0 {
-            self.hashes_to_evict_when_their_in_flight_dispatch_completes
+            *self
+                .hashes_to_evict_when_their_in_flight_dispatch_completes
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .insert(old_hash.to_string());
+                .entry(old_hash.to_string())
+                .or_insert(0) += deferred;
         }
         (evicted, deferred)
     }
@@ -990,13 +1011,39 @@ impl SharedPluginPool {
         guard: &mut std::sync::MutexGuard<'_, Option<SiblingHandle>>,
     ) {
         let Some(handle) = guard.as_ref() else { return };
-        let pending = self
+        let content_hash = handle.content_hash.clone();
+        if !self
+            .hashes_to_evict_when_their_in_flight_dispatch_completes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(&content_hash)
+        {
+            return;
+        }
+        **guard = None;
+        self.note_pending_eviction_consumed(&content_hash);
+    }
+
+    /// One slot has just dropped the superseded module, so one owed eviction is
+    /// discharged. A swap once inserted the hash and removed it only when a
+    /// LATER swap of the same bytes happened to name it, so the entry outlived
+    /// the slots it was inserted for and then emptied a slot after every
+    /// successful dispatch for as long as that module stayed loaded. Counting
+    /// owed evictions makes the entry disappear exactly when it is paid.
+    pub fn note_pending_eviction_consumed(&self, hash: &str) {
+        let mut pending = self
             .hashes_to_evict_when_their_in_flight_dispatch_completes
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        if pending.contains(&handle.content_hash) {
-            drop(pending);
-            **guard = None;
+        let paid_off = match pending.get_mut(hash) {
+            Some(owed) => {
+                *owed = owed.saturating_sub(1);
+                *owed == 0
+            }
+            None => false,
+        };
+        if paid_off {
+            pending.remove(hash);
         }
     }
 
@@ -1011,7 +1058,7 @@ impl SharedPluginPool {
         self.hashes_to_evict_when_their_in_flight_dispatch_completes
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .iter()
+            .keys()
             .cloned()
             .collect()
     }
@@ -1427,6 +1474,7 @@ impl ProjectPlugins {
                 log_poisoned_store_eviction_event(&self.root, plugin_name, verb, false, &format!("empty-slot refill failed: {detail}"));
                 return Err(PluginDispatchError::EvictedOrPoisoned {
                     plugin_name: plugin_name.to_string(),
+                    detail: format!("empty-slot refill failed: {detail}"),
                 }
                 .into());
             }
@@ -1576,6 +1624,7 @@ impl DispatchHandle {
                 log_poisoned_store_eviction_event(&self.root, plugin_name, verb, false, &format!("empty-slot refill failed: {detail}"));
                 return Err(PluginDispatchError::EvictedOrPoisoned {
                     plugin_name: plugin_name.to_string(),
+                    detail: format!("empty-slot refill failed: {detail}"),
                 }
                 .into());
             }
@@ -1688,8 +1737,12 @@ fn dispatch_and_evict_on_error(
     let handle = guard.as_mut().ok_or_else(|| {
         eprintln!("[agentplug registry] plugin {plugin_name} slot empty at dispatch of verb {verb} -- previously evicted for a poisoned Store, reload did not repopulate it");
         log_poisoned_store_eviction_event(root, plugin_name, verb, false, "slot already empty from a prior eviction, reload did not repopulate it");
-        PluginDispatchError::EvictedOrPoisoned { plugin_name: plugin_name.to_string() }
+        PluginDispatchError::EvictedOrPoisoned {
+            plugin_name: plugin_name.to_string(),
+            detail: "slot was empty from a prior poisoned-Store eviction and the in-place reload did not repopulate it".to_string(),
+        }
     })?;
+    let content_hash = handle.content_hash.clone();
     let result = dispatch_on(
         &mut handle.store,
         handle.instance,
@@ -1698,26 +1751,82 @@ fn dispatch_and_evict_on_error(
         root,
         siblings.clone(),
     );
-    if let Err(poisoning_error) = &result {
-        eprintln!("[agentplug registry] evicting plugin {plugin_name} slot -- verb {verb} poisoned its Store: {poisoning_error}");
-        **guard = None;
-        match refill_evicted_slot(guard, local, root, plugin_name, verb) {
-            Ok(()) => log_poisoned_store_eviction_event(
-                root,
-                plugin_name,
-                verb,
-                true,
-                &poisoning_error.to_string(),
-            ),
-            Err(detail) => {
-                eprintln!("[agentplug registry] plugin {plugin_name} slot could not be refilled in place after verb {verb} poisoned its Store -- {detail}");
-                log_poisoned_store_eviction_event(root, plugin_name, verb, false, &detail);
+    if result.is_ok() {
+        pool.evict_if_swap_pending(guard);
+        return result;
+    }
+    let poisoning_detail = result
+        .as_ref()
+        .err()
+        .map(|e| e.to_string())
+        .unwrap_or_default();
+    eprintln!("[agentplug registry] evicting plugin {plugin_name} slot -- verb {verb} poisoned its Store: {poisoning_detail}");
+    pool.note_pending_eviction_consumed(&content_hash);
+    **guard = None;
+    match refill_evicted_slot(guard, local, root, plugin_name, verb) {
+        Ok(()) => {
+            log_poisoned_store_eviction_event(root, plugin_name, verb, true, &poisoning_detail);
+            // A run that hit the call deadline already spent its whole budget; a
+            // second identical run spends it again and holds the slot for both.
+            if poisoning_detail.contains("plugin_call_deadline_exceeded") {
+                log_poisoned_store_recovery_event(
+                    root,
+                    plugin_name,
+                    verb,
+                    false,
+                    &format!("skipped: {poisoning_detail}"),
+                );
+            } else {
+                let retry = guard.as_mut().map(|fresh| {
+                    dispatch_on(
+                        &mut fresh.store,
+                        fresh.instance,
+                        verb,
+                        body,
+                        root,
+                        siblings.clone(),
+                    )
+                });
+                match retry {
+                    Some(Ok(recovered)) => {
+                        log_poisoned_store_recovery_event(
+                            root,
+                            plugin_name,
+                            verb,
+                            true,
+                            &poisoning_detail,
+                        );
+                        return Ok(recovered);
+                    }
+                    Some(Err(retry_error)) => {
+                        let retry_detail = retry_error.to_string();
+                        log_poisoned_store_recovery_event(
+                            root,
+                            plugin_name,
+                            verb,
+                            false,
+                            &format!("first: {poisoning_detail} | retry: {retry_detail}"),
+                        );
+                        **guard = None;
+                        return Err(anyhow::anyhow!(
+                            "plugin {plugin_name} verb {verb} failed on its poisoned Store ({poisoning_detail}) and again on a freshly instantiated one ({retry_detail})"
+                        ));
+                    }
+                    None => {}
+                }
             }
         }
-    } else {
-        pool.evict_if_swap_pending(guard);
+        Err(detail) => {
+            eprintln!("[agentplug registry] plugin {plugin_name} slot could not be refilled in place after verb {verb} poisoned its Store -- {detail}");
+            log_poisoned_store_eviction_event(root, plugin_name, verb, false, &detail);
+            return Err(anyhow::anyhow!(
+                "plugin {plugin_name} verb {verb} failed with {poisoning_detail} and its slot could not be refilled in place: {detail}"
+            ));
+        }
     }
-    result
+    Err(anyhow::anyhow!(
+        "plugin {plugin_name} verb {verb} failed with {poisoning_detail}; its Store was evicted and a fresh one installed, so re-dispatching this verb is safe"
+    ))
 }
 
 static GM_PROJECT_STEP_RELEASED: OnceLock<Condvar> = OnceLock::new();
