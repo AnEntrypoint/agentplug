@@ -714,8 +714,8 @@ fn build_command_mode(
         }
         "python" | "py" => Some(BuiltCommand {
             cmd: "python".to_string(),
-            args: vec!["-c".to_string(), code.to_string()],
-            stdin_payload: None,
+            args: vec!["-c".to_string(), PYTHON_STDIN_EVAL.to_string()],
+            stdin_payload: Some(code.to_string()),
         }),
         "bash" | "sh" | "shell" => Some(BuiltCommand {
             cmd: resolve_bash_cmd(),
@@ -728,9 +728,9 @@ fn build_command_mode(
                 "-NoProfile".to_string(),
                 "-NonInteractive".to_string(),
                 "-Command".to_string(),
-                code.to_string(),
+                "-".to_string(),
             ],
-            stdin_payload: None,
+            stdin_payload: Some(code.to_string()),
         }),
         "deno" => Some(BuiltCommand {
             cmd: "deno".to_string(),
@@ -802,9 +802,10 @@ fn resolve_node_cmd() -> String {
 }
 
 const BASH_STDIN_EVAL: &str = "eval \"$(cat)\"";
+const PYTHON_STDIN_EVAL: &str = "import sys;exec(compile(sys.stdin.read(),\"<stdin>\",\"exec\"))";
+
 
 fn resolve_bash_cmd() -> String {
-
     if cfg!(windows) {
         let git_bash = std::path::Path::new("C:\\Program Files\\Git\\bin\\bash.exe");
         if git_bash.exists() {
