@@ -497,7 +497,7 @@ fn settle_store_lock(root: &Path) -> StoreLockState {
             ),
         ),
         Some((pid, _)) if pid == own_pid => StoreLockState::Held {
-            lock_dir,
+            lock_dir: lock_dir.clone(),
             owner_pid,
             detail: format!(
                 "store lock {} is held by another dispatch of this daemon (pid {pid}); gm.db cannot be written until it releases it",
@@ -506,7 +506,7 @@ fn settle_store_lock(root: &Path) -> StoreLockState {
         },
         Some((pid, ts)) if pid_is_alive(pid) && !(ts > 0 && agentplug_host::now_ms().saturating_sub(ts) >= STORE_LOCK_STALE_MS) => {
             StoreLockState::Held {
-                lock_dir,
+                lock_dir: lock_dir.clone(),
                 owner_pid,
                 detail: format!(
                     "store lock {} is held by live pid {pid}; gm.db cannot be written until that process releases it",
