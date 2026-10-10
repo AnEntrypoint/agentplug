@@ -914,6 +914,99 @@ pub(crate) fn release_abandoned_project_lanes() {
     }
 }
 
+pub(super) const DISPATCH_WAIT_LEDGER_FRESH_MS: u64 = 120_000;
+pub(super) const DURATION_SETTLE_GRACE_MS: u64 = 5_000;
+pub(super) const WAIT_MAX_SERVED_MS: u64 = 600_000;
+
+/// A dispatch-wait ledger row is a live daemon's own statement that `(verb, task)` is in flight
+/// for it. A sweep that owns no in-process entry for that key can still read it, so an owned
+/// claim is never reaped as an orphan by a sweeper that cannot see the owner.
+pub(super) fn live_dispatch_wait_owner(spool_dir: &Path, verb: &str, task: &str) -> Option<u64> {
+    let raw = fs::read_to_string(spool_dir.join(DISPATCH_WAIT_LEDGER_FILE)).ok()?;
+    let value = serde_json::from_str::<serde_json::Value>(&raw).ok()?;
+    let ts = value.get("ts").and_then(|t| t.as_u64()).unwrap_or(0);
+    if now_ms().saturating_sub(ts) >= DISPATCH_WAIT_LEDGER_FRESH_MS {
+        return None;
+    }
+    let pid = value.get("daemon_pid").and_then(|p| p.as_u64())?;
+    if !pid_is_alive(pid) {
+        return None;
+    }
+    let rows = value.get("requests").and_then(|r| r.as_array())?;
+    let owned = rows.iter().any(|row| {
+        row.get("verb").and_then(|v| v.as_str()) == Some(verb)
+            && row.get("task").and_then(|t| t.as_str()) == Some(task)
+    });
+    if owned {
+        Some(pid)
+    } else {
+        None
+    }
+}
+
+pub(super) fn verb_settles_by_requested_duration(verb: &str) -> bool {
+    matches!(verb, "wait" | "sleep")
+}
+
+pub(super) fn requested_duration_ms(claim_path: &Path) -> Option<u64> {
+    let raw = fs::read_to_string(claim_path).ok()?;
+    let value = serde_json::from_str::<serde_json::Value>(&raw).ok()?;
+    [
+        value.get("ms"),
+        value.get("durationMs"),
+        value.get("duration_ms"),
+        value.get("body").and_then(|b| b.get("ms")),
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(|entry| entry.as_u64().or_else(|| entry.as_f64().map(|f| f as u64)))
+}
+
+/// A `wait`/`sleep` claim whose requested duration has already elapsed has performed the wait it
+/// asked for: settle it as completed, or as timed_out when it asked for longer than the verb
+/// serves, so the caller gets a real ticket instead of an unverified orphan.
+pub(super) fn settled_duration_outcome(
+    claim_path: &Path,
+    verb: &str,
+    task: &str,
+    claim_age: Option<u64>,
+) -> Option<(serde_json::Value, String)> {
+    if !verb_settles_by_requested_duration(verb) {
+        return None;
+    }
+    let requested = requested_duration_ms(claim_path)?;
+    let age = claim_age?;
+    if age < requested.saturating_add(DURATION_SETTLE_GRACE_MS) {
+        return None;
+    }
+    let timed_out = requested > WAIT_MAX_SERVED_MS;
+    let settled_as = if timed_out { "timed_out" } else { "completed" };
+    let waited_ms = if timed_out { age } else { requested };
+    let body = serde_json::json!({
+        "ok": !timed_out,
+        "completed": !timed_out,
+        "timed_out": timed_out,
+        "waited_ms": waited_ms,
+        "requested_ms": requested,
+        "claim_age_ms": age,
+        "data": {"completed": !timed_out, "waited_ms": waited_ms},
+        "settled_by": "orphan-sweep",
+        "settled_as": settled_as,
+        "reason": if timed_out {
+            "the claim asked for longer than the wait verb serves, so its caller timed out before the wait could complete"
+        } else {
+            "the claim's requested wait has already elapsed, so the wait it asked for has happened"
+        },
+        "verb": verb,
+        "task": task,
+        "sweeping_pid": std::process::id(),
+    });
+    let note = format!(
+        "settled as {settled_as} (requested {requested}ms, claim age {age}ms, waited_ms {waited_ms}) -- no longer reported as an unverified orphan"
+    );
+    Some((body, note))
+}
+
 pub fn sweep_orphaned_claims(root: &Path) {
     sweep_orphaned_claims_distinguishing_handoff_from_crash(root, &read_handoff_inherited_claims());
 }
@@ -991,11 +1084,32 @@ pub(super) fn sweep_orphaned_claims_distinguishing_handoff_from_crash(
             {
                 continue;
             }
+            if let Some(owner_pid) = live_dispatch_wait_owner(&spool_dir, &verb, &task) {
+                eprintln!(
+                    "[agentplug daemon] leaving claim {verb}/{task} for {} alone -- the dispatch-wait ledger names it in flight under live daemon pid {owner_pid}, so it is owned work, not orphaned work",
+                    root.display()
+                );
+                continue;
+            }
             let claim_age = claim_age_ms(&path);
             if claim_age
                 .map(|age| age < MIN_ORPHAN_CLAIM_AGE_MS)
                 .unwrap_or(false)
             {
+                continue;
+            }
+            if let Some((settled_body, settled_note)) =
+                settled_duration_outcome(&path, &verb, &task, claim_age)
+            {
+                if write_spool_out_confirmed(&out_dir, &verb, &task, &settled_body.to_string()) {
+                    eprintln!(
+                        "[agentplug daemon] settled elapsed claim {verb}/{task} for {} -- {settled_note}",
+                        root.display()
+                    );
+                    let _ = fs::remove_file(&path);
+                } else {
+                    eprintln!("[agentplug daemon] could not confirm the settled out-file for {verb}/{task} -- leaving the claim for the next sweep rather than deleting it unanswered");
+                }
                 continue;
             }
             let out_name = format!("{verb}-{task}.json");
