@@ -1864,6 +1864,19 @@ const STORE_LANE_VERBS: &[&str] = &[
 
 const TREE_SCAN_VERBS: &[&str] = &["grep", "codesearch"];
 
+/// Verbs that open and write gm.db but run outside the store lane: the codeinsight family is
+/// unserialized by design (a `callers` question must not queue behind an index pass), so it never
+/// passes through settle_store_lock. It still has to claim .gm/gm.db.lock.owner, or the store's
+/// liveness rule -- a lock with no owner record has no live writer -- would be a lie every time one
+/// of these is the writer holding it.
+const UNSERIALIZED_STORE_WRITER_VERBS: &[&str] = &["codeinsight", "callers", "callees", "impact"];
+
+/// True for every verb that can hold the libsql lock: the store lane plus the unserialized
+/// codeinsight family. Callers use it to record ownership of .gm/gm.db.lock, never to serialize.
+pub fn dispatch_claims_store_owner(verb: &str) -> bool {
+    STORE_LANE_VERBS.contains(&verb) || UNSERIALIZED_STORE_WRITER_VERBS.contains(&verb)
+}
+
 fn tree_scan_without_indexing(verb: &str, body: &str) -> bool {
     TREE_SCAN_VERBS.contains(&verb)
         && matches!(
