@@ -2269,6 +2269,35 @@ fn read_status_busy_until_if_future(root: &Path) -> Option<u64> {
     (busy_until > now_ms()).then_some(busy_until)
 }
 
+pub(crate) struct IdleEvictDecision {
+    pub(crate) to_evict: Vec<PathBuf>,
+    pub(crate) deferred_live_claims: usize,
+}
+
+pub(crate) fn idle_projects_to_evict(
+    projects: &HashMap<PathBuf, ProjectPlugins>,
+    evict_before: Instant,
+) -> IdleEvictDecision {
+    let mut to_evict = Vec::new();
+    let mut deferred_live_claims = 0usize;
+    for (root, project) in projects.iter() {
+        if project.last_active >= evict_before {
+            continue;
+        }
+        if project_in_flight_count(root.as_path()) > 0
+            || read_status_busy_until_if_future(root.as_path()).is_some()
+        {
+            deferred_live_claims += 1;
+            continue;
+        }
+        to_evict.push(root.clone());
+    }
+    IdleEvictDecision {
+        to_evict,
+        deferred_live_claims,
+    }
+}
+
 const TICKER_BUSY_UNTIL_EXTEND_MS: u64 = 60_000;
 
 const SPOOL_SCAN_BACKSTOP_TTL: Duration = Duration::from_secs(120);
@@ -3541,12 +3570,14 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
         let evict_before = Instant::now()
             .checked_sub(Duration::from_millis(daemon_cfg.project_idle_evict_ms()))
             .unwrap_or_else(Instant::now);
-        let to_evict: Vec<PathBuf> = projects
-            .iter()
-            .filter(|(_, p)| p.last_active < evict_before)
-            .map(|(root, _)| root.clone())
-            .collect();
-        for root in to_evict {
+        let idle_evict = idle_projects_to_evict(&projects, evict_before);
+        if idle_evict.deferred_live_claims > 0 {
+            eprintln!(
+                "[agentplug daemon] {} idle project(s) keep their loaded plugins: an admission claim or heartbeat is still live -- eviction deferred until that dispatch completes",
+                idle_evict.deferred_live_claims
+            );
+        }
+        for root in idle_evict.to_evict {
             eprintln!(
                 "[agentplug daemon] evicting idle project {}",
                 root.display()

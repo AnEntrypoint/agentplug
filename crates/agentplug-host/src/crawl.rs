@@ -57,12 +57,35 @@ pub(crate) fn kill_process_tree(pid: u32) {
 
 /// Closes every Chrome left running on the gm-owned crawl profile by an earlier
 /// call. The profile path is the marker: user Chrome never carries it.
+fn profile_markers(profile: &Path) -> Vec<String> {
+    let raw = profile.display().to_string();
+    let back = raw.replace('/', "\\");
+    let slash = back.replace('\\', "/");
+    let mut markers = vec![raw, back, slash];
+    markers.sort();
+    markers.dedup();
+    markers
+}
+
+fn escaped(value: &str) -> String {
+    value.replace('\'', "''")
+}
+
+fn like_any(markers: &[String]) -> String {
+    markers
+        .iter()
+        .map(|marker| format!("$_.CommandLine -like '*{}*'", escaped(marker)))
+        .collect::<Vec<_>>()
+        .join(" -or ")
+}
+
 pub(crate) fn reap_stale_crawl_browsers(profile: &Path) {
     let marker = profile.display().to_string();
     if cfg!(windows) {
-        let quoted = marker.replace('\'', "''");
+        let markers = profile_markers(profile);
         let script = format!(
-            "Get-CimInstance Win32_Process -Filter \"Name='chrome.exe'\" | Where-Object {{ $_.CommandLine -like '*{quoted}*' -and $_.CommandLine -notlike '*--type=*' }} | ForEach-Object {{ $_.ProcessId }}"
+            "Get-CimInstance Win32_Process -Filter \"Name='chrome.exe'\" | Where-Object {{ ({}) -and $_.CommandLine -notlike '*--type=*' }} | ForEach-Object {{ $_.ProcessId }}",
+            like_any(&markers)
         );
         let mut cmd = Command::new("powershell");
         cmd.args(["-NoProfile", "-Command", &script]).stderr(Stdio::null());
@@ -78,6 +101,40 @@ pub(crate) fn reap_stale_crawl_browsers(profile: &Path) {
         let mut cmd = Command::new("pkill");
         cmd.args(["-f", &format!("--user-data-dir={marker}")]);
         let _ = cmd.status();
+    }
+}
+
+pub(crate) fn crawl_browser_pid(profile: &Path) -> Option<u32> {
+    if !cfg!(windows) {
+        return None;
+    }
+    let raw = profile.display().to_string();
+    let back = escaped(&raw.replace('/', "\\"));
+    let slash = escaped(&back.replace('\\', "/"));
+    let script = format!(
+        "Get-CimInstance Win32_Process -Filter \"Name='chrome.exe'\" | Where-Object {{ ($_.CommandLine -like '*{back}*' -or $_.CommandLine -like '*{slash}*') -and $_.CommandLine -notlike '*--type=*' }} | Select-Object -First 1 -ExpandProperty ProcessId"
+    );
+    let mut cmd = Command::new("powershell");
+    cmd.args(["-NoProfile", "-Command", &script]).stderr(Stdio::null());
+    crate::windowless::apply_windowless(&mut cmd);
+    let output = cmd.output().ok()?;
+    String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse::<u32>()
+        .ok()
+}
+
+pub(crate) fn process_exists(pid: u32) -> bool {
+    if !cfg!(windows) {
+        return true;
+    }
+    let script = format!("if (Get-Process -Id {pid} -ErrorAction SilentlyContinue) {{ 'yes' }}");
+    let mut cmd = Command::new("powershell");
+    cmd.args(["-NoProfile", "-Command", &script]).stderr(Stdio::null());
+    crate::windowless::apply_windowless(&mut cmd);
+    match cmd.output() {
+        Ok(output) => String::from_utf8_lossy(&output.stdout).trim() == "yes",
+        Err(_) => false,
     }
 }
 
@@ -174,12 +231,14 @@ fn goto_step(url: &str) -> Result<Value, String> {
 pub struct CdpCrawl {
     pub session: Option<String>,
     pub steps: Vec<Value>,
+    pub headful: bool,
 }
 
-const TOOL_STEP_GRAMMAR: &str = "snapshot, click=<uid>, dblclick=<uid>, hover=<uid>, click_at=<x>,<y>, fill=<uid> <value>, type=<text>, press=<key>, press_uid=<uid> <key>, upload=<uid> <path>[;<path>], wait_for=<text>, reload, back, forward, console, network[=<reqid>], dialog=accept|dismiss, screenshot=<path>, screenshot_full=<path>, screenshot_uid=<uid> <path>, trace_start, trace_stop[=<path>]";
+const TOOL_STEP_GRAMMAR: &str ="snapshot, click=<uid>, dblclick=<uid>, hover=<uid>, click_at=<x>,<y>, fill=<uid> <value>, type=<text>, press=<key>, press_uid=<uid> <key>, upload=<uid> <path>[;<path>], wait_for=<text>, reload, back, forward, console, network[=<reqid>], dialog=accept|dismiss, screenshot=<path>, screenshot_full=<path>, screenshot_uid=<uid> <path>, trace_start, trace_stop[=<path>]";
 
 pub fn parse_cdp_crawl_body(body: &str) -> Result<CdpCrawl, String> {
     let mut session = None;
+    let mut headful = env_flag("GM_CRAWL_CDP_HEADFUL");
     let mut steps = Vec::new();
     for (index, raw) in body.lines().enumerate() {
         let line = raw.trim();
@@ -187,11 +246,6 @@ pub fn parse_cdp_crawl_body(body: &str) -> Result<CdpCrawl, String> {
             continue;
         }
         let number = index + 1;
-        if is_headless_request(line) {
-            return Err(format!(
-                "line {number}: headless is refused: engine=cdp always drives a visible Chrome, and headless is available only as engine=lightpanda; remove the headless line"
-            ));
-        }
         if steps.is_empty() {
             if let Some(value) = line.strip_prefix("engine=") {
                 if value.trim() != "cdp" {
@@ -210,6 +264,18 @@ pub fn parse_cdp_crawl_body(body: &str) -> Result<CdpCrawl, String> {
                     Some(session_name(value.trim()).map_err(|e| format!("line {number}: {e}"))?);
                 continue;
             }
+            if is_headful_request(line) {
+                headful = true;
+                continue;
+            }
+            if is_headless_request(line) {
+                headful = false;
+                continue;
+            }
+        } else if is_headful_request(line) || is_headless_request(line) {
+            return Err(format!(
+                "line {number}: headless/headful is a leading directive and must come before the first step"
+            ));
         }
         steps.push(parse_cdp_step(line).map_err(|e| format!("line {number}: {e}"))?);
     }
@@ -219,7 +285,25 @@ pub fn parse_cdp_crawl_body(body: &str) -> Result<CdpCrawl, String> {
                 .to_string(),
         );
     }
-    Ok(CdpCrawl { session, steps })
+    Ok(CdpCrawl {
+        session,
+        steps,
+        headful,
+    })
+}
+
+fn is_headful_request(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    lower == "headful" || lower.starts_with("headful=") || lower.starts_with("--headful")
+}
+
+fn env_flag(name: &str) -> bool {
+    std::env::var_os(name)
+        .map(|value| {
+            let value = value.to_string_lossy().to_ascii_lowercase();
+            !matches!(value.as_str(), "" | "0" | "false" | "no" | "off")
+        })
+        .unwrap_or(false)
 }
 
 fn session_name(name: &str) -> Result<String, String> {
@@ -383,29 +467,67 @@ pub fn free_local_port() -> Result<u16, String> {
         .map_err(|e| format!("could not reserve a local port: {e}"))
 }
 
-/// Polls `/json/version` on the local CDP port with a fixed interval until it
-/// answers with a websocket debugger URL or the deadline passes.
-pub fn endpoint_ready(port: u16, deadline: Instant, interval: Duration) -> bool {
-    let url = format!("http://127.0.0.1:{port}/json/version");
+pub fn endpoint_ready(
+    port: u16,
+    deadline: Instant,
+    interval: Duration,
+    require_targets: bool,
+) -> bool {
     loop {
-        if let Ok(resp) = shared_agent()
-            .get(&url)
-            .timeout(Duration::from_millis(800))
-            .call()
-        {
-            if resp
-                .into_string()
-                .map(|body| body.contains("webSocketDebuggerUrl"))
-                .unwrap_or(false)
-            {
-                return true;
-            }
+        if endpoint_state(port, require_targets).is_ok() {
+            return true;
         }
         let now = Instant::now();
         if now >= deadline {
             return false;
         }
         std::thread::sleep(interval.min(deadline - now));
+    }
+}
+
+fn endpoint_state(port: u16, require_targets: bool) -> Result<(), String> {
+    let version = endpoint_get(port, "/json/version")?;
+    if !version.contains("webSocketDebuggerUrl") {
+        return Err(format!(
+            "/json/version answered without webSocketDebuggerUrl: {}",
+            first_chars(&version, 120)
+        ));
+    }
+    if require_targets {
+        let list = endpoint_get(port, "/json/list")?;
+        match serde_json::from_str::<Value>(&list) {
+            Ok(Value::Array(_)) => {}
+            _ => {
+                return Err(format!(
+                    "/json/list answered without a target array: {}",
+                    first_chars(&list, 120)
+                ))
+            }
+        }
+    }
+    Ok(())
+}
+
+fn endpoint_get(port: u16, path: &str) -> Result<String, String> {
+    shared_agent()
+        .get(&format!("http://127.0.0.1:{port}{path}"))
+        .timeout(Duration::from_millis(800))
+        .call()
+        .map_err(|e| format!("{path} did not answer: {e}"))
+        .and_then(|resp| {
+            resp.into_string()
+                .map_err(|e| format!("{path} replied with an unreadable body: {e}"))
+        })
+}
+
+fn first_chars(text: &str, limit: usize) -> String {
+    text.chars().take(limit).collect()
+}
+
+pub fn endpoint_failure(port: u16) -> String {
+    match endpoint_state(port, true) {
+        Ok(()) => "the endpoint answered but carried no usable target".to_string(),
+        Err(e) => e,
     }
 }
 
@@ -652,10 +774,11 @@ pub fn crawl_cdp(cwd: &Path, body: &str) -> Value {
         Ok(parsed) => parsed,
         Err(e) => return crawl_error_reply("cdp", false, started, e),
     };
+    let headless = !parsed.headful;
     let agent = crawl_lease::next_agent_id();
-    let (port, _) = match crawl_lease::acquire(cwd, &agent) {
+    let (port, _) = match crawl_lease::acquire(cwd, &agent, parsed.headful) {
         Ok(attached) => attached,
-        Err(e) => return crawl_error_reply("cdp", false, started, e),
+        Err(e) => return crawl_error_reply("cdp", headless, started, e),
     };
     let run = run_helper_with(
         port,
@@ -665,11 +788,12 @@ pub fn crawl_cdp(cwd: &Path, body: &str) -> Value {
         false,
         cdp_run_config(cwd, parsed.session.as_deref()),
     );
+    let reply = match run {
+        Ok(run) => crawl_reply_from_run("cdp", headless, started, run),
+        Err(e) => crawl_error_reply("cdp", headless, started, e),
+    };
     crawl_lease::release(cwd, &agent);
-    match run {
-        Ok(run) => crawl_reply_from_run("cdp", false, started, run),
-        Err(e) => crawl_error_reply("cdp", false, started, e),
-    }
+    reply
 }
 
 fn cdp_run_config(cwd: &Path, session: Option<&str>) -> Value {
