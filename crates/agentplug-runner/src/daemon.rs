@@ -463,7 +463,7 @@ impl DaemonConfig {
         self.side_plugin_concurrency.unwrap_or(1).max(1)
     }
     fn shared_store_recycle_private_bytes(&self) -> u64 {
-        const DEFAULT_MB: u64 = 1600;
+        const DEFAULT_MB: u64 = 600;
         self.shared_store_recycle_private_mb
             .unwrap_or(DEFAULT_MB)
             .max(256)
