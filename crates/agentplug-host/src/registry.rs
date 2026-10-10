@@ -123,6 +123,7 @@ pub enum PluginDispatchError {
     },
     EvictedOrPoisoned {
         plugin_name: String,
+        verb: String,
         detail: String,
     },
     AdmissionStarved {
@@ -141,8 +142,12 @@ impl std::fmt::Display for PluginDispatchError {
             PluginDispatchError::NotRegistered { plugin_name } => {
                 write!(f, "plugin {plugin_name} is not registered for this project (no plugin pool exists -- check .agentplug/plugins.txt and daemon startup logs for a compile/install failure)")
             }
-            PluginDispatchError::EvictedOrPoisoned { plugin_name, detail } => {
-                write!(f, "plugin {plugin_name} slot is unusable: {detail}")
+            PluginDispatchError::EvictedOrPoisoned {
+                plugin_name,
+                verb,
+                detail,
+            } => {
+                write!(f, "plugin {plugin_name} slot is unusable for verb {verb}: {detail} -- the verb was NOT executed, the reload named above was attempted first and re-dispatching is safe")
             }
             PluginDispatchError::AdmissionStarved {
                 kind,
@@ -1261,10 +1266,14 @@ pub fn dispatch_on(
                 "plugin_response_lost: {plugin_name} verb {verb} produced a response that never reached the guest -- {reason}"
             ));
         }
-        eprintln!(
-            "[agentplug registry] plugin {plugin_name} verb {verb} returned a zero packed (ptr={ptr}, len={len}) with no recorded write failure -- treating it as a genuine empty response"
-        );
-        return Ok(String::new());
+        let shape = if ptr == 0 {
+            "a null pointer (no response was ever allocated)"
+        } else {
+            "a zero length (nothing was written into the allocated response)"
+        };
+        return Err(anyhow::anyhow!(
+            "plugin_response_missing: {plugin_name} verb {verb} returned packed ptr={ptr} len={len} -- {shape}, and no write failure was recorded. Every verb response is a non-empty JSON object, so this is not a response: the verb did not produce one and an empty string would have been served as if it had. Re-dispatching {verb} is safe."
+        ));
     }
     let mut buf = vec![0u8; len as usize];
     memory.read(&mut *store, ptr as usize, &mut buf)?;
@@ -1294,6 +1303,35 @@ fn host_fs_root() -> PathBuf {
     }
 }
 
+/// What a slot was last actually built from. The daemon republishes
+/// `SIBLING_RELOAD_SOURCE` from its per-tick compile pass, so around a wasm
+/// recompile or a failed recompile the published map can transiently lack a
+/// plugin that is already running. A Store evicted in that window then refilled
+/// from nothing and reported "no reload source holds this plugin", leaving an
+/// empty slot that every later dispatch answered as unusable. Remembering the
+/// module the slot was built from lets the refill rebuild it in place.
+type RememberedPluginModule = (Engine, Module, String);
+
+static REMEMBERED_PLUGIN_MODULES: OnceLock<Mutex<HashMap<String, RememberedPluginModule>>> =
+    OnceLock::new();
+
+fn remember_plugin_module(plugin_name: &str, entry: RememberedPluginModule) {
+    REMEMBERED_PLUGIN_MODULES
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(plugin_name.to_string(), entry);
+}
+
+fn remembered_plugin_module(plugin_name: &str) -> Option<RememberedPluginModule> {
+    REMEMBERED_PLUGIN_MODULES
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(plugin_name)
+        .map(|(engine, module, hash)| (engine.clone(), module.clone(), hash.clone()))
+}
+
 fn instantiate_plugin(
     engine: &Engine,
     root: PathBuf,
@@ -1315,6 +1353,10 @@ fn instantiate_plugin(
     store.set_epoch_deadline(epoch_ticks_for_seconds(DISPATCH_CALL_DEADLINE_SECS));
     let instance = linker.instantiate(&mut store, module)?;
     *self_instance_cell.lock().unwrap() = Some(instance);
+    remember_plugin_module(
+        plugin_name,
+        (engine.clone(), module.clone(), content_hash.to_string()),
+    );
     Ok(SiblingHandle {
         store,
         instance,
@@ -1474,7 +1516,8 @@ impl ProjectPlugins {
                 log_poisoned_store_eviction_event(&self.root, plugin_name, verb, false, &format!("empty-slot refill failed: {detail}"));
                 return Err(PluginDispatchError::EvictedOrPoisoned {
                     plugin_name: plugin_name.to_string(),
-                    detail: format!("empty-slot refill failed: {detail}"),
+                    verb: verb.to_string(),
+                    detail: format!("the slot was empty before verb {verb} ran and its in-place reload did not repopulate it: {detail}"),
                 }
                 .into());
             }
@@ -1624,7 +1667,8 @@ impl DispatchHandle {
                 log_poisoned_store_eviction_event(&self.root, plugin_name, verb, false, &format!("empty-slot refill failed: {detail}"));
                 return Err(PluginDispatchError::EvictedOrPoisoned {
                     plugin_name: plugin_name.to_string(),
-                    detail: format!("empty-slot refill failed: {detail}"),
+                    verb: verb.to_string(),
+                    detail: format!("the slot was empty before verb {verb} ran and its in-place reload did not repopulate it: {detail}"),
                 }
                 .into());
             }
@@ -1659,15 +1703,53 @@ fn global_reload_source() -> Option<Arc<SiblingReloadSource>> {
         .clone()
 }
 
+/// Every source a refill consults, named in the failure text: a refill that
+/// cannot rebuild a slot has to say where it looked, otherwise the only
+/// surviving evidence is "no reload source holds this plugin".
+fn reload_sources_summary(local: Option<&SiblingReloadSource>, plugin_name: &str) -> String {
+    let local_state = match local {
+        None => "this dispatch site carries no module map".to_string(),
+        Some(source) if source.1.contains_key(plugin_name) => {
+            format!("local module map holds {plugin_name}")
+        }
+        Some(source) => format!(
+            "local module map has {} module(s) and no {plugin_name}",
+            source.1.len()
+        ),
+    };
+    let global_state = match global_reload_source() {
+        None => "the daemon has not published a global module map".to_string(),
+        Some(source) if source.1.contains_key(plugin_name) => {
+            format!("global module map holds {plugin_name}")
+        }
+        Some(source) => format!(
+            "global module map has {} module(s) and no {plugin_name}",
+            source.1.len()
+        ),
+    };
+    let remembered_state = match remembered_plugin_module(plugin_name) {
+        Some((_, _, hash)) => format!("remembered module for {plugin_name} at {hash}"),
+        None => format!("no module remembered from any instantiation of {plugin_name}"),
+    };
+    format!("{local_state}; {global_state}; {remembered_state}")
+}
+
 fn reload_entry(
     local: Option<&SiblingReloadSource>,
     plugin_name: &str,
-) -> Option<(Engine, Module, String)> {
+) -> (Option<(Engine, Module, String)>, &'static str) {
     if let Some(entry) = local.and_then(|source| module_from_reload_source(source, plugin_name)) {
-        return Some(entry);
+        return (Some(entry), "the module map carried by this dispatch site");
     }
-    let global = global_reload_source()?;
-    module_from_reload_source(&global, plugin_name)
+    if let Some(global) = global_reload_source() {
+        if let Some(entry) = module_from_reload_source(&global, plugin_name) {
+            return (Some(entry), "the module map published by the daemon");
+        }
+    }
+    (
+        remembered_plugin_module(plugin_name),
+        "the module remembered from a prior instantiation of this plugin",
+    )
 }
 
 fn reinstantiate_evicted_slot_once(
@@ -1676,19 +1758,29 @@ fn reinstantiate_evicted_slot_once(
     plugin_name: &str,
     verb: &str,
     source: Option<(Engine, Module, String)>,
+    origin: &str,
+    local: Option<&SiblingReloadSource>,
 ) -> Result<(), String> {
     let Some((engine, module, content_hash)) = source else {
-        return Err("no reload source holds this plugin".to_string());
+        return Err(format!(
+            "no reload source holds plugin {plugin_name} -- {}",
+            reload_sources_summary(local, plugin_name)
+        ));
     };
     let handle = instantiate_plugin(&engine, root.to_path_buf(), plugin_name, &module, &content_hash)
-        .map_err(|e| format!("{e:#}"))?;
+        .map_err(|e| {
+            format!(
+                "re-instantiating plugin {plugin_name} failed: {e:#} -- {}",
+                reload_sources_summary(local, plugin_name)
+            )
+        })?;
     **guard = Some(handle);
     log_poisoned_store_eviction_event(
         root,
         plugin_name,
         verb,
         true,
-        "slot was empty after a poisoned-Store eviction; reinstantiated in place",
+        &format!("slot was empty after a poisoned-Store eviction; reinstantiated in place from {origin} (content hash {content_hash})"),
     );
     Ok(())
 }
@@ -1703,13 +1795,16 @@ fn refill_evicted_slot(
     plugin_name: &str,
     verb: &str,
 ) -> Result<(), String> {
-    let mut last = String::from("no reload source holds this plugin");
+    let sources = reload_sources_summary(local, plugin_name);
+    let mut last = format!("no reload source holds plugin {plugin_name} -- {sources}");
     for attempt in 0..EVICTED_SLOT_REFILL_ATTEMPTS {
-        let source = reload_entry(local, plugin_name);
-        match reinstantiate_evicted_slot_once(guard, root, plugin_name, verb, source) {
+        let (source, origin) = reload_entry(local, plugin_name);
+        match reinstantiate_evicted_slot_once(guard, root, plugin_name, verb, source, origin, local) {
             Ok(()) if guard.is_some() => return Ok(()),
             Ok(()) => {
-                last = "reload reported success but the slot is still empty".to_string();
+                last = format!(
+                    "reload reported success but the slot is still empty (a pending module swap evicted the fresh instance) -- {sources}"
+                );
             }
             Err(detail) => last = detail,
         }
@@ -1720,7 +1815,7 @@ fn refill_evicted_slot(
         }
     }
     Err(format!(
-        "reload did not repopulate the slot after {EVICTED_SLOT_REFILL_ATTEMPTS} attempts: {last}"
+        "reload did not repopulate the slot after {EVICTED_SLOT_REFILL_ATTEMPTS} attempts (re-dispatching verb {verb} is safe): {last}"
     ))
 }
 
@@ -1739,7 +1834,8 @@ fn dispatch_and_evict_on_error(
         log_poisoned_store_eviction_event(root, plugin_name, verb, false, "slot already empty from a prior eviction, reload did not repopulate it");
         PluginDispatchError::EvictedOrPoisoned {
             plugin_name: plugin_name.to_string(),
-            detail: "slot was empty from a prior poisoned-Store eviction and the in-place reload did not repopulate it".to_string(),
+            verb: verb.to_string(),
+            detail: format!("the slot was empty from a prior poisoned-Store eviction when verb {verb} reached dispatch and the in-place reload did not repopulate it ({})", reload_sources_summary(local, plugin_name)),
         }
     })?;
     let content_hash = handle.content_hash.clone();
