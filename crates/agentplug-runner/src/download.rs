@@ -577,10 +577,17 @@ pub fn local_build_pin_record() -> Option<serde_json::Value> {
     serde_json::from_str(&raw).ok()
 }
 
+/// A version file written with a UTF-8 BOM reads as "\u{feff}0.1.1520"; the BOM is an encoding
+/// artifact, not a developer sideload marker, so it is stripped before any semver test or compare.
+pub fn strip_version_file_bom(text: &str) -> &str {
+    let trimmed = text.trim();
+    trimmed.strip_prefix('\u{feff}').unwrap_or(trimmed).trim()
+}
+
 pub fn installed_runner_version() -> Option<String> {
     fs::read_to_string(runner_version_path())
         .ok()
-        .map(|s| s.trim().to_string())
+        .map(|s| strip_version_file_bom(&s).to_string())
         .filter(|s| !s.is_empty())
 }
 
@@ -973,11 +980,12 @@ pub fn fetch_latest_plugin_version(plugin_name: &str) -> anyhow::Result<Option<S
 pub fn installed_plugin_version(plugin_name: &str) -> Option<String> {
     fs::read_to_string(plugin_version_path(plugin_name))
         .ok()
-        .map(|s| s.trim().to_string())
+        .map(|s| strip_version_file_bom(&s).to_string())
         .filter(|s| !s.is_empty())
 }
 
 pub fn is_recognized_release_semver(version: &str) -> bool {
+    let version = strip_version_file_bom(version);
     let segments: Vec<&str> = version.split('.').collect();
     segments.len() == 3
         && segments
