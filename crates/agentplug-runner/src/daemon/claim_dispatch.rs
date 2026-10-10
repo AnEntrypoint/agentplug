@@ -951,15 +951,17 @@ pub(super) fn verb_settles_by_requested_duration(verb: &str) -> bool {
 pub(super) fn requested_duration_ms(claim_path: &Path) -> Option<u64> {
     let raw = fs::read_to_string(claim_path).ok()?;
     let value = serde_json::from_str::<serde_json::Value>(&raw).ok()?;
-    [
-        value.get("ms"),
-        value.get("durationMs"),
-        value.get("duration_ms"),
-        value.get("body").and_then(|b| b.get("ms")),
-    ]
-    .into_iter()
-    .flatten()
-    .find_map(|entry| entry.as_u64().or_else(|| entry.as_f64().map(|f| f as u64)))
+    for key in ["ms", "durationMs", "duration_ms"] {
+        if let Some(entry) = value.get(key) {
+            if let Some(ms) = entry.as_u64().or_else(|| entry.as_f64().map(|f| f as u64)) {
+                return Some(ms);
+            }
+        }
+    }
+    value
+        .get("body")
+        .and_then(|body| body.get("ms"))
+        .and_then(|entry| entry.as_u64().or_else(|| entry.as_f64().map(|f| f as u64)))
 }
 
 /// A `wait`/`sleep` claim whose requested duration has already elapsed has performed the wait it
