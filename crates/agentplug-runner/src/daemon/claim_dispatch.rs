@@ -398,8 +398,116 @@ pub(super) fn spill_large_exec_output_to_text_sibling(
     outer.to_string()
 }
 
-pub fn write_spool_out_confirmed(out_dir: &Path, out_name: &str, out_body: &str) -> bool {
-    let dest = out_dir.join(out_name);
+/// Entries kept in `.dispatch-ledger.json` -- the same cap the plugin-side ledger uses, so a
+/// host-minted id ages out of the window on the same schedule as a plugin-minted one.
+const DISPATCH_LEDGER_MAX_ENTRIES: usize = 500;
+/// Above this the receipt is not re-parsed to stamp an id: a megabyte-plus body is already spilling
+/// to a sibling file, and the id is a citation aid, never a reason to reserialize that much text.
+const DISPATCH_ID_STAMP_MAX_BODY_BYTES: usize = 1_048_576;
+
+/// Only the plugin mints a dispatch id (`dispatch_ledger::record`, reached from the guest reply), so
+/// every receipt the host builds because the plugin never answered -- an epoch deadline interrupt, a
+/// panic, an empty result, an admission or lane starvation answer, an orphaned claim -- carried no
+/// dispatch_id and left a failed dispatch uncitable, which breaks the (id, hash, ts) audit primitive.
+/// The stamping lives in the out-file writer rather than in each failing verb, so every written
+/// receipt gets one id of the same shape a successful receipt carries: `<ts>-<seq>-<hash>`.
+pub fn stamp_dispatch_id(out_dir: &Path, verb: &str, task: &str, out_body: &str) -> String {
+    if out_body.len() > DISPATCH_ID_STAMP_MAX_BODY_BYTES {
+        return out_body.to_string();
+    }
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(out_body) else {
+        return out_body.to_string();
+    };
+    let Some(obj) = value.as_object_mut() else {
+        return out_body.to_string();
+    };
+    if obj
+        .get("dispatch_id")
+        .and_then(|v| v.as_str())
+        .is_some_and(|s| !s.is_empty())
+    {
+        return out_body.to_string();
+    }
+    let Some(dispatch_id) = mint_host_dispatch_id(out_dir, verb, task, out_body.len() as u64) else {
+        return out_body.to_string();
+    };
+    obj.insert(
+        "dispatch_id".to_string(),
+        serde_json::Value::String(dispatch_id),
+    );
+    serde_json::to_string(&value).unwrap_or_else(|_| out_body.to_string())
+}
+
+/// Mints an id with the plugin ledger's own algorithm -- DefaultHasher (fixed keys, so the value is
+/// reproducible) over verb, fingerprint and ts -- and appends it to that same ledger file, so an
+/// ok:false dispatch resolves through `lookup()` like any other. The spool task stands in for the
+/// request fingerprint: at the writer the request body is gone, and the task is what identifies the
+/// request. The ledger write is best-effort for the same reason the out-file write is confirmed by a
+/// rename: the plugin writes this file too, and a lost ledger row costs a resolvable id, never the
+/// id itself, which the receipt carries either way.
+fn mint_host_dispatch_id(
+    out_dir: &Path,
+    verb: &str,
+    task: &str,
+    output_bytes: u64,
+) -> Option<String> {
+    let root = out_dir.ancestors().nth(3)?;
+    let path = root
+        .join(".gm")
+        .join("exec-spool")
+        .join(".dispatch-ledger.json");
+    let mut list: Vec<serde_json::Value> = fs::read_to_string(&path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .and_then(|v| v.as_array().cloned())
+        .unwrap_or_default();
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let seq = list.len() as u64;
+    let dispatch_id = format!("{}-{}-{:x}", ts, seq, {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        verb.hash(&mut h);
+        task.hash(&mut h);
+        ts.hash(&mut h);
+        h.finish()
+    });
+    list.push(serde_json::json!({
+        "dispatch_id": dispatch_id,
+        "verb": verb,
+        "fingerprint": task,
+        "ts": ts,
+        "exit_code": 1,
+        "output_bytes": output_bytes,
+        "session_id": null,
+        "host_minted": true,
+    }));
+    if list.len() > DISPATCH_LEDGER_MAX_ENTRIES {
+        let drop = list.len() - DISPATCH_LEDGER_MAX_ENTRIES;
+        list.drain(0..drop);
+    }
+    let serialized = serde_json::Value::Array(list).to_string();
+    let tmp = path.with_file_name(format!(
+        ".dispatch-ledger.json.tmp.{}",
+        std::process::id()
+    ));
+    if fs::write(&tmp, serialized).is_ok() {
+        let _ = fs::rename(&tmp, &path);
+    }
+    Some(dispatch_id)
+}
+
+pub fn write_spool_out_confirmed(
+    out_dir: &Path,
+    verb: &str,
+    task: &str,
+    out_body: &str,
+) -> bool {
+    let out_name = format!("{verb}-{task}.json");
+    let out_body = stamp_dispatch_id(out_dir, verb, task, out_body);
+    let dest = out_dir.join(&out_name);
     let tmp = out_dir.join(format!("{out_name}.tmp.{}", std::process::id()));
     if fs::write(&tmp, out_body).is_ok() && fs::rename(&tmp, &dest).is_ok() {
         let _ = fs::write(out_dir.join(format!("{out_name}.ready")), b"");
@@ -623,7 +731,7 @@ pub(super) fn write_spool_out_and_release_claim(
     out_body: &str,
 ) {
     forget_in_flight_claim(in_dir, verb, task);
-    if write_spool_out_confirmed(out_dir, &format!("{verb}-{task}.json"), out_body) {
+    if write_spool_out_confirmed(out_dir, verb, task, out_body) {
         let _ = fs::remove_file(inflight_claim_path(in_dir, verb, task));
     } else {
         eprintln!("[agentplug daemon] out-file write for {verb}/{task} did not confirm -- leaving the claim for the orphan sweep instead of deleting an unanswered request");
@@ -905,7 +1013,7 @@ pub(super) fn sweep_orphaned_claims_distinguishing_handoff_from_crash(
                     "task": task,
                     "sweeping_pid": std::process::id(),
                 }).to_string();
-                let confirmed = write_spool_out_confirmed(&out_dir, &out_name, &out_body);
+                let confirmed = write_spool_out_confirmed(&out_dir, &verb, &task, &out_body);
                 eprintln!("[agentplug daemon] swept orphaned claim {verb}/{task} for {} -- wrote error out-file", root.display());
                 confirmed
             };
@@ -1010,7 +1118,7 @@ fn answer_quarantined_spool_request(out_dir: &Path, verb: &str, request_path: &P
     })
     .to_string();
     let _ = fs::create_dir_all(out_dir);
-    if !write_spool_out_confirmed(out_dir, &out_name, &out_body) {
+    if !write_spool_out_confirmed(out_dir, &verb, &task, &out_body) {
         eprintln!("[agentplug daemon] could not write the spool_filename_rejected out-file for {verb}/{task}");
     }
 }
@@ -1613,8 +1721,7 @@ pub(crate) fn run_gm_dispatch_to_file(
     let out_body = annotate_admission_on_reply(out_body, admission);
     let out_body = patch_update_available_from_escalation(plugin_name, verb, out_body);
     let out_body = spill_large_exec_output_to_text_sibling(out_dir, verb, task, out_body);
-    let out_name = format!("{verb}-{task}.json");
-    let out_confirmed = write_spool_out_confirmed(out_dir, &out_name, &out_body);
+    let out_confirmed = write_spool_out_confirmed(out_dir, verb, task, &out_body);
     if out_confirmed {
         let _ = fs::remove_file(inflight_claim_path(&in_dir, verb, task));
     } else {
@@ -2405,6 +2512,7 @@ pub(super) fn dispatch_project(
                 let body = fs::read_to_string(&claim_path).unwrap_or_default();
 
                 let write_pd_out = |out_name: &str, out_body: &str| {
+                    let out_body = stamp_dispatch_id(&pd_out, &verb, &task, out_body);
                     let tmp = pd_out.join(format!("{out_name}.tmp.{}", std::process::id()));
                     if fs::write(&tmp, out_body).is_ok() {
                         let _ = fs::rename(&tmp, pd_out.join(out_name));

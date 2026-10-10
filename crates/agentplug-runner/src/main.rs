@@ -960,11 +960,8 @@ fn run_spool_watcher_single_process(
                     busy_stop.store(true, std::sync::atomic::Ordering::Relaxed);
                     let _ = ticker.join();
 
-                    let out_confirmed = daemon::write_spool_out_confirmed(
-                        &out_dir,
-                        &format!("{verb}-{stem}.json"),
-                        &result,
-                    );
+                    let out_confirmed =
+                        daemon::write_spool_out_confirmed(&out_dir, &verb, &stem, &result);
                     if out_confirmed {
                         let _ = fs::remove_file(&claim_path);
                     } else {
