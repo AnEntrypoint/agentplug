@@ -224,6 +224,7 @@ const SHORT_DISPATCH_VERBS: &[&str] = &[
     "kv_get",
     "config_resolve",
     "status",
+    "wait",
     "phase-status",
     "prd-list",
     "prd-status",
@@ -1398,9 +1399,10 @@ impl ProjectPlugins {
             plugin_name: plugin_name.to_string(),
         })?;
         let cost_class = cost_class_for_dispatch(verb, body);
-        let _heavy_admission = SharedPluginPool::admit_verb_within(
+        let _heavy_admission = SharedPluginPool::admit_verb_within_lane(
             &pool,
             cost_class,
+            verb.starts_with("git_").then_some("git"),
             verb,
             admission_wait_max_for(cost_class),
         )
@@ -1408,7 +1410,7 @@ impl ProjectPlugins {
         let _blocking_admission = SharedPluginPool::admit_blocking_within(
             &pool,
             verb,
-            admission_wait_max_for(cost_class),
+            admission_wait_max(),
         )
         .map_err(admission_starved_error)?;
         let (mut guard, _waited_ms) =
@@ -1529,9 +1531,10 @@ impl DispatchHandle {
             plugin_name: plugin_name.to_string(),
         })?;
         let cost_class = cost_class_for_dispatch(verb, body);
-        let _heavy_admission = SharedPluginPool::admit_verb_within(
+        let _heavy_admission = SharedPluginPool::admit_verb_within_lane(
             &pool,
             cost_class,
+            verb.starts_with("git_").then_some("git"),
             verb,
             admission_wait_max_for(cost_class),
         )
@@ -1539,7 +1542,7 @@ impl DispatchHandle {
         let _blocking_admission = SharedPluginPool::admit_blocking_within(
             &pool,
             verb,
-            admission_wait_max_for(cost_class),
+            admission_wait_max(),
         )
         .map_err(admission_starved_error)?;
         let (mut guard, _waited_ms) =
@@ -1769,7 +1772,6 @@ const BLOCKING_DISPATCH_VERBS: &[&str] = &[
     "java",
     "deno",
     "fetch",
-    "wait",
 ];
 
 pub fn is_blocking_dispatch_verb(verb: &str) -> bool {
