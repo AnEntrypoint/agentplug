@@ -422,6 +422,84 @@ pub(super) fn forget_in_flight_claim(in_dir: &Path, verb: &str, task: &str) {
         .remove(&(root.to_path_buf(), verb.to_string(), task.to_string()));
 }
 
+enum StoreLockState {
+    Clear,
+    Reclaimed,
+    Held {
+        lock_dir: PathBuf,
+        owner_pid: Option<u64>,
+        detail: String,
+    },
+}
+
+fn settle_store_lock(root: &Path) -> StoreLockState {
+    let gm_dir = root.join(".gm");
+    let lock_dir = gm_dir.join("gm.db.lock");
+    if !lock_dir.is_dir() {
+        return StoreLockState::Clear;
+    }
+    let owner_file = gm_dir.join("gm.db.lock.owner");
+    let owner_pid = fs::read_to_string(&owner_file).ok().and_then(|text| {
+        text.lines()
+            .next()
+            .and_then(|line| line.trim().parse::<u64>().ok())
+    });
+    let own_pid = u64::from(std::process::id());
+    match owner_pid {
+        None => {
+            let detail = format!(
+                "store lock {} has no owner record, so no live owner can be named and it is not reclaimed; it predates owner records",
+                lock_dir.display()
+            );
+            StoreLockState::Held { lock_dir, owner_pid, detail }
+        }
+        Some(pid) if pid != own_pid && pid_is_alive(pid) => {
+            let detail = format!(
+                "store lock {} is held by live pid {pid}; gm.db cannot be written until that process releases it",
+                lock_dir.display()
+            );
+            StoreLockState::Held { lock_dir, owner_pid, detail }
+        }
+        Some(pid) => {
+            if fs::remove_dir(&lock_dir).is_ok() {
+                let _ = fs::remove_file(&owner_file);
+                eprintln!(
+                    "[agentplug daemon] reclaimed store lock {} whose owner pid {pid} is no longer writing",
+                    lock_dir.display()
+                );
+                StoreLockState::Reclaimed
+            } else {
+                let detail = format!(
+                    "store lock {} is left by dead pid {pid} and could not be removed; remove it by hand",
+                    lock_dir.display()
+                );
+                StoreLockState::Held { lock_dir, owner_pid, detail }
+            }
+        }
+    }
+}
+
+struct StoreOwnerRecord {
+    path: PathBuf,
+}
+
+impl StoreOwnerRecord {
+    fn claim(root: &Path) -> Self {
+        let path = root.join(".gm").join("gm.db.lock.owner");
+        let _ = fs::write(
+            &path,
+            format!("{}\n{}\n", std::process::id(), agentplug_host::now_ms()),
+        );
+        Self { path }
+    }
+}
+
+impl Drop for StoreOwnerRecord {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
 pub(super) fn write_spool_out_and_release_claim(
     out_dir: &Path,
     in_dir: &Path,
@@ -1336,6 +1414,33 @@ pub(crate) fn run_gm_dispatch_to_file(
             refresh_dispatch_wait_ledger(root);
             return;
         }
+    };
+    let _store_owner = if lane == Some("store") {
+        match settle_store_lock(root) {
+            StoreLockState::Held { lock_dir, owner_pid, detail } => {
+                eprintln!(
+                    "[agentplug daemon] {verb}/{task} for {} refused: {detail}",
+                    root.display()
+                );
+                let out_body = serde_json::json!({
+                    "ok": false,
+                    "verb": verb,
+                    "error_code": "store_busy",
+                    "store_busy": true,
+                    "lock_dir": lock_dir.display().to_string(),
+                    "lock_owner_pid": owner_pid,
+                    "error": detail,
+                })
+                .to_string();
+                write_spool_out_and_release_claim(out_dir, &in_dir, verb, task, &out_body);
+                forget_dispatch_wait_record(root, verb, task);
+                refresh_dispatch_wait_ledger(root);
+                return;
+            }
+            StoreLockState::Clear | StoreLockState::Reclaimed => Some(StoreOwnerRecord::claim(root)),
+        }
+    } else {
+        None
     };
     note_dispatch_stage(root, verb, task, DispatchStage::WaitingForToolQueue, lane);
     let _tool_guard = match ToolDispatchGuard::acquire_within(
