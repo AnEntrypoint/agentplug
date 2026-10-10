@@ -25,19 +25,23 @@ async function acquireTarget(targetId) {
   }
   const created = await getJson('/json/new?about:blank', 'PUT');
   if (!created.webSocketDebuggerUrl) throw new Error('the endpoint created a target without webSocketDebuggerUrl');
-  return created;
+  return { ...created, created: true };
+}
+
+async function closeHttpTarget(id) {
+  await fetch(`${endpoint}/json/close/${id}`, { signal: AbortSignal.timeout(3000) }).then((r) => r.text()).catch(() => {});
 }
 
 async function attachBrowserTarget(browser) {
   if (cfg.targetId) {
     try {
       const attached = await browser.send('Target.attachToTarget', { targetId: cfg.targetId, flatten: true });
-      return { targetId: cfg.targetId, sessionId: attached.sessionId };
+      return { targetId: cfg.targetId, sessionId: attached.sessionId, created: false };
     } catch (_) {}
   }
   const created = await browser.send('Target.createTarget', { url: 'about:blank' });
   const attached = await browser.send('Target.attachToTarget', { targetId: created.targetId, flatten: true });
-  return { targetId: created.targetId, sessionId: attached.sessionId };
+  return { targetId: created.targetId, sessionId: attached.sessionId, created: true };
 }
 
 function openSession(wsUrl, timeoutMs) {
@@ -152,6 +156,7 @@ async function main() {
   let ctx = null;
   let unlock = () => {};
   let persisted = null;
+  let release = async () => {};
   try {
     if (cfg.session) {
       unlock = await lockSession(cfg.session.file, cfg.lockWaitMs || SESSION_LOCK_WAIT_MS);
@@ -163,6 +168,7 @@ async function main() {
       close = () => browser.close();
       const attached = await attachBrowserTarget(browser);
       out.targetId = attached.targetId;
+      if (attached.created) release = () => browser.send('Target.closeTarget', { targetId: attached.targetId }).catch(() => {});
       session = {
         send: (method, params) => browser.send(method, params, attached.sessionId),
         on: (method, handler) => browser.on(method, (params, sessionId) => {
@@ -174,6 +180,7 @@ async function main() {
       out.targetId = target.id;
       const page = await openSession(target.webSocketDebuggerUrl, 5000);
       close = () => page.close();
+      if (target.created) release = () => closeHttpTarget(target.id);
       session = page;
     }
     ctx = createToolContext({
@@ -215,6 +222,7 @@ async function main() {
         out.error = out.error || `session state was not saved: ${e.message}`;
       }
     }
+    await release();
     close();
     unlock();
     if (!cfg.browserSession && !cfg.session && out.targetId) {
