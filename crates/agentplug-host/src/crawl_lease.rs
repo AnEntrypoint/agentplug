@@ -8,8 +8,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde_json::json;
 
 use crate::crawl::{
-    endpoint_ready, find_chrome, free_local_port, kill_process_tree, reap_stale_crawl_browsers,
-    CDP_POLL_INTERVAL, CDP_READY_DEADLINE,
+    crawl_browser_pid, endpoint_failure, endpoint_ready, find_chrome, free_local_port,
+    kill_process_tree, process_exists, reap_stale_crawl_browsers, CDP_POLL_INTERVAL,
+    CDP_READY_DEADLINE,
 };
 use crate::windowless::apply_windowless;
 
@@ -17,9 +18,14 @@ pub const HOUSEKEEPING_TICK: Duration = Duration::from_secs(30);
 
 struct SharedBrowser {
     child: Child,
+    pid: u32,
     port: u16,
+    profile: PathBuf,
+    headful: bool,
     active: HashSet<String>,
 }
+
+const CDP_LAUNCH_ATTEMPTS: usize = 2;
 
 static BROWSERS: OnceLock<Mutex<HashMap<PathBuf, SharedBrowser>>> = OnceLock::new();
 static HOUSEKEEPING: OnceLock<()> = OnceLock::new();
@@ -41,6 +47,33 @@ fn now_ms() -> u64 {
 
 fn lease_dir(root: &Path) -> PathBuf {
     root.join(".gm").join("browser-leases")
+}
+
+fn profiles_root(root: &Path) -> PathBuf {
+    root.join(".gm").join("crawl-profiles")
+}
+
+fn fresh_profile(root: &Path) -> Result<PathBuf, String> {
+    let profile = profiles_root(root).join(format!(
+        "cdp-{}-{}",
+        std::process::id(),
+        AGENT_SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&profile)
+        .map_err(|e| format!("could not create Chrome profile {}: {e}", profile.display()))?;
+    Ok(profile)
+}
+
+fn sweep_old_profiles(root: &Path, keep: &Path) {
+    let Ok(entries) = std::fs::read_dir(profiles_root(root)) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() && path != keep {
+            let _ = std::fs::remove_dir_all(&path);
+        }
+    }
 }
 
 fn lease_path(root: &Path, agent: &str) -> PathBuf {
@@ -86,27 +119,30 @@ fn sweep_stale_leases(root: &Path, active: &HashSet<String>) {
     }
 }
 
-fn launch(root: &Path) -> Result<SharedBrowser, String> {
+fn launch(root: &Path, headful: bool) -> Result<SharedBrowser, String> {
     let chrome = find_chrome().ok_or_else(|| {
         "no Chrome found: set GM_BROWSER_CHROME_PATH or CHROME_PATH, or install Google Chrome or Chromium"
             .to_string()
     })?;
     if is_headless_shell(&chrome) {
         return Err(format!(
-            "{} is a headless shell, and the cdp engine needs a headful Chrome: point GM_BROWSER_CHROME_PATH or CHROME_PATH at chrome.exe",
+            "{} is a headless shell, and the cdp engine needs the full Chrome binary: point GM_BROWSER_CHROME_PATH or CHROME_PATH at chrome.exe",
             chrome.display()
         ));
     }
-    let port = free_local_port()?;
-    let profile = root.join(".gm").join("crawl-cdp-profile");
-    reap_stale_crawl_browsers(&profile);
-    let _ = std::fs::remove_dir_all(&profile);
-    std::fs::create_dir_all(&profile)
-        .map_err(|e| format!("could not create Chrome profile {}: {e}", profile.display()))?;
-    let mut cmd = Command::new(&chrome);
-    cmd.arg(format!("--remote-debugging-port={port}"))
-        .arg(format!("--user-data-dir={}", profile.display()))
-        .args([
+    reap_stale_crawl_browsers(&profiles_root(root));
+    let mut last_failure = String::new();
+    for attempt in 1..=CDP_LAUNCH_ATTEMPTS {
+        let port = free_local_port()?;
+        let profile = fresh_profile(root)?;
+        sweep_old_profiles(root, &profile);
+        let mut cmd = Command::new(&chrome);
+        cmd.arg(format!("--remote-debugging-port={port}"))
+            .arg(format!("--user-data-dir={}", profile.display()));
+        if !headful {
+            cmd.arg("--headless=new");
+        }
+        cmd.args([
             "--no-first-run",
             "--no-default-browser-check",
             "--disable-default-apps",
@@ -115,27 +151,41 @@ fn launch(root: &Path) -> Result<SharedBrowser, String> {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    apply_windowless(&mut cmd);
-    let child = cmd
-        .spawn()
-        .map_err(|e| format!("Chrome launch failed ({}): {e}", chrome.display()))?;
-    let mut browser = SharedBrowser {
-        child,
-        port,
-        active: HashSet::new(),
-    };
-    if !endpoint_ready(port, Instant::now() + CDP_READY_DEADLINE, CDP_POLL_INTERVAL) {
+        apply_windowless(&mut cmd);
+        let child = match cmd.spawn() {
+            Ok(child) => child,
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&profile);
+                return Err(format!("Chrome launch failed ({}): {e}", chrome.display()));
+            }
+        };
+        let spawn_pid = child.id();
+        let mut browser = SharedBrowser {
+            child,
+            pid: spawn_pid,
+            port,
+            profile,
+            headful,
+            active: HashSet::new(),
+        };
+        if endpoint_ready(port, Instant::now() + CDP_READY_DEADLINE, CDP_POLL_INTERVAL, true) {
+            browser.pid = crawl_browser_pid(&browser.profile).unwrap_or(spawn_pid);
+            return Ok(browser);
+        }
+        last_failure = format!(
+            "attempt {attempt}/{CDP_LAUNCH_ATTEMPTS}: {} ({}) on port {port} did not answer within {}ms: {}",
+            if headful { "headful Chrome" } else { "headless Chrome" },
+            chrome.display(),
+            CDP_READY_DEADLINE.as_millis(),
+            endpoint_failure(port)
+        );
         close_browser(&mut browser);
-        return Err(format!(
-            "Chrome CDP endpoint on port {port} did not become ready within {}ms (Chrome must be able to open a window: check DISPLAY on Linux)",
-            CDP_READY_DEADLINE.as_millis()
-        ));
     }
-    Ok(browser)
+    Err(format!(
+        "{last_failure}. Chrome needs a desktop session to open a window: pass `headful` only where one exists, and set GM_BROWSER_CHROME_PATH to a full Chrome otherwise"
+    ))
 }
 
-/// A headless shell is Chrome without a window. The cdp engine never runs one,
-/// so the binary is refused by name before any process starts.
 fn is_headless_shell(chrome: &Path) -> bool {
     chrome
         .file_name()
@@ -143,25 +193,37 @@ fn is_headless_shell(chrome: &Path) -> bool {
         .is_some_and(|name| name.to_ascii_lowercase().contains("headless"))
 }
 
+fn browser_running(browser: &mut SharedBrowser) -> bool {
+    if endpoint_ready(browser.port, Instant::now(), CDP_POLL_INTERVAL, true) {
+        return true;
+    }
+    if matches!(browser.child.try_wait(), Ok(None)) {
+        return true;
+    }
+    process_exists(browser.pid)
+}
+
 fn close_browser(browser: &mut SharedBrowser) {
+    kill_process_tree(browser.pid);
     kill_process_tree(browser.child.id());
     let _ = browser.child.kill();
     let _ = browser.child.wait();
+    let _ = std::fs::remove_dir_all(&browser.profile);
 }
 
 /// Attaches `agent` to the shared Chrome for `root`, starting it on first use,
 /// and returns its DevTools port. Pair every successful call with `release`.
-pub fn acquire(root: &Path, agent: &str) -> Result<(u16, u32), String> {
+pub fn acquire(root: &Path, agent: &str, headful: bool) -> Result<(u16, u32), String> {
     let mut map = browsers();
-    let alive = match map.get_mut(root) {
-        Some(browser) => matches!(browser.child.try_wait(), Ok(None)),
+    let reusable = match map.get_mut(root) {
+        Some(browser) => browser.headful == headful && browser_running(browser),
         None => false,
     };
-    if !alive {
-        if let Some(mut dead) = map.remove(root) {
-            close_browser(&mut dead);
+    if !reusable {
+        if let Some(mut stale) = map.remove(root) {
+            close_browser(&mut stale);
         }
-        let browser = launch(root)?;
+        let browser = launch(root, headful)?;
         map.insert(root.to_path_buf(), browser);
     }
     let Some(browser) = map.get_mut(root) else {
@@ -170,7 +232,7 @@ pub fn acquire(root: &Path, agent: &str) -> Result<(u16, u32), String> {
     sweep_stale_leases(root, &browser.active);
     browser.active.insert(agent.to_string());
     let port = browser.port;
-    let chrome_pid = browser.child.id();
+    let chrome_pid = browser.pid;
     if let Err(e) = write_lease(root, agent, port, chrome_pid) {
         let unused = browser.active.remove(agent) && browser.active.is_empty();
         if unused {
@@ -216,14 +278,14 @@ pub fn status(root: &Path) -> serde_json::Value {
             "close_deadline_ms": null,
         });
     };
-    let alive = matches!(browser.child.try_wait(), Ok(None));
+    let alive = browser_running(browser);
     let mut leases: Vec<String> = browser.active.iter().cloned().collect();
     leases.sort();
     json!({
         "root": root.display().to_string(),
         "alive": alive,
         "port": browser.port,
-        "chrome_pid": browser.child.id(),
+        "chrome_pid": browser.pid,
         "lease_count": leases.len(),
         "leases": leases,
         "close_deadline_ms": null,
@@ -251,7 +313,7 @@ pub fn lease_reply(verb: &str, dispatch_root: &Path, body: &str) -> String {
         ("browser_lease_acquire", None) | ("browser_lease_release", None) => {
             json!({"ok": false, "error": format!("{verb} needs an agent")})
         }
-        ("browser_lease_acquire", Some(agent)) => match acquire(&root, agent) {
+        ("browser_lease_acquire", Some(agent)) => match acquire(&root, agent, false) {
             Ok((port, chrome_pid)) => json!({
                 "ok": true,
                 "port": port,
@@ -283,7 +345,7 @@ pub fn housekeeping(_now: Instant) {
     let mut closing: Vec<PathBuf> = Vec::new();
     for (root, browser) in map.iter_mut() {
         sweep_stale_leases(root, &browser.active);
-        if !matches!(browser.child.try_wait(), Ok(None)) {
+        if !browser_running(browser) {
             closing.push(root.clone());
         }
     }
