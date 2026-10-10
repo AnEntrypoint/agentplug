@@ -19,7 +19,7 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
 name = "agentplug-host"
-version = "0.1.267"
+version = "0.1.268"
 dependencies = [
  "anyhow",
  "directories",
@@ -38,7 +38,7 @@ dependencies = [
 
 [[package]]
 name = "agentplug-lightpanda"
-version = "0.1.267"
+version = "0.1.268"
 dependencies = [
  "agentplug-host",
  "libc",
@@ -54,7 +54,7 @@ dependencies = [
 
 [[package]]
 name = "agentplug-runner"
-version = "0.1.267"
+version = "0.1.268"
 dependencies = [
  "agentplug-host",
  "agentplug-lightpanda",
