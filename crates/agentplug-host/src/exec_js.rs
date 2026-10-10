@@ -707,8 +707,8 @@ fn build_command_mode(
             } else {
                 Some(BuiltCommand {
                     cmd,
-                    args: vec!["-e".to_string(), wrapped],
-                    stdin_payload: None,
+                    args: vec!["run".to_string(), "-".to_string()],
+                    stdin_payload: Some(wrapped),
                 })
             }
         }
@@ -734,8 +734,12 @@ fn build_command_mode(
         }),
         "deno" => Some(BuiltCommand {
             cmd: "deno".to_string(),
-            args: vec!["eval".to_string(), code.to_string()],
-            stdin_payload: None,
+            args: vec![
+                "run".to_string(),
+                "--allow-all".to_string(),
+                "-".to_string(),
+            ],
+            stdin_payload: Some(code.to_string()),
         }),
         _ => None,
     }
