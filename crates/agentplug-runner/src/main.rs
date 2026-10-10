@@ -224,13 +224,14 @@ fn main() -> anyhow::Result<()> {
         }
         "selfcheck-registry" => selfcheck_registry(),
         "selfcheck-inflight" => selfcheck_inflight_cleanup(),
+        "selfcheck-idle-evict" => selfcheck_idle_evict(),
         "selfcheck-pool-fairness" => selfcheck_pool_fairness(),
         "selfcheck-git-admission" => selfcheck_git_admission(),
         "selfcheck-lane-release" => selfcheck_lane_release(),
         "selfcheck-spool-claim" => selfcheck_spool_claim(),
         other => {
             eprintln!(
-                "agentplug-runner: unknown command '{other}'. Usage: agentplug-runner <plugin <name> [version]|spool|daemon|takeover <version>|dispatch [plugin] <verb> [body]|sweep-spool [root]|update-runner|release-bootstrap-status|build-info|pin-local-build|unpin-local-build|selfcheck-registry|selfcheck-inflight|version>"
+                "agentplug-runner: unknown command '{other}'. Usage: agentplug-runner <plugin <name> [version]|spool|daemon|takeover <version>|dispatch [plugin] <verb> [body]|sweep-spool [root]|update-runner|release-bootstrap-status|build-info|pin-local-build|unpin-local-build|selfcheck-registry|selfcheck-inflight|selfcheck-idle-evict|version>"
             );
             std::process::exit(1);
         }
@@ -688,6 +689,109 @@ fn selfcheck_inflight_cleanup() -> anyhow::Result<()> {
 
     let _ = fs::remove_dir_all(&root);
     println!("[selfcheck-inflight] witnessed live against the real daemon dispatch path: PASS");
+    Ok(())
+}
+
+fn selfcheck_idle_evict() -> anyhow::Result<()> {
+    use std::collections::HashMap;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    const NAME: &str = "selfcheck-idle-evict";
+    let root = std::env::temp_dir().join(format!(
+        "agentplug-selfcheck-idle-evict-{}-{}",
+        std::process::id(),
+        agentplug_host::now_ms()
+    ));
+    let spool_dir = root.join(".gm").join("exec-spool");
+    fs::create_dir_all(&spool_dir)?;
+
+    let mut project = ProjectPlugins::new(root.clone());
+    project.last_active = Instant::now() - Duration::from_secs(3600);
+    let mut projects: HashMap<PathBuf, ProjectPlugins> = HashMap::new();
+    projects.insert(root.clone(), project);
+    let evict_before = Instant::now() - Duration::from_millis(60_000);
+
+    let quiet = daemon::idle_projects_to_evict(&projects, evict_before);
+    let evicted_when_quiet = quiet.to_evict.iter().any(|p| p == &root);
+    println!(
+        "[selfcheck-idle-evict] past the idle window with no claim: evicted={evicted_when_quiet} deferred={}",
+        quiet.deferred_live_claims
+    );
+    if !evicted_when_quiet {
+        return selfcheck_fail(
+            NAME,
+            "a project past its idle window with no live claim must still be evicted",
+        );
+    }
+
+    let key: daemon::InFlightKey = (root.clone(), "verbX".to_string(), "taskY".to_string());
+    daemon::in_flight_map()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(
+            key.clone(),
+            daemon::InFlightHandle {
+                detach: Arc::new(AtomicBool::new(false)),
+            },
+        );
+    let claimed = daemon::idle_projects_to_evict(&projects, evict_before);
+    let evicted_while_claimed = claimed.to_evict.iter().any(|p| p == &root);
+    println!(
+        "[selfcheck-idle-evict] live in-flight admission claim: evicted={evicted_while_claimed} deferred={}",
+        claimed.deferred_live_claims
+    );
+    daemon::in_flight_map()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&key);
+    if evicted_while_claimed {
+        return selfcheck_fail(
+            NAME,
+            "a project holding a live admission claim must not be evicted",
+        );
+    }
+
+    fs::write(
+        spool_dir.join(".status.json"),
+        format!(
+            "{{\"busy_until\":{}}}",
+            agentplug_host::now_ms() + 120_000
+        ),
+    )?;
+    let beating = daemon::idle_projects_to_evict(&projects, evict_before);
+    let evicted_while_heartbeating = beating.to_evict.iter().any(|p| p == &root);
+    println!(
+        "[selfcheck-idle-evict] live heartbeat promising work: evicted={evicted_while_heartbeating} deferred={}",
+        beating.deferred_live_claims
+    );
+    let _ = fs::remove_file(spool_dir.join(".status.json"));
+    if evicted_while_heartbeating {
+        return selfcheck_fail(
+            NAME,
+            "a project whose heartbeat promises work until a future instant must not be evicted",
+        );
+    }
+
+    let released = daemon::idle_projects_to_evict(&projects, evict_before);
+    let evicted_after_release = released.to_evict.iter().any(|p| p == &root);
+    println!(
+        "[selfcheck-idle-evict] after the claim and heartbeat clear: evicted={evicted_after_release} deferred={}",
+        released.deferred_live_claims
+    );
+    if !evicted_after_release {
+        return selfcheck_fail(
+            NAME,
+            "eviction must resume once the claim and heartbeat clear",
+        );
+    }
+
+    let _ = fs::remove_dir_all(&root);
+    println!("[selfcheck-idle-evict] witnessed live against the real idle-eviction path: PASS");
+    println!("RESULT: PASS");
     Ok(())
 }
 
