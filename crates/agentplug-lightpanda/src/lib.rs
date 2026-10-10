@@ -255,7 +255,7 @@ fn start_warm(key: &Path) -> Result<Warm, String> {
     } else {
         READY_DEADLINE
     };
-    if !endpoint_ready(port, Instant::now() + ready_deadline, READY_POLL) {
+    if !endpoint_ready(port, Instant::now() + ready_deadline, READY_POLL, false) {
         let tail = log_tail(&log_path);
         stop(&mut warm);
         return Err(format!(
