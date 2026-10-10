@@ -49,7 +49,8 @@ pub use precompiled::{load_module_file_backed, precompiled_module_path};
 pub use project_root::{canonical_project_root, project_root};
 pub use registry::{
     admission_wait_state_for_thread, advance_plugin_fiber, cost_class_for_dispatch,
-    cost_class_for_verb, dispatch_serial_lane, epoch_ticks_for_seconds, get_active_provider,
+    cost_class_for_verb, dispatch_claims_store_owner, dispatch_serial_lane,
+    epoch_ticks_for_seconds, get_active_provider,
     note_shared_plugin_bytes_current, read_plugin_lifecycle, read_project_plugin_list,
     release_shared_plugin, request_shared_store_swap, set_gm_pool_size, set_sibling_reload_source,
     set_side_plugin_pool_size, shared_plugin_slot_content_hashes,

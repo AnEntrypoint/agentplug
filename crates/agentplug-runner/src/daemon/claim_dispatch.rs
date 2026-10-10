@@ -1,5 +1,8 @@
 use super::*;
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
 pub(crate) type InFlightKey = (PathBuf, String, String);
 
 pub(crate) struct InFlightHandle {
@@ -432,6 +435,50 @@ enum StoreLockState {
     },
 }
 
+/// How stale a store lock's owner heartbeat must be before the lock is treated as abandoned. It is
+/// far longer than any real write because it is not a timeout on the write: the owner record is
+/// re-stamped every STORE_OWNER_HEARTBEAT_MS while a dispatch holds the lock, so a live writer never
+/// ages past this. It exists only to escape a pid that was recycled by an unrelated process, which
+/// is the one case where "owner pid is alive" is true and the owner is still gone.
+const STORE_LOCK_STALE_MS: u64 = 900_000;
+
+const STORE_OWNER_HEARTBEAT_MS: u64 = 15_000;
+
+fn read_store_lock_owner(owner_file: &Path) -> Option<(u64, u64)> {
+    let text = fs::read_to_string(owner_file).ok()?;
+    let mut lines = text.lines();
+    let pid = lines.next()?.trim().parse::<u64>().ok()?;
+    let ts = lines
+        .next()
+        .and_then(|line| line.trim().parse::<u64>().ok())
+        .unwrap_or(0);
+    Some((pid, ts))
+}
+
+fn reclaim_store_lock(lock_dir: &Path, owner_file: &Path, reason: &str) -> StoreLockState {
+    let removed = fs::remove_dir(lock_dir).is_ok() || fs::remove_dir_all(lock_dir).is_ok();
+    if !removed {
+        return StoreLockState::Held {
+            lock_dir: lock_dir.to_path_buf(),
+            owner_pid: None,
+            detail: format!(
+                "store lock {} is stale ({reason}) but could not be removed; remove it by hand",
+                lock_dir.display()
+            ),
+        };
+    }
+    let _ = fs::remove_file(owner_file);
+    eprintln!("[agentplug daemon] reclaimed store lock {}: {reason}", lock_dir.display());
+    StoreLockState::Reclaimed
+}
+
+/// A `<db>.lock` directory is libsql's mutual-exclusion marker: the writer removes it when it
+/// finishes, so a process killed mid-write leaves it forever and every later write fails with no
+/// holder to wait on. The check is therefore not "is the directory there" but "is its owner still
+/// here": every dispatch that writes gm.db claims `<db>.lock.owner` (see StoreOwnerRecord), so a lock
+/// with no record was never claimed by a live writer, a record naming a dead pid is provably
+/// abandoned, and a live pid whose heartbeat stopped is abandoned too. A lock whose recorded owner is
+/// alive and heartbeating is never touched -- only its owner may remove it.
 fn settle_store_lock(root: &Path) -> StoreLockState {
     let gm_dir = root.join(".gm");
     let lock_dir = gm_dir.join("gm.db.lock");
@@ -439,64 +486,132 @@ fn settle_store_lock(root: &Path) -> StoreLockState {
         return StoreLockState::Clear;
     }
     let owner_file = gm_dir.join("gm.db.lock.owner");
-    let owner_pid = fs::read_to_string(&owner_file).ok().and_then(|text| {
-        text.lines()
-            .next()
-            .and_then(|line| line.trim().parse::<u64>().ok())
-    });
+    let owner_pid = read_store_lock_owner(&owner_file).map(|(pid, _)| pid);
     let own_pid = u64::from(std::process::id());
-    match owner_pid {
-        None => {
-            let detail = format!(
-                "store lock {} has no owner record, so no live owner can be named and it is not reclaimed; it predates owner records",
+    match read_store_lock_owner(&owner_file) {
+        None => reclaim_store_lock(
+            &lock_dir,
+            &owner_file,
+            &format!(
+                "it has no owner record, and every dispatch that writes gm.db claims one, so no live writer holds it (a lock predating owner records)"
+            ),
+        ),
+        Some((pid, _)) if pid == own_pid => StoreLockState::Held {
+            lock_dir,
+            owner_pid,
+            detail: format!(
+                "store lock {} is held by another dispatch of this daemon (pid {pid}); gm.db cannot be written until it releases it",
                 lock_dir.display()
-            );
-            StoreLockState::Held { lock_dir, owner_pid, detail }
-        }
-        Some(pid) if pid != own_pid && pid_is_alive(pid) => {
-            let detail = format!(
-                "store lock {} is held by live pid {pid}; gm.db cannot be written until that process releases it",
-                lock_dir.display()
-            );
-            StoreLockState::Held { lock_dir, owner_pid, detail }
-        }
-        Some(pid) => {
-            if fs::remove_dir(&lock_dir).is_ok() {
-                let _ = fs::remove_file(&owner_file);
-                eprintln!(
-                    "[agentplug daemon] reclaimed store lock {} whose owner pid {pid} is no longer writing",
+            ),
+        },
+        Some((pid, ts)) if pid_is_alive(pid) && !(ts > 0 && agentplug_host::now_ms().saturating_sub(ts) >= STORE_LOCK_STALE_MS) => {
+            StoreLockState::Held {
+                lock_dir,
+                owner_pid,
+                detail: format!(
+                    "store lock {} is held by live pid {pid}; gm.db cannot be written until that process releases it",
                     lock_dir.display()
-                );
-                StoreLockState::Reclaimed
-            } else {
-                let detail = format!(
-                    "store lock {} is left by dead pid {pid} and could not be removed; remove it by hand",
-                    lock_dir.display()
-                );
-                StoreLockState::Held { lock_dir, owner_pid, detail }
+                ),
             }
+        }
+        Some((pid, ts)) => {
+            let reason = if !pid_is_alive(pid) {
+                format!("its owner pid {pid} is no longer alive")
+            } else {
+                format!(
+                    "its owner pid {pid} is alive but stopped heartbeating {} ms ago, past the {} ms stale bound",
+                    agentplug_host::now_ms().saturating_sub(ts),
+                    STORE_LOCK_STALE_MS
+                )
+            };
+            reclaim_store_lock(&lock_dir, &owner_file, &reason)
         }
     }
 }
 
+fn store_owner_refcounts() -> &'static Mutex<HashMap<PathBuf, usize>> {
+    static REFS: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
+    REFS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Ownership of .gm/gm.db.lock for the lifetime of one dispatch. Refcounted because the
+/// unserialized codeinsight family runs several store writes at once: the first claim writes the
+/// record and the last release removes it, so a concurrent sibling never sees a lock with no owner.
+/// The heartbeat re-stamps the timestamp so a long index pass is never judged stale.
 struct StoreOwnerRecord {
     path: PathBuf,
+    pid: u64,
+    stop: Arc<AtomicBool>,
 }
 
 impl StoreOwnerRecord {
     fn claim(root: &Path) -> Self {
         let path = root.join(".gm").join("gm.db.lock.owner");
-        let _ = fs::write(
-            &path,
-            format!("{}\n{}\n", std::process::id(), agentplug_host::now_ms()),
-        );
-        Self { path }
+        let pid = u64::from(std::process::id());
+        let stop = Arc::new(AtomicBool::new(false));
+        let first = {
+            let mut refs = store_owner_refcounts()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let entry = refs.entry(path.clone()).or_insert(0);
+            *entry += 1;
+            *entry == 1
+        };
+        let record = Self {
+            path: path.clone(),
+            pid,
+            stop: stop.clone(),
+        };
+        record.stamp();
+        if first {
+            let heartbeat_path = path;
+            let heartbeat_stop = stop;
+            let heartbeat_pid = pid;
+            std::thread::spawn(move || {
+                while !heartbeat_stop.load(Ordering::Relaxed) {
+                    std::thread::sleep(std::time::Duration::from_millis(
+                        STORE_OWNER_HEARTBEAT_MS,
+                    ));
+                    if heartbeat_stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let _ = fs::write(
+                        &heartbeat_path,
+                        format!("{}\n{}\n", heartbeat_pid, agentplug_host::now_ms()),
+                    );
+                }
+            });
+        }
+        record
+    }
+
+    fn stamp(&self) {
+        let _ = fs::write(&self.path, format!("{}\n{}\n", self.pid, agentplug_host::now_ms()));
     }
 }
 
 impl Drop for StoreOwnerRecord {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
+        self.stop.store(true, Ordering::Relaxed);
+        let last = {
+            let mut refs = store_owner_refcounts()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            match refs.get_mut(&self.path) {
+                Some(count) => {
+                    *count = count.saturating_sub(1);
+                    let last = *count == 0;
+                    if last {
+                        refs.remove(&self.path);
+                    }
+                    last
+                }
+                None => true,
+            }
+        };
+        if last {
+            let _ = fs::remove_file(&self.path);
+        }
     }
 }
 
@@ -1439,6 +1554,12 @@ pub(crate) fn run_gm_dispatch_to_file(
             }
             StoreLockState::Clear | StoreLockState::Reclaimed => Some(StoreOwnerRecord::claim(root)),
         }
+    } else if agentplug_host::dispatch_claims_store_owner(tool_verb) {
+        // Unserialized store writers (the codeinsight family) never reach settle_store_lock, so they
+        // must not settle -- a held lock there is answered by the guest from its persisted index, not
+        // refused -- but they do own the lock while they write, and claiming it is what lets the next
+        // settle tell a live writer from a directory an unclean exit left behind.
+        Some(StoreOwnerRecord::claim(root))
     } else {
         None
     };
