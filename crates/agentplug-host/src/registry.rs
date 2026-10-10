@@ -468,11 +468,15 @@ pub fn admission_wait_max() -> Duration {
     ))
 }
 
-const PROMPT_ADMISSION_WAIT_MAX_MS_DEFAULT: u64 = 20_000;
+const PROMPT_ADMISSION_WAIT_MAX_MS_DEFAULT: u64 = 120_000;
+const HEAVY_ADMISSION_WAIT_MAX_MS_DEFAULT: u64 = 180_000;
 
 pub fn admission_wait_max_for(class: DispatchCostClass) -> Duration {
     if class == DispatchCostClass::Heavy {
-        return admission_wait_max();
+        return Duration::from_millis(env_u64_or(
+            "AGENTPLUG_HEAVY_ADMISSION_WAIT_MAX_MS",
+            HEAVY_ADMISSION_WAIT_MAX_MS_DEFAULT,
+        ));
     }
     Duration::from_millis(env_u64_or(
         "AGENTPLUG_PROMPT_ADMISSION_WAIT_MAX_MS",
