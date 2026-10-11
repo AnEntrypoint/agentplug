@@ -229,6 +229,7 @@ fn main() -> anyhow::Result<()> {
         "selfcheck-git-admission" => selfcheck_git_admission(),
         "selfcheck-lane-release" => selfcheck_lane_release(),
         "selfcheck-lane-fifo" => selfcheck_lane_fifo(),
+        "selfcheck-lane-network-yield" => selfcheck_lane_network_yield(),
         "selfcheck-spool-claim" => selfcheck_spool_claim(),
         other => {
             eprintln!(
@@ -341,6 +342,38 @@ fn selfcheck_pool_fairness() -> anyhow::Result<()> {
         cost_class_for_dispatch("codesearch", r#"{"query":"semantic search"}"#),
         DispatchCostClass::Heavy,
         "default codesearch can rebuild and embed, so it must not consume the responsive slot"
+    );
+    assert_eq!(
+        cost_class_for_dispatch(
+            "codesearch",
+            r#"{"glob":"AGENTS.md","query":"creationSnapPending"}"#
+        ),
+        DispatchCostClass::Cheap,
+        "a codesearch scoped to one named file reads that file, so it must not queue on the store lane"
+    );
+    assert_eq!(
+        cost_class_for_dispatch(
+            "codesearch",
+            r#"{"path":"AGENTS.md","query":"creationSnapPending"}"#
+        ),
+        DispatchCostClass::Cheap,
+        "a codesearch scoped by path to one named file must not queue on the store lane"
+    );
+    assert_eq!(
+        cost_class_for_dispatch(
+            "codesearch",
+            r#"{"paths":["AGENTS.md","src/main.cpp"],"query":"creationSnapPending"}"#
+        ),
+        DispatchCostClass::Cheap,
+        "a codesearch scoped to a named file list must not queue on the store lane"
+    );
+    assert_eq!(
+        cost_class_for_dispatch(
+            "codesearch",
+            r#"{"glob":"**/*.md","query":"creationSnapPending"}"#
+        ),
+        DispatchCostClass::Heavy,
+        "a wildcard scope still walks and embeds a subtree, so it keeps the store lane"
     );
     assert_eq!(
         cost_class_for_verb("instruction"),
@@ -809,8 +842,225 @@ fn selfcheck_lane_release() -> anyhow::Result<()> {
     }
 }
 
-/// The FIFO property the lane exists for, witnessed live: a dispatch that starved and was
-/// re-dispatched verbatim keeps its place, and a later arrival never overtakes it.
+/// The yield the lane gives a checkout-bound claim over a network-bound one, witnessed live: a
+/// commit queued behind a fresh push takes the lane ahead of it, and a push that has waited out its
+/// yield budget stops yielding and is not starved by later commits. One writer per worktree holds
+/// throughout -- the yield reorders the queue, it never admits a second writer.
+fn selfcheck_lane_network_yield() -> anyhow::Result<()> {
+    use agentplug_host::GmFairnessGuard;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    const NAME: &str = "selfcheck-lane-network-yield";
+    // Read once per process, before any lane call: the real budget is minutes, so the aging half of
+    // this property is only witnessable against a shortened one.
+    std::env::set_var("AGENTPLUG_LANE_NETWORK_YIELD_MS", "1000");
+    let root = std::env::temp_dir().join(format!(
+        "agentplug-selfcheck-lane-yield-{}-{}",
+        std::process::id(),
+        agentplug_host::now_ms()
+    ));
+    std::fs::create_dir_all(&root)?;
+    // One lane key per property: a claim parked by an earlier part sits in the queue until it goes
+    // stale, and would otherwise be read as the later part's blocker.
+    let root_a = root.join("a");
+    let root_b = root.join("b");
+    let root_c = root.join("c");
+    std::fs::create_dir_all(&root_a)?;
+    std::fs::create_dir_all(&root_b)?;
+    std::fs::create_dir_all(&root_c)?;
+
+    const PUSH_BODY: &str = "{\"SESSION_ID\":\"yield-push\",\"rev\":\"HEAD\"}";
+    const COMMIT_BODY: &str = "{\"SESSION_ID\":\"yield-commit\",\"paths\":[\"a\"]}";
+
+    /// Hold the git lane until `release` fires, then let it go.
+    fn hold(root: &std::path::Path, task: &'static str) -> (mpsc::Receiver<bool>, mpsc::Sender<()>) {
+        let (held_tx, held_rx) = mpsc::channel::<bool>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let holder_root = root.to_path_buf();
+        std::thread::spawn(move || {
+            let guard = GmFairnessGuard::acquire_within(
+                &holder_root,
+                "git_commit",
+                "{}",
+                task,
+                Duration::from_secs(10),
+            );
+            let _ = held_tx.send(guard.is_ok());
+            let _ = release_rx.recv();
+            drop(guard);
+        });
+        (held_rx, release_tx)
+    }
+
+    let outcome = (|| -> Result<String, String> {
+        // A fresh push is queued, then a commit behind it. On release the commit is admitted first:
+        // the push's minutes-long remote round-trip is not allowed to make the checkout's own work
+        // queue behind it.
+        let (held_rx, release_tx) = hold(&root_a, "holder-yield");
+        if !held_rx.recv_timeout(Duration::from_secs(10)).unwrap_or(false) {
+            return Err("the holder could not take the project git lane".into());
+        }
+        match GmFairnessGuard::acquire_within(
+            &root_a,
+            "git_push",
+            PUSH_BODY,
+            "push-1",
+            Duration::from_millis(150),
+        ) {
+            Ok(_) => return Err("the push took the lane while the holder still held it".into()),
+            Err(report) if report.lane_position != Some(1) => {
+                return Err(format!(
+                    "the push starved at position {:?}, expected 1",
+                    report.lane_position
+                ))
+            }
+            Err(_) => {}
+        }
+        match GmFairnessGuard::acquire_within(
+            &root_a,
+            "git_commit",
+            COMMIT_BODY,
+            "commit-1",
+            Duration::from_millis(150),
+        ) {
+            Ok(_) => return Err("the commit took the lane while the holder still held it".into()),
+            Err(report) if report.lane_position != Some(2) => {
+                return Err(format!(
+                    "the commit starved at position {:?}, expected 2 behind the push",
+                    report.lane_position
+                ))
+            }
+            Err(_) => {}
+        }
+        let _ = release_tx.send(());
+        let commit = match GmFairnessGuard::acquire_within(
+            &root_a,
+            "git_commit",
+            COMMIT_BODY,
+            "commit-1-admitted",
+            Duration::from_secs(3),
+        ) {
+            Ok(guard) => guard,
+            Err(report) => {
+                return Err(format!(
+                    "the commit behind a fresh push was not admitted ahead of it (lane still held by {:?})",
+                    report.lane_holder_task
+                ))
+            }
+        };
+        drop(commit);
+
+        // The mirror image: the yield is one-directional. A push behind a commit stays behind it.
+        let (held_rx, release_tx) = hold(&root_b, "holder-fifo");
+        if !held_rx.recv_timeout(Duration::from_secs(10)).unwrap_or(false) {
+            return Err("the second holder could not take the project git lane".into());
+        }
+        let _ = GmFairnessGuard::acquire_within(
+            &root_b,
+            "git_commit",
+            "{\"SESSION_ID\":\"yield-commit-first\"}",
+            "commit-first",
+            Duration::from_millis(150),
+        );
+        let _ = GmFairnessGuard::acquire_within(
+            &root_b,
+            "git_push",
+            "{\"SESSION_ID\":\"yield-push-behind\"}",
+            "push-behind",
+            Duration::from_millis(150),
+        );
+        let _ = release_tx.send(());
+        let first = match GmFairnessGuard::acquire_within(
+            &root_b,
+            "git_commit",
+            "{\"SESSION_ID\":\"yield-commit-first\"}",
+            "commit-first-admitted",
+            Duration::from_secs(3),
+        ) {
+            Ok(guard) => guard,
+            Err(report) => {
+                return Err(format!(
+                    "a push overtook the commit queued ahead of it (lane held by {:?})",
+                    report.lane_holder_task
+                ))
+            }
+        };
+        drop(first);
+
+        // Aging: the push that has waited out its yield budget stops yielding, so a project that
+        // commits continuously still publishes instead of starving its pushes forever.
+        let (held_rx, release_tx) = hold(&root_c, "holder-aged");
+        if !held_rx.recv_timeout(Duration::from_secs(10)).unwrap_or(false) {
+            return Err("the third holder could not take the project git lane".into());
+        }
+        let _ = GmFairnessGuard::acquire_within(
+            &root_c,
+            "git_push",
+            "{\"SESSION_ID\":\"yield-push-aged\"}",
+            "push-aged",
+            Duration::from_millis(150),
+        );
+        let _ = GmFairnessGuard::acquire_within(
+            &root_c,
+            "git_commit",
+            "{\"SESSION_ID\":\"yield-commit-late\"}",
+            "commit-late",
+            Duration::from_millis(150),
+        );
+        // Aging: past its yield budget the push stops yielding, so a project that commits
+        // continuously still publishes instead of starving its pushes forever.
+        std::thread::sleep(Duration::from_millis(1200));
+        let _ = release_tx.send(());
+        match GmFairnessGuard::acquire_within(
+            &root_c,
+            "git_commit",
+            "{\"SESSION_ID\":\"yield-commit-late\"}",
+            "commit-late-admitted",
+            Duration::from_millis(600),
+        ) {
+            Ok(_) => {
+                return Err(
+                    "a push that had waited out its yield budget still yielded to the commit behind it"
+                        .into(),
+                )
+            }
+            Err(_) => {}
+        }
+        match GmFairnessGuard::acquire_within(
+            &root_c,
+            "git_push",
+            "{\"SESSION_ID\":\"yield-push-aged\"}",
+            "push-aged-admitted",
+            Duration::from_secs(3),
+        ) {
+            Ok(guard) => drop(guard),
+            Err(report) => {
+                return Err(format!(
+                    "the aged push was not admitted once it stopped yielding (lane held by {:?})",
+                    report.lane_holder_task
+                ))
+            }
+        }
+
+        Ok("a commit was admitted ahead of a fresh push, a push never overtook a commit ahead of it, and a push that waited out its yield budget stopped yielding and took the lane".into())
+    })();
+
+    let _ = std::fs::remove_dir_all(&root);
+    match outcome {
+        Ok(detail) => {
+            println!("[{NAME}] {detail}");
+            println!("[{NAME}] witnessed live against the real GmFairnessGuard: PASS");
+            println!("RESULT: PASS");
+            Ok(())
+        }
+        Err(reason) => selfcheck_fail(NAME, &reason),
+    }
+}
+
+/// The FIFO property of a project serial lane, witnessed live against the real guard: the claim that
+/// arrived first is admitted first, and a re-dispatch of the same request keeps its place in the
+/// queue instead of going to the back of it.
 fn selfcheck_lane_fifo() -> anyhow::Result<()> {
     use agentplug_host::GmFairnessGuard;
     use std::sync::mpsc;
