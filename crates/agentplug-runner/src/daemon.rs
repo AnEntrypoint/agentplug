@@ -3709,13 +3709,14 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
             self_update_starved && detached_still_running && self_update_hard_capped;
         let force_handoff_never_idle =
             self_update_starved && self_update_hard_capped && !detached_still_running && any_work;
+        // The backoff defers the handoff, it does not forgive the starve: clearing the staged-at
+        // clock here disarmed SELF_UPDATE_HARD_CAP_MS for the life of the daemon, because the
+        // clock is re-armed only while pending_self_update is None. The gate below withholds the
+        // attempt, so the clock survives the backoff and the first tick past it forces the handoff.
         let self_update_backed_off = pending_self_update
             .as_ref()
             .map(|(_, v)| handoff_backed_off(v))
             .unwrap_or(false);
-        if self_update_backed_off {
-            pending_self_update_staged_at = None;
-        }
         let task_handoff = if pending_self_update.is_some()
             && !self_update_backed_off
             && ((!any_work && !detached_still_running)
