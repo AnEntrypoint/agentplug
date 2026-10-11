@@ -1679,7 +1679,7 @@ pub(super) fn tool_queue_starved_answer(
         "executed": false,
         "re_dispatch_safe": true,
         "error": format!(
-            "verb {} (task {}) was claimed by daemon pid {} but never reached the front of the global {} FIFO within {}ms, so it was NOT executed -- re-dispatching is safe because nothing ran. That queue is global across every project this daemon serves, not per project; holder task {}. Live state for every unanswered request is in {}.",
+            "verb {} (task {}) was claimed by daemon pid {} but never reached the front of the {} queue within {}ms, so it was NOT executed -- re-dispatching is safe because nothing ran. That queue admits one dispatch at a time per project and per verb; holder task {}. Live state for every unanswered request is in {}.",
             verb, task, std::process::id(), queue_key, report.waited_ms,
             report.holder_task.as_deref().unwrap_or("unknown"),
             spool_dir.join(DISPATCH_WAIT_LEDGER_FILE).display()
@@ -1779,6 +1779,7 @@ pub(crate) fn run_gm_dispatch_to_file(
     };
     note_dispatch_stage(root, verb, task, DispatchStage::WaitingForToolQueue, lane);
     let _tool_guard = match ToolDispatchGuard::acquire_within(
+        root,
         plugin_name,
         tool_verb,
         body,
@@ -2684,7 +2685,7 @@ pub(super) fn dispatch_project(
                     }
                 }
 
-                let _tool_guard = ToolDispatchGuard::acquire(&plugin_name, &verb, &body);
+                let _tool_guard = ToolDispatchGuard::acquire(root, &plugin_name, &verb, &body);
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     project.dispatch(&plugin_name, &verb, &body)
                 }));

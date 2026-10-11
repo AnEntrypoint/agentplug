@@ -2379,11 +2379,11 @@ pub struct ToolDispatchGuard {
 }
 
 impl ToolDispatchGuard {
-    pub fn acquire(plugin: &str, verb: &str, body: &str) -> Self {
+    pub fn acquire(root: &Path, plugin: &str, verb: &str, body: &str) -> Self {
         if is_unserialized_dispatch(verb, body) {
             return Self { key: None };
         }
-        let key = format!("{plugin}\u{0}{verb}");
+        let key = format!("{}\u{0}{}\u{0}{}", lane_root_identity(root), plugin, verb);
         let mut active = tool_inflight().lock().unwrap_or_else(|e| e.into_inner());
         let ticket = {
             let queue = active.entry(key.clone()).or_insert(ToolQueue {
@@ -2411,6 +2411,7 @@ impl ToolDispatchGuard {
     }
 
     pub fn acquire_within(
+        root: &Path,
         plugin: &str,
         verb: &str,
         body: &str,
@@ -2420,7 +2421,7 @@ impl ToolDispatchGuard {
         if is_unserialized_dispatch(verb, body) {
             return Ok(Self { key: None });
         }
-        let key = format!("{plugin}\u{0}{verb}");
+        let key = format!("{}\u{0}{}\u{0}{}", lane_root_identity(root), plugin, verb);
         let started = Instant::now();
         let mut active = tool_inflight().lock().unwrap_or_else(|e| e.into_inner());
         let ticket = {
