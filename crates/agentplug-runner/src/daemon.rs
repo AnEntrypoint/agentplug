@@ -2739,7 +2739,10 @@ fn heartbeat_authority_lost() -> bool {
     HEARTBEAT_AUTHORITY_LOST.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-const PROJECT_HEARTBEAT_TICK: Duration = Duration::from_secs(2);
+/// One project-heartbeat refresh per write cadence: a shorter tick only re-scans the spool for a
+/// write `status_write_needed` then declines, and `write_project_heartbeat_with_queue_info` counts
+/// spool steps on every call.
+const PROJECT_HEARTBEAT_TICK: Duration = STATUS_LIVENESS_REFRESH;
 
 fn spawn_heartbeat_ticker(heartbeat_interval: Duration) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
