@@ -1922,8 +1922,9 @@ pub(super) fn lane_starved_answer(
         "dispatch_wait_ledger": spool_dir.join(DISPATCH_WAIT_LEDGER_FILE).to_string_lossy(),
         "executed": false,
         "re_dispatch_safe": true,
+        "re_dispatch_keeps_lane_place": true,
         "error": format!(
-            "verb {} (task {}) was claimed by daemon pid {} but never reached the {} serial lane within {}ms, so it was NOT executed -- re-dispatching is safe because nothing ran. The lane is held by one dispatch at a time per project (git, store, state lanes) and admits waiters oldest-claim-first; holder task {} (verb {}, holding the lane for {}ms), this dispatch was {} in the lane queue with {} waiter(s) behind it. Live state for every unanswered request is in {}.",
+            "verb {} (task {}) was claimed by daemon pid {} but never reached the {} serial lane within {}ms, so it was NOT executed -- re-dispatching is safe because nothing ran. The lane is held by one dispatch at a time per project (git, store, state lanes) and admits waiters oldest-claim-first; holder task {} (verb {}, holding the lane for {}ms), this dispatch was {} in the lane queue with {} waiter(s) behind it. Re-dispatching this verb with a byte-identical body re-claims the place this dispatch already held -- a lane place is keyed on the verb plus a hash of the body, never on the task id -- so the retry keeps its FIFO position; resuming this task id only re-reads this answer. Live state for every unanswered request is in {}.",
             verb, task, std::process::id(), lane.unwrap_or("unassigned"), report.waited_ms,
             report.lane_holder_task.as_deref().unwrap_or("unknown"),
               report.lane_holder_verb.as_deref().unwrap_or("unknown"),
