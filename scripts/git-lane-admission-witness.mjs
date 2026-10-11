@@ -35,9 +35,16 @@ const SELFCHECKS = [
   'selfcheck-lane-release',
   'selfcheck-lane-fifo',
   'selfcheck-lane-network-yield',
+  'selfcheck-claim-reap',
 ];
 const GIT_BAND_EXPRESSION = 'self.short_reserved_slots().saturating_sub(1)';
 const LANE_FIFO_EXPRESSION = '!owners.contains_key(&key) && lane_admissible(&owned_root, lane, token)';
+// Dropping `claimed_not_yet_tracked` from the unowned set is the regression the claim-reap
+// selfcheck exists to catch: the sweep's own ledger row starts protecting the claim again.
+const CLAIM_REAP_EXPRESSION =
+  'pub(super) const LEDGER_UNOWNED_STATES: [&str; 2] = ["claimed_not_yet_tracked", "never_claimed"];';
+const CLAIM_REAP_MUTANT =
+  'pub(super) const LEDGER_UNOWNED_STATES: [&str; 1] = ["never_claimed"];';
 const DEFAULT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const MAX_BUFFER = 64 * 1024 * 1024;
 
@@ -93,6 +100,25 @@ function prepareMutant(root, scratch) {
   fs.writeFileSync(
     registry,
     mutated.replace(LANE_FIFO_EXPRESSION, '!owners.contains_key(&key)'),
+  );
+  const claimReap = path.join(
+    scratch,
+    'crates',
+    'agentplug-runner',
+    'src',
+    'daemon',
+    'claim_dispatch.rs',
+  );
+  const claimReapSource = fs.readFileSync(claimReap, 'utf8');
+  const claimReapHits = claimReapSource.split(CLAIM_REAP_EXPRESSION).length - 1;
+  if (claimReapHits !== 1) {
+    throw new UsageError(
+      `expected exactly one unowned-ledger-state declaration in ${claimReap}, found ${claimReapHits}`,
+    );
+  }
+  fs.writeFileSync(
+    claimReap,
+    claimReapSource.replace(CLAIM_REAP_EXPRESSION, CLAIM_REAP_MUTANT),
   );
 }
 
