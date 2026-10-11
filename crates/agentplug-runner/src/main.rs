@@ -1069,7 +1069,9 @@ fn selfcheck_lane_network_yield() -> anyhow::Result<()> {
 /// member, is stripped before anything hashes or runs that body, and bounds the wait between a floor
 /// and the lane's own ceiling.
 fn selfcheck_lane_budget() -> anyhow::Result<()> {
-    use crate::daemon::{lane_wait_max, split_caller_lane_wait_ms};
+    use crate::daemon::{
+        lane_wait_ceiling_ms, lane_wait_default_ms, lane_wait_max, split_caller_lane_wait_ms,
+    };
     use agentplug_host::GmFairnessGuard;
     use std::sync::mpsc;
     use std::time::Duration;
@@ -1130,6 +1132,22 @@ fn selfcheck_lane_budget() -> anyhow::Result<()> {
         if strip_without_budget() {
             return Err("a body with no reserved member was altered".into());
         }
+        let (stripped_public, budget_public) = split_caller_lane_wait_ms(
+            "{\"SESSION_ID\":\"budget\",\"paths\":[\"a\"],\"lane_wait_ms\":9000}",
+        );
+        if stripped_public != BODY_STRIPPED || budget_public != Some(9_000) {
+            return Err(format!(
+                "a caller-written lane_wait_ms was not read and stripped: got {stripped_public:?} / {budget_public:?}"
+            ));
+        }
+        if split_caller_lane_wait_ms(
+            "{\"SESSION_ID\":\"budget\",\"_agentplug_lane_wait_ms\":1200,\"lane_wait_ms\":9000}",
+        )
+        .1
+            != Some(1_200)
+        {
+            return Err("a caller-written lane_wait_ms overrode the reserved budget".into());
+        }
 
         // The budget bounds the wait between a floor and the lane's own ceiling, so a caller can
         // raise it to what it asked for and no further.
@@ -1149,6 +1167,30 @@ fn selfcheck_lane_budget() -> anyhow::Result<()> {
             return Err(
                 "a caller budget larger than the lane ceiling was honoured past that ceiling".into(),
             );
+        }
+
+        // The default is a prompt answer for a caller that asked for nothing, and it no longer
+        // doubles as the ceiling: a codesearch caller that DID state a budget buys the ceiling.
+        let codesearch_default = lane_wait_default_ms("codesearch");
+        let codesearch_ceiling = lane_wait_ceiling_ms("codesearch");
+        if codesearch_default >= codesearch_ceiling {
+            return Err(format!(
+                "codesearch's default wait ({codesearch_default}ms) is not below its ceiling ({codesearch_ceiling}ms) -- a caller that states no budget would no longer be answered promptly"
+            ));
+        }
+        if lane_wait_max("codesearch", None) != Duration::from_millis(codesearch_default) {
+            return Err(format!(
+                "a codesearch with no stated budget did not get the short default: got {:?}",
+                lane_wait_max("codesearch", None)
+            ));
+        }
+        if lane_wait_max("codesearch", Some(240_000))
+            != Duration::from_millis(codesearch_ceiling.min(240_000))
+        {
+            return Err(format!(
+                "a codesearch caller that asked for 240s did not buy the wait: got {:?} of a {codesearch_ceiling}ms ceiling",
+                lane_wait_max("codesearch", Some(240_000))
+            ));
         }
 
         // Live: a waiter whose caller budgeted 1200ms starves at ~1200ms, not at a budget it never
@@ -1181,7 +1223,7 @@ fn selfcheck_lane_budget() -> anyhow::Result<()> {
         }
         let _ = release_tx.send(());
         Ok(format!(
-            "the reserved member is stripped byte-exactly from either side of the body, the caller's budget bounds the lane wait (starved at {waited_ms}ms on a 1200ms budget) between a 1000ms floor and the lane ceiling"
+            "the reserved member is stripped byte-exactly from either side of the body, a caller-written lane_wait_ms is read and stripped too, the caller's budget bounds the lane wait (starved at {waited_ms}ms on a 1200ms budget) between a 1000ms floor and the lane ceiling, and codesearch's short {codesearch_default}ms default no longer clips a caller that asked for 240s (ceiling {codesearch_ceiling}ms)"
         ))
     })();
 

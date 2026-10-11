@@ -30,7 +30,7 @@ pub(super) const MAX_CLAIMED_DISPATCHES_PER_PROJECT: usize = 32;
 /// hold at any budget.
 pub(super) const LANE_WAIT_MAX_MS_DEFAULT: u64 = 240_000;
 pub(super) const GIT_LANE_WAIT_MAX_MS_DEFAULT: u64 = 600_000;
-pub(super) const CODESEARCH_LANE_WAIT_MAX_MS: u64 = 5_000;
+pub(super) const CODESEARCH_LANE_WAIT_MS_DEFAULT: u64 = 5_000;
 pub(super) const DISPATCH_WAIT_LEDGER_FILE: &str = ".dispatch-wait.json";
 pub(super) const LEDGER_REFRESH_MIN_INTERVAL_MS: u64 = 250;
 
@@ -55,6 +55,9 @@ pub(super) const LANE_HOLD_STUCK_MIN_MS_DEFAULT: u64 = 180_000;
 /// the body is hashed for its FIFO identity and before it reaches any plugin, so the channel can
 /// never change what a request is or what a plugin sees.
 pub(super) const LANE_WAIT_MS_BODY_KEY: &str = "_agentplug_lane_wait_ms";
+/// The public spelling of the same channel, so a caller writing its own spool body buys the wait
+/// without owning the reserved name. The reserved member wins when both appear.
+pub(super) const LANE_WAIT_MS_PUBLIC_BODY_KEY: &str = "lane_wait_ms";
 /// A caller's budget is honoured down to this floor, so a sub-second poll cannot turn every lane
 /// wait into an instant starvation.
 pub(super) const LANE_WAIT_FLOOR_MS: u64 = 1_000;
@@ -1796,38 +1799,57 @@ pub(super) fn spool_dir_of_root(root: &Path) -> PathBuf {
 }
 
 pub(crate) fn lane_wait_max(verb: &str, caller_budget_ms: Option<u64>) -> Duration {
-    let cap = lane_wait_cap_ms(verb);
-    // The caller's own poll budget bounds the wait and never extends it: a caller that asked for 30s
-    // is answered inside 30s, and one that asked for the documented maximum reaches the lane budget
-    // instead of being cut off at 120s by a timer it could not see. The floor keeps a sub-second
-    // poll from turning every lane wait into an instant starvation.
     let bounded = match caller_budget_ms {
-        Some(budget) => cap.min(budget.max(LANE_WAIT_FLOOR_MS)),
-        None => cap,
+        Some(budget) => lane_wait_ceiling_ms(verb).min(budget.max(LANE_WAIT_FLOOR_MS)),
+        None => lane_wait_default_ms(verb),
     };
     Duration::from_millis(bounded)
 }
 
-/// The lane's own wait ceiling, before the caller's budget is applied to it.
-fn lane_wait_cap_ms(verb: &str) -> u64 {
+/// The wait a caller that stated no budget gets: short for a verb whose whole point is a fast
+/// answer, the lane ceiling everywhere else.
+pub(crate) fn lane_wait_default_ms(verb: &str) -> u64 {
     if verb == "codesearch" {
-        return CODESEARCH_LANE_WAIT_MAX_MS;
+        return env_ms_or(
+            "AGENTPLUG_CODESEARCH_LANE_WAIT_MS",
+            CODESEARCH_LANE_WAIT_MS_DEFAULT,
+        );
     }
+    lane_wait_ceiling_ms(verb)
+}
+
+/// The longest wait a caller may buy on this lane, before the caller's own budget clamps it.
+///
+/// A default that doubled as the ceiling is what answered a `timeout_seconds: 240` caller at 5008ms:
+/// a caller that named a budget was clipped to the short default instead of buying the ceiling. The
+/// two are separate numbers now, so the prompt default is kept and the ceiling stays buyable.
+pub(crate) fn lane_wait_ceiling_ms(verb: &str) -> u64 {
     if dispatch_serial_lane(verb, "") == Some("git") {
         return git_lane_wait_max().as_millis() as u64;
     }
     env_ms_or("AGENTPLUG_LANE_WAIT_MAX_MS", LANE_WAIT_MAX_MS_DEFAULT)
 }
 
-/// Splits the caller's reserved lane-wait member out of a dispatch body.
+/// Splits the caller's lane-wait budget out of a dispatch body.
 ///
 /// Returns the body with the member removed -- that is the body the plugin sees and the one hashed
 /// for the claim's FIFO identity, so the channel is invisible to both -- plus the budget it carried.
-/// A body that is not a JSON object, or that carries the name without a plain integer value, is
-/// returned untouched with no budget: an unparseable channel is ignored rather than acted on.
+/// The reserved member gm-mcp writes from `timeout_seconds` wins; `lane_wait_ms` is the public
+/// spelling for a caller writing its own body. A body that is not a JSON object, or that carries the
+/// name without a plain integer value, is returned untouched with no budget: an unparseable channel
+/// is ignored rather than acted on.
 pub(crate) fn split_caller_lane_wait_ms(body: &str) -> (String, Option<u64>) {
+    let (stripped, reserved) = strip_lane_wait_member(body, LANE_WAIT_MS_BODY_KEY);
+    if reserved.is_some() {
+        return (stripped, reserved);
+    }
+    let (stripped_public, public) = strip_lane_wait_member(&stripped, LANE_WAIT_MS_PUBLIC_BODY_KEY);
+    (stripped_public, public)
+}
+
+fn strip_lane_wait_member(body: &str, member: &str) -> (String, Option<u64>) {
     let bytes = body.as_bytes();
-    let key_at_body = format!("\"{}\"", LANE_WAIT_MS_BODY_KEY);
+    let key_at_body = format!("\"{}\"", member);
     let key = key_at_body.as_bytes();
     let Some(key_at) = bytes.windows(key.len()).position(|window| window == key) else {
         return (body.to_string(), None);
@@ -1897,13 +1919,17 @@ pub(super) fn git_lane_wait_max() -> Duration {
 }
 
 
+/// `granted_ms` is the budget this dispatch was actually given, so the answer names the wait it
+/// lost to and the ceiling it could have bought instead of leaving the caller to guess one.
 pub(super) fn lane_starved_answer(
     root: &Path,
     verb: &str,
     task: &str,
     lane: Option<&'static str>,
     report: &LaneWaitReport,
+    granted_ms: u64,
 ) -> String {
+    let ceiling_ms = lane_wait_ceiling_ms(verb);
     let spool_dir = spool_dir_of_root(root);
     let (request_path, claim_path, out_path) = unanswered_spool_paths(&spool_dir, verb, task);
     serde_json::json!({
@@ -1919,6 +1945,14 @@ pub(super) fn lane_starved_answer(
         "lane_holder_verb": report.lane_holder_verb,
         "lane_holder_held_ms": report.lane_holder_held_ms,
         "lane_holder_age_ms": report.lane_holder_age_ms,
+        "lane_wait_budget_ms": granted_ms,
+        "lane_wait_default_ms": lane_wait_default_ms(verb),
+        "lane_wait_ceiling_ms": ceiling_ms,
+        "suggested_lane_wait_ms": ceiling_ms,
+        "retry_hint": format!(
+            "re-dispatch this verb with \"lane_wait_ms\": {ceiling_ms} (or timeout_seconds: {}) to wait for the lane instead of being answered at {granted_ms}ms",
+            ceiling_ms.div_ceil(1_000)
+        ),
         "daemon_pid": std::process::id(),
         "request_path": request_path.to_string_lossy(),
         "claim_path": claim_path.to_string_lossy(),
@@ -2054,6 +2088,7 @@ pub(crate) fn run_gm_dispatch_to_file(
     let (body_owned, caller_lane_wait_ms) = split_caller_lane_wait_ms(body);
     let body = body_owned.as_str();
     let lane = dispatch_serial_lane(tool_verb, body);
+    let lane_wait_budget = lane_wait_max(tool_verb, caller_lane_wait_ms);
     let in_dir = root.join(".gm").join("exec-spool").join("in");
     note_dispatch_stage(root, verb, task, DispatchStage::WaitingForLane, lane);
     let _fairness_guard = match GmFairnessGuard::acquire_within(
@@ -2061,11 +2096,18 @@ pub(crate) fn run_gm_dispatch_to_file(
         tool_verb,
         body,
         task,
-        lane_wait_max(tool_verb, caller_lane_wait_ms),
+        lane_wait_budget,
     ) {
         Ok(guard) => guard,
         Err(report) => {
-            let out_body = lane_starved_answer(root, verb, task, lane, &report);
+            let out_body = lane_starved_answer(
+                root,
+                verb,
+                task,
+                lane,
+                &report,
+                lane_wait_budget.as_millis() as u64,
+            );
             eprintln!(
                 "[agentplug daemon] {verb}/{task} for {} was claimed but never reached the {:?} lane within {}ms -- answered dispatch_starved_waiting_for_serial_lane; the verb did not run",
                 root.display(), lane, report.waited_ms
@@ -2116,7 +2158,7 @@ pub(crate) fn run_gm_dispatch_to_file(
         tool_verb,
         body,
         task,
-        lane_wait_max(tool_verb, caller_lane_wait_ms),
+        lane_wait_budget,
     ) {
         Ok(guard) => guard,
         Err(report) => {
