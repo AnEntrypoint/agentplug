@@ -892,6 +892,20 @@ pub fn stage_runner_self_update() -> anyhow::Result<Option<(PathBuf, String)>> {
             .map(|e| format!("{}.{staged_suffix}", e.to_string_lossy()))
             .unwrap_or_else(|| staged_suffix.to_string()),
     );
+    let staged_marker = PathBuf::from(format!("{}.json", staged.display()));
+    if staged.exists() {
+        if let Ok(raw) = fs::read_to_string(&staged_marker) {
+            let recorded = serde_json::from_str::<serde_json::Value>(&raw)
+                .ok()
+                .as_ref()
+                .and_then(|marker| marker.get("version"))
+                .and_then(|version| version.as_str())
+                .map(str::to_string);
+            if recorded.as_deref() == Some(latest.as_str()) {
+                return Ok(Some((staged, latest)));
+            }
+        }
+    }
     let base = format!("https://github.com/{RUNNER_BIN_REPO}/releases/download/v{latest}");
     let sha_line = agentplug_host::shared_agent()
         .get(&format!("{base}/{asset}.sha256"))
@@ -910,6 +924,15 @@ pub fn stage_runner_self_update() -> anyhow::Result<Option<(PathBuf, String)>> {
         perms.set_mode(0o755);
         fs::set_permissions(&staged, perms)?;
     }
+    let _ = fs::write(
+        &staged_marker,
+        serde_json::json!({
+            "version": latest,
+            "asset": asset,
+            "sha256": expected_sha,
+        })
+        .to_string(),
+    );
     Ok(Some((staged, latest)))
 }
 
