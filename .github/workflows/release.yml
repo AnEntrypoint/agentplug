@@ -97,6 +97,28 @@ jobs:
           AGENTPLUG_RELEASE_BUILD: "1"
         run: cargo build -p agentplug-runner --bin agentplug-runner --release --target ${{ matrix.target }}
 
+      - name: Lane selfchecks against the freshly built runner
+        shell: bash
+        run: |
+          set -e
+          bin="target/${{ matrix.target }}/release/agentplug-runner"
+          if [[ "${{ matrix.asset }}" == *.exe ]]; then bin="$bin.exe"; fi
+          for check in selfcheck-git-admission selfcheck-lane-release selfcheck-lane-fifo; do
+            set +e
+            out=$("$bin" "$check" 2>&1)
+            code=$?
+            set -e
+            printf '%s\n' "$out" | sed "s/^/[$check] /"
+            if [ "$code" -ne 0 ]; then
+              echo "::error::$check exited $code"
+              exit 1
+            fi
+            if ! printf '%s\n' "$out" | grep -q "RESULT: PASS"; then
+              echo "::error::$check did not print RESULT: PASS"
+              exit 1
+            fi
+          done
+
       - name: Stage asset with checksum
         shell: bash
         run: |
