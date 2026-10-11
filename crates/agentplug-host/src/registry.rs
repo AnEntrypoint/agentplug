@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -1938,6 +1938,7 @@ static TOOL_INFLIGHT: OnceLock<Mutex<HashMap<String, ToolQueue>>> = OnceLock::ne
 static TOOL_STEP_RELEASED: OnceLock<Condvar> = OnceLock::new();
 
 struct LaneOwner {
+    verb: String,
     token: u64,
     task: String,
     acquired_ms: u64,
@@ -2160,9 +2161,197 @@ pub fn dispatch_serial_lane(verb: &str, body: &str) -> Option<&'static str> {
     serial_lane_for_dispatch(verb, body)
 }
 
-fn gm_lane_waiters() -> &'static Mutex<HashMap<(PathBuf, &'static str), usize>> {
-    static WAITERS: OnceLock<Mutex<HashMap<(PathBuf, &'static str), usize>>> = OnceLock::new();
+/// One dispatch waiting its turn on a project serial lane, in claim order.
+///
+/// Admission is FIFO by claim age: a waiter is admitted only while it is the head, so a later
+/// arrival can never overtake an older one. The token is drawn under the same lock that pushes the
+/// entry, so queue order and claim order cannot disagree.
+///
+/// `identity` is what makes FIFO survive re-dispatch. A starved caller re-dispatches its request
+/// verbatim, and the spool mints a fresh task id and a fresh token for it, so an arrival-ordered
+/// queue would put that waiter behind every newer arrival and one long holder would starve the same
+/// request forever while `lane_waiters` grew. The entry is keyed by the request's identity -- verb
+/// plus a hash of its body, both byte-identical across the re-dispatch -- so the re-dispatch
+/// re-claims the token it already held and keeps its place. The entry survives starvation and is
+/// dropped when its dispatch finally gets the lane, or by TTL on `last_seen_ms` once its caller
+/// stops re-dispatching.
+struct LaneWaiter {
+    token: u64,
+    task: String,
+    identity: String,
+    last_seen_ms: u64,
+    /// True while some dispatch is inside `acquire_within` under this ticket. A place is inherited
+    /// only from a PARKED ticket (`active == false`), so two callers that happen to send a
+    /// byte-identical body still get one ticket each: sharing one would let the first acquire remove
+    /// it from the queue and leave the second waiting on a token that is no longer queued, which
+    /// never becomes head and so starves until its budget runs out.
+    active: bool,
+}
+
+/// A waiter that has not re-claimed its place within this long is no longer contending: the lane
+/// passes to the next ticket instead of idling until the TTL. This bounds the cost of a caller that
+/// starved once and never came back at 30s rather than at the TTL.
+const LANE_TICKET_STALE_MS: u64 = 30_000;
+
+/// A ticket not re-claimed within this long has been abandoned by its caller and leaves the queue.
+const LANE_TICKET_TTL_MS: u64 = 600_000;
+
+/// The stable identity of one request across re-dispatches: its verb plus a hash of its body.
+/// Never the task id -- the spool mints that fresh on every dispatch.
+fn lane_claim_identity(verb: &str, body: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    body.hash(&mut hasher);
+    format!("{}:{:016x}", verb, hasher.finish())
+}
+
+fn gm_lane_waiters() -> &'static Mutex<HashMap<(PathBuf, &'static str), VecDeque<LaneWaiter>>> {
+    static WAITERS: OnceLock<Mutex<HashMap<(PathBuf, &'static str), VecDeque<LaneWaiter>>>> =
+        OnceLock::new();
     WAITERS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// True when `token` is the oldest claim waiting on this lane.
+///
+/// Callers hold the lane-owner lock across this check and the insert that follows it, so the head
+/// cannot change in between: exactly one waiter is admissible at a time, and one owner per
+/// `(project, lane)` is what keeps concurrent git writers on one worktree serialized.
+fn lane_head_is(root: &Path, lane: &'static str, token: u64) -> bool {
+    let now = crate::now_ms();
+    gm_lane_waiters()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&(root.to_path_buf(), lane))
+        .and_then(|queue| {
+            queue
+                .iter()
+                .position(|entry| entry.token == token)
+                .map(|index| (queue, index))
+        })
+        .map(|(queue, index)| {
+            // Every claim ahead of this one has stopped re-dispatching, so waiting for it would
+            // only idle the lane: this claim is admissible. A claim that is still contending stays
+            // ahead because its `last_seen_ms` keeps moving forward.
+            queue
+                .iter()
+                .take(index)
+                .all(|entry| now.saturating_sub(entry.last_seen_ms) >= LANE_TICKET_STALE_MS)
+        })
+        .unwrap_or(false)
+}
+
+fn lane_name(name: &str) -> Option<&'static str> {
+    match name {
+        "git" => Some("git"),
+        "read" => Some("read"),
+        "store" => Some("store"),
+        "state" => Some("state"),
+        _ => None,
+    }
+}
+
+/// Where `task` stands on its project serial lane, and how long the lane's current holder has held it.
+///
+/// `lane_position` is 1-based over the FIFO queue and counts only dispatchers still waiting: 1 means
+/// this task is admitted the moment the current holder releases. This is the cheap-poll surface
+/// behind `.dispatch-wait.json` -- read it instead of spending a whole dispatch budget to learn the
+/// caller would lose the race. Lock order is owners-then-waiters, matching `acquire_within`.
+pub struct LaneQueueState {
+    pub lane_position: Option<u64>,
+    pub lane_holder_age_ms: Option<u64>,
+    pub lane_holder_task: Option<String>,
+    pub lane_holder_verb: Option<String>,
+    pub lane_waiters: usize,
+}
+
+pub fn lane_queue_state(root: &Path, lane: Option<&str>, task: &str) -> LaneQueueState {
+    let unassigned = LaneQueueState {
+        lane_position: None,
+        lane_holder_age_ms: None,
+        lane_holder_task: None,
+        lane_holder_verb: None,
+        lane_waiters: 0,
+    };
+    let Some(lane) = lane.and_then(lane_name) else {
+        return unassigned;
+    };
+    let key = (root.to_path_buf(), lane);
+    let now = crate::now_ms();
+    let owners = gm_lane_owners().lock().unwrap_or_else(|e| e.into_inner());
+    let holder = owners.get(&key).map(|owner| {
+        (
+            now.saturating_sub(owner.acquired_ms),
+            owner.task.clone(),
+            owner.verb.clone(),
+        )
+    });
+    drop(owners);
+    let waiters = gm_lane_waiters().lock().unwrap_or_else(|e| e.into_inner());
+    let queue = waiters.get(&key);
+    let lane_position = queue
+        .and_then(|queue| queue.iter().position(|entry| entry.task == task))
+        .map(|index| index as u64 + 1);
+    let lane_waiters = queue.map(|queue| queue.len()).unwrap_or(0);
+    drop(waiters);
+    let (lane_holder_age_ms, lane_holder_task, lane_holder_verb) = match holder {
+        Some((age, task, verb)) => (
+            Some(age),
+            if task.is_empty() { None } else { Some(task) },
+            if verb.is_empty() { None } else { Some(verb) },
+        ),
+        None => (None, None, None),
+    };
+    LaneQueueState {
+        lane_position,
+        lane_holder_age_ms,
+        lane_holder_task,
+        lane_holder_verb,
+        lane_waiters,
+    }
+}
+
+/// One lane this project currently holds.
+pub struct LaneHold {
+    pub lane: &'static str,
+    pub verb: String,
+    pub task: String,
+    pub held_ms: u64,
+    pub waiters: usize,
+}
+
+/// Every lane this project holds, with how long it has been held and how many claims wait on it.
+///
+/// A lane is single-writer, so a hold far longer than any real operation is the signature of a
+/// stalled holder freezing the project's whole lane. This is the watchdog's read: it names the
+/// holder and its hold duration. It never releases a live holder -- one writer per lane is the
+/// property that keeps concurrent git writers on one worktree serialized, and dropping it would
+/// trade a visible stall for a corrupted index.
+///
+/// Lock order is owners-then-waiters, matching `acquire_within`.
+pub fn lane_holds(root: &Path) -> Vec<LaneHold> {
+    let now = crate::now_ms();
+    let owners = gm_lane_owners().lock().unwrap_or_else(|e| e.into_inner());
+    let holds: Vec<LaneHold> = owners
+        .iter()
+        .filter(|((owner_root, _), _)| owner_root == root)
+        .map(|((_, lane), owner)| {
+            let waiters = gm_lane_waiters()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&(root.to_path_buf(), *lane))
+                .map(|queue| queue.len())
+                .unwrap_or(0);
+            LaneHold {
+                lane,
+                verb: owner.verb.clone(),
+                task: owner.task.clone(),
+                held_ms: now.saturating_sub(owner.acquired_ms),
+                waiters,
+            }
+        })
+        .collect();
+    drop(owners);
+    holds
 }
 
 fn tool_queue_holders() -> &'static Mutex<HashMap<String, String>> {
@@ -2171,7 +2360,11 @@ fn tool_queue_holders() -> &'static Mutex<HashMap<String, String>> {
 }
 
 pub struct LaneWaitReport {
+    pub lane_holder_verb: Option<String>,
+    pub lane_holder_held_ms: u64,
+    pub lane_holder_age_ms: u64,
     pub lane: &'static str,
+    pub lane_position: Option<u64>,
     pub waited_ms: u64,
     pub waiters: usize,
     pub lane_holder_task: Option<String>,
@@ -2202,6 +2395,7 @@ fn lane_root_identity(root: &Path) -> String {
 }
 
 pub struct AbandonedLaneOwner {
+    pub verb: String,
     pub root: PathBuf,
     pub lane: &'static str,
     pub task: String,
@@ -2227,6 +2421,7 @@ impl GmFairnessGuard {
                     key,
                     LaneOwner {
                         token,
+                        verb: verb.to_string(),
                         task: String::new(),
                         acquired_ms: crate::now_ms(),
                     },
@@ -2259,19 +2454,46 @@ impl GmFairnessGuard {
             });
         };
         let started = Instant::now();
-        {
+        let identity = lane_claim_identity(verb, body);
+        let now = crate::now_ms();
+        let token = {
             let mut waiters = gm_lane_waiters().lock().unwrap_or_else(|e| e.into_inner());
-            *waiters.entry((owned_root.clone(), lane)).or_insert(0) += 1;
-        }
-        let token = next_lane_token();
+            let queue = waiters.entry((owned_root.clone(), lane)).or_default();
+            queue.retain(|entry| now.saturating_sub(entry.last_seen_ms) < LANE_TICKET_TTL_MS);
+            match queue
+                .iter()
+                .position(|entry| entry.identity == identity && !entry.active)
+            {
+                // The same request re-dispatched after starving: keep its token, and so its place.
+                Some(index) => {
+                    let entry = &mut queue[index];
+                    entry.last_seen_ms = now;
+                    entry.task = task.to_string();
+                    entry.active = true;
+                    entry.token
+                }
+                None => {
+                    let token = next_lane_token();
+                    queue.push_back(LaneWaiter {
+                        token,
+                        task: task.to_string(),
+                        identity,
+                        last_seen_ms: now,
+                        active: true,
+                    });
+                    token
+                }
+            }
+        };
         let mut owners = gm_lane_owners().lock().unwrap_or_else(|e| e.into_inner());
         let acquired = loop {
             let key = (owned_root.clone(), lane);
-            if !owners.contains_key(&key) {
+            if !owners.contains_key(&key) && lane_head_is(&owned_root, lane, token) {
                 owners.insert(
                     key,
                     LaneOwner {
                         token,
+                        verb: verb.to_string(),
                         task: task.to_string(),
                         acquired_ms: crate::now_ms(),
                     },
@@ -2288,30 +2510,58 @@ impl GmFairnessGuard {
             owners = next;
         };
         drop(owners);
-        let waiters = {
+        let (waiters, lane_position) = {
             let mut waiters = gm_lane_waiters().lock().unwrap_or_else(|e| e.into_inner());
             let key = (owned_root.clone(), lane);
-            let remaining = waiters.get(&key).copied().unwrap_or(0).saturating_sub(1);
-            if remaining == 0 {
-                waiters.remove(&key);
-            } else {
-                waiters.insert(key, remaining);
+            let position = waiters
+                .get(&key)
+                .and_then(|queue| queue.iter().position(|entry| entry.token == token))
+                .map(|index| index as u64 + 1);
+            if acquired {
+                // Served: the claim leaves the queue. A starved claim deliberately stays, so its
+                // caller's re-dispatch inherits this place instead of rejoining at the back.
+                if let Some(queue) = waiters.get_mut(&key) {
+                    queue.retain(|entry| entry.token != token);
+                    if queue.is_empty() {
+                        waiters.remove(&key);
+                    }
+                }
+            } else if let Some(queue) = waiters.get_mut(&key) {
+                // Parked: this caller is going back to poll, and its place is held for it.
+                if let Some(entry) = queue.iter_mut().find(|entry| entry.token == token) {
+                    entry.active = false;
+                }
             }
-            remaining
+            let remaining = waiters.get(&key).map(|queue| queue.len()).unwrap_or(0);
+            (remaining, position)
         };
         if !acquired {
-            let lane_holder_task = gm_lane_owners()
+            let (holder_task, holder_verb, holder_held_ms) = gm_lane_owners()
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .get(&(owned_root.clone(), lane))
-                .map(|owner| owner.task.clone())
-                .filter(|holder| !holder.is_empty());
+                .map(|owner| {
+                    (
+                        owner.task.clone(),
+                        owner.verb.clone(),
+                        crate::now_ms().saturating_sub(owner.acquired_ms),
+                    )
+                })
+                .unwrap_or_else(|| (String::new(), String::new(), 0));
+            let lane_holder_task = if holder_task.is_empty() { None } else { Some(holder_task) };
+            let lane_holder_verb = if holder_verb.is_empty() { None } else { Some(holder_verb) };
+            let lane_holder_held_ms = holder_held_ms;
+            let lane_holder_age_ms = holder_held_ms;
             gm_project_step_released().notify_all();
             return Err(LaneWaitReport {
                 lane,
                 waited_ms: started.elapsed().as_millis() as u64,
                 waiters,
+                lane_position,
                 lane_holder_task,
+                lane_holder_verb,
+                lane_holder_held_ms,
+                lane_holder_age_ms,
             });
         }
         Ok(Self {
@@ -2369,7 +2619,64 @@ pub fn release_abandoned_lane_owners(
             released.push(AbandonedLaneOwner {
                 root: key.0.clone(),
                 lane: key.1,
+                verb: owner.verb,
                 task: owner.task,
+                held_ms: now.saturating_sub(owner.acquired_ms),
+            });
+        }
+    }
+    if !released.is_empty() {
+        gm_project_step_released().notify_all();
+    }
+    released
+}
+
+/// Frees each lane whose holder dispatch is provably gone, whatever the project's own liveness.
+///
+/// `release_abandoned_lane_owners` only fires once the whole project root drops out of the
+/// registry, so inside a leased project -- every project agents are actually working in -- a lane
+/// held by a dispatch that died without dropping its guard stayed held for the life of the daemon.
+/// This is the per-holder form: it asks the caller, which owns the dispatch ledger, whether that
+/// one dispatch is still live, and frees the lane when it is not. The owning dispatch keeps
+/// running either way; its guard then finds a different token on drop and leaves the new owner
+/// alone. A holder whose verb or task is unknown is never reaped, because it cannot be identified.
+pub fn release_dead_lane_owners<F>(min_held_ms: u64, holder_is_live: &F) -> Vec<AbandonedLaneOwner>
+where
+    F: Fn(&Path, &'static str, &str, &str) -> bool,
+{
+    let now = crate::now_ms();
+    let candidates: Vec<((PathBuf, &'static str), u64)> = gm_lane_owners()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .filter(|(_, owner)| now.saturating_sub(owner.acquired_ms) >= min_held_ms)
+        .map(|(key, owner)| (key.clone(), owner.token))
+        .collect();
+    let mut released = Vec::new();
+    for (key, token) in candidates {
+        let (verb, task) = {
+            let owners = gm_lane_owners().lock().unwrap_or_else(|e| e.into_inner());
+            match owners.get(&key) {
+                Some(owner) if owner.token == token => (owner.verb.clone(), owner.task.clone()),
+                _ => continue,
+            }
+        };
+        if verb.is_empty() || task.is_empty() {
+            continue;
+        }
+        if holder_is_live(&key.0, key.1, &verb, &task) {
+            continue;
+        }
+        let mut owners = gm_lane_owners().lock().unwrap_or_else(|e| e.into_inner());
+        if owners.get(&key).map(|owner| owner.token) != Some(token) {
+            continue;
+        }
+        if let Some(owner) = owners.remove(&key) {
+            released.push(AbandonedLaneOwner {
+                root: key.0.clone(),
+                lane: key.1,
+                verb: owner.verb.clone(),
+                task: owner.task.clone(),
                 held_ms: now.saturating_sub(owner.acquired_ms),
             });
         }
