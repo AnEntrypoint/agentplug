@@ -2812,6 +2812,62 @@ impl GmFairnessGuard {
     }
 }
 
+impl GmFairnessGuard {
+    /// True while this guard is still the lane's single writer.
+    ///
+    /// The hold watchdog takes the lane away from a holder that is stuck before it ever runs -- a
+    /// hold is bounded, so one stalled dispatch cannot freeze a project's lane forever. The holder
+    /// is not executing at that point (it holds the lane while it waits for its tool-queue turn),
+    /// so it asks this before dispatching and answers starved instead: the lane stays single-writer
+    /// because a holder that lost it never touches the worktree.
+    pub fn still_owns(&self) -> bool {
+        let Some(lane) = self.lane else {
+            return true;
+        };
+        gm_lane_owners()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&(self.root.clone(), lane))
+            .map(|owner| owner.token) == Some(self.token)
+    }
+}
+
+/// Puts a claim the hold watchdog displaced back at the head of its lane queue, parked.
+///
+/// A displaced holder never runs, so fairness owes it the place it had: it was the head when the
+/// watchdog took the lane, and without this its caller's re-dispatch would rejoin at the back and
+/// lose to every newer arrival. The ticket is parked (`active: false`) and keeps the claim's
+/// identity, so the re-dispatch -- byte-identical body, fresh task id -- inherits it instead of
+/// minting a new one.
+pub fn requeue_lane_claimer_front(
+    root: &Path,
+    lane: Option<&'static str>,
+    verb: &str,
+    body: &str,
+    task: &str,
+) {
+    let Some(lane) = lane.and_then(lane_name) else {
+        return;
+    };
+    let now = crate::now_ms();
+    let identity = lane_claim_identity(verb, body);
+    let key = (root.to_path_buf(), lane);
+    let mut waiters = gm_lane_waiters().lock().unwrap_or_else(|e| e.into_inner());
+    let queue = waiters.entry(key).or_default();
+    if queue.iter().any(|entry| entry.identity == identity) {
+        return;
+    }
+    queue.push_front(LaneWaiter {
+        token: next_lane_token(),
+        task: task.to_string(),
+        identity,
+        verb: verb.to_string(),
+        claimed_ms: now,
+        last_seen_ms: now,
+        active: false,
+    });
+}
+
 impl Drop for GmFairnessGuard {
     fn drop(&mut self) {
         let Some(lane) = self.lane else {

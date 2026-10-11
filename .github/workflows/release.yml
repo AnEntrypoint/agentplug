@@ -105,7 +105,7 @@ jobs:
           set -e
           bin="target/${{ matrix.target }}/release/agentplug-runner"
           if [[ "${{ matrix.asset }}" == *.exe ]]; then bin="$bin.exe"; fi
-          for check in selfcheck-git-admission selfcheck-lane-release selfcheck-lane-fifo selfcheck-lane-network-yield selfcheck-claim-reap; do
+          for check in selfcheck-git-admission selfcheck-lane-release selfcheck-lane-fifo selfcheck-lane-budget selfcheck-lane-hold-release selfcheck-lane-network-yield; do
             set +e
             out=$("$bin" "$check" 2>&1)
             code=$?
