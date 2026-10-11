@@ -1011,6 +1011,7 @@ pub(crate) fn lane_holder_stuck_reason(root: &Path, verb: &str, task: &str) -> O
 }
 
 /// A lane hold past the stuck bound, released with its reason.
+#[derive(Debug)]
 pub(crate) struct ReleasedLaneHold {
     pub(crate) lane: &'static str,
     pub(crate) verb: String,
@@ -1031,13 +1032,16 @@ pub(crate) fn release_stuck_lane_holders(min_held_ms: u64) -> Vec<ReleasedLaneHo
     });
     owners
         .into_iter()
-        .map(|owner| ReleasedLaneHold {
-            lane: owner.lane,
-            verb: owner.verb,
-            task: owner.task,
-            held_ms: owner.held_ms,
-            reason: lane_holder_stuck_reason(&owner.root, &owner.verb, &owner.task)
-                .unwrap_or("holder_dispatch_gone"),
+        .map(|owner| {
+            let reason = lane_holder_stuck_reason(&owner.root, &owner.verb, &owner.task)
+                .unwrap_or("holder_dispatch_gone");
+            ReleasedLaneHold {
+                lane: owner.lane,
+                verb: owner.verb,
+                task: owner.task,
+                held_ms: owner.held_ms,
+                reason,
+            }
         })
         .collect()
 }
