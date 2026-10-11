@@ -152,10 +152,11 @@ fn main() -> anyhow::Result<()> {
         "takeover" => {
             let version = args.get(2).cloned().unwrap_or_default();
             if version.is_empty() {
-                eprintln!("usage: agentplug-runner takeover <version>");
+                eprintln!("usage: agentplug-runner takeover <version> [--force]");
                 std::process::exit(1);
             }
-            daemon::run_takeover(&version)
+            let force = args.iter().skip(3).any(|arg| arg == "--force");
+            daemon::run_takeover(&version, force)
         }
         "dispatch" => {
             let plugin = args.get(2).cloned().unwrap_or_else(|| "gm".to_string());

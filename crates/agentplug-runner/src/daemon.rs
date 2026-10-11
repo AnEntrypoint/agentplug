@@ -1155,7 +1155,17 @@ fn takeover_ready_path() -> PathBuf {
 
 const TAKEOVER_READY_MAX_AGE_MS: u64 = 2 * 60 * 1000;
 
-fn write_takeover_ready(version: &str) -> anyhow::Result<()> {
+/// How long a ready successor waits for an idle daemon before the daemon hands over anyway.
+///
+/// A shared daemon serving many callers rarely reaches a tick with nothing in flight, so an
+/// unconditional "nothing in flight" gate is a handoff that never happens: the successor exhausts
+/// its own wait window and aborts while the old daemon keeps serving the version it was staged to
+/// replace. Past this bound the handoff is forced and whatever is still in flight is re-queued for
+/// the incoming daemon -- the same rule the staged self-update path applies past its hard cap. It
+/// must stay below `TAKEOVER_READY_MAX_AGE_MS`, or the marker goes stale before it can fire.
+const TAKEOVER_FORCE_HANDOFF_AFTER_MS: u64 = 60 * 1000;
+
+fn write_takeover_ready(version: &str, force: bool) -> anyhow::Result<()> {
     let path = takeover_ready_path();
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -1163,14 +1173,20 @@ fn write_takeover_ready(version: &str) -> anyhow::Result<()> {
     let temporary = path.with_extension(format!("json.tmp.{}", std::process::id()));
     fs::write(
         &temporary,
-        serde_json::json!({"version": version, "pid": std::process::id(), "ts": now_ms()})
+        serde_json::json!({"version": version, "pid": std::process::id(), "ts": now_ms(), "force": force})
             .to_string(),
     )?;
     fs::rename(temporary, path)?;
     Ok(())
 }
 
-fn ready_takeover_successor() -> Option<(u64, String)> {
+/// The ready successor: its pid and version, how long its marker has waited, and whether it asked
+/// to be served without waiting for an idle tick.
+///
+/// The age is what bounds the handoff: a successor that has waited past
+/// `TAKEOVER_FORCE_HANDOFF_AFTER_MS`, or one staged with `--force`, is served even with dispatches
+/// in flight.
+fn ready_takeover_successor() -> Option<(u64, String, u64, bool)> {
     let path = takeover_ready_path();
     let ready = fs::read_to_string(&path)
         .ok()
@@ -1184,13 +1200,21 @@ fn ready_takeover_successor() -> Option<(u64, String)> {
         .and_then(|value| value.as_str())
         .filter(|version| !version.is_empty())
         .map(str::to_owned);
-    let fresh = ready
+    let forced = ready
+        .get("force")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    let ready_age_ms = ready
         .get("ts")
         .and_then(|value| value.as_u64())
-        .map(|ts| now_ms().saturating_sub(ts) <= TAKEOVER_READY_MAX_AGE_MS)
+        .map(|ts| now_ms().saturating_sub(ts));
+    let fresh = ready_age_ms
+        .map(|age_ms| age_ms <= TAKEOVER_READY_MAX_AGE_MS)
         .unwrap_or(false);
     match (pid, version, fresh) {
-        (Some(pid), Some(version), true) if pid_is_alive(pid) => Some((pid, version)),
+        (Some(pid), Some(version), true) if pid_is_alive(pid) => {
+            Some((pid, version, ready_age_ms.unwrap_or(0), forced))
+        }
         _ => {
             let _ = fs::remove_file(path);
             None
@@ -1199,13 +1223,19 @@ fn ready_takeover_successor() -> Option<(u64, String)> {
 }
 
 fn hand_off_to_ready_successor() -> Option<(String, usize)> {
-    let (successor_pid, version) = ready_takeover_successor()?;
-    if !in_flight_map()
+    let (successor_pid, version, ready_age_ms, forced) = ready_takeover_successor()?;
+    let in_flight = in_flight_map()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .is_empty()
-    {
+        .len();
+    if in_flight > 0 && !forced && ready_age_ms < TAKEOVER_FORCE_HANDOFF_AFTER_MS {
         return None;
+    }
+    if in_flight > 0 {
+        eprintln!(
+            "[agentplug daemon] ready takeover successor {version}{} waited {ready_age_ms}ms with {in_flight} dispatch(es) still in flight -- forcing the handoff and re-queuing them for the incoming daemon; their callers wait longer and never see dispatch_orphaned",
+            if forced { " (--force)" } else { "" }
+        );
     }
     let task_handoff = match agentplug_host::prepare_task_handoff() {
         Ok(Some(guard)) => guard,
@@ -1601,7 +1631,7 @@ fn reexec_from_canonical_and_exit(canonical: &std::path::Path) -> ! {
     }
 }
 
-pub fn run_takeover(version: &str) -> anyhow::Result<()> {
+pub fn run_takeover(version: &str, force: bool) -> anyhow::Result<()> {
     eprintln!("[agentplug daemon] takeover: building engine for version {version}");
     let mut plugin_modules = PluginModules::new()?;
     for plugin_name in ["gm", "bert", "libsql", "treesitter", "crux", "lightpanda"] {
@@ -1609,9 +1639,19 @@ pub fn run_takeover(version: &str) -> anyhow::Result<()> {
             eprintln!("[agentplug daemon] takeover: pre-warm of {plugin_name} failed (non-fatal, will lazy-compile on first use): {e}");
         }
     }
-    write_takeover_ready(version)?;
-    eprintln!("[agentplug daemon] takeover: readiness marker written, waiting for old daemon to release ownership");
-    for _ in 0..480 {
+    write_takeover_ready(version, force)?;
+    eprintln!(
+        "[agentplug daemon] takeover: readiness marker written{}, waiting for old daemon to release ownership",
+        if force { " (forced: skipping the wait for an idle tick)" } else { "" }
+    );
+    for waited in 0..480 {
+        if waited % 60 == 59 {
+            eprintln!(
+                "[agentplug daemon] takeover: still waiting for the old daemon to release ownership ({}ms) -- it hands off as soon as no dispatch is in flight and forces the handoff at {}ms, re-queuing whatever is still running",
+                (waited + 1) * 250,
+                TAKEOVER_FORCE_HANDOFF_AFTER_MS
+            );
+        }
         if read_owner_pid().is_none() && claim_ownership() {
             let _ = fs::remove_file(takeover_ready_path());
             if let Err(error) = record_runner_version(version) {
