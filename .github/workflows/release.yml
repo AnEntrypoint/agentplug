@@ -98,6 +98,8 @@ jobs:
         run: cargo build -p agentplug-runner --bin agentplug-runner --release --target ${{ matrix.target }}
 
       - name: Lane selfchecks against the freshly built runner
+        # aarch64-pc-windows-msvc is cross-compiled on an x64 host, so its binary cannot run there.
+        if: ${{ matrix.target != 'aarch64-pc-windows-msvc' }}
         shell: bash
         run: |
           set -e
