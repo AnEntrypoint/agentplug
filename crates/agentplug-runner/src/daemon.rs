@@ -30,6 +30,7 @@ const GM_SPOOL_VERBS: &[&str] = &[
     "transition",
     "phase-status",
     "prd-add",
+    "prd-repair",
     "prd-list",
     "prd-resolve",
     "prd-status",
@@ -2033,11 +2034,24 @@ fn write_project_heartbeat_rate_limited(
     write_project_heartbeat_with_queue_info(root, busy_until, queue_info);
 }
 
+fn plugin_compiling() -> &'static std::sync::atomic::AtomicBool {
+    static SLOT: OnceLock<std::sync::atomic::AtomicBool> = OnceLock::new();
+    SLOT.get_or_init(|| std::sync::atomic::AtomicBool::new(false))
+}
+
+fn project_status_write_lock() -> &'static Mutex<()> {
+    static SLOT: OnceLock<Mutex<()>> = OnceLock::new();
+    SLOT.get_or_init(|| Mutex::new(()))
+}
+
 fn write_project_heartbeat_with_queue_info(
     root: &Path,
     busy_until: Option<u64>,
     queue_info: Option<(usize, usize)>,
 ) {
+    let _status_guard = project_status_write_lock()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let spool_dir = spool_dir_of(root);
     let status_path = spool_dir.join(".status.json");
     let mut payload = match fs::read_to_string(&status_path)
@@ -2113,13 +2127,18 @@ fn write_project_heartbeat_with_queue_info(
     } else {
         payload["plugin_compile_failures"] = serde_json::json!(failures);
     }
+    if plugin_compiling().load(std::sync::atomic::Ordering::Relaxed) {
+        payload["plugin_compiling"] = serde_json::json!(true);
+    } else if let Some(map) = payload.as_object_mut() {
+        map.remove("plugin_compiling");
+    }
     if !status_write_needed(&status_path, &previous, &payload) {
         return;
     }
     let _ = fs::write(&status_path, payload.to_string());
 }
 
-const STATUS_LIVENESS_REFRESH: Duration = Duration::from_secs(600);
+const STATUS_LIVENESS_REFRESH: Duration = Duration::from_secs(5);
 const STATUS_MIN_WRITE_INTERVAL: Duration = Duration::from_secs(60);
 
 fn status_write_needed(
@@ -2153,6 +2172,9 @@ fn status_write_needed(
     let Some(age) = last_written_age else {
         return true;
     };
+    if age >= STATUS_LIVENESS_REFRESH && previous.get("ts") != next.get("ts") {
+        return true;
+    }
     if age < STATUS_MIN_WRITE_INTERVAL {
         return false;
     }
@@ -2717,26 +2739,49 @@ fn heartbeat_authority_lost() -> bool {
     HEARTBEAT_AUTHORITY_LOST.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+const PROJECT_HEARTBEAT_TICK: Duration = Duration::from_secs(2);
+
 fn spawn_heartbeat_ticker(heartbeat_interval: Duration) -> std::thread::JoinHandle<()> {
-    std::thread::spawn(move || loop {
-        std::thread::sleep(heartbeat_interval);
-        if heartbeat_authority_lost() {
-            return;
+    std::thread::spawn(move || {
+        let tick = PROJECT_HEARTBEAT_TICK.min(heartbeat_interval).max(Duration::from_millis(250));
+        let mut next_global_at = Instant::now() + heartbeat_interval;
+        loop {
+            std::thread::sleep(tick);
+            if heartbeat_authority_lost() {
+                return;
+            }
+            if !holds_heartbeat_authority() {
+                eprintln!(
+                    "[agentplug daemon] heartbeat ticker: authority lost to another daemon -- the main loop only checks this flag between dispatch batches, which can be blocked indefinitely by in-flight work, so exiting the process directly here instead of merely signaling"
+                );
+                HEARTBEAT_AUTHORITY_LOST.store(true, std::sync::atomic::Ordering::Relaxed);
+                let requeued = hand_claims_to_live_successor("heartbeat-authority-holder");
+                eprintln!("[agentplug daemon] heartbeat ticker: re-queued {requeued} in-flight claim(s) for the daemon that holds authority -- exiting without orphaning them");
+                std::process::exit(0);
+            }
+            if Instant::now() >= next_global_at {
+                next_global_at = Instant::now() + heartbeat_interval;
+                write_daemon_heartbeat(
+                    HEARTBEAT_PROJECT_COUNT.load(std::sync::atomic::Ordering::Relaxed),
+                    HEARTBEAT_PLUGIN_MODULE_COUNT.load(std::sync::atomic::Ordering::Relaxed),
+                );
+            }
+            refresh_project_heartbeats_off_loop();
         }
-        if !holds_heartbeat_authority() {
-            eprintln!(
-                "[agentplug daemon] heartbeat ticker: authority lost to another daemon -- the main loop only checks this flag between dispatch batches, which can be blocked indefinitely by in-flight work, so exiting the process directly here instead of merely signaling"
-            );
-            HEARTBEAT_AUTHORITY_LOST.store(true, std::sync::atomic::Ordering::Relaxed);
-            let requeued = hand_claims_to_live_successor("heartbeat-authority-holder");
-            eprintln!("[agentplug daemon] heartbeat ticker: re-queued {requeued} in-flight claim(s) for the daemon that holds authority -- exiting without orphaning them");
-            std::process::exit(0);
-        }
-        write_daemon_heartbeat(
-            HEARTBEAT_PROJECT_COUNT.load(std::sync::atomic::Ordering::Relaxed),
-            HEARTBEAT_PLUGIN_MODULE_COUNT.load(std::sync::atomic::Ordering::Relaxed),
-        );
     })
+}
+
+fn refresh_project_heartbeats_off_loop() {
+    for root in read_known_project_roots() {
+        if fs::create_dir_all(&spool_dir_of(&root)).is_err() {
+            continue;
+        }
+        write_project_heartbeat_with_queue_info(
+            &root,
+            read_status_busy_until_if_future(&root),
+            None,
+        );
+    }
 }
 
 struct PluginModules {
@@ -2914,12 +2959,15 @@ impl PluginModules {
             return Ok(());
         }
         eprintln!("[agentplug daemon] compiling {plugin_name}.wasm (shared across every project that uses it)...");
-        let module = agentplug_host::load_module_file_backed(
+        plugin_compiling().store(true, std::sync::atomic::Ordering::Relaxed);
+        let compiled = agentplug_host::load_module_file_backed(
             &self.engine,
             &wasm_path,
             plugin_name,
             &on_disk_hash,
-        )?;
+        );
+        plugin_compiling().store(false, std::sync::atomic::Ordering::Relaxed);
+        let module = compiled?;
         self.install_compiled(plugin_name, module, on_disk_hash, &wasm_path);
         Ok(())
     }
@@ -3476,16 +3524,14 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
         if skipped_cold > 0 {
             eprintln!("[agentplug daemon] cold-project sweep: {skipped_cold} project(s) with no recent activity skipped this tick, {queue_total} project(s) rescanned ({reported_queue_total} genuinely active)");
         }
-        if reported_queue_total > worker_count {
-            for (position, (_, root)) in active_roots.iter().enumerate() {
-                let spool_dir = root.join(".gm").join("exec-spool");
-                if fs::create_dir_all(&spool_dir).is_ok() {
-                    write_project_heartbeat_rate_limited(
-                        root,
-                        read_status_busy_until_if_future(root),
-                        Some((position, reported_queue_total)),
-                    );
-                }
+        for (position, (_, root)) in active_roots.iter().enumerate() {
+            let spool_dir = root.join(".gm").join("exec-spool");
+            if fs::create_dir_all(&spool_dir).is_ok() {
+                write_project_heartbeat_rate_limited(
+                    root,
+                    read_status_busy_until_if_future(root),
+                    Some((position, reported_queue_total)),
+                );
             }
         }
         let mut background_projects = Vec::with_capacity(all_projects.len());
@@ -3538,15 +3584,13 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
         let mut any_work = false;
         for (root, project, did_work) in done.into_inner().unwrap_or_else(|e| e.into_inner()) {
             any_work = any_work || did_work;
-            if reported_queue_total > worker_count {
-                let spool_dir = root.join(".gm").join("exec-spool");
-                if fs::create_dir_all(&spool_dir).is_ok() {
-                    write_project_heartbeat_rate_limited(
-                        root.as_path(),
-                        read_status_busy_until_if_future(root.as_path()),
-                        Some((0, 0)),
-                    );
-                }
+            let spool_dir = root.join(".gm").join("exec-spool");
+            if fs::create_dir_all(&spool_dir).is_ok() {
+                write_project_heartbeat_rate_limited(
+                    root.as_path(),
+                    read_status_busy_until_if_future(root.as_path()),
+                    Some((0, 0)),
+                );
             }
             projects.insert(root, project);
         }
