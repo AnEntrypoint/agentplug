@@ -17,10 +17,30 @@ pub(crate) fn in_flight_map() -> &'static Mutex<HashMap<InFlightKey, InFlightHan
 
 pub(super) const MAX_CLAIMED_DISPATCHES_PER_PROJECT: usize = 32;
 
-pub(super) const LANE_WAIT_MAX_MS_DEFAULT: u64 = 120_000;
+/// The lane-wait budget for every lane except codesearch and git, and the floor every other
+/// budget is read against.
+///
+/// A caller's `timeout_seconds` is a poll budget, not a cancellation: a dispatch that outlives it
+/// keeps waiting and the caller resumes it with `resume_task`. It tops out at 240s, so the lane may
+/// never answer inside one poll -- a caller that asked for the maximum budget used to be starved at
+/// 120s with `waited_ms: 120005` and no way to raise it. The lane budget now spans that whole
+/// documented budget, so a caller polling at the maximum and resuming once reaches the same wait it
+/// asked for instead of losing the race on a timer it could not see. Nothing runs while a dispatch
+/// waits, so a longer budget costs no correctness: `executed: false` and `re_dispatch_safe: true`
+/// hold at any budget.
+pub(super) const LANE_WAIT_MAX_MS_DEFAULT: u64 = 240_000;
+pub(super) const GIT_LANE_WAIT_MAX_MS_DEFAULT: u64 = 600_000;
 pub(super) const CODESEARCH_LANE_WAIT_MAX_MS: u64 = 5_000;
 pub(super) const DISPATCH_WAIT_LEDGER_FILE: &str = ".dispatch-wait.json";
 pub(super) const LEDGER_REFRESH_MIN_INTERVAL_MS: u64 = 250;
+
+/// A lane hold past this long is a stalled holder, not a slow operation, and the watchdog reports
+/// it. The bound is a report threshold only: a live holder is never released, because one writer
+/// per lane is what keeps concurrent git writers on one worktree serialized.
+pub(super) const LANE_HOLD_REPORT_MIN_MS: u64 = 120_000;
+/// The watchdog names a long hold at most this often, so one stalled `git_finalize` produces a
+/// readable line per minute instead of one per ledger refresh.
+pub(super) const LANE_HOLD_REPORT_INTERVAL_MS: u64 = 60_000;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum DispatchStage {
@@ -900,6 +920,28 @@ pub(super) fn read_handoff_inherited_claims() -> HashSet<AbandonedClaim> {
         .unwrap_or_default()
 }
 
+/// True when the dispatch holding a lane is still a live caller in some daemon.
+///
+/// This is the same question the orphan sweep asks of a claim file, asked of a lane holder: is the
+/// dispatch still in this daemon's in-flight map, and if not, does some daemon with a live pid
+/// still carry a fresh ledger row for it. A holder the daemon cannot name -- empty verb or empty
+/// task -- is treated as live, because an unidentified holder must never be reaped: reaping a
+/// running dispatch would let a second mutating git run in the same repo.
+fn lane_holder_is_live(root: &Path, _lane: &'static str, verb: &str, task: &str) -> bool {
+    if verb.is_empty() || task.is_empty() {
+        return true;
+    }
+    if in_flight_map()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains_key(&(root.to_path_buf(), verb.to_string(), task.to_string()))
+    {
+        return true;
+    }
+    let spool_dir = spool_dir_of_root(root);
+    live_dispatch_wait_owner(&spool_dir, verb, task).is_some()
+}
+
 pub(crate) fn release_abandoned_project_lanes() {
     let live_roots = read_registry();
     let min_held_ms = env_ms_or("AGENTPLUG_LANE_RELEASE_MIN_AGE_MS", MIN_ORPHAN_CLAIM_AGE_MS);
@@ -908,6 +950,16 @@ pub(crate) fn release_abandoned_project_lanes() {
             "[agentplug daemon] released the {} lane of {} held by task {} for {}ms -- its requester has no live lease, so the lane no longer waits on it; the dispatch itself keeps running",
             owner.lane,
             owner.root.display(),
+            owner.task,
+            owner.held_ms
+        );
+    }
+    for owner in agentplug_host::release_dead_lane_owners(min_held_ms, &lane_holder_is_live) {
+        eprintln!(
+            "[agentplug daemon] released the {} lane of {} -- holder {}/{} held it for {}ms and no dispatch in this daemon owns it and no live daemon ledger names it",
+            owner.lane,
+            owner.root.display(),
+            owner.verb,
             owner.task,
             owner.held_ms
         );
@@ -1610,11 +1662,30 @@ pub(super) fn lane_wait_max(verb: &str) -> Duration {
     if verb == "codesearch" {
         return Duration::from_millis(CODESEARCH_LANE_WAIT_MAX_MS);
     }
+    if dispatch_serial_lane(verb, "") == Some("git") {
+        return git_lane_wait_max();
+    }
     Duration::from_millis(env_ms_or(
         "AGENTPLUG_LANE_WAIT_MAX_MS",
         LANE_WAIT_MAX_MS_DEFAULT,
     ))
 }
+
+/// The wait budget for a dispatch that lands on the git serial lane.
+///
+/// Every lane budget exists to turn an unreachable lane into an answer the caller can act on, not
+/// to cancel work: a starved dispatch never ran, so `re_dispatch_safe` holds no matter how long
+/// the budget is. Git is the slowest lane by a wide margin -- `git add`/`git commit` over a
+/// multi-thousand-path index takes minutes on this box -- and every starved caller re-dispatches
+/// immediately, so a short budget does not shorten anybody's wait, it only multiplies the number
+/// of waiters competing for the same lane. One long wait beats a dozen short ones.
+pub(super) fn git_lane_wait_max() -> Duration {
+    Duration::from_millis(env_ms_or(
+        "AGENTPLUG_GIT_LANE_WAIT_MAX_MS",
+        GIT_LANE_WAIT_MAX_MS_DEFAULT,
+    ))
+}
+
 
 pub(super) fn lane_starved_answer(
     root: &Path,
@@ -1633,7 +1704,11 @@ pub(super) fn lane_starved_answer(
         "lane": lane,
         "waited_ms": report.waited_ms,
         "lane_waiters": report.waiters,
+        "lane_position": report.lane_position,
         "lane_holder_task": report.lane_holder_task,
+        "lane_holder_verb": report.lane_holder_verb,
+        "lane_holder_held_ms": report.lane_holder_held_ms,
+        "lane_holder_age_ms": report.lane_holder_age_ms,
         "daemon_pid": std::process::id(),
         "request_path": request_path.to_string_lossy(),
         "claim_path": claim_path.to_string_lossy(),
@@ -1642,9 +1717,13 @@ pub(super) fn lane_starved_answer(
         "executed": false,
         "re_dispatch_safe": true,
         "error": format!(
-            "verb {} (task {}) was claimed by daemon pid {} but never reached the {} serial lane within {}ms, so it was NOT executed -- re-dispatching is safe because nothing ran. The lane is held by one dispatch at a time per project (git, store, state lanes); holder task {}. Live state for every unanswered request is in {}.",
+            "verb {} (task {}) was claimed by daemon pid {} but never reached the {} serial lane within {}ms, so it was NOT executed -- re-dispatching is safe because nothing ran. The lane is held by one dispatch at a time per project (git, store, state lanes) and admits waiters oldest-claim-first; holder task {} (verb {}, holding the lane for {}ms), this dispatch was {} in the lane queue with {} waiter(s) behind it. Live state for every unanswered request is in {}.",
             verb, task, std::process::id(), lane.unwrap_or("unassigned"), report.waited_ms,
             report.lane_holder_task.as_deref().unwrap_or("unknown"),
+              report.lane_holder_verb.as_deref().unwrap_or("unknown"),
+              report.lane_holder_age_ms,
+              report.lane_position.map(|position| position.to_string()).unwrap_or_else(|| "unknown".to_string()),
+              report.waiters,
             spool_dir.join(DISPATCH_WAIT_LEDGER_FILE).display()
         ),
     })
@@ -1917,6 +1996,21 @@ pub(super) fn code_index_state(spool_dir: &Path) -> CodeIndexState {
     }
 }
 
+/// True at most once per `LANE_HOLD_REPORT_INTERVAL_MS`, so a stalled holder is named on a readable
+/// cadence instead of on every ledger refresh.
+fn lane_hold_watchdog_due(now: u64) -> bool {
+    static LAST_REPORT_MS: OnceLock<Mutex<u64>> = OnceLock::new();
+    let mut last = LAST_REPORT_MS
+        .get_or_init(|| Mutex::new(0))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if now.saturating_sub(*last) < LANE_HOLD_REPORT_INTERVAL_MS {
+        return false;
+    }
+    *last = now;
+    true
+}
+
 pub(super) fn refresh_dispatch_wait_ledger(root: &Path) {
     let spool_dir = spool_dir_of_root(root);
     let ledger_path = spool_dir.join(DISPATCH_WAIT_LEDGER_FILE);
@@ -1996,6 +2090,7 @@ pub(super) fn refresh_dispatch_wait_ledger(root: &Path) {
                 })
                 .unwrap_or(0);
             let lane = record.as_ref().and_then(|record| record.lane);
+            let queue_state = agentplug_host::registry::lane_queue_state(root, lane, &task);
             let index_state = if CODE_INDEX_CONSUMING_VERBS.contains(&verb.as_str()) {
                 Some(code_index_state(&spool_dir))
             } else {
@@ -2006,6 +2101,11 @@ pub(super) fn refresh_dispatch_wait_ledger(root: &Path) {
                 "task": task,
                 "state": state,
                 "lane": lane,
+                "lane_position": queue_state.lane_position,
+                "lane_holder_age_ms": queue_state.lane_holder_age_ms,
+                "lane_waiters": queue_state.lane_waiters,
+                "lane_holder_task": queue_state.lane_holder_task,
+                "lane_holder_verb": queue_state.lane_holder_verb,
                 "admission_kind": admission_wait.as_ref().map(|wait| wait.kind),
                 "admission_in_flight": admission_wait.as_ref().map(|wait| wait.in_flight),
                 "admission_limit": admission_wait.as_ref().map(|wait| wait.limit),
@@ -2024,12 +2124,43 @@ pub(super) fn refresh_dispatch_wait_ledger(root: &Path) {
         let _ = fs::remove_file(&ledger_path);
         return;
     }
+    let lane_holds = agentplug_host::registry::lane_holds(root);
+    let lane_hold_rows: Vec<serde_json::Value> = lane_holds
+        .iter()
+        .map(|hold| {
+            serde_json::json!({
+                "lane": hold.lane,
+                "verb": hold.verb,
+                "task": hold.task,
+                "held_ms": hold.held_ms,
+                "waiters": hold.waiters,
+                "holds_waiters": hold.waiters > 0,
+                "over_bound": hold.held_ms >= LANE_HOLD_REPORT_MIN_MS,
+            })
+        })
+        .collect();
+    for hold in &lane_holds {
+        if hold.held_ms >= LANE_HOLD_REPORT_MIN_MS && lane_hold_watchdog_due(now) {
+            eprintln!(
+                "[lane-hold] project {} lane {} held by task {} (verb {}) for {}ms with {} waiter(s) queued -- past the {}ms bound this is a stalled holder, not a slow operation. Reported, not released: the lane stays single-writer.",
+                root.display(),
+                hold.lane,
+                hold.task,
+                hold.verb,
+                hold.held_ms,
+                hold.waiters,
+                LANE_HOLD_REPORT_MIN_MS
+            );
+        }
+    }
     let payload = serde_json::json!({
         "daemon_pid": std::process::id(),
         "ts": now,
         "root": root.to_string_lossy(),
         "project_in_flight": project_in_flight_count(root),
         "project_in_flight_cap": MAX_CLAIMED_DISPATCHES_PER_PROJECT,
+        "lane_hold_report_min_ms": LANE_HOLD_REPORT_MIN_MS,
+        "lane_holds": lane_hold_rows,
         "requests": rows,
     })
     .to_string();

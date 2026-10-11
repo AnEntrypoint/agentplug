@@ -228,6 +228,7 @@ fn main() -> anyhow::Result<()> {
         "selfcheck-pool-fairness" => selfcheck_pool_fairness(),
         "selfcheck-git-admission" => selfcheck_git_admission(),
         "selfcheck-lane-release" => selfcheck_lane_release(),
+        "selfcheck-lane-fifo" => selfcheck_lane_fifo(),
         "selfcheck-spool-claim" => selfcheck_spool_claim(),
         other => {
             eprintln!(
@@ -636,6 +637,359 @@ fn selfcheck_lane_release() -> anyhow::Result<()> {
     })();
     let _ = release_tx.send(());
     let _ = holder.join();
+
+    // The case the abandoned-root sweep can never reach: the project keeps its lease, so the
+    // only thing that can free its lane is proof that this one dispatch is gone. A holder that
+    // dies without dropping its guard -- a thread killed mid-git -- used to hold a live
+    // project's git lane for the life of the daemon.
+    let live_root = root.join("live-project");
+    std::fs::create_dir_all(&live_root)?;
+    let (held2_tx, held2_rx) = mpsc::channel::<bool>();
+    let (release2_tx, release2_rx) = mpsc::channel::<()>();
+    let holder2_root = live_root.clone();
+    let holder2 = std::thread::spawn(move || {
+        let guard = GmFairnessGuard::acquire_within(
+            &holder2_root,
+            "git_commit",
+            "{}",
+            "git-task-dead",
+            Duration::from_secs(5),
+        );
+        let _ = held2_tx.send(guard.is_ok());
+        let _ = release2_rx.recv();
+        drop(guard);
+    });
+    let outcome2 = (|| -> Result<String, String> {
+        if !held2_rx.recv_timeout(Duration::from_secs(10)).unwrap_or(false) {
+            return Err("the dead git holder could not take the project lane".into());
+        }
+        match GmFairnessGuard::acquire_within(
+            &live_root,
+            "git_commit",
+            "{}",
+            "git-task-2",
+            Duration::from_millis(500),
+        ) {
+            Ok(_) => return Err("the git lane was free while git-task-dead still held it".into()),
+            Err(report) if report.lane_holder_task.as_deref() != Some("git-task-dead") => {
+                return Err(format!(
+                    "the waiter was refused without naming the holder (holder {:?})",
+                    report.lane_holder_task
+                ))
+            }
+            Err(report) if report.lane_holder_verb.as_deref() != Some("git_commit") => {
+                return Err(format!(
+                    "the waiter was refused without naming the holder verb (verb {:?})",
+                    report.lane_holder_verb
+                ))
+            }
+            Err(report) if report.lane_holder_held_ms == 0 => {
+                return Err(
+                    "the waiter was refused without reporting how long the lane was held".into(),
+                )
+            }
+            Err(_) => {}
+        }
+        std::thread::sleep(Duration::from_millis(250));
+        let live_reaped = agentplug_host::release_dead_lane_owners(
+            200,
+            &|_r: &std::path::Path, _l: &'static str, _v: &str, _t: &str| true,
+        );
+        if live_reaped.iter().any(|o| o.task == "git-task-dead") {
+            return Err("the reap freed a lane whose holder dispatch is still live".into());
+        }
+        let reaped = agentplug_host::release_dead_lane_owners(
+            200,
+            &|_r: &std::path::Path, _l: &'static str, _v: &str, _t: &str| false,
+        );
+        if !reaped
+            .iter()
+            .any(|o| o.task == "git-task-dead" && o.verb == "git_commit" && o.lane == "git")
+        {
+            return Err(format!(
+                "the per-holder reap did not free a git lane inside a live project (reaped {:?})",
+                reaped.iter().map(|o| o.task.clone()).collect::<Vec<_>>()
+            ));
+        }
+        // Take the freed lane and KEEP it, then let the old holder drop its guard: a drop that
+        // released the lane by key would hand the repo to a second git at the same time.
+        let successor = match GmFairnessGuard::acquire_within(
+            &live_root,
+            "git_commit",
+            "{}",
+            "git-task-3",
+            Duration::from_secs(2),
+        ) {
+            Ok(guard) => guard,
+            Err(report) => {
+                return Err(format!(
+                    "the lane stayed held by {:?} after the per-holder reap",
+                    report.lane_holder_task
+                ))
+            }
+        };
+        let _ = release2_tx.send(());
+        let _ = holder2.join();
+        match GmFairnessGuard::acquire_within(
+            &live_root,
+            "git_commit",
+            "{}",
+            "git-task-4",
+            Duration::from_millis(500),
+        ) {
+            Ok(_) => {
+                return Err("the old holder's late drop released the successor's lane".into())
+            }
+            Err(report) if report.lane_holder_task.as_deref() != Some("git-task-3") => {
+                return Err(format!(
+                    "the old holder's late drop left the lane owned by {:?}",
+                    report.lane_holder_task
+                ))
+            }
+            Err(_) => {}
+        }
+        drop(successor);
+        Ok("per-holder reap released a git lane inside a live project, and the dead holder's late drop left its successor alone".into())
+    })();
+    let _ = release2_tx.send(());
+
+
+    // A dispatch that panics has no release call to reach: the lane comes back only because the
+    // guard drops. The daemon runs every dispatch inside catch_unwind, so this is the throw
+    // path, witnessed.
+    let panic_root = root.join("panicking-project");
+    std::fs::create_dir_all(&panic_root)?;
+    let panic_root2 = panic_root.clone();
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _guard = GmFairnessGuard::acquire_within(
+            &panic_root2,
+            "git_commit",
+            "{}",
+            "git-task-panic",
+            Duration::from_secs(2),
+        )
+        .map_err(|_| "the panicking holder could not take the git lane")?;
+        panic!("the dispatch died mid-git");
+        #[allow(unreachable_code)]
+        Ok::<(), &str>(())
+    }));
+    let outcome3 = (|| -> Result<String, String> {
+        if !panicked.is_err() {
+            return Err("the holder meant to panic did not panic".into());
+        }
+        match GmFairnessGuard::acquire_within(
+            &panic_root,
+            "git_commit",
+            "{}",
+            "git-task-after-panic",
+            Duration::from_secs(2),
+        ) {
+            Ok(_) => Ok("a panicking dispatch released its lane through Drop".into()),
+            Err(report) => Err(format!(
+                "a panicking dispatch left the lane held by {:?}",
+                report.lane_holder_task
+            )),
+        }
+    })();
+
+    let outcome = match (outcome, outcome2, outcome3) {
+        (Ok(a), Ok(b), Ok(c)) => Ok(format!("{a}; {b}; {c}")),
+        (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => Err(e),
+    };
+
+    let _ = std::fs::remove_dir_all(&root);
+    match outcome {
+        Ok(detail) => {
+            println!("[{NAME}] {detail}");
+            println!("[{NAME}] witnessed live against the real GmFairnessGuard: PASS");
+            println!("RESULT: PASS");
+            Ok(())
+        }
+        Err(reason) => selfcheck_fail(NAME, &reason),
+    }
+}
+
+/// The FIFO property the lane exists for, witnessed live: a dispatch that starved and was
+/// re-dispatched verbatim keeps its place, and a later arrival never overtakes it.
+fn selfcheck_lane_fifo() -> anyhow::Result<()> {
+    use agentplug_host::GmFairnessGuard;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    const NAME: &str = "selfcheck-lane-fifo";
+    let root = std::env::temp_dir().join(format!(
+        "agentplug-selfcheck-lane-fifo-{}-{}",
+        std::process::id(),
+        agentplug_host::now_ms()
+    ));
+    std::fs::create_dir_all(&root)?;
+
+    // One request, re-dispatched verbatim: the spool mints a fresh task id per dispatch, so only
+    // the verb and the body carry the request's identity across it.
+    const BODY_A: &str = "{\"SESSION_ID\":\"fifo-first\",\"paths\":[\"a\"]}";
+    const BODY_B: &str = "{\"SESSION_ID\":\"fifo-later\",\"paths\":[\"b\"]}";
+
+    let (held_tx, held_rx) = mpsc::channel::<bool>();
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    let holder_root = root.clone();
+    let holder = std::thread::spawn(move || {
+        let guard = GmFairnessGuard::acquire_within(
+            &holder_root,
+            "git_commit",
+            "{}",
+            "holder",
+            Duration::from_secs(5),
+        );
+        let _ = held_tx.send(guard.is_ok());
+        let _ = release_rx.recv();
+        drop(guard);
+    });
+
+    let outcome = (|| -> Result<String, String> {
+        if !held_rx.recv_timeout(Duration::from_secs(10)).unwrap_or(false) {
+            return Err("the holder could not take the project git lane".into());
+        }
+        // Waiter 1 arrives and starves. Nothing ran -- the lane is single-writer -- and it keeps
+        // its place in the queue.
+        match GmFairnessGuard::acquire_within(
+            &root,
+            "git_commit",
+            BODY_A,
+            "task-1",
+            Duration::from_millis(400),
+        ) {
+            Ok(_) => return Err("waiter 1 took the lane while the holder still held it".into()),
+            Err(report) => {
+                if report.lane_position != Some(1) {
+                    return Err(format!(
+                        "waiter 1 starved at position {:?}, expected 1",
+                        report.lane_position
+                    ));
+                }
+                if report.lane_holder_task.as_deref() != Some("holder") {
+                    return Err(format!(
+                        "waiter 1 was refused without naming the holder (holder {:?})",
+                        report.lane_holder_task
+                    ));
+                }
+                if report.lane_holder_held_ms == 0 {
+                    return Err(
+                        "waiter 1 was refused without reporting how long the holder held the lane"
+                            .into(),
+                    );
+                }
+            }
+        }
+        // Waiter 2 arrives later and must queue behind waiter 1, never ahead of it.
+        match GmFairnessGuard::acquire_within(
+            &root,
+            "git_commit",
+            BODY_B,
+            "task-2",
+            Duration::from_millis(400),
+        ) {
+            Ok(_) => return Err("waiter 2 took the lane while the holder still held it".into()),
+            Err(report) if report.lane_position != Some(2) => {
+                return Err(format!(
+                    "waiter 2 starved at position {:?}, expected 2 behind waiter 1",
+                    report.lane_position
+                ))
+            }
+            Err(_) => {}
+        }
+        // Waiter 1 is re-dispatched verbatim under a NEW task id. It is the same request, so it
+        // keeps position 1: an arrival-ordered queue would have sent it to the back, behind every
+        // later arrival, and one long holder would starve it forever.
+        match GmFairnessGuard::acquire_within(
+            &root,
+            "git_commit",
+            BODY_A,
+            "task-1-redispatch",
+            Duration::from_millis(400),
+        ) {
+            Ok(_) => {
+                return Err("the re-dispatched waiter 1 took the lane while the holder held it".into())
+            }
+            Err(report) if report.lane_position != Some(1) => {
+                return Err(format!(
+                    "the re-dispatched waiter 1 lost its place (position {:?}, expected 1)",
+                    report.lane_position
+                ))
+            }
+            Err(_) => {}
+        }
+        // The watchdog surface: who holds the lane, for how long, with how many claims behind it.
+        let holds = agentplug_host::registry::lane_holds(&root);
+        let named = holds.iter().any(|hold| {
+            hold.lane == "git"
+                && hold.task == "holder"
+                && hold.verb == "git_commit"
+                && hold.waiters >= 1
+        });
+        if !named {
+            return Err(format!(
+                "lane_holds did not name the git holder and its queued waiters (holds {:?})",
+                holds
+                    .iter()
+                    .map(|hold| (hold.lane, hold.task.clone(), hold.waiters))
+                    .collect::<Vec<_>>()
+            ));
+        }
+        // The holder releases: waiter 1 is admitted first, although waiter 2 arrived before
+        // waiter 1's re-dispatch did.
+        let _ = release_tx.send(());
+        let first = match GmFairnessGuard::acquire_within(
+            &root,
+            "git_commit",
+            BODY_A,
+            "task-1-redispatch-2",
+            Duration::from_secs(3),
+        ) {
+            Ok(guard) => guard,
+            Err(report) => {
+                return Err(format!(
+                    "waiter 1 never got the lane after the holder released it (still held by {:?})",
+                    report.lane_holder_task
+                ))
+            }
+        };
+        match GmFairnessGuard::acquire_within(
+            &root,
+            "git_commit",
+            BODY_B,
+            "task-2-redispatch",
+            Duration::from_millis(400),
+        ) {
+            Ok(_) => return Err("waiter 2 took the lane while waiter 1 still held it".into()),
+            Err(report) if report.lane_holder_task.as_deref() != Some("task-1-redispatch-2") => {
+                return Err(format!(
+                    "waiter 1 was not admitted before waiter 2 (lane held by {:?})",
+                    report.lane_holder_task
+                ))
+            }
+            Err(_) => {}
+        }
+        drop(first);
+        match GmFairnessGuard::acquire_within(
+            &root,
+            "git_commit",
+            BODY_B,
+            "task-2-redispatch-2",
+            Duration::from_secs(3),
+        ) {
+            Ok(_) => {}
+            Err(report) => {
+                return Err(format!(
+                    "waiter 2 never got the lane after waiter 1 released it (still held by {:?})",
+                    report.lane_holder_task
+                ))
+            }
+        }
+        Ok("a starved git dispatch kept its queue position across re-dispatch, a later arrival never overtook it, and the lane admitted oldest-claim-first with exactly one holder at a time".into())
+    })();
+    let _ = release_tx.send(());
+    let _ = holder.join();
+
     let _ = std::fs::remove_dir_all(&root);
     match outcome {
         Ok(detail) => {

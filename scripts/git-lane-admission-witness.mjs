@@ -1,16 +1,22 @@
 #!/usr/bin/env node
 // Git-lane admission witness for the agentplug shared daemon.
 //
-// Builds the runner and runs two live self-checks against the real SharedPluginPool and
-// GmFairnessGuard. RESULT: PASS is printed only when both exit 0 and print their own RESULT: PASS:
+// Builds the runner and runs three live self-checks against the real SharedPluginPool and
+// GmFairnessGuard. RESULT: PASS is printed only when all three exit 0 and print their own
+// RESULT: PASS:
 //   selfcheck-git-admission  with the general band of cheap dispatches full, a git-lane cheap
 //                            dispatch is admitted within 10 s, a second one is refused within its
 //                            bound, and a physical slot stays free for a short verb
 //   selfcheck-lane-release   a project lane held by a dispatch whose requester has no live lease is
 //                            released by the orphan sweep, and the abandoned holder cannot free the
 //                            lane once a successor owns it
+//   selfcheck-lane-fifo      three git dispatches queued behind one holder report lane positions
+//                            1, 2 and 3 through lane_queue_state and are admitted in claim order;
+//                            a refused waiter names its own position and the holder's age
 //
-//   node scripts/git-lane-admission-witness.mjs [--root <agentplug dir>] [--mutant] [--scratch <dir>]
+// --mutant additionally drops the head-of-queue test from lane admission, so selfcheck-lane-fifo
+// faces a lane that admits any waiter and must print RESULT: FAIL.
+////   node scripts/git-lane-admission-witness.mjs [--root <agentplug dir>] [--mutant] [--scratch <dir>]
 //     [--timeout-ms 900000]
 //
 // --mutant copies crates/ and the workspace manifest into a scratch tree, disables the git band
@@ -24,8 +30,9 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-const SELFCHECKS = ['selfcheck-git-admission', 'selfcheck-lane-release'];
+const SELFCHECKS = ['selfcheck-git-admission', 'selfcheck-lane-release', 'selfcheck-lane-fifo'];
 const GIT_BAND_EXPRESSION = 'self.short_reserved_slots().saturating_sub(1)';
+const LANE_FIFO_EXPRESSION = '!owners.contains_key(&key) && lane_head_is(&owned_root, lane, token)';
 const DEFAULT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const MAX_BUFFER = 64 * 1024 * 1024;
 
@@ -73,6 +80,15 @@ function prepareMutant(root, scratch) {
     throw new UsageError(`expected exactly one git band limit expression in ${registry}, found ${hits}`);
   }
   fs.writeFileSync(registry, source.replace(GIT_BAND_EXPRESSION, `0 * ${GIT_BAND_EXPRESSION}`));
+  const mutated = fs.readFileSync(registry, 'utf8');
+  const fifoHits = mutated.split(LANE_FIFO_EXPRESSION).length - 1;
+  if (fifoHits !== 1) {
+    throw new UsageError(`expected exactly one lane admission test in ${registry}, found ${fifoHits}`);
+  }
+  fs.writeFileSync(
+    registry,
+    mutated.replace(LANE_FIFO_EXPRESSION, '!owners.contains_key(&key)'),
+  );
 }
 
 function buildRunner(treeRoot, targetDir, timeoutMs) {
