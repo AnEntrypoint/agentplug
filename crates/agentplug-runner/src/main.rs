@@ -814,6 +814,7 @@ fn selfcheck_lane_release() -> anyhow::Result<()> {
 fn selfcheck_lane_fifo() -> anyhow::Result<()> {
     use agentplug_host::GmFairnessGuard;
     use std::sync::mpsc;
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     const NAME: &str = "selfcheck-lane-fifo";
@@ -985,6 +986,90 @@ fn selfcheck_lane_fifo() -> anyhow::Result<()> {
                 ))
             }
         }
+
+        // Three claims that arrive in order behind a fresh holder are admitted in claim order. A
+        // lane that admitted whichever waiter happened to poll would let the newest arrival
+        // overtake an older claim, which is the starvation the queue exists to prevent.
+        let (held2_tx, held2_rx) = mpsc::channel::<bool>();
+        let (release2_tx, release2_rx) = mpsc::channel::<()>();
+        let holder2_root = root.clone();
+        let holder2 = std::thread::spawn(move || {
+            let guard = GmFairnessGuard::acquire_within(
+                &holder2_root,
+                "git_commit",
+                "{}",
+                "holder-2",
+                Duration::from_secs(5),
+            );
+            let _ = held2_tx.send(guard.is_ok());
+            let _ = release2_rx.recv();
+            drop(guard);
+        });
+        if !held2_rx.recv_timeout(Duration::from_secs(10)).unwrap_or(false) {
+            return Err("the second holder could not take the project git lane".into());
+        }
+        let order: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let mut handles = Vec::new();
+        for index in 1..=3 {
+            let task = format!("claim-{index}");
+            // Distinct bodies: three separate claims of one verb, as three callers would send them.
+            let body = format!("{{\"SESSION_ID\":\"fifo-claim-{index}\",\"paths\":[\"c{index}\"]}}");
+            let waiter_root = root.clone();
+            let order = Arc::clone(&order);
+            handles.push(std::thread::spawn(move || {
+                match GmFairnessGuard::acquire_within(
+                    &waiter_root,
+                    "git_commit",
+                    &body,
+                    &task,
+                    Duration::from_secs(10),
+                ) {
+                    Ok(guard) => {
+                        order.lock().unwrap_or_else(|e| e.into_inner()).push(task.clone());
+                        drop(guard);
+                    }
+                    Err(_) => {
+                        order
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .push(format!("{task}:starved"));
+                    }
+                }
+            }));
+            // A claim is queued at the top of acquire_within, so a gap wider than a thread start
+            // makes "claim-N queued before claim-N+1" a fact rather than a hope.
+            std::thread::sleep(Duration::from_millis(60));
+        }
+        std::thread::sleep(Duration::from_millis(20));
+        let positions = ["claim-1", "claim-2", "claim-3"]
+            .iter()
+            .map(|task| {
+                agentplug_host::registry::lane_queue_state(&root, Some("git"), task).lane_position
+            })
+            .collect::<Vec<_>>();
+        if positions != vec![Some(1), Some(2), Some(3)] {
+            return Err(format!(
+                "the git lane did not rank its waiters by claim age (positions {positions:?})"
+            ));
+        }
+        let _ = release2_tx.send(());
+        let _ = holder2.join();
+        for handle in handles {
+            let _ = handle.join();
+        }
+        let admitted = order.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if admitted
+            != vec![
+                "claim-1".to_string(),
+                "claim-2".to_string(),
+                "claim-3".to_string(),
+            ]
+        {
+            return Err(format!(
+                "the git lane did not admit its waiters oldest-claim-first (order {admitted:?})"
+            ));
+        }
+
         Ok("a starved git dispatch kept its queue position across re-dispatch, a later arrival never overtook it, and the lane admitted oldest-claim-first with exactly one holder at a time".into())
     })();
     let _ = release_tx.send(());
