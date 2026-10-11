@@ -970,9 +970,23 @@ pub(super) const DISPATCH_WAIT_LEDGER_FRESH_MS: u64 = 120_000;
 pub(super) const DURATION_SETTLE_GRACE_MS: u64 = 5_000;
 pub(super) const WAIT_MAX_SERVED_MS: u64 = 600_000;
 
+/// Ledger states that name NO owner: the writing daemon lists the file but keeps no dispatch record
+/// for it, so the row restates the claim's existence instead of proving somebody runs it. A row in
+/// one of these states is how a claim that outlived its daemon came to be protected by the very
+/// ledger that lists it -- the sweep wrote the row, the row protected the claim, and the claim kept
+/// counting against the project's in-flight cap forever (measured 2026-10-11 in C:/dev/spoint:
+/// three `claimed_not_yet_tracked` rows at ~6.9e6 ms under a live daemon pid).
+pub(super) const LEDGER_UNOWNED_STATES: [&str; 2] = ["claimed_not_yet_tracked", "never_claimed"];
+
 /// A dispatch-wait ledger row is a live daemon's own statement that `(verb, task)` is in flight
 /// for it. A sweep that owns no in-process entry for that key can still read it, so an owned
 /// claim is never reaped as an orphan by a sweeper that cannot see the owner.
+///
+/// The statement counts only when the daemon that wrote it can name a dispatch: a row THIS daemon
+/// wrote in an unowned state is this daemon saying it holds no record for the task, which is the
+/// orphan case, not the owned one. A FOREIGN daemon's row still protects the claim whatever its
+/// state -- that daemon may track the dispatch in ways this process cannot read, and the sweep
+/// already refuses to run at all while a foreign sweeper holds a live heartbeat on this spool.
 pub(super) fn live_dispatch_wait_owner(spool_dir: &Path, verb: &str, task: &str) -> Option<u64> {
     let raw = fs::read_to_string(spool_dir.join(DISPATCH_WAIT_LEDGER_FILE)).ok()?;
     let value = serde_json::from_str::<serde_json::Value>(&raw).ok()?;
@@ -984,10 +998,20 @@ pub(super) fn live_dispatch_wait_owner(spool_dir: &Path, verb: &str, task: &str)
     if !pid_is_alive(pid) {
         return None;
     }
+    let written_by_this_daemon = pid == std::process::id() as u64;
     let rows = value.get("requests").and_then(|r| r.as_array())?;
     let owned = rows.iter().any(|row| {
-        row.get("verb").and_then(|v| v.as_str()) == Some(verb)
-            && row.get("task").and_then(|t| t.as_str()) == Some(task)
+        if row.get("verb").and_then(|v| v.as_str()) != Some(verb)
+            || row.get("task").and_then(|t| t.as_str()) != Some(task)
+        {
+            return false;
+        }
+        let unowned_state = row
+            .get("state")
+            .and_then(|s| s.as_str())
+            .map(|state| LEDGER_UNOWNED_STATES.contains(&state))
+            .unwrap_or(false);
+        !(written_by_this_daemon && unowned_state)
     });
     if owned {
         Some(pid)
@@ -1147,7 +1171,12 @@ pub(super) fn sweep_orphaned_claims_distinguishing_handoff_from_crash(
             }
             let claim_age = claim_age_ms(&path);
             if claim_age
-                .map(|age| age < MIN_ORPHAN_CLAIM_AGE_MS)
+                .map(|age| {
+                    age < env_ms_or(
+                        "AGENTPLUG_MIN_ORPHAN_CLAIM_AGE_MS",
+                        MIN_ORPHAN_CLAIM_AGE_MS,
+                    )
+                })
                 .unwrap_or(false)
             {
                 continue;

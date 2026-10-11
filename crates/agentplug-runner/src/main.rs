@@ -230,6 +230,7 @@ fn main() -> anyhow::Result<()> {
         "selfcheck-lane-release" => selfcheck_lane_release(),
         "selfcheck-lane-fifo" => selfcheck_lane_fifo(),
         "selfcheck-lane-network-yield" => selfcheck_lane_network_yield(),
+        "selfcheck-claim-reap" => selfcheck_claim_reap(),
         "selfcheck-spool-claim" => selfcheck_spool_claim(),
         other => {
             eprintln!(
@@ -1051,6 +1052,90 @@ fn selfcheck_lane_network_yield() -> anyhow::Result<()> {
         Ok(detail) => {
             println!("[{NAME}] {detail}");
             println!("[{NAME}] witnessed live against the real GmFairnessGuard: PASS");
+            println!("RESULT: PASS");
+            Ok(())
+        }
+        Err(reason) => selfcheck_fail(NAME, &reason),
+    }
+}
+
+/// The orphan sweep's reap of a claim no live dispatch owns, witnessed live against the real sweep:
+/// a claim this daemon lists as untracked is reaped -- the sweep's own ledger row used to protect
+/// it, so it counted against the project's in-flight cap for hours -- while a claim the ledger names
+/// as still running is left alone, because reaping a live holder is what would let a second writer
+/// into the same worktree.
+fn selfcheck_claim_reap() -> anyhow::Result<()> {
+    const NAME: &str = "selfcheck-claim-reap";
+    // The real floor is 60 s and the property is the ledger row's state, not the clock, so the
+    // floor is lowered here rather than waited out.
+    std::env::set_var("AGENTPLUG_MIN_ORPHAN_CLAIM_AGE_MS", "0");
+    let root = std::env::temp_dir().join(format!(
+        "agentplug-selfcheck-claim-reap-{}-{}",
+        std::process::id(),
+        agentplug_host::now_ms()
+    ));
+    let root_reaped = root.join("reaped");
+    let root_owned = root.join("owned");
+
+    /// One project holding a single claimed git dispatch, with the ledger row the sweep itself
+    /// would write for it carrying `state`.
+    fn project_with_claim(
+        root: &std::path::Path,
+        task: &str,
+        state: &str,
+    ) -> anyhow::Result<()> {
+        let spool = root.join(".gm").join("exec-spool");
+        let in_dir = spool.join("in").join("git_commit");
+        std::fs::create_dir_all(&in_dir)?;
+        std::fs::write(in_dir.join(format!("{task}.txt.inflight")), "{}")?;
+        let ledger = format!(
+            "{{\"daemon_pid\":{},\"ts\":{},\"requests\":[{{\"verb\":\"git_commit\",\"task\":\"{}\",\"state\":\"{}\"}}]}}",
+            std::process::id(),
+            agentplug_host::now_ms(),
+            task,
+            state
+        );
+        std::fs::write(spool.join(".dispatch-wait.json"), ledger)?;
+        Ok(())
+    }
+
+    let outcome = (|| -> Result<String, String> {
+        // An untracked claim is the one that outlived its dispatcher: nothing in any live daemon
+        // owns it, so the sweep answers it instead of leaving it to hold a claim slot forever.
+        project_with_claim(&root_reaped, "reap-task", "claimed_not_yet_tracked")
+            .map_err(|e| format!("could not lay out the reaped-claim project: {e}"))?;
+        daemon::sweep_orphaned_claims(&root_reaped);
+        let claim = root_reaped.join(".gm/exec-spool/in/git_commit/reap-task.txt.inflight");
+        let out = root_reaped.join(".gm/exec-spool/out/git_commit-reap-task.json");
+        if claim.exists() {
+            return Err("a claim no live dispatch owns was left in the spool, so it keeps counting against the project's in-flight cap".into());
+        }
+        let body = std::fs::read_to_string(&out).unwrap_or_default();
+        if !body.contains("dispatch_orphaned") {
+            return Err("the reaped claim left no dispatch_orphaned out-file, so its caller waits forever instead of being told".into());
+        }
+
+        // The running claim is the safety half: the same sweep, same pid, one field different. A
+        // reap here would free a lane a live git dispatch still holds, and two git writers would
+        // run in one worktree.
+        project_with_claim(&root_owned, "owned-task", "claimed_running")
+            .map_err(|e| format!("could not lay out the owned-claim project: {e}"))?;
+        daemon::sweep_orphaned_claims(&root_owned);
+        if !root_owned
+            .join(".gm/exec-spool/in/git_commit/owned-task.txt.inflight")
+            .exists()
+        {
+            return Err("a claim the ledger names as running was reaped -- that releases a lane a live dispatch still holds".into());
+        }
+
+        Ok("an untracked claim no live dispatch owns was reaped and stopped counting against the project's in-flight cap, while the same sweep left a claim the ledger names as running alone".into())
+    })();
+
+    let _ = std::fs::remove_dir_all(&root);
+    match outcome {
+        Ok(detail) => {
+            println!("[{NAME}] {detail}");
+            println!("[{NAME}] witnessed live against the real orphan sweep: PASS");
             println!("RESULT: PASS");
             Ok(())
         }
