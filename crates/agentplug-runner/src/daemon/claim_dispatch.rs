@@ -1923,6 +1923,17 @@ pub(crate) fn run_gm_dispatch_to_file(
     } else {
         eprintln!("[agentplug daemon] out-file write for {verb}/{task} did not confirm for {} -- leaving the claim for the orphan sweep instead of deleting an unanswered request", root.display());
     }
+    // The result is written, so this dispatch is finished: no admission slot may stay
+    // booked under this thread. Under unwinding the guards already released and this is
+    // a no-op; a slot whose guard never ran is reclaimed here instead of starving the
+    // next dispatch.
+    let reclaimed = agentplug_host::release_admission_for_current_thread();
+    if reclaimed > 0 {
+        eprintln!(
+            "[agentplug daemon] {verb}/{task} for {} reclaimed {reclaimed} admission slot(s) still booked to its thread after its result was written",
+            root.display()
+        );
+    }
     let key: InFlightKey = (root.to_path_buf(), verb.to_string(), task.to_string());
     in_flight_map()
         .lock()
