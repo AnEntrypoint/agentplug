@@ -2049,6 +2049,34 @@ fn write_project_heartbeat(root: &Path, busy_until: Option<u64>) {
 
 const DISPATCH_HEARTBEAT_MIN_GAP: Duration = Duration::from_secs(3);
 
+/// One instruction-source sync per slot: with one pass over every leased project, an unbounded
+/// per-root thread would spawn on each interval, so the fan-out is capped and a root that finds no
+/// free slot stays due for the next pass instead of queueing.
+const INSTRUCTION_SOURCE_SYNC_SLOTS: usize = 2;
+
+fn instruction_source_sync_slots_taken() -> &'static std::sync::atomic::AtomicUsize {
+    static SLOT: OnceLock<std::sync::atomic::AtomicUsize> = OnceLock::new();
+    SLOT.get_or_init(|| std::sync::atomic::AtomicUsize::new(0))
+}
+
+fn instruction_source_sync_slot_taken() -> bool {
+    instruction_source_sync_slots_taken()
+        .fetch_update(
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+            |taken| (taken < INSTRUCTION_SOURCE_SYNC_SLOTS).then_some(taken + 1),
+        )
+        .is_ok()
+}
+
+struct InstructionSourceSyncSlot;
+
+impl Drop for InstructionSourceSyncSlot {
+    fn drop(&mut self) {
+        instruction_source_sync_slots_taken().fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 fn dispatch_heartbeat_last_write() -> &'static Mutex<HashMap<PathBuf, Instant>> {
     static SLOT: OnceLock<Mutex<HashMap<PathBuf, Instant>>> = OnceLock::new();
     SLOT.get_or_init(|| Mutex::new(HashMap::new()))
@@ -3472,15 +3500,21 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
                         .map(|t| t.elapsed() >= instruction_source_poll_interval)
                         .unwrap_or(true);
                     if due && instruction_source_syncing.insert(root.clone()) {
-                        last_instruction_source_sync.insert(root.clone(), Instant::now());
-                        let thread_root = root.clone();
-                        let done = instruction_source_sync_done_tx.clone();
-                        std::thread::spawn(move || {
-                            if let Err(e) = sync_instruction_source_if_configured(&thread_root) {
-                                eprintln!("[agentplug daemon] instruction source-repo sync failed for {}: {e:#}", thread_root.display());
-                            }
-                            let _ = done.send(thread_root);
-                        });
+                        if !instruction_source_sync_slot_taken() {
+                            instruction_source_syncing.remove(root);
+                        } else {
+                            last_instruction_source_sync.insert(root.clone(), Instant::now());
+                            let thread_root = root.clone();
+                            let done = instruction_source_sync_done_tx.clone();
+                            std::thread::spawn(move || {
+                                let _slot = InstructionSourceSyncSlot;
+                                if let Err(e) = sync_instruction_source_if_configured(&thread_root)
+                                {
+                                    eprintln!("[agentplug daemon] instruction source-repo sync failed for {}: {e:#}", thread_root.display());
+                                }
+                                let _ = done.send(thread_root);
+                            });
+                        }
                     }
                 },
             );

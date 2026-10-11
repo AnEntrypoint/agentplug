@@ -2286,6 +2286,7 @@ pub(super) const CODE_INDEX_CONSUMING_VERBS: &[&str] = &[
     "search",
 ];
 
+#[derive(Clone)]
 pub(super) struct CodeIndexState {
     cold: bool,
     partial: bool,
@@ -2335,6 +2336,68 @@ fn lane_hold_watchdog_due(now: u64) -> bool {
     true
 }
 
+/// Bounded well inside `DISPATCH_WAIT_LEDGER_STALE_MS` so a quiet ledger still answers with a fresh `ts`.
+const DISPATCH_WAIT_LEDGER_REFRESH: Duration = Duration::from_secs(15);
+
+fn without_wait_volatile_fields(value: &serde_json::Value) -> serde_json::Value {
+    let mut copy = value.clone();
+    let Some(map) = copy.as_object_mut() else {
+        return copy;
+    };
+    map.remove("ts");
+    for row in map
+        .get_mut("requests")
+        .and_then(serde_json::Value::as_array_mut)
+        .into_iter()
+        .flatten()
+    {
+        if let Some(row) = row.as_object_mut() {
+            for key in ["file_age_ms", "stage_age_ms", "lane_holder_age_ms"] {
+                row.remove(key);
+            }
+        }
+    }
+    for list in ["lane_holds", "lane_hold_released"] {
+        for hold in map
+            .get_mut(list)
+            .and_then(serde_json::Value::as_array_mut)
+            .into_iter()
+            .flatten()
+        {
+            if let Some(hold) = hold.as_object_mut() {
+                hold.remove("held_ms");
+            }
+        }
+    }
+    copy
+}
+
+/// A ledger whose rows have not changed is left on disk: only the daemon pid, a real change, or the
+/// liveness refresh forces another tmp-then-rename across every watched root.
+fn dispatch_wait_ledger_write_needed(ledger_path: &Path, payload: &str) -> bool {
+    let Ok(existing) = fs::read_to_string(ledger_path) else {
+        return true;
+    };
+    let (Ok(next), Ok(previous)) = (
+        serde_json::from_str::<serde_json::Value>(payload),
+        serde_json::from_str::<serde_json::Value>(&existing),
+    ) else {
+        return true;
+    };
+    if previous.get("daemon_pid") != next.get("daemon_pid") {
+        return true;
+    }
+    let age = fs::metadata(ledger_path)
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|modified| modified.elapsed().ok())
+        .unwrap_or(Duration::MAX);
+    if age >= DISPATCH_WAIT_LEDGER_REFRESH {
+        return true;
+    }
+    without_wait_volatile_fields(&previous) != without_wait_volatile_fields(&next)
+}
+
 pub(super) fn refresh_dispatch_wait_ledger(root: &Path) {
     let spool_dir = spool_dir_of_root(root);
     let ledger_path = spool_dir.join(DISPATCH_WAIT_LEDGER_FILE);
@@ -2356,6 +2419,7 @@ pub(super) fn refresh_dispatch_wait_ledger(root: &Path) {
     };
     let now = now_ms();
     let mut rows: Vec<serde_json::Value> = Vec::new();
+    let mut index_state: Option<CodeIndexState> = None;
     for verb_entry in verb_dirs.flatten() {
         if !verb_entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
             continue;
@@ -2416,7 +2480,7 @@ pub(super) fn refresh_dispatch_wait_ledger(root: &Path) {
             let lane = record.as_ref().and_then(|record| record.lane);
             let queue_state = agentplug_host::registry::lane_queue_state(root, lane, &task);
             let index_state = if CODE_INDEX_CONSUMING_VERBS.contains(&verb.as_str()) {
-                Some(code_index_state(&spool_dir))
+                Some(index_state.get_or_insert_with(|| code_index_state(&spool_dir)).clone())
             } else {
                 None
             };
@@ -2537,6 +2601,9 @@ pub(super) fn refresh_dispatch_wait_ledger(root: &Path) {
         "requests": rows,
     })
     .to_string();
+    if !dispatch_wait_ledger_write_needed(&ledger_path, &payload) {
+        return;
+    }
     let tmp = spool_dir.join(format!(
         "{DISPATCH_WAIT_LEDGER_FILE}.tmp.{}",
         std::process::id()
