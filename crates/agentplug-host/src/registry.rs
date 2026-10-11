@@ -341,6 +341,17 @@ struct AdmissionHolder {
     id: u64,
     verb: String,
     since: Instant,
+    thread: std::thread::ThreadId,
+    kind: HolderKind,
+}
+
+/// Which counters a holder took when it was admitted, so releasing it can give
+/// exactly those back.
+#[derive(Clone, Copy)]
+enum HolderKind {
+    General { heavy: bool },
+    GitBand,
+    Blocking,
 }
 
 struct TicketQueue {
@@ -356,19 +367,37 @@ struct TicketQueue {
 }
 
 impl TicketQueue {
-    fn register_holder(&mut self, verb: &str) -> u64 {
+    fn register_holder(&mut self, verb: &str, kind: HolderKind) -> u64 {
         self.next_holder_id += 1;
         let id = self.next_holder_id;
         self.holders.push(AdmissionHolder {
             id,
             verb: verb.to_string(),
             since: Instant::now(),
+            thread: std::thread::current().id(),
+            kind,
         });
         id
     }
 
-    fn release_holder(&mut self, id: u64) {
-        self.holders.retain(|holder| holder.id != id);
+    /// Gives back every counter the holder took. Returns false when the id is
+    /// already gone, so a dispatch can be reclaimed from outside its guard
+    /// without that guard's Drop giving the same counter back twice.
+    fn release_holder(&mut self, id: u64) -> bool {
+        let Some(index) = self.holders.iter().position(|holder| holder.id == id) else {
+            return false;
+        };
+        match self.holders.remove(index).kind {
+            HolderKind::General { heavy } => {
+                self.non_short_inflight = self.non_short_inflight.saturating_sub(1);
+                if heavy {
+                    self.heavy_inflight = self.heavy_inflight.saturating_sub(1);
+                }
+            }
+            HolderKind::GitBand => self.git_band_inflight = self.git_band_inflight.saturating_sub(1),
+            HolderKind::Blocking => self.blocking_inflight = self.blocking_inflight.saturating_sub(1),
+        }
+        true
     }
 
     fn holders_summary(&self) -> String {
@@ -432,10 +461,67 @@ pub fn take_last_admission() -> Option<AdmissionRecord> {
     LAST_ADMISSION.with(|slot| slot.take())
 }
 
+/// Every pool that has admitted at least one dispatch, so a finished dispatch can
+/// be reclaimed by thread without the caller knowing which pool owns the slot.
+fn live_pools() -> &'static Mutex<Vec<std::sync::Weak<SharedPluginPool>>> {
+    static POOLS: OnceLock<Mutex<Vec<std::sync::Weak<SharedPluginPool>>>> = OnceLock::new();
+    POOLS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn remember_pool(pool: &Arc<SharedPluginPool>) {
+    let mut known = live_pools().lock().unwrap_or_else(|e| e.into_inner());
+    if known
+        .iter()
+        .any(|weak| weak.upgrade().is_some_and(|live| Arc::ptr_eq(&live, pool)))
+    {
+        return;
+    }
+    known.retain(|weak| weak.upgrade().is_some());
+    known.push(Arc::downgrade(pool));
+}
+
+/// Gives back every admission slot still held by `thread`. A dispatch calls this
+/// once its result is written: under normal unwinding the guards already released
+/// and this is a no-op, but a dispatch whose thread died holding a slot leaves no
+/// guard to run, and that slot would otherwise starve every later dispatch.
+pub fn release_admission_for_thread(thread: std::thread::ThreadId) -> usize {
+    let pools: Vec<Arc<SharedPluginPool>> = {
+        let mut known = live_pools().lock().unwrap_or_else(|e| e.into_inner());
+        known.retain(|weak| weak.upgrade().is_some());
+        known.iter().filter_map(|weak| weak.upgrade()).collect()
+    };
+    let mut released = 0;
+    for pool in pools {
+        let ids: Vec<u64> = {
+            let q = pool.ticket_queue.lock().unwrap_or_else(|e| e.into_inner());
+            q.holders
+                .iter()
+                .filter(|holder| holder.thread == thread)
+                .map(|holder| holder.id)
+                .collect()
+        };
+        if ids.is_empty() {
+            continue;
+        }
+        {
+            let mut q = pool.ticket_queue.lock().unwrap_or_else(|e| e.into_inner());
+            for id in ids {
+                if q.release_holder(id) {
+                    released += 1;
+                }
+            }
+        }
+        pool.slot_released.notify_all();
+    }
+    released
+}
+
+pub fn release_admission_for_current_thread() -> usize {
+    release_admission_for_thread(std::thread::current().id())
+}
+
 pub struct HeavyDispatchAdmission {
     pool: Option<Arc<SharedPluginPool>>,
-    class: DispatchCostClass,
-    band: AdmissionBand,
     holder: u64,
 }
 
@@ -445,14 +531,6 @@ impl Drop for HeavyDispatchAdmission {
         {
             let mut q = pool.ticket_queue.lock().unwrap_or_else(|e| e.into_inner());
             q.release_holder(self.holder);
-            if self.band == AdmissionBand::GitBand {
-                q.git_band_inflight = q.git_band_inflight.saturating_sub(1);
-            } else {
-                q.non_short_inflight = q.non_short_inflight.saturating_sub(1);
-                if self.class == DispatchCostClass::Heavy {
-                    q.heavy_inflight = q.heavy_inflight.saturating_sub(1);
-                }
-            }
         }
         pool.slot_released.notify_all();
     }
@@ -469,7 +547,6 @@ impl Drop for BlockingDispatchAdmission {
         {
             let mut q = pool.ticket_queue.lock().unwrap_or_else(|e| e.into_inner());
             q.release_holder(self.holder);
-            q.blocking_inflight = q.blocking_inflight.saturating_sub(1);
         }
         pool.slot_released.notify_all();
     }
@@ -606,6 +683,11 @@ impl SharedPluginPool {
 
     pub const ACQUIRE_TIMEOUT_MS: u64 = 60_000;
 
+    /// How long a dispatch that already holds a plugin slot waits for admission before
+    /// it gives the slot back and re-queues. Short on purpose: the slot stays available
+    /// to short verbs, and the gate never counts a dispatch that is only waiting.
+    pub const SLOT_HELD_ADMISSION_WAIT_MS: u64 = 250;
+
     fn short_reserved_slots(&self) -> usize {
         (self.slots.len() / 4).max(1)
     }
@@ -639,10 +721,7 @@ impl SharedPluginPool {
 
     pub fn admit_blocking(pool: &Arc<SharedPluginPool>, verb: &str) -> BlockingDispatchAdmission {
         Self::admit_blocking_within(pool, verb, Duration::from_secs(86_400))
-            .unwrap_or(BlockingDispatchAdmission {
-                pool: None,
-                holder: 0,
-            })
+            .unwrap_or(BlockingDispatchAdmission { pool: None, holder: 0 })
     }
 
     pub fn admit_blocking_within(
@@ -651,19 +730,17 @@ impl SharedPluginPool {
         max_wait: Duration,
     ) -> Result<BlockingDispatchAdmission, AdmissionWaitReport> {
         if !is_blocking_dispatch_verb(verb) || pool.slots.len() < 2 {
-            return Ok(BlockingDispatchAdmission {
-                pool: None,
-                holder: 0,
-            });
+            return Ok(BlockingDispatchAdmission { pool: None, holder: 0 });
         }
         let limit = pool.blocking_admission_limit();
+        remember_pool(pool);
         let start = Instant::now();
         loop {
             let (in_flight, holders) = {
                 let mut q = pool.ticket_queue.lock().unwrap_or_else(|e| e.into_inner());
                 if q.blocking_inflight < limit {
                     q.blocking_inflight += 1;
-                    let holder = q.register_holder(verb);
+                    let holder = q.register_holder(verb, HolderKind::Blocking);
                     clear_admission_wait();
                     return Ok(BlockingDispatchAdmission {
                         pool: Some(pool.clone()),
@@ -695,12 +772,7 @@ impl SharedPluginPool {
 
     pub fn admit(pool: &Arc<SharedPluginPool>, class: DispatchCostClass) -> HeavyDispatchAdmission {
         Self::admit_within(pool, class, Duration::from_secs(86_400))
-            .unwrap_or(HeavyDispatchAdmission {
-                pool: None,
-                class,
-                band: AdmissionBand::Unmetered,
-                holder: 0,
-            })
+            .unwrap_or(HeavyDispatchAdmission { pool: None, holder: 0 })
     }
 
     pub fn admit_within(
@@ -746,12 +818,7 @@ impl SharedPluginPool {
                 limit: 0,
                 in_flight: 0,
             });
-            return Ok(HeavyDispatchAdmission {
-                pool: None,
-                class,
-                band: AdmissionBand::Unmetered,
-                holder: 0,
-            });
+            return Ok(HeavyDispatchAdmission { pool: None, holder: 0 });
         }
         let is_heavy = class == DispatchCostClass::Heavy;
         let is_git_lane = !is_heavy && lane == Some("git");
@@ -759,6 +826,7 @@ impl SharedPluginPool {
         let limit = pool.non_short_admission_limit();
         let heavy_limit = pool.heavy_admission_limit();
         let git_band_limit = pool.git_band_admission_limit();
+        remember_pool(pool);
         let start = Instant::now();
         let mut logged_at_ms = 0u64;
         loop {
@@ -770,7 +838,7 @@ impl SharedPluginPool {
                     if is_heavy {
                         q.heavy_inflight += 1;
                     }
-                    let holder = q.register_holder(verb);
+                    let holder = q.register_holder(verb, HolderKind::General { heavy: is_heavy });
                     clear_admission_wait();
                     record_admission(AdmissionRecord {
                         band: AdmissionBand::General,
@@ -780,14 +848,12 @@ impl SharedPluginPool {
                     });
                     return Ok(HeavyDispatchAdmission {
                         pool: Some(pool.clone()),
-                        class,
-                        band: AdmissionBand::General,
                         holder,
                     });
                 }
                 if is_git_lane && q.git_band_inflight < git_band_limit {
                     q.git_band_inflight += 1;
-                    let holder = q.register_holder(verb);
+                    let holder = q.register_holder(verb, HolderKind::GitBand);
                     clear_admission_wait();
                     record_admission(AdmissionRecord {
                         band: AdmissionBand::GitBand,
@@ -797,8 +863,6 @@ impl SharedPluginPool {
                     });
                     return Ok(HeavyDispatchAdmission {
                         pool: Some(pool.clone()),
-                        class,
-                        band: AdmissionBand::GitBand,
                         holder,
                     });
                 }
@@ -1492,36 +1556,68 @@ impl ProjectPlugins {
             plugin_name: plugin_name.to_string(),
         })?;
         let cost_class = cost_class_for_dispatch(verb, body);
-        let _heavy_admission = SharedPluginPool::admit_verb_within_lane(
-            &pool,
-            cost_class,
-            verb.starts_with("git_").then_some("git"),
-            verb,
-            admission_wait_max_for(cost_class),
-        )
-        .map_err(admission_starved_error)?;
-        let _blocking_admission = SharedPluginPool::admit_blocking_within(
-            &pool,
-            verb,
-            admission_wait_max(),
-        )
-        .map_err(admission_starved_error)?;
-        let (mut guard, _waited_ms) =
-            pool.acquire_within_for_class(SharedPluginPool::ACQUIRE_TIMEOUT_MS, cost_class);
-        if guard.is_none() {
-            if let Err(detail) =
-                refill_evicted_slot(&mut guard, None, &self.root, plugin_name, verb)
-            {
-                eprintln!("[agentplug registry] plugin {plugin_name} slot was evicted for verb {verb} and its refill did not repopulate it -- {detail}");
-                log_poisoned_store_eviction_event(&self.root, plugin_name, verb, false, &format!("empty-slot refill failed: {detail}"));
-                return Err(PluginDispatchError::EvictedOrPoisoned {
-                    plugin_name: plugin_name.to_string(),
-                    verb: verb.to_string(),
-                    detail: format!("the slot was empty before verb {verb} ran and its in-place reload did not repopulate it: {detail}"),
+        // A dispatch holds an admission slot only while it is about to run: it takes a
+        // plugin slot first and then asks for admission, and when admission is not granted
+        // at once it hands the plugin slot back and re-queues. A dispatch that waits for a
+        // plugin slot while already admitted wedges the gate past its own wait cap, and a
+        // dispatch that waits for admission while holding a plugin slot takes the slot the
+        // gate reserves for short verbs.
+        let mut _heavy_admission: Option<HeavyDispatchAdmission> = None;
+        let mut _blocking_admission: Option<BlockingDispatchAdmission> = None;
+        let admission_start = Instant::now();
+        let admission_deadline =
+            Instant::now() + admission_wait_max_for(cost_class).max(admission_wait_max());
+        let (mut guard, _waited_ms) = loop {
+            let (mut slot, waited) =
+                pool.acquire_within_for_class(SharedPluginPool::ACQUIRE_TIMEOUT_MS, cost_class);
+            if slot.is_none() {
+                if let Err(detail) =
+                    refill_evicted_slot(&mut slot, None, &self.root, plugin_name, verb)
+                {
+                    eprintln!("[agentplug registry] plugin {plugin_name} slot was evicted for verb {verb} and its refill did not repopulate it -- {detail}");
+                    log_poisoned_store_eviction_event(&self.root, plugin_name, verb, false, &format!("empty-slot refill failed: {detail}"));
+                    return Err(PluginDispatchError::EvictedOrPoisoned {
+                        plugin_name: plugin_name.to_string(),
+                        verb: verb.to_string(),
+                        detail: format!("the slot was empty before verb {verb} ran and its in-place reload did not repopulate it: {detail}"),
+                    }
+                    .into());
                 }
-                .into());
             }
-        }
+            match (
+                SharedPluginPool::admit_verb_within_lane(
+                    &pool,
+                    cost_class,
+                    verb.starts_with("git_").then_some("git"),
+                    verb,
+                    Duration::from_millis(SharedPluginPool::SLOT_HELD_ADMISSION_WAIT_MS),
+                ),
+                SharedPluginPool::admit_blocking_within(
+                    &pool,
+                    verb,
+                    Duration::from_millis(SharedPluginPool::SLOT_HELD_ADMISSION_WAIT_MS),
+                ),
+            ) {
+                (Ok(heavy), Ok(blocking)) => {
+                    _heavy_admission = Some(heavy);
+                    _blocking_admission = Some(blocking);
+                    break (slot, waited);
+                }
+                (Err(report), _) | (_, Err(report)) => {
+                    drop(slot);
+                    if Instant::now() >= admission_deadline {
+                        let mut report = report;
+                        report.waited_ms = admission_start.elapsed().as_millis() as u64;
+                        return Err(admission_starved_error(report).into());
+                    }
+                    let ticket = pool.ticket_queue.lock().unwrap_or_else(|e| e.into_inner());
+                    let _ = pool
+                        .slot_released
+                        .wait_timeout(ticket, std::time::Duration::from_millis(25))
+                        .unwrap_or_else(|e| e.into_inner());
+                }
+            }
+        };
         dispatch_and_evict_on_error(
             &mut guard,
             &pool,
@@ -1639,40 +1735,72 @@ impl DispatchHandle {
             plugin_name: plugin_name.to_string(),
         })?;
         let cost_class = cost_class_for_dispatch(verb, body);
-        let _heavy_admission = SharedPluginPool::admit_verb_within_lane(
-            &pool,
-            cost_class,
-            verb.starts_with("git_").then_some("git"),
-            verb,
-            admission_wait_max_for(cost_class),
-        )
-        .map_err(admission_starved_error)?;
-        let _blocking_admission = SharedPluginPool::admit_blocking_within(
-            &pool,
-            verb,
-            admission_wait_max(),
-        )
-        .map_err(admission_starved_error)?;
-        let (mut guard, _waited_ms) =
-            pool.acquire_within_for_class(SharedPluginPool::ACQUIRE_TIMEOUT_MS, cost_class);
-        if guard.is_none() {
-            if let Err(detail) = refill_evicted_slot(
-                &mut guard,
-                self.reload_source.as_ref(),
-                &self.root,
-                plugin_name,
-                verb,
-            ) {
-                eprintln!("[agentplug registry] plugin {plugin_name} slot was evicted for verb {verb} and its refill did not repopulate it -- {detail}");
-                log_poisoned_store_eviction_event(&self.root, plugin_name, verb, false, &format!("empty-slot refill failed: {detail}"));
-                return Err(PluginDispatchError::EvictedOrPoisoned {
-                    plugin_name: plugin_name.to_string(),
-                    verb: verb.to_string(),
-                    detail: format!("the slot was empty before verb {verb} ran and its in-place reload did not repopulate it: {detail}"),
+        // A dispatch holds an admission slot only while it is about to run: it takes a
+        // plugin slot first and then asks for admission, and when admission is not granted
+        // at once it hands the plugin slot back and re-queues. A dispatch that waits for a
+        // plugin slot while already admitted wedges the gate past its own wait cap, and a
+        // dispatch that waits for admission while holding a plugin slot takes the slot the
+        // gate reserves for short verbs.
+        let mut _heavy_admission: Option<HeavyDispatchAdmission> = None;
+        let mut _blocking_admission: Option<BlockingDispatchAdmission> = None;
+        let admission_start = Instant::now();
+        let admission_deadline =
+            Instant::now() + admission_wait_max_for(cost_class).max(admission_wait_max());
+        let (mut guard, _waited_ms) = loop {
+            let (mut slot, waited) =
+                pool.acquire_within_for_class(SharedPluginPool::ACQUIRE_TIMEOUT_MS, cost_class);
+            if slot.is_none() {
+                if let Err(detail) = refill_evicted_slot(
+                    &mut slot,
+                    self.reload_source.as_ref(),
+                    &self.root,
+                    plugin_name,
+                    verb,
+                ) {
+                    eprintln!("[agentplug registry] plugin {plugin_name} slot was evicted for verb {verb} and its refill did not repopulate it -- {detail}");
+                    log_poisoned_store_eviction_event(&self.root, plugin_name, verb, false, &format!("empty-slot refill failed: {detail}"));
+                    return Err(PluginDispatchError::EvictedOrPoisoned {
+                        plugin_name: plugin_name.to_string(),
+                        verb: verb.to_string(),
+                        detail: format!("the slot was empty before verb {verb} ran and its in-place reload did not repopulate it: {detail}"),
+                    }
+                    .into());
                 }
-                .into());
             }
-        }
+            match (
+                SharedPluginPool::admit_verb_within_lane(
+                    &pool,
+                    cost_class,
+                    verb.starts_with("git_").then_some("git"),
+                    verb,
+                    Duration::from_millis(SharedPluginPool::SLOT_HELD_ADMISSION_WAIT_MS),
+                ),
+                SharedPluginPool::admit_blocking_within(
+                    &pool,
+                    verb,
+                    Duration::from_millis(SharedPluginPool::SLOT_HELD_ADMISSION_WAIT_MS),
+                ),
+            ) {
+                (Ok(heavy), Ok(blocking)) => {
+                    _heavy_admission = Some(heavy);
+                    _blocking_admission = Some(blocking);
+                    break (slot, waited);
+                }
+                (Err(report), _) | (_, Err(report)) => {
+                    drop(slot);
+                    if Instant::now() >= admission_deadline {
+                        let mut report = report;
+                        report.waited_ms = admission_start.elapsed().as_millis() as u64;
+                        return Err(admission_starved_error(report).into());
+                    }
+                    let ticket = pool.ticket_queue.lock().unwrap_or_else(|e| e.into_inner());
+                    let _ = pool
+                        .slot_released
+                        .wait_timeout(ticket, std::time::Duration::from_millis(25))
+                        .unwrap_or_else(|e| e.into_inner());
+                }
+            }
+        };
         dispatch_and_evict_on_error(
             &mut guard,
             &pool,
