@@ -2791,7 +2791,9 @@ fn spawn_heartbeat_ticker(heartbeat_interval: Duration) -> std::thread::JoinHand
         loop {
             std::thread::sleep(tick);
             if heartbeat_authority_lost() {
-                return;
+                let requeued = hand_claims_to_live_successor("heartbeat-authority-holder");
+                eprintln!("[agentplug daemon] heartbeat ticker: authority was already handed to the live successor -- re-queued {requeued} in-flight claim(s) and exiting, because a daemon that no longer refreshes heartbeats is invisible to every MCP preflight while it keeps executing dispatches");
+                std::process::exit(0);
             }
             if !holds_heartbeat_authority() {
                 eprintln!(
@@ -2810,6 +2812,32 @@ fn spawn_heartbeat_ticker(heartbeat_interval: Duration) -> std::thread::JoinHand
                 );
             }
             refresh_project_heartbeats_off_loop();
+            HEARTBEAT_TICK_TS.store(now_ms(), std::sync::atomic::Ordering::Relaxed);
+        }
+    })
+}
+
+static HEARTBEAT_TICK_TS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+const HEARTBEAT_TICK_STALL_TICKS: u32 = 4;
+const HEARTBEAT_TICK_STALL_FLOOR: Duration = Duration::from_secs(30);
+
+fn spawn_heartbeat_stall_watchdog(heartbeat_interval: Duration) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let stall_limit = (heartbeat_interval * HEARTBEAT_TICK_STALL_TICKS)
+            .max(HEARTBEAT_TICK_STALL_FLOOR);
+        loop {
+            std::thread::sleep(HEARTBEAT_TICK_STALL_FLOOR.min(stall_limit));
+            let last = HEARTBEAT_TICK_TS.load(std::sync::atomic::Ordering::Relaxed);
+            if last == 0 {
+                continue;
+            }
+            let stalled_for = now_ms().saturating_sub(last);
+            if stalled_for <= stall_limit.as_millis() as u64 {
+                continue;
+            }
+            eprintln!("[agentplug daemon] heartbeat ticker has not refreshed a project heartbeat for {stalled_for} ms while this process is still running -- MCP preflight sees a stale heartbeat and refuses to dispatch, so exiting so the daemon-guard can start a replacement");
+            std::process::exit(70);
         }
     })
 }
@@ -3382,6 +3410,7 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
         std::sync::mpsc::channel::<PathBuf>();
 
     let _heartbeat_ticker = spawn_heartbeat_ticker(heartbeat_interval);
+    let _heartbeat_stall_watchdog = spawn_heartbeat_stall_watchdog(heartbeat_interval);
     write_daemon_heartbeat(0, 0);
 
     const DREAM_RSI_CYCLE_TICK_INTERVAL_MS: u64 = 60_000;
