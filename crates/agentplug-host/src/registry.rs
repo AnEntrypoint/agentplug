@@ -1997,6 +1997,12 @@ const UNSERIALIZED_VERBS: &[&str] = &[
     "fs_read",
     "fs_readdir",
     "fs_stat",
+    // Every fs_write is already a per-path mutex plus an atomic temp-file rename
+    // (imports.rs atomic_write_locked), so two writes cannot interleave on one
+    // path. Holding a marker write in the project-wide state lane buys no extra
+    // safety and costs the caller a two-minute starvation answer for a write that
+    // finishes in milliseconds.
+    "fs_write",
     "env_get",
     "kv_get",
     "config_resolve",

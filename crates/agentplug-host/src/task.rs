@@ -406,10 +406,11 @@ fn resolve_cwd(params: &Value, cwd: &Path) -> Result<PathBuf, String> {
 fn spawn(params: &Value, cwd: &Path) -> Value {
     let lang = params.get("lang").and_then(|v| v.as_str()).unwrap_or("");
     let code = params.get("code").and_then(|v| v.as_str()).unwrap_or("");
+    let agent_spawn = matches!(lang, "agent" | "claude");
     let timeout_ms = params
         .get("timeoutMs")
         .and_then(|v| v.as_u64())
-        .unwrap_or(120_000);
+        .unwrap_or(if agent_spawn { 1_800_000 } else { 120_000 });
     if lang.is_empty() {
         return json!({"ok": false, "error": "lang required"});
     }
@@ -420,7 +421,7 @@ fn spawn(params: &Value, cwd: &Path) -> Value {
         Ok(cwd) => cwd,
         Err(error) => return json!({"ok": false, "error": error}),
     };
-    let Some((cmd, args, stdin_payload)) = crate::exec_js::build_command(lang, code) else {
+    let Some((cmd, args, stdin_payload)) = crate::exec_js::build_command(lang, code, params) else {
         return json!({"ok": false, "error": format!("unsupported lang: {lang}")});
     };
     let _admission = match admit_execution() {

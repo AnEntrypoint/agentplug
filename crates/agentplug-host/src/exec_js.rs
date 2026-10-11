@@ -608,9 +608,91 @@ enum ExecMode {
 pub(crate) fn build_command(
     lang: &str,
     code: &str,
+    opts: &Value,
 ) -> Option<(String, Vec<String>, Option<String>)> {
-    build_command_mode(lang, code, ExecMode::Default, &json!({}))
+    build_command_mode(lang, code, ExecMode::Default, opts)
         .map(|b| (b.cmd, b.args, b.stdin_payload))
+}
+
+const ESM_REQUIRE_PRELUDE: &str = "import { createRequire as __gmCreateRequire } from 'node:module';\nconst require = __gmCreateRequire(process.cwd() + '/');\n";
+
+fn is_ident_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_' || b == b'$'
+}
+
+/// True when `code` carries top-level `import`/`export` syntax, which node
+/// rejects while evaluating the body as CommonJS (`'import', and 'export' cannot
+/// be used outside of module code`). Declarations of either kind are legal only
+/// at module top level, so statement position plus a non-identifier tail covers
+/// every legal module body. `require`, `module.exports` and `exports.x` carry an
+/// identifier tail and never fire; `import(...)` is dynamic import, which
+/// CommonJS already supports. Comments and string bodies are skipped, so a
+/// mention of the word inside them is not read as syntax.
+fn module_syntax_requested(code: &str) -> bool {
+    let bytes = code.as_bytes();
+    let mut i = 0usize;
+    let mut at_stmt_start = true;
+    while i < bytes.len() {
+        let b = bytes[i];
+        match b {
+            b'/' if bytes.get(i + 1) == Some(&b'/') => {
+                i += 2;
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+                at_stmt_start = true;
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                i += 2;
+                while i < bytes.len() && !(bytes[i] == b'*' && bytes.get(i + 1) == Some(&b'/')) {
+                    i += 1;
+                }
+                i += 2;
+            }
+            b'"' | b'\'' | b'`' => {
+                let quote = b;
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == b'\\' {
+                        i += 2;
+                        continue;
+                    }
+                    let closed = bytes[i] == quote;
+                    i += 1;
+                    if closed {
+                        break;
+                    }
+                }
+                at_stmt_start = false;
+            }
+            b'\n' => {
+                at_stmt_start = true;
+                i += 1;
+            }
+            b'\t' | b'\r' | b' ' => i += 1,
+            b';' | b')' => {
+                at_stmt_start = true;
+                i += 1;
+            }
+            _ => {
+                if at_stmt_start {
+                    for keyword in [b"import".as_slice(), b"export".as_slice()] {
+                        if !bytes[i..].starts_with(keyword) {
+                            continue;
+                        }
+                        let tail = bytes.get(i + keyword.len()).copied();
+                        let dynamic_import = keyword == b"import" && tail == Some(b'(');
+                        if !tail.is_some_and(is_ident_byte) && !dynamic_import {
+                            return true;
+                        }
+                    }
+                }
+                at_stmt_start = false;
+                i += 1;
+            }
+        }
+    }
+    false
 }
 
 fn build_command_mode(
@@ -621,6 +703,7 @@ fn build_command_mode(
 ) -> Option<BuiltCommand> {
     match lang {
         "nodejs" | "js" => {
+            let as_module = module_syntax_requested(code);
             let wrapped = match mode {
                 ExecMode::Default => {
                     let trimmed = code.trim();
@@ -697,20 +780,26 @@ fn build_command_mode(
                     )
                 }
             };
-            let cmd = resolve_node_cmd();
-            if command_is_node(&cmd) {
-                Some(BuiltCommand {
-                    cmd,
-                    args: vec!["-".to_string()],
-                    stdin_payload: Some(wrapped),
-                })
+            let wrapped = if as_module && mode != ExecMode::Default {
+                format!("{ESM_REQUIRE_PRELUDE}{wrapped}")
             } else {
-                Some(BuiltCommand {
-                    cmd,
-                    args: vec!["run".to_string(), "-".to_string()],
-                    stdin_payload: Some(wrapped),
-                })
+                wrapped
+            };
+            let cmd = resolve_node_cmd();
+            let is_node = command_is_node(&cmd);
+            let mut args = Vec::new();
+            if !is_node {
+                args.push("run".to_string());
             }
+            if as_module && is_node {
+                args.push("--input-type=module".to_string());
+            }
+            args.push("-".to_string());
+            Some(BuiltCommand {
+                cmd,
+                args,
+                stdin_payload: Some(wrapped),
+            })
         }
         "python" | "py" => Some(BuiltCommand {
             cmd: "python".to_string(),
@@ -741,6 +830,33 @@ fn build_command_mode(
             ],
             stdin_payload: Some(code.to_string()),
         }),
+        // An agent-level spawn: `code` is the prompt for a headless Claude Code
+        // agent, so a subagent with no host Agent tool can start its own
+        // successor. Print mode cannot answer a permission prompt, and without a
+        // permissive mode the child burns its turns on a tool it is never
+        // allowed to call; bypassPermissions is the default for the same reason
+        // gm's own exec surface is ungated.
+        "agent" | "claude" => {
+            let permission_mode = opts
+                .get("permissionMode")
+                .and_then(|v| v.as_str())
+                .filter(|mode| {
+                    matches!(*mode, "default" | "acceptEdits" | "plan" | "bypassPermissions")
+                })
+                .unwrap_or("bypassPermissions");
+            Some(BuiltCommand {
+                cmd: resolve_claude_cmd(),
+                args: vec![
+                    "-p".to_string(),
+                    code.to_string(),
+                    "--output-format".to_string(),
+                    "text".to_string(),
+                    "--permission-mode".to_string(),
+                    permission_mode.to_string(),
+                ],
+                stdin_payload: None,
+            })
+        }
         _ => None,
     }
 }
@@ -803,6 +919,22 @@ fn resolve_node_cmd() -> String {
         }
     }
     "node".to_string()
+}
+
+fn resolve_claude_cmd() -> String {
+    if let Some(found) = which("claude") {
+        return found.to_string_lossy().into_owned();
+    }
+    let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"));
+    if let Some(home) = home {
+        for name in ["claude", "claude.exe"] {
+            let installed = Path::new(&home).join(".local").join("bin").join(name);
+            if installed.exists() {
+                return installed.to_string_lossy().into_owned();
+            }
+        }
+    }
+    "claude".to_string()
 }
 
 const BASH_STDIN_EVAL: &str = "eval \"$(cat)\"";
