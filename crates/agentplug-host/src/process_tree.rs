@@ -62,36 +62,20 @@ mod platform {
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Foundation::HANDLE;
     use windows_sys::Win32::System::JobObjects::{
-        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
-        SetInformationJobObject, TerminateJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        AssignProcessToJobObject, CreateJobObjectW, TerminateJobObject,
     };
 
     pub struct Job(usize);
 
     impl Job {
+        /// Members outlive this handle: the job carries no JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, so
+        /// dropping it when a dispatch returns leaves work the caller backgrounded running.
+        /// `terminate_job` is the only path through which this job kills anything.
         pub fn assign(child: &std::process::Child) -> Result<Self, String> {
             let handle = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
             if handle.is_null() {
                 return Err(format!(
                     "CreateJobObjectW failed: {}",
-                    std::io::Error::last_os_error()
-                ));
-            }
-            let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
-            limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-            let configured = unsafe {
-                SetInformationJobObject(
-                    handle,
-                    JobObjectExtendedLimitInformation,
-                    (&limits as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
-                    std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-                )
-            };
-            if configured == 0 {
-                unsafe { CloseHandle(handle as isize) };
-                return Err(format!(
-                    "SetInformationJobObject failed: {}",
                     std::io::Error::last_os_error()
                 ));
             }
