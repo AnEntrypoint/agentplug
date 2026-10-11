@@ -2402,11 +2402,12 @@ pub(super) fn refresh_dispatch_wait_ledger(root: &Path) {
     let spool_dir = spool_dir_of_root(root);
     let ledger_path = spool_dir.join(DISPATCH_WAIT_LEDGER_FILE);
     let (queued, claimed) = spool_step_counts(root);
-    let records_empty = dispatch_wait_records()
+    let root_has_waits = dispatch_wait_records()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .is_empty();
-    if records_empty && queued == 0 && claimed == 0 {
+        .keys()
+        .any(|(active_root, _, _)| active_root == root);
+    if !root_has_waits && queued == 0 && claimed == 0 {
         if ledger_path.exists() && dispatch_wait_ledger_is_mine_or_stale(&ledger_path) {
             let _ = fs::remove_file(&ledger_path);
         }
