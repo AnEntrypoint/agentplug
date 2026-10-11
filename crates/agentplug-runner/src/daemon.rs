@@ -491,6 +491,10 @@ impl DaemonConfig {
     }
 }
 
+const SHARED_STORE_PRESSURE_RELEASE_CEILING_MB: u64 = 512;
+static SHARED_STORE_PRESSURE_RELEASE_ARMED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
 fn shared_store_recycle_reason_independent_of_daemon_idle_state(
     cfg: &DaemonConfig,
 ) -> Option<String> {
@@ -499,12 +503,28 @@ fn shared_store_recycle_reason_independent_of_daemon_idle_state(
         agentplug_host::process_private_bytes_tracking_retained_wasm_peak_unlike_working_set()
     {
         let limit = cfg.shared_store_recycle_private_bytes();
-        if private_bytes >= limit {
-            return Some(format!(
-                "memory pressure: {}MB private commit >= {}MB limit (after {dispatches} shared dispatches)",
-                private_bytes / (1024 * 1024),
-                limit / (1024 * 1024)
-            ));
+        if private_bytes < limit {
+            SHARED_STORE_PRESSURE_RELEASE_ARMED.store(true, std::sync::atomic::Ordering::Relaxed);
+        } else {
+            let ceiling =
+                limit.saturating_add(SHARED_STORE_PRESSURE_RELEASE_CEILING_MB * 1024 * 1024);
+            let over_ceiling = private_bytes >= ceiling;
+            let armed = SHARED_STORE_PRESSURE_RELEASE_ARMED
+                .swap(false, std::sync::atomic::Ordering::Relaxed);
+            if armed || over_ceiling {
+                let ceiling_note = if over_ceiling {
+                    format!(
+                        ", over the +{SHARED_STORE_PRESSURE_RELEASE_CEILING_MB}MB ceiling that outranks the one-release-per-pressure-episode latch"
+                    )
+                } else {
+                    String::new()
+                };
+                return Some(format!(
+                    "memory pressure: {}MB private commit >= {}MB limit (after {dispatches} shared dispatches){ceiling_note}",
+                    private_bytes / (1024 * 1024),
+                    limit / (1024 * 1024)
+                ));
+            }
         }
     }
     let dispatch_limit = cfg.shared_store_recycle_dispatches();
