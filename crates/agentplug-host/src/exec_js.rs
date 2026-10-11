@@ -620,16 +620,22 @@ fn is_ident_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_' || b == b'$'
 }
 
-/// True when `code` carries top-level `import`/`export` syntax, which node
-/// rejects while evaluating the body as CommonJS (`'import', and 'export' cannot
-/// be used outside of module code`). Declarations of either kind are legal only
-/// at module top level, so statement position plus a non-identifier tail covers
-/// every legal module body. `require`, `module.exports` and `exports.x` carry an
-/// identifier tail and never fire; `import(...)` is dynamic import, which
-/// CommonJS already supports. Comments and string bodies are skipped, so a
-/// mention of the word inside them is not read as syntax.
-fn module_syntax_requested(code: &str) -> bool {
+/// Splits `code` into its top-level `import`/`export` declarations and everything
+/// else. Those declarations are legal only at module top level, and node rejects
+/// them while evaluating a stdin body as CommonJS (`'import', and 'export' cannot
+/// be used outside of module code`), so a body carrying one runs with
+/// `--input-type=module` and the declarations are lifted back to the top of the
+/// module, ahead of the wrapper that captures the result. A CommonJS body yields
+/// an empty head and runs byte-identically to before. `require`, `module.exports`
+/// and `exports.x` carry an identifier tail after the keyword and never fire;
+/// `import(...)` is dynamic import, which CommonJS already supports. Comments and
+/// string bodies are skipped, so a mention of the word inside them is not read as
+/// syntax.
+fn module_head(code: &str) -> (String, String) {
     let bytes = code.as_bytes();
+    let mut head = String::new();
+    let mut rest = String::new();
+    let mut copy_from = 0usize;
     let mut i = 0usize;
     let mut at_stmt_start = true;
     while i < bytes.len() {
@@ -675,6 +681,7 @@ fn module_syntax_requested(code: &str) -> bool {
                 i += 1;
             }
             _ => {
+                let mut declared = false;
                 if at_stmt_start {
                     for keyword in [b"import".as_slice(), b"export".as_slice()] {
                         if !bytes[i..].starts_with(keyword) {
@@ -683,16 +690,83 @@ fn module_syntax_requested(code: &str) -> bool {
                         let tail = bytes.get(i + keyword.len()).copied();
                         let dynamic_import = keyword == b"import" && tail == Some(b'(');
                         if !tail.is_some_and(is_ident_byte) && !dynamic_import {
-                            return true;
+                            let end = module_decl_end(code, i + keyword.len());
+                            rest.push_str(&code[copy_from..i]);
+                            copy_from = end;
+                            head.push_str(code[i..end].trim());
+                            head.push('\n');
+                            i = end;
+                            declared = true;
                         }
                     }
                 }
-                at_stmt_start = false;
-                i += 1;
+                if !declared {
+                    at_stmt_start = false;
+                    i += 1;
+                }
             }
         }
     }
-    false
+    if copy_from == 0 {
+        (String::new(), code.to_string())
+    } else {
+        rest.push_str(&code[copy_from..]);
+        (head, rest)
+    }
+}
+
+/// End of one `import`/`export` declaration: the first `;` at bracket depth 0, else
+/// the first newline at depth 0. Quotes and comments are skipped, so a `;` inside
+/// a specifier string and the newlines of `import {\n a,\n b\n} from 'x';` do not
+/// end it early.
+fn module_decl_end(code: &str, from: usize) -> usize {
+    let bytes = code.as_bytes();
+    let mut i = from;
+    let mut depth = 0i32;
+    while i < bytes.len() {
+        let b = bytes[i];
+        match b {
+            b'/' if bytes.get(i + 1) == Some(&b'/') => {
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                i += 2;
+                while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                    i += 1;
+                }
+                i += 2;
+            }
+            b'"' | b'\'' | b'`' => {
+                let quote = b;
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == b'\\' {
+                        i += 2;
+                        continue;
+                    }
+                    let closed = bytes[i] == quote;
+                    i += 1;
+                    if closed {
+                        break;
+                    }
+                }
+            }
+            b'{' | b'(' | b'[' => {
+                depth += 1;
+                i += 1;
+            }
+            b'}' | b')' | b']' => {
+                depth -= 1;
+                i += 1;
+            }
+            b';' if depth <= 0 => return i + 1,
+            b'\n' if depth <= 0 => return i + 1,
+            _ => i += 1,
+        }
+    }
+    bytes.len()
 }
 
 fn build_command_mode(
@@ -703,10 +777,11 @@ fn build_command_mode(
 ) -> Option<BuiltCommand> {
     match lang {
         "nodejs" | "js" => {
-            let as_module = module_syntax_requested(code);
+            let (module_head_src, body) = module_head(code);
+            let as_module = !module_head_src.is_empty();
             let wrapped = match mode {
                 ExecMode::Default => {
-                    let trimmed = code.trim();
+                    let trimmed = body.trim();
                     let is_bare_expression = !trimmed.is_empty()
                         && !trimmed.contains(';')
                         && !trimmed.contains('\n')
@@ -725,9 +800,9 @@ fn build_command_mode(
                         && !trimmed.starts_with("//")
                         && !trimmed.starts_with("/*");
                     let body = if is_bare_expression {
-                        format!("    return (\n{code}\n);\n")
+                        format!("    return (\n{body}\n);\n")
                     } else {
-                        format!("{code}\n")
+                        format!("{body}\n")
                     };
                     format!(
                         "(async () => {{\n  try {{\n    const __r = await (async () => {{\n{body}}})();\n    try {{ console.log('{RESULT_SENTINEL}' + JSON.stringify(__r === undefined ? null : __r)); }}\n    catch (__se) {{ console.log('{RESULT_SENTINEL}' + JSON.stringify({{ __unserializable: String(__se && __se.message || __se) }})); }}\n  }} catch (__e) {{\n    console.error(String(__e && __e.stack || __e));\n    process.exitCode = 1;\n  }}\n}})();\n"
@@ -738,7 +813,7 @@ fn build_command_mode(
                      (async () => {{\n\
                      \x20 const __mb = process.memoryUsage(); const __w0 = __perf.now();\n\
                      \x20 let __r = null, __err = null;\n\
-                     \x20 try {{ __r = await (async () => {{\n{code}\n}})(); }} catch (e) {{ __err = {{ name: e && e.name || 'Error', message: String(e && e.message || e), stack: String(e && e.stack || '') }}; }}\n\
+                     \x20 try {{ __r = await (async () => {{\n{body}\n}})(); }} catch (e) {{ __err = {{ name: e && e.name || 'Error', message: String(e && e.message || e), stack: String(e && e.stack || '') }}; }}\n\
                      \x20 const __wallMs = Math.round((__perf.now() - __w0) * 1000) / 1000; const __ma = process.memoryUsage();\n\
                      \x20 const __mem = {{ rss_mb: Math.round(__ma.rss/10485.76)/100, heapUsed_mb: Math.round(__ma.heapUsed/10485.76)/100, heapUsed_delta_mb: Math.round((__ma.heapUsed-__mb.heapUsed)/10485.76)/100, external_mb: Math.round(__ma.external/10485.76)/100 }};\n\
                      \x20 process.stdout.write('{META_SENTINEL}' + JSON.stringify({{ result: __r === undefined ? null : __r, error: __err, mem: __mem, wall_ms: __wallMs }}));\n\
@@ -763,7 +838,7 @@ fn build_command_mode(
                          \x20\x20  await __post('Profiler.setSamplingInterval', {{ interval: {sample_interval} }});\n\
                          \x20\x20  await __post('Profiler.start');\n\
                          \x20\x20  const __w0 = __perf.now();\n\
-                         \x20\x20  try {{ __userResult = await (async () => {{\n{code}\n}})(); }} catch (ue) {{ __userError = String(ue && ue.stack || ue); }}\n\
+                         \x20\x20  try {{ __userResult = await (async () => {{\n{body}\n}})(); }} catch (ue) {{ __userError = String(ue && ue.stack || ue); }}\n\
                          \x20\x20  __wallMs = Math.round((__perf.now() - __w0) * 1000) / 1000;\n\
                          \x20\x20  const __r = await __post('Profiler.stop');\n\
                          \x20\x20  __profile = __r && __r.profile || null;\n\
@@ -781,7 +856,9 @@ fn build_command_mode(
                 }
             };
             let wrapped = if as_module && mode != ExecMode::Default {
-                format!("{ESM_REQUIRE_PRELUDE}{wrapped}")
+                format!("{ESM_REQUIRE_PRELUDE}{module_head_src}{wrapped}")
+            } else if as_module {
+                format!("{module_head_src}{wrapped}")
             } else {
                 wrapped
             };
