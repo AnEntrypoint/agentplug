@@ -301,8 +301,22 @@ fn atomic_write_under_held_lock(full: &Path, data: &str) -> std::io::Result<()> 
         std::process::id()
     ));
     fs::write(&tmp, data)?;
+    // A rename is only durable for the bytes it renames once those bytes are on
+    // disk and the directory entry that names them is too: without both syncs a
+    // crash or a power loss can leave the target holding the old or empty file
+    // while this call has already reported success.
+    if let Ok(f) = fs::File::open(&tmp) {
+        let _ = f.sync_all();
+    }
     match fs::rename(&tmp, full) {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            if let Some(dir) = full.parent() {
+                if let Ok(d) = fs::File::open(dir) {
+                    let _ = d.sync_all();
+                }
+            }
+            Ok(())
+        }
         Err(e) => {
             let _ = fs::remove_file(&tmp);
             Err(e)
