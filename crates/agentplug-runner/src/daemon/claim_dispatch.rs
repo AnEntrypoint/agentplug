@@ -42,8 +42,25 @@ pub(super) const LANE_HOLD_REPORT_MIN_MS: u64 = 120_000;
 /// readable line per minute instead of one per ledger refresh.
 pub(super) const LANE_HOLD_REPORT_INTERVAL_MS: u64 = 60_000;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) enum DispatchStage {
+/// A hold past this long is no longer a slow operation: the holder is either gone or has never
+/// reached `Running`, and the lane is released with a named reason. A hold by a dispatch that IS
+/// running is never released -- the lane is what keeps two git writers out of one worktree, and a
+/// running holder is exactly the writer it protects. The env override exists only so the selfcheck
+/// can witness the release without a three-minute wait. No shipped path sets it.
+pub(super) const LANE_HOLD_STUCK_MIN_MS_DEFAULT: u64 = 180_000;
+
+/// The reserved body member the caller's own poll budget arrives in. gm-mcp writes it so the lane
+/// wait spans the budget the caller actually asked for -- a caller polling at the documented maximum
+/// used to be starved at 120s by a budget it had no way to raise -- and the runner strips it before
+/// the body is hashed for its FIFO identity and before it reaches any plugin, so the channel can
+/// never change what a request is or what a plugin sees.
+pub(super) const LANE_WAIT_MS_BODY_KEY: &str = "_agentplug_lane_wait_ms";
+/// A caller's budget is honoured down to this floor, so a sub-second poll cannot turn every lane
+/// wait into an instant starvation.
+pub(super) const LANE_WAIT_FLOOR_MS: u64 = 1_000;
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum DispatchStage {
     WaitingForLane,
     WaitingForToolQueue,
     Running,
@@ -62,7 +79,7 @@ pub(super) fn dispatch_wait_records() -> &'static Mutex<HashMap<InFlightKey, Dis
     RECORDS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-pub(super) fn note_dispatch_stage(
+pub(crate) fn note_dispatch_stage(
     root: &Path,
     verb: &str,
     task: &str,
@@ -942,6 +959,93 @@ fn lane_holder_is_live(root: &Path, _lane: &'static str, verb: &str, task: &str)
     live_dispatch_wait_owner(&spool_dir, verb, task).is_some()
 }
 
+/// Why this lane holder must give the lane up, or `None` while it must keep it.
+///
+/// Two holds are pathological, and both are named so the ledger says which one fired:
+///
+/// - `holder_dispatch_gone`: nothing live owns the dispatch any more. It cannot be running, so the
+///   hold is a tombstone and the lane is free.
+/// - `holder_stuck_before_running`: the dispatch is live but its stage is not `Running`, and has not
+///   been for `LANE_HOLD_STUCK_MIN_MS`. It holds the lane while it waits for its tool-queue turn, so
+///   it has not touched the worktree; the lane is taken from it and the displaced-holder check stops
+///   it from running on a lane it no longer owns.
+///
+/// A holder whose stage IS `Running` is never released, whatever the hold duration: it is the writer
+/// the lane exists to protect, and releasing it would let a second mutating git run in one worktree.
+/// A holder this daemon cannot see the stage of -- owned by another daemon -- is never released
+/// either, for the same reason.
+pub(crate) fn lane_holder_stuck_reason(root: &Path, verb: &str, task: &str) -> Option<&'static str> {
+    if verb.is_empty() || task.is_empty() {
+        return None;
+    }
+    let key = (root.to_path_buf(), verb.to_string(), task.to_string());
+    let record = dispatch_wait_records()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&key)
+        .map(|record| (record.stage, record.stage_since_ms));
+    // A staged holder is one this daemon is running, so the stage is authoritative: `Running` means
+    // it is executing and no wait is long enough to take the lane from it; any other stage means it
+    // holds the lane without having touched the worktree, and past the bound that hold is over.
+    match record {
+        Some((DispatchStage::Running, _)) => return None,
+        Some((_, since_ms)) if now_ms().saturating_sub(since_ms) >= lane_hold_stuck_min_ms() => {
+            return Some("holder_stuck_before_running")
+        }
+        Some(_) => return None,
+        // Unstaged here: it may be mid-claim, or owned by another daemon. The only safe reason to
+        // free the lane is that no daemon anywhere still owns this dispatch.
+        None => {}
+    }
+    if in_flight_map()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains_key(&key)
+    {
+        return None;
+    }
+    if live_dispatch_wait_owner(&spool_dir_of_root(root), verb, task).is_some() {
+        return None;
+    }
+    Some("holder_dispatch_gone")
+}
+
+/// A lane hold past the stuck bound, released with its reason.
+pub(crate) struct ReleasedLaneHold {
+    pub(crate) lane: &'static str,
+    pub(crate) verb: String,
+    pub(crate) task: String,
+    pub(crate) held_ms: u64,
+    pub(crate) reason: &'static str,
+}
+
+/// Frees every lane whose holder is gone or stuck before running, past the stuck bound.
+///
+/// This is the hold watchdog's action, and it is the safe half of it: a released holder is either
+/// not a live dispatch at all, or one that has never reached `Running` and whose dispatch then
+/// answers starved instead of running. One writer per lane holds throughout -- the lane is taken
+/// away from a dispatch that is not executing, never from one that is.
+pub(crate) fn release_stuck_lane_holders(min_held_ms: u64) -> Vec<ReleasedLaneHold> {
+    let owners = agentplug_host::release_dead_lane_owners(min_held_ms, &|root, _lane, verb, task| {
+        lane_holder_stuck_reason(root, verb, task).is_none()
+    });
+    owners
+        .into_iter()
+        .map(|owner| ReleasedLaneHold {
+            lane: owner.lane,
+            verb: owner.verb,
+            task: owner.task,
+            held_ms: owner.held_ms,
+            reason: lane_holder_stuck_reason(&owner.root, &owner.verb, &owner.task)
+                .unwrap_or("holder_dispatch_gone"),
+        })
+        .collect()
+}
+
+fn lane_hold_stuck_min_ms() -> u64 {
+    env_ms_or("AGENTPLUG_LANE_HOLD_STUCK_MIN_MS", LANE_HOLD_STUCK_MIN_MS_DEFAULT)
+}
+
 pub(crate) fn release_abandoned_project_lanes() {
     let live_roots = read_registry();
     let min_held_ms = env_ms_or("AGENTPLUG_LANE_RELEASE_MIN_AGE_MS", MIN_ORPHAN_CLAIM_AGE_MS);
@@ -1687,17 +1791,90 @@ pub(super) fn spool_dir_of_root(root: &Path) -> PathBuf {
     root.join(".gm").join("exec-spool")
 }
 
-pub(super) fn lane_wait_max(verb: &str) -> Duration {
+pub(crate) fn lane_wait_max(verb: &str, caller_budget_ms: Option<u64>) -> Duration {
+    let cap = lane_wait_cap_ms(verb);
+    // The caller's own poll budget bounds the wait and never extends it: a caller that asked for 30s
+    // is answered inside 30s, and one that asked for the documented maximum reaches the lane budget
+    // instead of being cut off at 120s by a timer it could not see. The floor keeps a sub-second
+    // poll from turning every lane wait into an instant starvation.
+    let bounded = match caller_budget_ms {
+        Some(budget) => cap.min(budget.max(LANE_WAIT_FLOOR_MS)),
+        None => cap,
+    };
+    Duration::from_millis(bounded)
+}
+
+/// The lane's own wait ceiling, before the caller's budget is applied to it.
+fn lane_wait_cap_ms(verb: &str) -> u64 {
     if verb == "codesearch" {
-        return Duration::from_millis(CODESEARCH_LANE_WAIT_MAX_MS);
+        return CODESEARCH_LANE_WAIT_MAX_MS;
     }
     if dispatch_serial_lane(verb, "") == Some("git") {
-        return git_lane_wait_max();
+        return git_lane_wait_max().as_millis() as u64;
     }
-    Duration::from_millis(env_ms_or(
-        "AGENTPLUG_LANE_WAIT_MAX_MS",
-        LANE_WAIT_MAX_MS_DEFAULT,
-    ))
+    env_ms_or("AGENTPLUG_LANE_WAIT_MAX_MS", LANE_WAIT_MAX_MS_DEFAULT)
+}
+
+/// Splits the caller's reserved lane-wait member out of a dispatch body.
+///
+/// Returns the body with the member removed -- that is the body the plugin sees and the one hashed
+/// for the claim's FIFO identity, so the channel is invisible to both -- plus the budget it carried.
+/// A body that is not a JSON object, or that carries the name without a plain integer value, is
+/// returned untouched with no budget: an unparseable channel is ignored rather than acted on.
+pub(crate) fn split_caller_lane_wait_ms(body: &str) -> (String, Option<u64>) {
+    let bytes = body.as_bytes();
+    let key_at_body = format!("\"{}\"", LANE_WAIT_MS_BODY_KEY);
+    let key = key_at_body.as_bytes();
+    let Some(key_at) = bytes.windows(key.len()).position(|window| window == key) else {
+        return (body.to_string(), None);
+    };
+    let is_space = |byte: u8| matches!(byte, b' ' | b'\t' | b'\r' | b'\n');
+    let mut at = key_at + key.len();
+    while at < bytes.len() && is_space(bytes[at]) {
+        at += 1;
+    }
+    if at >= bytes.len() || bytes[at] != b':' {
+        return (body.to_string(), None);
+    }
+    at += 1;
+    while at < bytes.len() && is_space(bytes[at]) {
+        at += 1;
+    }
+    let digits_at = at;
+    while at < bytes.len() && bytes[at].is_ascii_digit() {
+        at += 1;
+    }
+    if at == digits_at {
+        return (body.to_string(), None);
+    }
+    let budget = body[digits_at..at].parse::<u64>().ok();
+    let value_end = at;
+    // Drop the member and one separating comma, whichever side it sits on, so every other byte of
+    // the body is preserved exactly.
+    let mut after = value_end;
+    while after < bytes.len() && is_space(bytes[after]) {
+        after += 1;
+    }
+    if after < bytes.len() && bytes[after] == b',' {
+        return (
+            format!("{}{}", &body[..key_at], &body[after + 1..]),
+            budget,
+        );
+    }
+    let mut before = key_at;
+    while before > 0 && is_space(bytes[before - 1]) {
+        before -= 1;
+    }
+    if before > 0 && bytes[before - 1] == b',' {
+        return (
+            format!("{}{}", &body[..before - 1], &body[value_end..]),
+            budget,
+        );
+    }
+    (
+        format!("{}{}", &body[..key_at], &body[value_end..]),
+        budget,
+    )
 }
 
 /// The wait budget for a dispatch that lands on the git serial lane.
@@ -1753,6 +1930,40 @@ pub(super) fn lane_starved_answer(
               report.lane_holder_age_ms,
               report.lane_position.map(|position| position.to_string()).unwrap_or_else(|| "unknown".to_string()),
               report.waiters,
+            spool_dir.join(DISPATCH_WAIT_LEDGER_FILE).display()
+        ),
+    })
+    .to_string()
+}
+
+/// The answer for a dispatch the hold watchdog displaced from a lane it had already won.
+///
+/// It holds the lane and has not run, so the reply is the same shape as a starvation: nothing
+/// executed, re-dispatching is safe, and the claim keeps its place at the head of the queue. The
+/// extra fields name the release, because this is the one starvation the caller did not cause by
+/// running out of budget -- the lane was taken from a holder that was stuck, and the caller's
+/// re-dispatch is the continuation of the same request, not a new one.
+pub(super) fn lane_displaced_answer(root: &Path, verb: &str, task: &str, lane: Option<&'static str>) -> String {
+    let spool_dir = spool_dir_of_root(root);
+    let (request_path, claim_path, out_path) = unanswered_spool_paths(&spool_dir, verb, task);
+    serde_json::json!({
+        "ok": false,
+        "error_code": "dispatch_starved_waiting_for_serial_lane",
+        "verb": verb,
+        "task": task,
+        "lane": lane,
+        "lane_hold_released": true,
+        "lane_hold_released_reason": "holder_stuck_before_running",
+        "daemon_pid": std::process::id(),
+        "request_path": request_path.to_string_lossy(),
+        "claim_path": claim_path.to_string_lossy(),
+        "out_path": out_path.to_string_lossy(),
+        "dispatch_wait_ledger": spool_dir.join(DISPATCH_WAIT_LEDGER_FILE).to_string_lossy(),
+        "executed": false,
+        "re_dispatch_safe": true,
+        "error": format!(
+            "verb {} (task {}) won the {:?} serial lane but the hold watchdog released that hold before it ran, so it was NOT executed -- re-dispatching is safe because nothing ran. The lane stays single-writer: a holder that lost it never touches the worktree. This claim is parked at the head of its lane queue, so the re-dispatch keeps its place. Live state for every unanswered request is in {}.",
+            verb, task, lane.unwrap_or("unassigned"),
             spool_dir.join(DISPATCH_WAIT_LEDGER_FILE).display()
         ),
     })
@@ -1829,6 +2040,14 @@ pub(crate) fn run_gm_dispatch_to_file(
     } else {
         inner_verb_owned.as_str()
     };
+    // The caller's own poll budget rides in the body as one reserved member (gm-mcp writes it from
+    // `timeout_seconds`). Take it out here, before anything hashes or runs the body: the plugin below
+    // must see exactly the body the caller wrote, and the lane's FIFO identity is hashed from that
+    // body, so a member that appeared in one dispatch and not in its re-dispatch would fork one
+    // waiting request into two queue places. The budget itself is what bounds the lane wait -- the
+    // caller could not raise it before, so a caller polling for 240s starved at a hard 120s.
+    let (body_owned, caller_lane_wait_ms) = split_caller_lane_wait_ms(body);
+    let body = body_owned.as_str();
     let lane = dispatch_serial_lane(tool_verb, body);
     let in_dir = root.join(".gm").join("exec-spool").join("in");
     note_dispatch_stage(root, verb, task, DispatchStage::WaitingForLane, lane);
@@ -1837,7 +2056,7 @@ pub(crate) fn run_gm_dispatch_to_file(
         tool_verb,
         body,
         task,
-        lane_wait_max(tool_verb),
+        lane_wait_max(tool_verb, caller_lane_wait_ms),
     ) {
         Ok(guard) => guard,
         Err(report) => {
@@ -1892,7 +2111,7 @@ pub(crate) fn run_gm_dispatch_to_file(
         tool_verb,
         body,
         task,
-        lane_wait_max(tool_verb),
+        lane_wait_max(tool_verb, caller_lane_wait_ms),
     ) {
         Ok(guard) => guard,
         Err(report) => {
@@ -1907,6 +2126,24 @@ pub(crate) fn run_gm_dispatch_to_file(
             return;
         }
     };
+    // A hold is bounded, so the watchdog may have taken this lane while we waited for the tool
+    // queue: it releases a holder that is stuck *before* running, and such a holder is not executing.
+    // Ask before dispatching rather than after -- a guard that no longer owns the lane must never
+    // reach the worktree, or two mutating git dispatches would share one repo. The claim is parked
+    // back at the head of its queue, so the caller's re-dispatch keeps the place it earned instead of
+    // rejoining behind every newer arrival.
+    if !_fairness_guard.still_owns() {
+        eprintln!(
+            "[agentplug daemon] {verb}/{task} for {} won the {:?} lane but lost it to the hold watchdog before running -- answered dispatch_starved_waiting_for_serial_lane and parked the claim at the head of the queue; the verb did not run",
+            root.display(), lane
+        );
+        agentplug_host::requeue_lane_claimer_front(root, lane, tool_verb, body, task);
+        let out_body = lane_displaced_answer(root, verb, task, lane);
+        write_spool_out_and_release_claim(out_dir, &in_dir, verb, task, &out_body);
+        forget_dispatch_wait_record(root, verb, task);
+        refresh_dispatch_wait_ledger(root);
+        return;
+    }
     note_dispatch_stage(root, verb, task, DispatchStage::Running, lane);
     let _dispatch_origin_scope =
         agentplug_host::enter_dispatch_origin_scope(task, submitted_at_ms);
@@ -2165,9 +2402,27 @@ pub(super) fn refresh_dispatch_wait_ledger(root: &Path) {
         return;
     }
     let lane_holds = agentplug_host::registry::lane_holds(root);
+    // A hold past the bound is now bounded, not merely reported: the watchdog frees the lane when the
+    // holder is gone, or is live but has sat at a pre-Running stage past the stuck bound. Neither is
+    // executing, so the lane stays single-writer -- and the displaced holder asks `still_owns()`
+    // before dispatching, so it answers starved instead of running. A holder that IS running is never
+    // released however long it holds: that hold is the lane's whole purpose.
+    let released_holds = if lane_hold_watchdog_due(now) {
+        release_stuck_lane_holders(lane_hold_stuck_min_ms())
+    } else {
+        Vec::new()
+    };
     let lane_hold_rows: Vec<serde_json::Value> = lane_holds
         .iter()
         .map(|hold| {
+            let released = released_holds
+                .iter()
+                .find(|released| {
+                    released.lane == hold.lane
+                        && released.verb == hold.verb
+                        && released.task == hold.task
+                })
+                .map(|released| released.reason);
             serde_json::json!({
                 "lane": hold.lane,
                 "verb": hold.verb,
@@ -2176,21 +2431,39 @@ pub(super) fn refresh_dispatch_wait_ledger(root: &Path) {
                 "waiters": hold.waiters,
                 "holds_waiters": hold.waiters > 0,
                 "over_bound": hold.held_ms >= LANE_HOLD_REPORT_MIN_MS,
+                "released": released.is_some(),
+                "released_reason": released,
             })
         })
         .collect();
     for hold in &lane_holds {
         if hold.held_ms >= LANE_HOLD_REPORT_MIN_MS && lane_hold_watchdog_due(now) {
-            eprintln!(
-                "[lane-hold] project {} lane {} held by task {} (verb {}) for {}ms with {} waiter(s) queued -- past the {}ms bound this is a stalled holder, not a slow operation. Reported, not released: the lane stays single-writer.",
-                root.display(),
-                hold.lane,
-                hold.task,
-                hold.verb,
-                hold.held_ms,
-                hold.waiters,
-                LANE_HOLD_REPORT_MIN_MS
-            );
+            let released = released_holds.iter().find(|released| {
+                released.lane == hold.lane && released.verb == hold.verb && released.task == hold.task
+            });
+            match released {
+                Some(released) => eprintln!(
+                    "[lane-hold] project {} lane {} held by task {} (verb {}) for {}ms with {} waiter(s) -- past the {}ms bound, released as {}: the holder was not executing, so the lane was freed and the holder's own still_owns() check answers starved instead of running it. Still one writer per lane.",
+                    root.display(),
+                    hold.lane,
+                    hold.task,
+                    hold.verb,
+                    hold.held_ms,
+                    hold.waiters,
+                    LANE_HOLD_REPORT_MIN_MS,
+                    released.reason
+                ),
+                None => eprintln!(
+                    "[lane-hold] project {} lane {} held by task {} (verb {}) for {}ms with {} waiter(s) -- past the {}ms bound and NOT released: the holder is running, or its stage is another daemon's to know. One writer per lane is kept.",
+                    root.display(),
+                    hold.lane,
+                    hold.task,
+                    hold.verb,
+                    hold.held_ms,
+                    hold.waiters,
+                    LANE_HOLD_REPORT_MIN_MS
+                ),
+            }
         }
     }
     let payload = serde_json::json!({
@@ -2200,6 +2473,19 @@ pub(super) fn refresh_dispatch_wait_ledger(root: &Path) {
         "project_in_flight": project_in_flight_count(root),
         "project_in_flight_cap": MAX_CLAIMED_DISPATCHES_PER_PROJECT,
         "lane_hold_report_min_ms": LANE_HOLD_REPORT_MIN_MS,
+        "lane_hold_stuck_min_ms": lane_hold_stuck_min_ms(),
+        "lane_hold_released": released_holds
+            .iter()
+            .map(|released| {
+                serde_json::json!({
+                    "lane": released.lane,
+                    "verb": released.verb,
+                    "task": released.task,
+                    "held_ms": released.held_ms,
+                    "reason": released.reason,
+                })
+            })
+            .collect::<Vec<serde_json::Value>>(),
         "lane_holds": lane_hold_rows,
         "requests": rows,
     })
