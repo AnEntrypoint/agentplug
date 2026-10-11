@@ -30,9 +30,14 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-const SELFCHECKS = ['selfcheck-git-admission', 'selfcheck-lane-release', 'selfcheck-lane-fifo'];
+const SELFCHECKS = [
+  'selfcheck-git-admission',
+  'selfcheck-lane-release',
+  'selfcheck-lane-fifo',
+  'selfcheck-lane-network-yield',
+];
 const GIT_BAND_EXPRESSION = 'self.short_reserved_slots().saturating_sub(1)';
-const LANE_FIFO_EXPRESSION = '!owners.contains_key(&key) && lane_head_is(&owned_root, lane, token)';
+const LANE_FIFO_EXPRESSION = '!owners.contains_key(&key) && lane_admissible(&owned_root, lane, token)';
 const DEFAULT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const MAX_BUFFER = 64 * 1024 * 1024;
 

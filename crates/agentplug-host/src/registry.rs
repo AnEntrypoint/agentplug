@@ -281,18 +281,56 @@ pub fn cost_class_for_verb(verb: &str) -> DispatchCostClass {
     }
 }
 
+const CODESEARCH_SCOPE_FIELDS: &[&str] = &["paths", "path", "path_glob", "glob", "include"];
+
+fn codesearch_scope_pattern_is_literal(raw: &str) -> bool {
+    let normalized = raw.trim().replace('\\', "/");
+    let normalized = normalized.trim_start_matches("./").trim_end_matches('/');
+    !normalized.is_empty() && !normalized.contains(['*', '?', '[', ']', '{', '}'])
+}
+
+fn codesearch_scope_is_literal(value: &serde_json::Value) -> bool {
+    let mut named = 0usize;
+    for field in CODESEARCH_SCOPE_FIELDS {
+        match value.get(*field) {
+            None | Some(serde_json::Value::Null) => continue,
+            Some(serde_json::Value::String(text)) => {
+                if !codesearch_scope_pattern_is_literal(text) {
+                    return false;
+                }
+                named += 1;
+            }
+            Some(serde_json::Value::Array(entries)) => {
+                if entries.is_empty() {
+                    return false;
+                }
+                for entry in entries {
+                    match entry.as_str() {
+                        Some(text) if codesearch_scope_pattern_is_literal(text) => named += 1,
+                        _ => return false,
+                    }
+                }
+            }
+            Some(_) => return false,
+        }
+    }
+    named > 0
+}
+
 pub fn cost_class_for_dispatch(verb: &str, body: &str) -> DispatchCostClass {
     if verb != "codesearch" {
         return cost_class_for_verb(verb);
     }
-    let mode = serde_json::from_str::<serde_json::Value>(body)
-        .ok()
-        .and_then(|value| {
-            value
-                .get("mode")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_owned)
-        });
+    let parsed = serde_json::from_str::<serde_json::Value>(body).ok();
+    let mode = parsed.as_ref().and_then(|value| {
+        value
+            .get("mode")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+    });
+    if parsed.as_ref().map(codesearch_scope_is_literal) == Some(true) {
+        return DispatchCostClass::Cheap;
+    }
     match mode.as_deref() {
         None | Some("dual") => DispatchCostClass::Heavy,
         Some(_) => DispatchCostClass::Cheap,
@@ -2208,6 +2246,23 @@ const GIT_LANE_VERBS: &[&str] = &[
     "git_worktree_prune",
 ];
 
+/// Git verbs whose lane hold is set by the remote, not by the checkout: a push is measured in
+/// minutes (round-trips plus transient-rejection backoff) where a commit is measured in seconds.
+///
+/// They stay on the git lane -- one writer per worktree is the property that keeps concurrent git
+/// writers serialized, and `git_push` can `pull --rebase` the checkout it is publishing from
+/// (`rs-plugkit/crates/plugkit-core/src/wasm_dispatch/verbs/git.rs`, the rebase-retry branch) -- so
+/// what they give up is their place, not the guarantee: a claim here yields to a checkout-bound
+/// claim behind it until `LANE_NETWORK_YIELD_MS` of its own waiting has passed.
+const GIT_NETWORK_LANE_VERBS: &[&str] = &["git_push", "git_pull", "git_fetch"];
+
+/// How long a network-bound claim yields its place to checkout-bound claims behind it.
+///
+/// Measured against the claim's own arrival, not against its last poll, so a caller that keeps
+/// re-dispatching cannot hold the yield open forever: past this the network claim competes
+/// ordinary FIFO again and is admitted, so queueing commits never starve publication.
+const LANE_NETWORK_YIELD_MS: u64 = 120_000;
+
 const READ_LANE_VERBS: &[&str] = &["health", "recall"];
 
 const STORE_LANE_VERBS: &[&str] = &[
@@ -2291,9 +2346,11 @@ pub fn dispatch_serial_lane(verb: &str, body: &str) -> Option<&'static str> {
 
 /// One dispatch waiting its turn on a project serial lane, in claim order.
 ///
-/// Admission is FIFO by claim age: a waiter is admitted only while it is the head, so a later
-/// arrival can never overtake an older one. The token is drawn under the same lock that pushes the
-/// entry, so queue order and claim order cannot disagree.
+/// Admission is FIFO by claim age with one exception, the network yield: a claim is admitted while
+/// it is the head, so a later arrival can never overtake an older one of its own class, and a
+/// network-bound claim (`GIT_NETWORK_LANE_VERBS`) additionally yields to a checkout-bound claim
+/// behind it until it has waited `LANE_NETWORK_YIELD_MS`. See `lane_admissible`. The token is drawn
+/// under the same lock that pushes the entry, so queue order and claim order cannot disagree.
 ///
 /// `identity` is what makes FIFO survive re-dispatch. A starved caller re-dispatches its request
 /// verbatim, and the spool mints a fresh task id and a fresh token for it, so an arrival-ordered
@@ -2303,10 +2360,16 @@ pub fn dispatch_serial_lane(verb: &str, body: &str) -> Option<&'static str> {
 /// re-claims the token it already held and keeps its place. The entry survives starvation and is
 /// dropped when its dispatch finally gets the lane, or by TTL on `last_seen_ms` once its caller
 /// stops re-dispatching.
+///
+/// `claimed_ms` is the arrival this place dates from and is deliberately NOT refreshed on
+/// re-dispatch: it bounds the network yield, so a claim that keeps polling its way to the front
+/// cannot hold the yield open indefinitely.
 struct LaneWaiter {
     token: u64,
     task: String,
     identity: String,
+    verb: String,
+    claimed_ms: u64,
     last_seen_ms: u64,
     /// True while some dispatch is inside `acquire_within` under this ticket. A place is inherited
     /// only from a PARKED ticket (`active == false`), so two callers that happen to send a
@@ -2339,12 +2402,44 @@ fn gm_lane_waiters() -> &'static Mutex<HashMap<(PathBuf, &'static str), VecDeque
     WAITERS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// True when `token` is the oldest claim waiting on this lane.
+/// The yield budget, read once per process. The env override exists only so the selfcheck can
+/// witness the aging bound without a two-minute wait: an unset or unparseable value leaves the
+/// default in force. No shipped path sets it.
+fn lane_network_yield_ms() -> u64 {
+    static OVERRIDE: OnceLock<Option<u64>> = OnceLock::new();
+    OVERRIDE
+        .get_or_init(|| {
+            std::env::var("AGENTPLUG_LANE_NETWORK_YIELD_MS")
+                .ok()
+                .and_then(|raw| raw.trim().parse::<u64>().ok())
+        })
+        .unwrap_or(LANE_NETWORK_YIELD_MS)
+}
+
+/// Admission class of one claim: 0 for a verb whose lane hold is set by the remote, 1 for one whose
+/// hold is set by the checkout. Only the relative order inside one lane matters, so every non-git
+/// verb is class 1 and unaffected by the yield.
+fn lane_yield_class(verb: &str) -> u8 {
+    if GIT_NETWORK_LANE_VERBS.contains(&verb) {
+        0
+    } else {
+        1
+    }
+}
+
+/// True when `token` may take this lane now.
+///
+/// The claim is admissible when every claim ahead of it has either stopped contending or is
+/// outranked. Outranked means the claim ahead is network-bound while this one is checkout-bound,
+/// and the claim ahead has not yet waited `LANE_NETWORK_YIELD_MS` of its own: a minutes-long push
+/// therefore does not leave the commits behind it queueing once the lane frees, and a push stops
+/// yielding once its own wait passes the budget, so a project that commits continuously still
+/// publishes.
 ///
 /// Callers hold the lane-owner lock across this check and the insert that follows it, so the head
 /// cannot change in between: exactly one waiter is admissible at a time, and one owner per
 /// `(project, lane)` is what keeps concurrent git writers on one worktree serialized.
-fn lane_head_is(root: &Path, lane: &'static str, token: u64) -> bool {
+fn lane_admissible(root: &Path, lane: &'static str, token: u64) -> bool {
     let now = crate::now_ms();
     gm_lane_waiters()
         .lock()
@@ -2357,13 +2452,23 @@ fn lane_head_is(root: &Path, lane: &'static str, token: u64) -> bool {
                 .map(|index| (queue, index))
         })
         .map(|(queue, index)| {
-            // Every claim ahead of this one has stopped re-dispatching, so waiting for it would
-            // only idle the lane: this claim is admissible. A claim that is still contending stays
-            // ahead because its `last_seen_ms` keeps moving forward.
-            queue
-                .iter()
-                .take(index)
-                .all(|entry| now.saturating_sub(entry.last_seen_ms) >= LANE_TICKET_STALE_MS)
+            let mine = lane_yield_class(&queue[index].verb);
+            queue.iter().take(index).all(|entry| {
+                // Every claim ahead of this one has stopped re-dispatching, so waiting for it would
+                // only idle the lane: this claim is admissible. A claim that is still contending
+                // stays ahead because its `last_seen_ms` keeps moving forward.
+                if now.saturating_sub(entry.last_seen_ms) >= LANE_TICKET_STALE_MS {
+                    return true;
+                }
+                let theirs = lane_yield_class(&entry.verb);
+                if theirs >= mine {
+                    return false;
+                }
+                // The claim ahead is network-bound, so it yields -- but only for its own first
+                // `LANE_NETWORK_YIELD_MS` of waiting, measured from `claimed_ms` and never
+                // refreshed, so a caller that keeps re-dispatching cannot extend the yield.
+                now.saturating_sub(entry.claimed_ms) < lane_network_yield_ms()
+            })
         })
         .unwrap_or(false)
 }
@@ -2380,8 +2485,11 @@ fn lane_name(name: &str) -> Option<&'static str> {
 
 /// Where `task` stands on its project serial lane, and how long the lane's current holder has held it.
 ///
-/// `lane_position` is 1-based over the FIFO queue and counts only dispatchers still waiting: 1 means
-/// this task is admitted the moment the current holder releases. This is the cheap-poll surface
+/// `lane_position` is 1-based over the FIFO queue and counts only dispatchers still waiting.
+/// Position 1 means the task is admitted the moment the current holder releases, with one
+/// exception: a network-bound claim (`git_push`, `git_pull`, `git_fetch`) yields its place to a
+/// checkout-bound claim behind it for its first `LANE_NETWORK_YIELD_MS` of waiting, so a commit at
+/// position 2 behind a fresh push is admitted before that push is. This is the cheap-poll surface
 /// behind `.dispatch-wait.json` -- read it instead of spending a whole dispatch budget to learn the
 /// caller would lose the race. Lock order is owners-then-waiters, matching `acquire_within`.
 pub struct LaneQueueState {
@@ -2593,6 +2701,8 @@ impl GmFairnessGuard {
                 .position(|entry| entry.identity == identity && !entry.active)
             {
                 // The same request re-dispatched after starving: keep its token, and so its place.
+                // `claimed_ms` is deliberately left at the original arrival: it caps the network
+                // yield, so re-dispatching cannot buy a fresh yield window.
                 Some(index) => {
                     let entry = &mut queue[index];
                     entry.last_seen_ms = now;
@@ -2606,6 +2716,8 @@ impl GmFairnessGuard {
                         token,
                         task: task.to_string(),
                         identity,
+                        verb: verb.to_string(),
+                        claimed_ms: now,
                         last_seen_ms: now,
                         active: true,
                     });
@@ -2616,7 +2728,7 @@ impl GmFairnessGuard {
         let mut owners = gm_lane_owners().lock().unwrap_or_else(|e| e.into_inner());
         let acquired = loop {
             let key = (owned_root.clone(), lane);
-            if !owners.contains_key(&key) && lane_head_is(&owned_root, lane, token) {
+            if !owners.contains_key(&key) && lane_admissible(&owned_root, lane, token) {
                 owners.insert(
                     key,
                     LaneOwner {
