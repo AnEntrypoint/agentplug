@@ -69,7 +69,7 @@ impl DrainedPipe {
             .clone()
     }
 
-    fn snapshot(&self) -> Vec<u8> {
+    pub(crate) fn snapshot(&self) -> Vec<u8> {
         self.buffer
             .lock()
             .unwrap_or_else(|e| e.into_inner())

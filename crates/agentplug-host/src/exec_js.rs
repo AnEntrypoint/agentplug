@@ -402,6 +402,14 @@ pub fn run(code: &str, opts: &Value, cwd: &Path) -> Value {
     }
     let duration_ms = t0.elapsed().as_millis() as u64;
     if !drains_finished() {
+        let partial_stdout = stdout_pipe
+            .as_ref()
+            .map(crate::task::DrainedPipe::snapshot)
+            .unwrap_or_default();
+        let partial_stderr = stderr_pipe
+            .as_ref()
+            .map(crate::task::DrainedPipe::snapshot)
+            .unwrap_or_default();
         let task_id = match crate::task::adopt_running(
             child,
             containment,
@@ -429,7 +437,10 @@ pub fn run(code: &str, opts: &Value, cwd: &Path) -> Value {
             "exit_code": exit_code,
             "duration_ms": duration_ms,
             "task_timeout_ms": 30 * 60 * 1000,
-            "decision_required": "the direct process exited but its output drains remain unfinished after the bounded grace; a descendant may still hold the pipes. task-output with {\"id\":\"<task_id>\"} retains output until every pipe closes. Call task-stop with that id to terminate the process group."
+            "stdout": String::from_utf8_lossy(&partial_stdout),
+            "stderr": String::from_utf8_lossy(&partial_stderr),
+            "pipes_held_by_descendant": true,
+            "decision_required": "the direct process exited but its output drains remain unfinished after the bounded grace; a descendant still holds the pipes. stdout and stderr above are everything the direct process wrote before it exited and are not lost. task-output with {\"id\":\"<task_id>\"} keeps collecting until every pipe closes; task-stop with that id terminates the process group. To return synchronously next time, detach so no descendant inherits the pipes: ( nohup cmd >log 2>&1 & )"
         });
     }
     let stdout_buf = stdout_pipe.map(|p| p.collect()).unwrap_or_default();
@@ -1060,6 +1071,147 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use serde_json::json;
+
+    fn bash_path(path: &std::path::Path) -> String {
+        path.to_string_lossy().replace('\\', "/")
+    }
+
+    #[test]
+    fn backgrounded_sleeper_returns_foreground_output_instead_of_blocking() {
+        let _guard = crate::task::test_registry_guard();
+        let marker = std::env::temp_dir()
+            .join(format!("gm-exec-detach-{}-held.marker", std::process::id()));
+        let _ = std::fs::remove_file(&marker);
+        let code = format!(
+            "printf '%s' foreground-; {{ sleep 3; touch \"{}\"; }} &",
+            bash_path(&marker)
+        );
+        let started = Instant::now();
+        let result = super::run(
+            &code,
+            &json!({"lang": "bash", "timeoutMs": 10_000}),
+            Path::new("."),
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "dispatch waited on the backgrounded sleeper: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(result.get("exit_code").and_then(|v| v.as_i64()), Some(0));
+        assert_eq!(result.get("in_progress").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(
+            result.get("stdout").and_then(|v| v.as_str()),
+            Some("foreground-"),
+            "foreground stdout must survive a descendant holding the pipes"
+        );
+        assert!(
+            !marker.exists(),
+            "the sleeper finished before the dispatch returned"
+        );
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !marker.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "the backgrounded sleeper did not keep running after the dispatch returned"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let _ = std::fs::remove_file(&marker);
+    }
+
+    #[test]
+    fn detached_subshell_returns_synchronously_and_leaves_the_sleeper_running() {
+        let _guard = crate::task::test_registry_guard();
+        let marker = std::env::temp_dir()
+            .join(format!("gm-exec-detach-{}-detached.marker", std::process::id()));
+        let log = std::env::temp_dir()
+            .join(format!("gm-exec-detach-{}-detached.log", std::process::id()));
+        let _ = std::fs::remove_file(&marker);
+        let code = format!(
+            "printf '%s' foreground-; ( sleep 3; touch \"{}\" ) >\"{}\" 2>&1 &",
+            bash_path(&marker),
+            bash_path(&log)
+        );
+        let started = Instant::now();
+        let result = super::run(
+            &code,
+            &json!({"lang": "bash", "timeoutMs": 10_000}),
+            Path::new("."),
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "detached subshell made the dispatch wait: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(result.get("ok").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(result.get("exit_code").and_then(|v| v.as_i64()), Some(0));
+        assert_eq!(result.get("in_progress").and_then(|v| v.as_bool()), None);
+        assert_eq!(
+            result.get("stdout").and_then(|v| v.as_str()),
+            Some("foreground-")
+        );
+        assert!(
+            !marker.exists(),
+            "the sleeper finished before the dispatch returned"
+        );
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !marker.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "the detached sleeper did not keep running after the dispatch returned"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let _ = std::fs::remove_file(&marker);
+        let _ = std::fs::remove_file(&log);
+    }
+
+    #[test]
+    fn detached_writer_is_still_appending_a_minute_after_the_dispatch_returned() {
+        let _guard = crate::task::test_registry_guard();
+        let log = std::env::temp_dir()
+            .join(format!("gm-exec-durable-{}-writer.log", std::process::id()));
+        let _ = std::fs::remove_file(&log);
+        let code = format!(
+            "( i=0; while [ $i -lt 90 ]; do echo $i >> '{}'; i=$((i+1)); sleep 1; done ) >/dev/null 2>&1 &",
+            bash_path(&log)
+        );
+        let result = super::run(
+            &code,
+            &json!({"lang": "bash", "timeoutMs": 10_000}),
+            Path::new("."),
+        );
+        assert_eq!(result.get("ok").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(result.get("exit_code").and_then(|v| v.as_i64()), Some(0));
+        assert_eq!(
+            result.get("in_progress").and_then(|v| v.as_bool()),
+            None,
+            "a detached writer that owns no pipe must not hand the dispatch off to a task"
+        );
+        let lines = || {
+            std::fs::read_to_string(&log)
+                .map(|body| body.lines().count())
+                .unwrap_or(0)
+        };
+        let deadline = Instant::now() + Duration::from_secs(80);
+        while lines() < 60 {
+            assert!(
+                Instant::now() < deadline,
+                "the detached writer stopped after {} lines, so the dispatch killed it",
+                lines()
+            );
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        let at_minute = lines();
+        std::thread::sleep(Duration::from_secs(3));
+        assert!(
+            lines() > at_minute,
+            "the detached writer wrote {} lines at the minute mark and {} three seconds later",
+            at_minute,
+            lines()
+        );
+        let _ = std::fs::remove_file(&log);
+    }
 
     #[test]
     fn exited_foreground_child_hands_late_descendant_output_to_task() {
