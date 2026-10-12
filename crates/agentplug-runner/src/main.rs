@@ -234,6 +234,7 @@ fn main() -> anyhow::Result<()> {
         "selfcheck-lane-hold-release" => selfcheck_lane_hold_release(),
         "selfcheck-lane-network-yield" => selfcheck_lane_network_yield(),
         "selfcheck-spool-claim" => selfcheck_spool_claim(),
+        "selfcheck-browser-lease" => selfcheck_browser_lease(),
         other => {
             eprintln!(
                 "agentplug-runner: unknown command '{other}'. Usage: agentplug-runner <plugin <name> [version]|spool|daemon|takeover <version>|dispatch [plugin] <verb> [body]|sweep-spool [root]|update-runner|release-bootstrap-status|build-info|pin-local-build|unpin-local-build|selfcheck-registry|selfcheck-inflight|selfcheck-idle-evict|version>"
@@ -1913,6 +1914,118 @@ fn selfcheck_spool_claim() -> anyhow::Result<()> {
     println!("[selfcheck-spool-claim] witnessed live against the real claim predicate: PASS");
     Ok(())
 }
+fn selfcheck_browser_lease() -> anyhow::Result<()> {
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    const NAME: &str = "[selfcheck-browser-lease]";
+    const HOLD: &str = "AGENTPLUG_SELFCHECK_LEASE_HOLD";
+    const ROOT: &str = "AGENTPLUG_SELFCHECK_LEASE_ROOT";
+
+    if std::env::var_os(HOLD).is_some() {
+        let root = std::path::PathBuf::from(std::env::var(ROOT).unwrap_or_default());
+        agentplug_host::claim_session(&root, "selfcheck-holder", agentplug_host::TTL_MS, 30_000)
+            .map_err(|e| anyhow::anyhow!("{NAME} holder could not claim its own session: {e}"))?;
+        println!("{NAME} holder claimed pid={}", std::process::id());
+        let stop = agentplug_host::session_dir(&root).join("stop");
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while Instant::now() < deadline && !stop.exists() {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        agentplug_host::release_session(&root);
+        println!("{NAME} holder released");
+        return Ok(());
+    }
+
+    let root = std::env::temp_dir().join(format!(
+        "agentplug-selfcheck-lease-{}-{}",
+        std::process::id(),
+        agentplug_host::now_ms()
+    ));
+    let session = agentplug_host::session_dir(&root);
+    std::fs::create_dir_all(&session)?;
+
+    let exe = std::env::current_exe()?;
+    let mut child = Command::new(&exe)
+        .arg("selfcheck-browser-lease")
+        .env(HOLD, "1")
+        .env(ROOT, &root)
+        .stdin(Stdio::null())
+        .spawn()?;
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut seen = false;
+    while Instant::now() < deadline {
+        let state = agentplug_host::lease_status(&root);
+        if state["held"].as_bool() == Some(true) && state["live"].as_bool() == Some(true) {
+            seen = true;
+            println!(
+                "{NAME} holder live: owner={} pid={} heartbeat_age_ms={}",
+                state["owner"], state["pid"], state["heartbeat_age_ms"]
+            );
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(seen, "{NAME} the first process must publish a live session claim");
+
+    let second =
+        agentplug_host::claim_session(&root, "selfcheck-waiter", agentplug_host::TTL_MS, 1_500);
+    let err = match second {
+        Ok(_) => panic!(
+            "{NAME} a live holder must refuse a second claim: two processes would launch two browsers"
+        ),
+        Err(e) => e,
+    };
+    println!("{NAME} second process refused: {err}");
+    assert!(
+        err.contains("selfcheck-holder"),
+        "{NAME} the refusal must name the holder: {err}"
+    );
+    assert!(
+        err.contains("no browser was launched"),
+        "{NAME} the refusal must say no browser was launched: {err}"
+    );
+
+    std::fs::write(session.join("stop"), b"")?;
+    let exited = child.wait()?;
+    assert!(
+        exited.success(),
+        "{NAME} the holder must exit cleanly after its release"
+    );
+
+    let released = agentplug_host::lease_status(&root);
+    println!("{NAME} after release held={}", released["held"]);
+    assert!(
+        released["held"].as_bool() == Some(false),
+        "{NAME} releasing the holder must drop its claim"
+    );
+
+    agentplug_host::claim_session(&root, "selfcheck-waiter", agentplug_host::TTL_MS, 1_500)
+        .map_err(|e| anyhow::anyhow!("{NAME} the next process must claim after a release: {e}"))?;
+    agentplug_host::release_session(&root);
+
+    let stale_epoch = agentplug_host::now_ms().saturating_sub(10 * 60_000);
+    std::fs::write(
+        agentplug_host::owner_file(&root),
+        format!(
+            "{{\"owner\":\"dead-holder\",\"pid\":1,\"browser_pid\":1,\"port\":0,\"startedAt\":{stale_epoch},\"heartbeatAt\":{stale_epoch},\"ttlMs\":{}}}",
+            agentplug_host::TTL_MS
+        ),
+    )?;
+    assert!(
+        agentplug_host::lease_status(&root)["live"].as_bool() == Some(false),
+        "{NAME} a heartbeat older than the TTL is a dead holder, not a live one"
+    );
+    agentplug_host::claim_session(&root, "selfcheck-after-stale", agentplug_host::TTL_MS, 2_000)
+        .map_err(|e| anyhow::anyhow!("{NAME} a dead holder must be taken over, not waited for: {e}"))?;
+    agentplug_host::release_session(&root);
+
+    let _ = std::fs::remove_dir_all(&root);
+    println!("{NAME} two real processes against the real claim file: RESULT: PASS");
+    Ok(())
+}
+
 fn write_standalone_status(status_path: &std::path::Path, busy_until: Option<u64>) {
     use std::fs;
     let mut payload = match fs::read_to_string(status_path)

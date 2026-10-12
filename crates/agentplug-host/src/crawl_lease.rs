@@ -1,11 +1,13 @@
 use std::collections::{HashMap, HashSet};
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use serde_json::json;
+use serde_json::{json, Value};
 
 use crate::crawl::{
     crawl_browser_pid, endpoint_failure, endpoint_ready, find_chrome, free_local_port,
@@ -15,6 +17,21 @@ use crate::crawl::{
 use crate::windowless::apply_windowless;
 
 pub const HOUSEKEEPING_TICK: Duration = Duration::from_secs(30);
+
+/// How often a holder restamps `heartbeatAt` while it owns a session.
+pub const HEARTBEAT_MS: u64 = 2_000;
+/// A holder whose newest heartbeat is older than this is dead, whatever its pid does.
+pub const TTL_MS: u64 = 120_000;
+/// How long one acquire waits for a live holder before it fails.
+pub const WAIT_MS: u64 = 600_000;
+const POLL_MS: u64 = 500;
+/// A claim file exists before its record is readable. A freshly created unreadable
+/// file is a claim being written by a peer, never a dead holder to kill for.
+const CLAIM_CREATE_GRACE_MS: u64 = 5_000;
+
+const SESSION: &str = "session";
+const PROFILE: &str = "profile";
+const OWNER_FILE: &str = "owner.json";
 
 struct SharedBrowser {
     child: Child,
@@ -28,11 +45,27 @@ struct SharedBrowser {
 const CDP_LAUNCH_ATTEMPTS: usize = 2;
 
 static BROWSERS: OnceLock<Mutex<HashMap<PathBuf, SharedBrowser>>> = OnceLock::new();
+static CLAIMED: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+static HEARTBEATS: OnceLock<Mutex<HashMap<PathBuf, Arc<AtomicBool>>>> = OnceLock::new();
 static HOUSEKEEPING: OnceLock<()> = OnceLock::new();
 static AGENT_SEQ: AtomicU64 = AtomicU64::new(0);
 
 fn browsers() -> MutexGuard<'static, HashMap<PathBuf, SharedBrowser>> {
     BROWSERS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
+fn claimed() -> MutexGuard<'static, HashSet<PathBuf>> {
+    CLAIMED
+        .get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
+fn heartbeats() -> MutexGuard<'static, HashMap<PathBuf, Arc<AtomicBool>>> {
+    HEARTBEATS
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -45,39 +78,65 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-fn lease_dir(root: &Path) -> PathBuf {
-    root.join(".gm").join("browser-leases")
+/// One holder per project root: the exclusive claim file every process races for.
+pub fn session_dir(root: &Path) -> PathBuf {
+    root.join(".gm").join("browser-lease").join(SESSION)
 }
 
-fn profiles_root(root: &Path) -> PathBuf {
-    root.join(".gm").join("crawl-profiles")
+pub fn owner_file(root: &Path) -> PathBuf {
+    session_dir(root).join(OWNER_FILE)
 }
 
-fn fresh_profile(root: &Path) -> Result<PathBuf, String> {
-    let profile = profiles_root(root).join(format!(
-        "cdp-{}-{}",
-        std::process::id(),
-        AGENT_SEQ.fetch_add(1, Ordering::Relaxed)
-    ));
-    std::fs::create_dir_all(&profile)
-        .map_err(|e| format!("could not create Chrome profile {}: {e}", profile.display()))?;
-    Ok(profile)
+pub fn profile_dir(root: &Path) -> PathBuf {
+    session_dir(root).join(PROFILE)
 }
 
-fn sweep_old_profiles(root: &Path, keep: &Path) {
-    let Ok(entries) = std::fs::read_dir(profiles_root(root)) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() && path != keep {
-            let _ = std::fs::remove_dir_all(&path);
+/// The claim record, written as `owner.json` by whoever holds the session.
+#[derive(Clone)]
+pub struct LeaseHolder {
+    pub owner: String,
+    pub pid: u32,
+    pub browser_pid: u32,
+    pub port: u16,
+    pub started_at_ms: u64,
+    pub heartbeat_at_ms: u64,
+    pub ttl_ms: u64,
+}
+
+impl LeaseHolder {
+    fn new(owner: &str, port: u16, browser_pid: u32, ttl_ms: u64) -> Self {
+        let now = now_ms();
+        Self {
+            owner: owner.to_string(),
+            pid: std::process::id(),
+            browser_pid,
+            port,
+            started_at_ms: now,
+            heartbeat_at_ms: now,
+            ttl_ms,
         }
     }
-}
 
-fn lease_path(root: &Path, agent: &str) -> PathBuf {
-    lease_dir(root).join(format!("{agent}.json"))
+    fn to_value(&self) -> Value {
+        json!({
+            "owner": self.owner,
+            "pid": self.pid,
+            "browser_pid": self.browser_pid,
+            "port": self.port,
+            "startedAt": self.started_at_ms,
+            "heartbeatAt": self.heartbeat_at_ms,
+            "ttlMs": self.ttl_ms,
+        })
+    }
+
+    /// Milliseconds since the last heartbeat: the portable liveness signal.
+    pub fn heartbeat_age_ms(&self) -> u64 {
+        now_ms().saturating_sub(self.heartbeat_at_ms)
+    }
+
+    pub fn held_for_ms(&self) -> u64 {
+        now_ms().saturating_sub(self.started_at_ms)
+    }
 }
 
 pub fn next_agent_id() -> String {
@@ -88,35 +147,254 @@ pub fn next_agent_id() -> String {
     )
 }
 
-fn write_lease(root: &Path, agent: &str, port: u16, chrome_pid: u32) -> Result<(), String> {
-    let dir = lease_dir(root);
-    std::fs::create_dir_all(&dir)
-        .map_err(|e| format!("could not create {}: {e}", dir.display()))?;
-    let body = json!({"agent": agent, "port": port, "chrome_pid": chrome_pid, "pid": std::process::id(), "ts": now_ms()});
-    let path = lease_path(root, agent);
-    std::fs::write(&path, body.to_string())
-        .map_err(|e| format!("could not write lease {}: {e}", path.display()))
+fn int_field(value: &Value, key: &str) -> u64 {
+    value
+        .get(key)
+        .and_then(Value::as_u64)
+        .or_else(|| {
+            value
+                .get(key)
+                .and_then(Value::as_i64)
+                .map(|n| n.max(0) as u64)
+        })
+        .unwrap_or(0)
 }
 
-/// Removes lease files whose agent holds no live lease in this runner. Every
-/// crawl runs inside the runner process, so the in-memory active set is the
-/// authority; a file without an active owner is left by a dead caller.
-fn sweep_stale_leases(root: &Path, active: &HashSet<String>) {
-    let Ok(entries) = std::fs::read_dir(lease_dir(root)) else {
-        return;
+pub fn read_holder(root: &Path) -> Option<LeaseHolder> {
+    let text = std::fs::read_to_string(owner_file(root)).ok()?;
+    let value: Value = serde_json::from_str(&text).ok()?;
+    let owner = value.get("owner").and_then(Value::as_str)?;
+    let ttl_ms = match int_field(&value, "ttlMs") {
+        0 => TTL_MS,
+        other => other,
     };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("json") {
-            continue;
+    Some(LeaseHolder {
+        owner: owner.to_string(),
+        pid: int_field(&value, "pid") as u32,
+        browser_pid: int_field(&value, "browser_pid") as u32,
+        port: int_field(&value, "port") as u16,
+        started_at_ms: int_field(&value, "startedAt"),
+        heartbeat_at_ms: int_field(&value, "heartbeatAt"),
+        ttl_ms,
+    })
+}
+
+fn write_holder(root: &Path, holder: &LeaseHolder) -> Result<(), String> {
+    let dir = session_dir(root);
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| format!("could not create {}: {e}", dir.display()))?;
+    let path = owner_file(root);
+    let tmp = session_dir(root).join(format!("{OWNER_FILE}.{}.tmp", std::process::id()));
+    std::fs::write(&tmp, format!("{}\n", holder.to_value()))
+        .map_err(|e| format!("could not write {}: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, &path).map_err(|e| {
+        format!(
+            "could not move {} onto {}: {e}",
+            tmp.display(),
+            path.display()
+        )
+    })
+}
+
+fn effective_ttl(ttl_ms: u64) -> u64 {
+    if ttl_ms == 0 {
+        TTL_MS
+    } else {
+        ttl_ms
+    }
+}
+
+fn file_age_ms(path: &Path) -> u64 {
+    let Ok(modified) = std::fs::metadata(path).and_then(|meta| meta.modified()) else {
+        return u64::MAX;
+    };
+    let written = modified
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    now_ms().saturating_sub(written)
+}
+
+/// Live means the holder restamped its heartbeat inside the TTL. Heartbeat
+/// freshness is the whole test: it is the only liveness signal that reads the
+/// same on macOS, Windows and Linux without a platform probe.
+pub fn holder_live(root: &Path, ttl_ms: u64) -> bool {
+    match read_holder(root) {
+        Some(holder) => holder.heartbeat_age_ms() < effective_ttl(ttl_ms),
+        None => file_age_ms(&owner_file(root)) < CLAIM_CREATE_GRACE_MS,
+    }
+}
+
+fn claim_is_ours(root: &Path) -> bool {
+    read_holder(root)
+        .map(|holder| holder.pid == std::process::id())
+        .unwrap_or(false)
+}
+
+/// Creates the claim file or reports that it already exists. `create_new` is the
+/// mutex: exactly one process in the race gets `true`.
+fn create_claim(root: &Path, holder: &LeaseHolder) -> Result<bool, String> {
+    let dir = session_dir(root);
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| format!("could not create {}: {e}", dir.display()))?;
+    let path = owner_file(root);
+    match OpenOptions::new().write(true).create_new(true).open(&path) {
+        Ok(mut file) => {
+            if let Err(e) = file
+                .write_all(format!("{}\n", holder.to_value()).as_bytes())
+                .and_then(|()| file.sync_all())
+            {
+                let _ = std::fs::remove_file(&path);
+                return Err(format!("could not write {}: {e}", path.display()));
+            }
+            Ok(true)
         }
-        let Some(agent) = path.file_stem().map(|s| s.to_string_lossy().into_owned()) else {
-            continue;
-        };
-        if !active.contains(&agent) {
-            let _ = std::fs::remove_file(&path);
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        Err(e) => Err(format!("could not create {}: {e}", path.display())),
+    }
+}
+
+fn kill_tree(pid: u32) {
+    if pid <= 1 {
+        return;
+    }
+    kill_process_tree(pid);
+}
+
+/// Takes a claim whose holder stopped heartbeating: kills the holder it names,
+/// reaps whatever browser still owns the profile, then unlinks so the next
+/// create can win.
+fn evict_holder(root: &Path, prior: Option<&LeaseHolder>) {
+    if let Some(holder) = prior {
+        kill_tree(holder.browser_pid);
+        if holder.pid != std::process::id() {
+            kill_tree(holder.pid);
         }
     }
+    reap_stale_crawl_browsers(&profile_dir(root));
+    let _ = std::fs::remove_file(owner_file(root));
+}
+
+fn refresh_heartbeat(root: &Path) -> bool {
+    let Some(mut holder) = read_holder(root) else {
+        return false;
+    };
+    if holder.pid != std::process::id() {
+        return false;
+    }
+    holder.heartbeat_at_ms = now_ms();
+    write_holder(root, &holder).is_ok()
+}
+
+fn start_heartbeat(root: &Path) {
+    let key = root.to_path_buf();
+    let mut map = heartbeats();
+    if map.contains_key(&key) {
+        return;
+    }
+    let stop = Arc::new(AtomicBool::new(false));
+    map.insert(key.clone(), Arc::clone(&stop));
+    drop(map);
+    std::thread::spawn(move || {
+        while !stop.load(Ordering::Relaxed) {
+            std::thread::sleep(Duration::from_millis(HEARTBEAT_MS));
+            if !refresh_heartbeat(&key) {
+                break;
+            }
+        }
+    });
+}
+
+fn stop_heartbeat(root: &Path) {
+    if let Some(stop) = heartbeats().remove(root) {
+        stop.store(true, Ordering::Relaxed);
+    }
+}
+
+fn held_by_error(root: &Path, owner: &str, wait_ms: u64) -> String {
+    match read_holder(root) {
+        Some(holder) => format!(
+            "browser-lease: {owner} waited {wait_ms}ms for the accelerated browser session of {} held by {} pid {} for {}ms (since epoch {}ms), so no browser was launched",
+            root.display(),
+            holder.owner,
+            holder.pid,
+            holder.held_for_ms(),
+            holder.started_at_ms,
+        ),
+        None => format!(
+            "browser-lease: {owner} waited {wait_ms}ms for the accelerated browser session of {} held by an unreadable owner file ({}), so no browser was launched",
+            root.display(),
+            owner_file(root).display(),
+        ),
+    }
+}
+
+/// Takes the one session claim for `root`, waiting out a live holder and taking
+/// over a dead one. Returns the record this process now owns.
+pub fn claim_session(
+    root: &Path,
+    owner: &str,
+    ttl_ms: u64,
+    wait_ms: u64,
+) -> Result<LeaseHolder, String> {
+    let ttl = effective_ttl(ttl_ms);
+    let already = { claimed().contains(root) };
+    if already {
+        if claim_is_ours(root) {
+            let holder = read_holder(root).unwrap_or_else(|| LeaseHolder::new(owner, 0, 0, ttl));
+            start_heartbeat(root);
+            return Ok(holder);
+        }
+        claimed().remove(root);
+        stop_heartbeat(root);
+    }
+    let deadline = Instant::now() + Duration::from_millis(wait_ms);
+    loop {
+        let holder = LeaseHolder::new(owner, 0, 0, ttl);
+        if create_claim(root, &holder)? {
+            claimed().insert(root.to_path_buf());
+            start_heartbeat(root);
+            return Ok(holder);
+        }
+        if Instant::now() >= deadline {
+            return Err(held_by_error(root, owner, wait_ms));
+        }
+        if !holder_live(root, ttl) {
+            let prior = read_holder(root);
+            evict_holder(root, prior.as_ref());
+        }
+        std::thread::sleep(Duration::from_millis(POLL_MS));
+    }
+}
+
+/// Drops this process's own claim, and only its own: a claim whose pid is not
+/// ours belongs to whoever took over, and is left alone.
+pub fn release_session(root: &Path) {
+    claimed().remove(root);
+    stop_heartbeat(root);
+    let Some(holder) = read_holder(root) else {
+        return;
+    };
+    if holder.pid != std::process::id() {
+        return;
+    }
+    kill_tree(holder.browser_pid);
+    reap_stale_crawl_browsers(&profile_dir(root));
+    let _ = std::fs::remove_file(owner_file(root));
+    let _ = std::fs::remove_dir_all(profile_dir(root));
+}
+
+fn publish_holder(root: &Path, port: u16, chrome_pid: u32) -> Result<(), String> {
+    let Some(mut holder) = read_holder(root) else {
+        return Ok(());
+    };
+    if holder.pid != std::process::id() {
+        return Ok(());
+    }
+    holder.port = port;
+    holder.browser_pid = chrome_pid;
+    holder.heartbeat_at_ms = now_ms();
+    write_holder(root, &holder)
 }
 
 fn launch(root: &Path, headful: bool) -> Result<SharedBrowser, String> {
@@ -130,12 +408,14 @@ fn launch(root: &Path, headful: bool) -> Result<SharedBrowser, String> {
             chrome.display()
         ));
     }
-    reap_stale_crawl_browsers(&profiles_root(root));
     let mut last_failure = String::new();
     for attempt in 1..=CDP_LAUNCH_ATTEMPTS {
         let port = free_local_port()?;
-        let profile = fresh_profile(root)?;
-        sweep_old_profiles(root, &profile);
+        let profile = profile_dir(root);
+        reap_stale_crawl_browsers(&profile);
+        let _ = std::fs::remove_dir_all(&profile);
+        std::fs::create_dir_all(&profile)
+            .map_err(|e| format!("could not create Chrome profile {}: {e}", profile.display()))?;
         let mut cmd = Command::new(&chrome);
         cmd.arg(format!("--remote-debugging-port={port}"))
             .arg(format!("--user-data-dir={}", profile.display()));
@@ -204,8 +484,8 @@ fn browser_running(browser: &mut SharedBrowser) -> bool {
 }
 
 fn close_browser(browser: &mut SharedBrowser) {
-    kill_process_tree(browser.pid);
-    kill_process_tree(browser.child.id());
+    kill_tree(browser.pid);
+    kill_tree(browser.child.id());
     let _ = browser.child.kill();
     let _ = browser.child.wait();
     let _ = std::fs::remove_dir_all(&browser.profile);
@@ -214,92 +494,145 @@ fn close_browser(browser: &mut SharedBrowser) {
 /// Attaches `agent` to the shared Chrome for `root`, starting it on first use,
 /// and returns its DevTools port. Pair every successful call with `release`.
 pub fn acquire(root: &Path, agent: &str, headful: bool) -> Result<(u16, u32), String> {
-    let mut map = browsers();
-    let reusable = match map.get_mut(root) {
+    acquire_session(root, agent, headful, TTL_MS, WAIT_MS)
+}
+
+/// `acquire` with the wait and TTL the caller asked for.
+pub fn acquire_session(
+    root: &Path,
+    agent: &str,
+    headful: bool,
+    ttl_ms: u64,
+    wait_ms: u64,
+) -> Result<(u16, u32), String> {
+    let reusable = match browsers().get_mut(root) {
         Some(browser) => browser.headful == headful && browser_running(browser),
         None => false,
     };
-    if !reusable {
-        if let Some(mut stale) = map.remove(root) {
-            close_browser(&mut stale);
-        }
-        let browser = launch(root, headful)?;
-        map.insert(root.to_path_buf(), browser);
+    if reusable {
+        let mut map = browsers();
+        let Some(browser) = map.get_mut(root) else {
+            return Err("shared Chrome vanished while attaching a lease".to_string());
+        };
+        browser.active.insert(agent.to_string());
+        let port = browser.port;
+        let chrome_pid = browser.pid;
+        drop(map);
+        publish_holder(root, port, chrome_pid)?;
+        return Ok((port, chrome_pid));
     }
-    let Some(browser) = map.get_mut(root) else {
-        return Err("shared Chrome vanished while attaching a lease".to_string());
+    if let Some(mut stale) = browsers().remove(root) {
+        close_browser(&mut stale);
+    }
+    claim_session(root, agent, ttl_ms, wait_ms)?;
+    let browser = match launch(root, headful) {
+        Ok(browser) => browser,
+        Err(e) => {
+            release_session(root);
+            return Err(e);
+        }
     };
-    sweep_stale_leases(root, &browser.active);
-    browser.active.insert(agent.to_string());
     let port = browser.port;
     let chrome_pid = browser.pid;
-    if let Err(e) = write_lease(root, agent, port, chrome_pid) {
-        let unused = browser.active.remove(agent) && browser.active.is_empty();
-        if unused {
-            if let Some(mut idle) = map.remove(root) {
-                close_browser(&mut idle);
-            }
-        }
-        return Err(e);
-    }
+    let mut active = HashSet::new();
+    active.insert(agent.to_string());
+    browsers().insert(
+        root.to_path_buf(),
+        SharedBrowser {
+            child: browser.child,
+            pid: browser.pid,
+            port,
+            profile: browser.profile,
+            headful,
+            active,
+        },
+    );
+    publish_holder(root, port, chrome_pid)?;
     Ok((port, chrome_pid))
 }
 
-/// Detaches `agent` and deletes its lease file. When the last lease goes, the
-/// shared Chrome closes with it: the run that opened the window closes it.
+/// Detaches `agent`. When the last lease goes, the shared Chrome closes and the
+/// session claim is dropped so another process can take it.
 pub fn release(root: &Path, agent: &str) {
-    let mut map = browsers();
-    let last_lease_gone = match map.get_mut(root) {
+    let last_lease_gone = match browsers().get_mut(root) {
         Some(browser) => {
             browser.active.remove(agent);
             browser.active.is_empty()
         }
         None => false,
     };
-    if last_lease_gone {
-        if let Some(mut browser) = map.remove(root) {
-            close_browser(&mut browser);
-        }
+    if !last_lease_gone {
+        return;
     }
-    let _ = std::fs::remove_file(lease_path(root, agent));
+    if let Some(mut browser) = browsers().remove(root) {
+        close_browser(&mut browser);
+    }
+    release_session(root);
 }
 
-/// Shared-browser state for `root`: liveness, port, pid and held leases.
-/// `close_deadline_ms` is always null because the browser closes as soon as
-/// its last lease releases.
-pub fn status(root: &Path) -> serde_json::Value {
-    let mut map = browsers();
-    let Some(browser) = map.get_mut(root) else {
-        return json!({
-            "root": root.display().to_string(),
-            "alive": false,
-            "lease_count": 0,
-            "leases": [],
-            "close_deadline_ms": null,
-        });
+/// Session state for `root`: whether a claim is held, who holds it, how stale
+/// its heartbeat is, and whether that holder is live.
+pub fn status(root: &Path) -> Value {
+    let mine = {
+        let mut map = browsers();
+        map.get_mut(root).map(|browser| {
+            let mut leases: Vec<String> = browser.active.iter().cloned().collect();
+            leases.sort();
+            (browser.port, browser.pid, browser_running(browser), leases)
+        })
     };
-    let alive = browser_running(browser);
-    let mut leases: Vec<String> = browser.active.iter().cloned().collect();
-    leases.sort();
-    json!({
+    let holder = read_holder(root);
+    let ttl_ms = holder.as_ref().map(|h| h.ttl_ms).unwrap_or(TTL_MS);
+    let mut out = json!({
         "root": root.display().to_string(),
-        "alive": alive,
-        "port": browser.port,
-        "chrome_pid": browser.pid,
-        "lease_count": leases.len(),
-        "leases": leases,
+        "held": holder.is_some(),
+        "owner": holder.as_ref().map(|h| h.owner.clone()),
+        "pid": holder.as_ref().map(|h| h.pid),
+        "browser_pid": holder.as_ref().map(|h| h.browser_pid),
+        "heartbeat_age_ms": holder.as_ref().map(|h| h.heartbeat_age_ms()),
+        "ttl_ms": ttl_ms,
+        "live": holder_live(root, ttl_ms),
+        "lease_file": owner_file(root).display().to_string(),
         "close_deadline_ms": null,
-    })
+    });
+    match (mine, holder) {
+        (Some((port, chrome_pid, alive, leases)), _) => {
+            out["alive"] = json!(alive);
+            out["port"] = json!(port);
+            out["chrome_pid"] = json!(chrome_pid);
+            out["lease_count"] = json!(leases.len());
+            out["leases"] = json!(leases);
+        }
+        (None, Some(foreign)) => {
+            out["alive"] = json!(
+                foreign.port > 0
+                    && endpoint_ready(foreign.port, Instant::now(), CDP_POLL_INTERVAL, true)
+            );
+            out["port"] = json!(foreign.port);
+            out["chrome_pid"] = json!(foreign.browser_pid);
+            out["lease_count"] = json!(0);
+            out["leases"] = json!([]);
+        }
+        (None, None) => {
+            out["alive"] = json!(false);
+            out["lease_count"] = json!(0);
+            out["leases"] = json!([]);
+        }
+    }
+    out
 }
 
 /// Serves the runner-native verbs `browser_lease_acquire`, `browser_lease_release`
-/// and `browser_lease_status`. Body: `{root, agent}`; `root` defaults to the
-/// dispatching project root, and `agent` is required by acquire and release.
+/// and `browser_lease_status`. Body: `{root, agent, ttl_ms, wait_ms}`; `root`
+/// defaults to the dispatching project root, and `agent` is required by acquire
+/// and release.
 pub fn lease_reply(verb: &str, dispatch_root: &Path, body: &str) -> String {
     #[derive(serde::Deserialize)]
     struct Req {
         root: Option<PathBuf>,
         agent: Option<String>,
+        ttl_ms: Option<u64>,
+        wait_ms: Option<u64>,
     }
     let req: Req = match serde_json::from_str(body) {
         Ok(req) => req,
@@ -309,19 +642,23 @@ pub fn lease_reply(verb: &str, dispatch_root: &Path, body: &str) -> String {
         }
     };
     let root = req.root.unwrap_or_else(|| dispatch_root.to_path_buf());
+    let ttl_ms = req.ttl_ms.unwrap_or(TTL_MS);
+    let wait_ms = req.wait_ms.unwrap_or(WAIT_MS);
     let reply = match (verb, req.agent.as_deref()) {
         ("browser_lease_acquire", None) | ("browser_lease_release", None) => {
             json!({"ok": false, "error": format!("{verb} needs an agent")})
         }
-        ("browser_lease_acquire", Some(agent)) => match acquire(&root, agent, false) {
-            Ok((port, chrome_pid)) => json!({
-                "ok": true,
-                "port": port,
-                "chrome_pid": chrome_pid,
-                "lease_file": lease_path(&root, agent).display().to_string(),
-            }),
-            Err(e) => json!({"ok": false, "error": e}),
-        },
+        ("browser_lease_acquire", Some(agent)) => {
+            match acquire_session(&root, agent, false, ttl_ms, wait_ms) {
+                Ok((port, chrome_pid)) => json!({
+                    "ok": true,
+                    "port": port,
+                    "chrome_pid": chrome_pid,
+                    "lease_file": owner_file(&root).display().to_string(),
+                }),
+                Err(e) => json!({"ok": false, "error": e}),
+            }
+        }
         ("browser_lease_release", Some(agent)) => {
             release(&root, agent);
             let mut state = status(&root);
@@ -339,20 +676,37 @@ pub fn lease_reply(verb: &str, dispatch_root: &Path, body: &str) -> String {
     reply.to_string()
 }
 
-/// Closes a shared Chrome that has died, and sweeps leases no live agent owns.
+/// Closes a shared Chrome that has died or whose claim another process took,
+/// and drops the session claim with it.
 pub fn housekeeping(_now: Instant) {
-    let mut map = browsers();
-    let mut closing: Vec<PathBuf> = Vec::new();
-    for (root, browser) in map.iter_mut() {
-        sweep_stale_leases(root, &browser.active);
-        if !browser_running(browser) {
-            closing.push(root.clone());
+    let mut dead: Vec<PathBuf> = Vec::new();
+    {
+        let mut map = browsers();
+        for (root, browser) in map.iter_mut() {
+            if !browser_running(browser) {
+                dead.push(root.clone());
+            }
         }
     }
-    for root in closing {
-        if let Some(mut browser) = map.remove(&root) {
+    for root in dead {
+        if let Some(mut browser) = browsers().remove(&root) {
             close_browser(&mut browser);
         }
+        release_session(&root);
+    }
+    let lost: Vec<PathBuf> = {
+        let map = claimed();
+        map.iter()
+            .filter(|root| !claim_is_ours(root.as_path()))
+            .map(|root| root.to_path_buf())
+            .collect()
+    };
+    for root in lost {
+        if let Some(mut browser) = browsers().remove(&root) {
+            close_browser(&mut browser);
+        }
+        claimed().remove(&root);
+        stop_heartbeat(&root);
     }
 }
 
@@ -370,7 +724,13 @@ pub fn spawn_housekeeping_timer() {
 
 /// Closes every shared Chrome. Call at runner shutdown.
 pub fn shutdown_shared_browsers() {
-    for (_, mut browser) in browsers().drain() {
+    for (root, mut browser) in browsers().drain() {
         close_browser(&mut browser);
+        release_session(&root);
+    }
+    let still_claimed: Vec<PathBuf> = claimed().drain().collect();
+    for root in still_claimed {
+        stop_heartbeat(&root);
+        release_session(&root);
     }
 }
