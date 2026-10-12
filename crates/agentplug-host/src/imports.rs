@@ -982,6 +982,7 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
                 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
                 git_cmd.creation_flags(CREATE_NO_WINDOW);
             }
+            let spawn_started = Instant::now();
             let v = match git_cmd.spawn() {
                 Ok(mut child) => {
                     let cap_hit = Arc::new(AtomicBool::new(false));
@@ -1033,6 +1034,13 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
                 }
                 Err(e) => serde_json::json!({"stdout": "", "stderr": e.to_string(), "exit_code": 1}),
             };
+            if std::env::var_os("GM_GIT_TRACE").is_some() {
+                eprintln!(
+                    "[agentplug:git_trace] argv={argv:?} cwd={} elapsed_ms={:.1}",
+                    cwd.display(),
+                    spawn_started.elapsed().as_secs_f64() * 1000.0
+                );
+            }
             write_guest_json(&mut caller, v)
         },
     )?;
