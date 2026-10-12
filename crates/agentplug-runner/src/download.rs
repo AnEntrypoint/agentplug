@@ -1238,6 +1238,21 @@ fn discover_installed_skill_names(home: &Path) -> anyhow::Result<Vec<String>> {
     Ok(names.into_iter().collect())
 }
 
+// A link (a directory junction on Windows, a symlink elsewhere) means the
+// installed directory IS the source tree: overwriting its SKILL.md with the
+// published one would silently revert a local edit made through that link.
+fn is_link(path: &Path) -> bool {
+    fs::symlink_metadata(path)
+        .map(|meta| meta.file_type().is_symlink())
+        .unwrap_or(false)
+}
+
+fn link_target_note(path: &Path) -> String {
+    fs::read_link(path)
+        .map(|t| t.display().to_string())
+        .unwrap_or_else(|_| "link".to_string())
+}
+
 fn fetch_remote_skill_md(skill_name: &str) -> anyhow::Result<String> {
     let url = format!(
         "https://raw.githubusercontent.com/{SKILL_MD_REMOTE_REPO}/{SKILL_MD_REMOTE_BRANCH}/skills/{skill_name}/SKILL.md"
@@ -1259,6 +1274,7 @@ pub fn refresh_installed_skill_md() -> anyhow::Result<Vec<PathBuf>> {
 
     let mut refreshed = Vec::new();
     let mut failures = Vec::new();
+    let mut linked = Vec::new();
     for skill_name in skill_names {
         let bundled = match fetch_remote_skill_md(&skill_name) {
             Ok(content) => content,
@@ -1270,8 +1286,18 @@ pub fn refresh_installed_skill_md() -> anyhow::Result<Vec<PathBuf>> {
         let bundled_hash = sha256_hex(normalize_newlines(&bundled).as_bytes());
 
         for root in installed_skill_roots(&home) {
-            let target = root.join(&skill_name).join("SKILL.md");
+            let dir = root.join(&skill_name);
+            let target = dir.join("SKILL.md");
             if !target.exists() {
+                continue;
+            }
+            if is_link(&dir) || is_link(&target) {
+                linked.push(dir.clone());
+                eprintln!(
+                    "[agentplug daemon] skill {skill_name} at {} is source-linked -> {}; not overwriting it with the published SKILL.md (edit the source instead)",
+                    dir.display(),
+                    link_target_note(&dir)
+                );
                 continue;
             }
             let needs_write = match fs::read_to_string(&target) {
@@ -1291,8 +1317,18 @@ pub fn refresh_installed_skill_md() -> anyhow::Result<Vec<PathBuf>> {
     }
     if !refreshed.is_empty() {
         eprintln!(
-            "[agentplug daemon] SKILL.md refreshed: {} target(s)",
-            refreshed.len()
+            "[agentplug daemon] SKILL.md refreshed (these had drifted from the published copy): {}",
+            refreshed
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    if !linked.is_empty() {
+        eprintln!(
+            "[agentplug daemon] SKILL.md refresh skipped {} source-linked install(s) -- a link is the source of truth, not an install",
+            linked.len()
         );
     }
     if !failures.is_empty() {
@@ -1515,6 +1551,32 @@ mod tests {
         assert_eq!(release_version_from_tag("1.2.3"), None);
         assert_eq!(release_version_from_tag("vv1.2.3"), None);
         assert_eq!(release_version_from_tag("v1.2"), None);
+    }
+
+    #[test]
+    fn skill_refresh_reads_a_link_as_a_link_and_not_as_its_target() {
+        let root = std::env::temp_dir().join(format!(
+            "agentplug-skill-link-test-{}-{}",
+            std::process::id(),
+            now_ms_for_marker()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let dir = root.join("gm");
+        fs::create_dir_all(&dir).unwrap();
+
+        assert!(!is_link(&dir), "a real directory is not a link");
+        assert!(!is_link(&root.join("absent")), "an absent path is not a link");
+
+        // Symlink creation needs elevation on Windows, so only assert it where
+        // it is always available; the junction case is the same metadata flag.
+        #[cfg(not(windows))]
+        {
+            let link = root.join("gm-link");
+            std::os::unix::fs::symlink(&dir, &link).unwrap();
+            assert!(is_link(&link), "a symlink to a directory is a link");
+        }
+
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
