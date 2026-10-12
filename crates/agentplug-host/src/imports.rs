@@ -74,7 +74,7 @@ fn git_layout_dirs_overlap(a: &str, b: &str) -> bool {
     a == b || a.starts_with(&format!("{b}/")) || b.starts_with(&format!("{a}/"))
 }
 
-fn git_argv_fold(cwd: &Path, argv: &[String]) -> Option<(PathBuf, Vec<&str>)> {
+fn git_argv_fold<'a>(cwd: &'a Path, argv: &'a [String]) -> Option<(PathBuf, Vec<&'a str>)> {
     let mut dir = cwd.to_path_buf();
     let mut rest: Vec<&str> = Vec::with_capacity(argv.len());
     let mut i = 0usize;
@@ -254,6 +254,7 @@ fn git_call_stats_add_ms(argv: &[String], elapsed_ms: u64) {
 
 pub fn git_call_stats_note(argv: &[String], reached: bool, elapsed_ms: u64) {
     let key = git_call_stats_key(argv);
+    git_call_stats_add_ms(argv, elapsed_ms);
     {
         let mut counts = match git_call_stats_counts(reached).lock() {
             Ok(counts) => counts,
@@ -293,7 +294,15 @@ pub fn git_call_stats_note(argv: &[String], reached: bool, elapsed_ms: u64) {
         "[agentplug host] git calls this minute: {asked_total} asked, {reached_total} spawned a git process, {ms_total}ms of wall time in them, {} answered without spawning git",
         asked_total.saturating_sub(reached_total)
     );
-    let mut ranked: Vec<(String, usize)> = asked.drain().collect();
+    let mut ranked: Vec<(String, usize)> = asked
+        .iter()
+        .map(|(key, count)| (key.clone(), *count))
+        .collect();
+    for (key, count) in reached_counts.iter() {
+        if !asked.contains_key(key) {
+            ranked.push((key.clone(), *count));
+        }
+    }
     ranked.sort_by(|a, b| b.1.cmp(&a.1));
     for (key, count) in ranked.into_iter().take(8) {
         let reached = reached_counts.remove(&key).unwrap_or(0);
@@ -304,6 +313,7 @@ pub fn git_call_stats_note(argv: &[String], reached: bool, elapsed_ms: u64) {
     }
     reached_counts.clear();
     ms_by_key.clear();
+    asked.clear();
 }
 
 #[derive(serde::Deserialize)]
