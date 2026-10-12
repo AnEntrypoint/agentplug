@@ -71,6 +71,7 @@ pub fn gc_stale_tmp_files(min_age: Duration) {
     }
     enforce_install_dir_backup_retention(true);
     enforce_wasi_fs_retention(true);
+    enforce_plugin_cache_retention(true);
 }
 
 // Bounded install-dir backup retention.
@@ -529,6 +530,248 @@ pub fn enforce_wasi_fs_retention(apply: bool) -> WasiFsRetentionPlan {
     plan
 }
 
+// A shared, content-addressed payload cache for plugin wasm.
+//
+// `AGENTPLUG_HOME` selects the install dir, so every isolated home a witness or a lane
+// booted fetched its own full copy of every plugin: measured on one machine, six homes
+// held six byte-identical copies of a 130.2 MB `bert.wasm` and of a 53.7 MB
+// `treesitter.wasm`, 1537.3 MB of the 2790 MB of installed wasm on the machine being
+// duplicate bytes. A published wasm is immutable -- `download_and_verify` refuses any
+// payload whose sha256 differs from the release's own `.wasm.sha256` sidecar -- so that
+// hash IS the identity of the bytes, and one copy per hash serves every home.
+//
+// The cache sits under the real home and never under `install_dir()`, so an
+// `AGENTPLUG_HOME` override cannot move or fork it; that is the same reason
+// `system_precompiled_dir()` exists. A home's `plugins/<name>.wasm` is hard-linked to
+// the cache entry, so a home costs one directory entry per plugin rather than a copy,
+// and where a hard link is impossible -- another volume, a filesystem without them --
+// this falls back to a copy, which is correct and merely unshared.
+//
+// Hard links are safe here only because no writer mutates `plugins/<name>.wasm` in
+// place: `write_download_atomically` writes a temp and renames, and
+// `record_plugin_load_failure_and_rollback` below stages its restore the same way, so a
+// shared inode is only ever replaced, never written through.
+
+fn shared_plugin_cache_dir() -> Option<PathBuf> {
+    home_dir().map(|home| home.join(".agentplug").join("plugin-cache"))
+}
+
+fn plugin_payload_cache_path(expected_sha256_hex: &str) -> Option<PathBuf> {
+    shared_plugin_cache_dir()
+        .map(|dir| dir.join(format!("{}.wasm", expected_sha256_hex.to_ascii_lowercase())))
+}
+
+fn plugin_payload_use_path(expected_sha256_hex: &str) -> Option<PathBuf> {
+    shared_plugin_cache_dir()
+        .map(|dir| dir.join(format!("{}.used", expected_sha256_hex.to_ascii_lowercase())))
+}
+
+/// The cached payload for `expected_sha256_hex`, or `None` when there is none or when
+/// the file no longer hashes to it. An entry is handed out only once its bytes are
+/// proven, so a truncated or clobbered cache file falls back to a download rather than
+/// installing a payload the release never published.
+fn shared_plugin_payload(expected_sha256_hex: &str) -> Option<PathBuf> {
+    let path = plugin_payload_cache_path(expected_sha256_hex)?;
+    if !path.exists() {
+        return None;
+    }
+    let bytes = fs::read(&path).ok()?;
+    sha256_hex(&bytes)
+        .eq_ignore_ascii_case(expected_sha256_hex)
+        .then_some(path)
+}
+
+/// Record that an entry is still being handed out, so retention keys on use rather than
+/// on the age of the immutable blob itself.
+fn mark_shared_payload_used(expected_sha256_hex: &str) {
+    let Some(path) = plugin_payload_use_path(expected_sha256_hex) else {
+        return;
+    };
+    let Some(dir) = path.parent() else {
+        return;
+    };
+    if let Err(e) = fs::create_dir_all(dir) {
+        eprintln!(
+            "[agentplug] plugin payload cache: could not create {}: {e}",
+            dir.display()
+        );
+        return;
+    }
+    let tmp = path.with_extension(format!("used.tmp.{}", std::process::id()));
+    if fs::write(&tmp, now_ms_for_marker().to_string()).is_err() {
+        return;
+    }
+    if let Err(e) = fs::rename(&tmp, &path) {
+        let _ = fs::remove_file(&tmp);
+        eprintln!(
+            "[agentplug] plugin payload cache: could not record use of {}: {e}",
+            path.display()
+        );
+    }
+}
+
+/// Put `dest` in place from `src` without copying the bytes where the filesystem allows
+/// it: a hard link first, a copy only where a link is refused.
+fn link_or_copy_payload(src: &Path, dest: &Path) -> anyhow::Result<()> {
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let tmp = dest.with_extension(format!("wasm.tmp.{}", std::process::id()));
+    let _ = fs::remove_file(&tmp);
+    if let Err(link_err) = fs::hard_link(src, &tmp) {
+        eprintln!(
+            "[agentplug] plugin payload cache: could not hard-link {} -> {} ({link_err}) -- copying instead",
+            src.display(),
+            dest.display()
+        );
+        fs::copy(src, &tmp)?;
+    }
+    fs::rename(&tmp, dest)?;
+    Ok(())
+}
+
+/// Restore `dest` from a staged copy by writing a temp and renaming it over `dest`.
+/// `fs::copy` straight onto `dest` would write THROUGH the live path, and `dest` may be a
+/// hard link to a shared cache entry, so an in-place write would clobber every other home
+/// linked to those bytes; a rename replaces this one directory entry instead.
+fn restore_wasm_atomically(prev: &Path, dest: &Path) -> anyhow::Result<()> {
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let tmp = dest.with_extension(format!("wasm.restore.{}", std::process::id()));
+    let _ = fs::remove_file(&tmp);
+    fs::copy(prev, &tmp)?;
+    fs::rename(&tmp, dest)?;
+    Ok(())
+}
+
+/// Offer a payload that has just been verified to the cache. An entry already present is
+/// left alone and only marked used; a failure here costs sharing, never correctness, so
+/// it is reported and swallowed.
+fn populate_shared_plugin_payload(src: &Path, expected_sha256_hex: &str) {
+    let Some(path) = plugin_payload_cache_path(expected_sha256_hex) else {
+        return;
+    };
+    if path.exists() {
+        mark_shared_payload_used(expected_sha256_hex);
+        return;
+    }
+    let Some(dir) = path.parent() else {
+        return;
+    };
+    if let Err(e) = fs::create_dir_all(dir) {
+        eprintln!(
+            "[agentplug] plugin payload cache: could not create {}: {e}",
+            dir.display()
+        );
+        return;
+    }
+    let tmp = path.with_extension(format!("wasm.stage.{}", std::process::id()));
+    let _ = fs::remove_file(&tmp);
+    if let Err(e) = fs::hard_link(src, &tmp).or_else(|_| fs::copy(src, &tmp).map(|_| ())) {
+        eprintln!(
+            "[agentplug] plugin payload cache: could not stage {}: {e}",
+            path.display()
+        );
+        return;
+    }
+    if let Err(e) = fs::rename(&tmp, &path) {
+        let _ = fs::remove_file(&tmp);
+        eprintln!(
+            "[agentplug] plugin payload cache: could not install {}: {e}",
+            path.display()
+        );
+    }
+}
+
+// An entry nobody has been handed out within this bound is removed. Removing an entry a
+// live home still links costs that home nothing -- unlinking one name leaves the data
+// alive under the home's own link -- so this bounds the cache without risking any
+// installed plugin: the next home that needs those bytes fetches them again.
+pub const PLUGIN_CACHE_RETAIN_AGE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+
+fn shared_payload_newest_ms(blob: &Path, use_marker: &Path) -> u64 {
+    let mut newest = fs::metadata(blob)
+        .map(|meta| modified_ms_of(&meta))
+        .unwrap_or(0);
+    if let Ok(meta) = fs::metadata(use_marker) {
+        newest = newest.max(modified_ms_of(&meta));
+    }
+    newest
+}
+
+/// Bounded retention over the shared payload cache. `apply: false` is the dry run: it
+/// plans and reports without deleting anything.
+pub fn enforce_plugin_cache_retention(apply: bool) -> (usize, u64) {
+    let Some(dir) = shared_plugin_cache_dir() else {
+        return (0, 0);
+    };
+    let Ok(entries) = fs::read_dir(&dir) else {
+        return (0, 0);
+    };
+    let now_ms = now_ms_for_marker();
+    let min_age_ms = PLUGIN_CACHE_RETAIN_AGE.as_millis() as u64;
+    let mut stale: Vec<(PathBuf, u64)> = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        if !meta.is_file() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let Some(sha) = name.strip_suffix(".wasm") else {
+            continue;
+        };
+        if sha.len() != 64 || !sha.bytes().all(|b| b.is_ascii_hexdigit()) {
+            continue;
+        }
+        let newest_ms = shared_payload_newest_ms(&path, &path.with_extension("used"));
+        if newest_ms == 0 || now_ms.saturating_sub(newest_ms) < min_age_ms {
+            continue;
+        }
+        stale.push((path, meta.len()));
+    }
+    stale.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let mut removed = 0usize;
+    let mut reclaimed = 0u64;
+    for (path, bytes) in &stale {
+        if apply {
+            match fs::remove_file(path) {
+                Ok(()) => {
+                    let _ = fs::remove_file(path.with_extension("used"));
+                    removed += 1;
+                    reclaimed = reclaimed.saturating_add(*bytes);
+                }
+                Err(error) => {
+                    eprintln!(
+                        "[agentplug] plugin payload cache: could not remove {}: {error}",
+                        path.display()
+                    );
+                    continue;
+                }
+            }
+        } else {
+            removed += 1;
+            reclaimed = reclaimed.saturating_add(*bytes);
+        }
+    }
+    if removed > 0 || !apply {
+        eprintln!(
+            "[agentplug] plugin payload cache retention{}: {} {} entry(ies) ({} bytes) reclaimed; bound = entries handed out within {}s",
+            if apply { "" } else { " (dry run)" },
+            if apply { "removed" } else { "would remove" },
+            removed,
+            reclaimed,
+            PLUGIN_CACHE_RETAIN_AGE.as_secs(),
+        );
+    }
+    (removed, reclaimed)
+}
+
 fn release_version_from_tag(tag: &str) -> Option<String> {
     let version = tag.strip_prefix('v')?;
     is_recognized_release_semver(version).then(|| version.to_string())
@@ -671,7 +914,26 @@ fn try_ensure_plugin_installed_via_direct_release_latest(
 
     let wasm_url = format!("{base}/{}.wasm", spec.asset_basename);
     snapshot_prev_wasm_and_version(dest, version_file)?;
+    if let Some(cached) = shared_plugin_payload(&expected_sha) {
+        match link_or_copy_payload(&cached, dest) {
+            Ok(()) => {
+                mark_shared_payload_used(&expected_sha);
+                eprintln!(
+                    "[agentplug] plugin {} {version} served from the shared payload cache ({}), no download needed",
+                    spec.asset_basename,
+                    cached.display()
+                );
+                record_plugin_install(dest, version_file, &version)?;
+                return Ok(dest.to_path_buf());
+            }
+            Err(e) => eprintln!(
+                "[agentplug] plugin {}: could not link the cached payload ({e:#}) -- downloading it instead",
+                spec.asset_basename
+            ),
+        }
+    }
     download_and_verify(&wasm_url, dest, &expected_sha)?;
+    populate_shared_plugin_payload(dest, &expected_sha);
     record_plugin_install(dest, version_file, &version)?;
     eprintln!(
         "[agentplug] {} installed via direct release-asset download {wasm_url} (api.github.com path failed or was blocked)",
@@ -1640,7 +1902,7 @@ pub fn record_plugin_load_failure_and_rollback(plugin_name: &str) -> anyhow::Res
     if !prev_dest.exists() {
         return Ok(false);
     }
-    fs::copy(&prev_dest, &dest)?;
+    restore_wasm_atomically(&prev_dest, &dest)?;
     let version_file = plugin_version_path(plugin_name);
     let prev_version_file = version_file.with_extension("version.prev");
     if prev_version_file.exists() {
@@ -1922,7 +2184,25 @@ fn ensure_plugin_installed_via_github(
         .to_string();
 
     snapshot_prev_wasm_and_version(dest, version_file)?;
+    if let Some(cached) = shared_plugin_payload(&expected_sha) {
+        match link_or_copy_payload(&cached, dest) {
+            Ok(()) => {
+                mark_shared_payload_used(&expected_sha);
+                eprintln!(
+                    "[agentplug] plugin {plugin_name} {version} served from the shared payload cache ({}), no download needed",
+                    cached.display()
+                );
+                record_plugin_install(dest, version_file, &version)?;
+                write_plugin_build_record(plugin_name, &spec.repo, &version, dest);
+                return Ok(dest.to_path_buf());
+            }
+            Err(e) => eprintln!(
+                "[agentplug] plugin {plugin_name}: could not link the cached payload ({e:#}) -- downloading it instead"
+            ),
+        }
+    }
     download_and_verify(&wasm_url, dest, &expected_sha)?;
+    populate_shared_plugin_payload(dest, &expected_sha);
     record_plugin_install(dest, version_file, &version)?;
     write_plugin_build_record(plugin_name, &spec.repo, &version, dest);
     Ok(dest.to_path_buf())
