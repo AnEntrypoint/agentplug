@@ -96,6 +96,19 @@ and the `agentplug-host` imports. Work on `main` as GitHub user `lanmower`.
   populated or busy pools retain their owners. Failed reloads remain failures, not indexed evidence.
   If poisoned-store recovery fails, capture the active module map and instantiation error before
   changing registry behavior.
+- The `gm` pool defaults to 8 slots (`DEFAULT_GM_POOL_SIZE`, capped by host parallelism and
+  `MAX_GM_POOL_SIZE`; `gm_pool_size` in `daemon-config.json` overrides). A dispatch holds one slot for
+  its whole run, including a long `exec_js`, so the pool size bounds how many slow dispatches can run
+  before a quick one waits. Heavy verbs stay capped at `MAX_CONCURRENT_HEAVY_DISPATCHES` (3) slots.
+- The claim pass is the daemon main loop, so anything synchronous on that thread delays every queued
+  dispatch in every project. Measured on a scratch daemon with 128 registered roots of 139 empty verb
+  dirs each, claim latency p50 15 s / p95 28 s / max 30 s before and p50 2.1 s / p95 6.0 s / max 8.1 s
+  after. The causes, largest first: a `git rev-parse --show-toplevel` per registry entry on every poll
+  (now `cached_project_root`, 10 min TTL); the browser orphan sweep and the plugin and runner update
+  polls inline (now a housekeeping timer thread and the `update-poll` worker, which returns a staged
+  runner over a channel); and re-reading every empty verb dir each pass (now skipped with one `stat`
+  while its mtime is unchanged and at least 2 s old). A new synchronous call in the main loop needs the
+  same measurement.
 
 ## Configuration and compatibility
 
