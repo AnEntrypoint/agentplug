@@ -1591,6 +1591,14 @@ fn promote_staged_exe_to_canonical(version: &str) -> bool {
     match promotion {
         Ok(()) => {
             record_completed_runner_swap(version);
+            // The replacement is on the canonical path and reached here only after
+            // `download_and_verify` matched its release sha256 and
+            // `staged_binary_self_check` matched its `--version`, so the update is
+            // verified in place and the older images beside it are retention-eligible
+            // rather than rollback targets. Retention hangs off that verification, not
+            // off the rename: the canonical path and this process's own image are pinned
+            // inside it, so a failure here can never strand the running daemon.
+            crate::download::enforce_install_dir_backup_retention(true);
             eprintln!("[agentplug daemon] takeover: promoted {version} onto canonical exe path {} (previous version kept at {})", canonical.display(), prev.display());
             true
         }
