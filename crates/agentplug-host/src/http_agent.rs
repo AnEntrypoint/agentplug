@@ -13,7 +13,10 @@ fn extra_trust_anchor_pem_path() -> Option<std::path::PathBuf> {
         .filter(|p| p.exists())
 }
 
-fn load_extra_trust_anchors(store: &mut rustls::RootCertStore, pem_path: &std::path::Path) -> anyhow::Result<usize> {
+fn load_extra_trust_anchors(
+    store: &mut rustls::RootCertStore,
+    pem_path: &std::path::Path,
+) -> anyhow::Result<usize> {
     let file = std::fs::File::open(pem_path)?;
     let mut reader = std::io::BufReader::new(file);
     let mut added = 0usize;
@@ -49,7 +52,29 @@ pub fn build_agent(timeout: std::time::Duration) -> ureq::Agent {
         .build()
 }
 
+/// An agent that hands every 3xx back to the caller instead of following it, so a
+/// caller that validates each hop can refuse a redirect into a private address.
+pub fn build_agent_without_redirects(timeout: std::time::Duration) -> ureq::Agent {
+    ensure_crypto_provider_installed();
+    let tls_config = rustls::ClientConfig::builder()
+        .with_root_certificates(build_root_store())
+        .with_no_client_auth();
+    ureq::AgentBuilder::new()
+        .tls_config(std::sync::Arc::new(tls_config))
+        .timeout(timeout)
+        .redirects(0)
+        .build()
+}
+
 pub fn shared_agent() -> &'static ureq::Agent {
     static AGENT: std::sync::OnceLock<ureq::Agent> = std::sync::OnceLock::new();
     AGENT.get_or_init(|| build_agent(std::time::Duration::from_secs(10)))
+}
+
+// The 10 s budget of shared_agent is for small API replies. A release binary is
+// 14 MB and a plugin wasm is far larger; on a slow link the whole body must fit
+// inside the request timeout, so downloads get their own agent.
+pub fn download_agent() -> &'static ureq::Agent {
+    static AGENT: std::sync::OnceLock<ureq::Agent> = std::sync::OnceLock::new();
+    AGENT.get_or_init(|| build_agent(std::time::Duration::from_secs(900)))
 }

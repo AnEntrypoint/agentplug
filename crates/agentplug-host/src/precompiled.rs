@@ -1,0 +1,214 @@
+use std::hash::{Hash, Hasher};
+use std::path::{Path, PathBuf};
+
+use wasmtime::{Engine, Module};
+
+use crate::install::{legacy_wasmtime_cache_dir, precompiled_dir, system_precompiled_dir};
+
+const PRECOMPILED_EXTENSION: &str = "cwasm";
+
+fn remove_legacy_wasmtime_cache_once() {
+    static DONE: std::sync::Once = std::sync::Once::new();
+    DONE.call_once(|| {
+        let legacy = legacy_wasmtime_cache_dir();
+        if !legacy.exists() {
+            return;
+        }
+        match std::fs::remove_dir_all(&legacy) {
+            Ok(()) => eprintln!(
+                "[agentplug precompiled] removed the legacy wasmtime cache at {} (artifacts now live in {})",
+                legacy.display(),
+                precompiled_dir().display()
+            ),
+            Err(e) => eprintln!("[agentplug precompiled] could not remove the legacy wasmtime cache at {}: {e}", legacy.display()),
+        }
+    });
+}
+
+fn engine_compatibility_key(engine: &Engine) -> String {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    engine.precompile_compatibility_hash().hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+fn precompiled_file_name(plugin_name: &str, content_hash: &str, compat_key: &str) -> String {
+    let short_hash: String = content_hash.chars().take(16).collect();
+    format!("{plugin_name}-{short_hash}-{compat_key}.{PRECOMPILED_EXTENSION}")
+}
+
+pub fn precompiled_module_path(engine: &Engine, plugin_name: &str, content_hash: &str) -> PathBuf {
+    precompiled_dir().join(precompiled_file_name(
+        plugin_name,
+        content_hash,
+        &engine_compatibility_key(engine),
+    ))
+}
+
+fn remove_superseded_artifacts_for(plugin_name: &str, keep: &Path) {
+    let Ok(entries) = std::fs::read_dir(precompiled_dir()) else {
+        return;
+    };
+    let prefix = format!("{plugin_name}-");
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path == keep {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let is_this_plugins_artifact =
+            name.starts_with(&prefix) && name.ends_with(PRECOMPILED_EXTENSION);
+        if is_this_plugins_artifact {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+}
+
+fn write_precompiled_artifact(
+    engine: &Engine,
+    wasm_path: &Path,
+    artifact_path: &Path,
+) -> anyhow::Result<()> {
+    let wasm_bytes = std::fs::read(wasm_path)?;
+    let serialized = engine
+        .precompile_module(&wasm_bytes)
+        .map_err(|e| anyhow::anyhow!("{e:#}"))?;
+    drop(wasm_bytes);
+    if let Some(parent) = artifact_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = artifact_path.with_extension(format!(
+        "{PRECOMPILED_EXTENSION}.tmp.{}",
+        std::process::id()
+    ));
+    std::fs::write(&tmp, &serialized)?;
+    drop(serialized);
+    std::fs::rename(&tmp, artifact_path)?;
+    return_freed_compile_buffers_to_the_os();
+    Ok(())
+}
+
+#[cfg(all(unix, target_env = "gnu"))]
+fn return_freed_compile_buffers_to_the_os() {
+    unsafe {
+        libc::malloc_trim(0);
+    }
+}
+
+#[cfg(not(all(unix, target_env = "gnu")))]
+fn return_freed_compile_buffers_to_the_os() {}
+
+fn deserialize_file_backed(engine: &Engine, artifact_path: &Path) -> anyhow::Result<Module> {
+    unsafe { Module::deserialize_file(engine, artifact_path) }.map_err(|e| anyhow::anyhow!("{e:#}"))
+}
+
+fn system_artifact_path(engine: &Engine, plugin_name: &str, content_hash: &str) -> Option<PathBuf> {
+    let local_dir = precompiled_dir();
+    let system_dir = system_precompiled_dir();
+    (system_dir != local_dir).then(|| {
+        system_dir.join(precompiled_file_name(
+            plugin_name,
+            content_hash,
+            &engine_compatibility_key(engine),
+        ))
+    })
+}
+
+// A compiled artifact is a pure function of the wasm bytes and the engine's compatibility
+// hash, so one copy serves every install dir. The system dir is READ before compiling
+// (above) but was never written, so every isolated home a witness or a lane booted
+// recompiled each plugin itself: measured 4051 ms and 73 MB for bert, once per install
+// dir, with ~30 scratch homes per session.
+//
+// Publishing hard-links the freshly compiled artifact into the system dir and then
+// re-points the local name at those bytes, so the artifact exists once on disk and the
+// next home deserializes it instead of compiling. Hard links are safe here only because
+// no writer mutates an artifact in place: write_precompiled_artifact stages a sibling and
+// renames it over the path, and a superseded artifact is removed by unlinking its name.
+// A failure at any step leaves the local artifact as compiled, so the load still succeeds.
+fn publish_artifact_to_system_dir(plugin_name: &str, system_path: &Path, artifact_path: &Path) {
+    if let Some(parent) = system_path.parent() {
+        if std::fs::create_dir_all(parent).is_err() {
+            return;
+        }
+    }
+    let staged = system_path.with_extension(format!(
+        "{PRECOMPILED_EXTENSION}.sys.{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&staged);
+    if std::fs::hard_link(artifact_path, &staged).is_err()
+        && std::fs::copy(artifact_path, &staged).is_err()
+    {
+        let _ = std::fs::remove_file(&staged);
+        return;
+    }
+    if std::fs::rename(&staged, system_path).is_err() {
+        let _ = std::fs::remove_file(&staged);
+        return;
+    }
+    let local = artifact_path.with_extension(format!(
+        "{PRECOMPILED_EXTENSION}.link.{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&local);
+    let linked = std::fs::hard_link(system_path, &local).is_ok()
+        && std::fs::rename(&local, artifact_path).is_ok();
+    if !linked {
+        let _ = std::fs::remove_file(&local);
+        return;
+    }
+    eprintln!(
+        "[agentplug precompiled] {plugin_name} published to the system artifact dir ({}) -- the next install dir deserializes it instead of compiling",
+        system_path.display()
+    );
+}
+
+pub fn load_module_file_backed(
+    engine: &Engine,
+    wasm_path: &Path,
+    plugin_name: &str,
+    content_hash: &str,
+) -> anyhow::Result<Module> {
+    remove_legacy_wasmtime_cache_once();
+    let artifact_path = precompiled_module_path(engine, plugin_name, content_hash);
+    if artifact_path.exists() {
+        match deserialize_file_backed(engine, &artifact_path) {
+            Ok(module) => return Ok(module),
+            Err(e) => {
+                eprintln!(
+                    "[agentplug precompiled] {} failed to deserialize ({e:#}) -- removing it and recompiling from {}",
+                    artifact_path.display(),
+                    wasm_path.display()
+                );
+                let _ = std::fs::remove_file(&artifact_path);
+            }
+        }
+    }
+    if let Some(system_artifact) = system_artifact_path(engine, plugin_name, content_hash) {
+        if system_artifact.exists() {
+            if let Ok(module) = deserialize_file_backed(engine, &system_artifact) {
+                return Ok(module);
+            }
+        }
+    }
+    eprintln!(
+        "[agentplug precompiled] compiling {plugin_name} from {} because no compatible cached artifact is available",
+        wasm_path.display()
+    );
+    let started = std::time::Instant::now();
+    write_precompiled_artifact(engine, wasm_path, &artifact_path)?;
+    remove_superseded_artifacts_for(plugin_name, &artifact_path);
+    if let Some(system_artifact) = system_artifact_path(engine, plugin_name, content_hash) {
+        publish_artifact_to_system_dir(plugin_name, &system_artifact, &artifact_path);
+    }
+    let artifact_len = std::fs::metadata(&artifact_path)
+        .map(|m| m.len())
+        .unwrap_or(0);
+    eprintln!(
+        "[agentplug precompiled] {plugin_name} compiled to {} ({} MB, {}ms) -- later loads map this file instead of copying the artifact into anonymous memory",
+        artifact_path.display(),
+        artifact_len / (1024 * 1024),
+        started.elapsed().as_millis()
+    );
+    deserialize_file_backed(engine, &artifact_path)
+}

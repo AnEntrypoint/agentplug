@@ -1,14 +1,14 @@
 [workspace]
 resolver = "2"
-members = ["crates/agentplug-host", "crates/agentplug-runner"]
+members = ["crates/agentplug-host", "crates/agentplug-lightpanda", "crates/agentplug-lightpanda-wasm", "crates/agentplug-runner"]
 default-members = ["crates/agentplug-runner"]
 
 [workspace.package]
 edition = "2021"
-version = "0.1.144"
+version = "0.1.318"
 
 [profile.release]
 strip = true
-lto = true
-codegen-units = 1
+lto = false
+codegen-units = 16
 opt-level = "z"
