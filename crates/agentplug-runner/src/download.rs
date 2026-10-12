@@ -292,13 +292,46 @@ pub fn install_dir_backup_pins() -> Vec<PathBuf> {
     pinned
 }
 
+/// The directories that actually hold installed assets, deduplicated.
+///
+/// `install_dir()` is `AGENTPLUG_HOME` or `~/.agentplug`, but the runner image, the plugin
+/// wasm and the trees written beside them live in the directory this process was launched
+/// from -- `~/.gm-tools` on the measured machine, a different directory. A retention rule
+/// scoped to `install_dir()` alone swept a subtree holding no assets and reclaimed
+/// nothing, which is how 92 runner siblings and a 2113.0 MB instance tree came to sit in
+/// one directory while the rule watched another.
+pub fn install_dir_roots() -> Vec<PathBuf> {
+    let mut roots = vec![install_dir()];
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let dir = dir.to_path_buf();
+            if !roots.iter().any(|root| same_existing_path(root, &dir)) {
+                roots.push(dir);
+            }
+        }
+    }
+    roots
+}
+
+/// Every directory retention scans: each install root and its plugin subdirectory.
+fn install_dir_retention_dirs() -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    for root in install_dir_roots() {
+        for dir in [root.clone(), root.join("plugins")] {
+            if !dirs.iter().any(|seen| same_existing_path(seen, &dir)) {
+                dirs.push(dir);
+            }
+        }
+    }
+    dirs
+}
+
 /// Bounded retention over every asset family in the install dir. `apply: false` is the
 /// dry run: it plans and reports without deleting anything.
 pub fn enforce_install_dir_backup_retention(apply: bool) -> Vec<BackupRetentionPlan> {
-    let install = install_dir();
     let pinned = install_dir_backup_pins();
     let mut plans = Vec::new();
-    for dir in [install.clone(), install.join("plugins")] {
+    for dir in install_dir_retention_dirs() {
         for stem in install_asset_stems(&dir) {
             plans.push(apply_install_backup_retention(&dir, &stem, &pinned, apply));
         }
@@ -466,14 +499,21 @@ pub fn apply_wasi_fs_retention(
     plan
 }
 
-/// Bounded retention over the retired per-instance WASI fs tree in the install dir.
+/// Bounded retention over the retired per-instance WASI fs tree in every install root.
 /// `apply: false` is the dry run: it plans and reports without deleting anything.
 pub fn enforce_wasi_fs_retention(apply: bool) -> WasiFsRetentionPlan {
-    let dir = install_dir().join("wasi-fs");
-    if !dir.exists() {
-        return WasiFsRetentionPlan::default();
+    let mut plan = WasiFsRetentionPlan::default();
+    for dir in install_dir_roots() {
+        let dir = dir.join("wasi-fs");
+        if !dir.exists() {
+            continue;
+        }
+        let found = apply_wasi_fs_retention(&dir, WASI_FS_RETAIN_AGE, apply);
+        plan.delete.extend(found.delete);
+        plan.live.extend(found.live);
+        plan.delete_bytes = plan.delete_bytes.saturating_add(found.delete_bytes);
+        plan.live_bytes = plan.live_bytes.saturating_add(found.live_bytes);
     }
-    let plan = apply_wasi_fs_retention(&dir, WASI_FS_RETAIN_AGE, apply);
     if !plan.delete.is_empty() || !apply {
         eprintln!(
             "[agentplug] wasi-fs retention{}: {} {} instance(s) ({} bytes) reclaimed, {} live ({} bytes) kept; bound = instances written within {}s",
