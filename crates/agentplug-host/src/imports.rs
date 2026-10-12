@@ -41,7 +41,11 @@ const GIT_SUBPROCESS_TIMEOUT_MS_DEFAULT_AMPLE_FOR_SLOW_PUSH_FETCH_OR_FIRST_CLONE
 // (directory, question) and asked again only after a git command that can move that layout
 // runs in a directory sharing a path prefix with the cached one. Nothing that gates a write
 // is in the flag list: `status --porcelain`, `hash-object` and gating `ls-files` still reach
-// git every single time, and each of them drops the answers it can invalidate.
+// git every single time, and each of them drops the unguarded answers it can invalidate. An
+// answer guarded by a file identity is dropped by that identity alone, never by another
+// command: `ls-files --stage` and `ls-files --others` run in the same scan pass over the same
+// directory, so forgetting the guarded listing on the unguarded call would delete every
+// listing before it is ever served again.
 const GIT_LAYOUT_QUESTION_FLAGS: &[&str] = &[
     "--show-toplevel",
     "--show-prefix",
@@ -245,7 +249,9 @@ fn git_layout_forget_dir(dir: &Path) {
         Ok(cache) => cache,
         Err(poisoned) => poisoned.into_inner(),
     };
-    cache.retain(|_, (dir_key, _)| !git_layout_dirs_overlap(dir_key, &key));
+    cache.retain(|_, (dir_key, answer)| {
+        answer.fingerprint.is_some() || !git_layout_dirs_overlap(dir_key, &key)
+    });
 }
 
 // Every git question gm asks, and how many of them actually reached a git process, printed
