@@ -43,6 +43,14 @@ impl Drop for KillOnDrop {
     }
 }
 
+#[cfg(unix)]
+fn platform_kill(pid: u32) {
+    unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+}
+
+#[cfg(not(unix))]
+fn platform_kill(_pid: u32) {}
+
 pub(crate) fn kill_process_tree(pid: u32) {
     if cfg!(windows) {
         let mut cmd = Command::new("taskkill");
@@ -52,6 +60,8 @@ pub(crate) fn kill_process_tree(pid: u32) {
             .stderr(Stdio::null());
         crate::windowless::apply_windowless(&mut cmd);
         let _ = cmd.status();
+    } else {
+        platform_kill(pid);
     }
 }
 
