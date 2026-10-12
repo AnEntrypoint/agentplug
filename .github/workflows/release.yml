@@ -216,11 +216,25 @@ jobs:
         run: |
           set -e
           base="https://github.com/$REPO/releases/download/v$VER"
+          # GitHub's release CDN answers 504 transiently in the seconds right after an
+          # upload, and one probe per asset with no retry red-published a release whose asset
+          # set had already been verified -- which also skipped the gm submodule-pin dispatch
+          # below, the step that makes a freshly published runner reach machines. Retry only
+          # what can recover (connection failure, 429, 5xx) and still fail on the code read
+          # after the last attempt: an asset that is genuinely absent answers 404 on all five.
           for f in release-assets/*; do
             name=$(basename "$f")
-            code=$(curl -sL -o /dev/null -w '%{http_code}' "$base/$name")
+            code=000
+            for attempt in 1 2 3 4 5; do
+              code=$(curl -sL -o /dev/null -w '%{http_code}' "$base/$name")
+              case "$code" in
+                200) break ;;
+                000|429|5??) sleep $((attempt * 5)); continue ;;
+                *) break ;;
+              esac
+            done
             if [ "$code" != "200" ]; then
-              echo "::error::published release v$VER's $name is not fetchable (HTTP $code)" >&2
+              echo "::error::published release v$VER's $name is not fetchable (HTTP $code after $attempt attempts)" >&2
               exit 1
             fi
           done
