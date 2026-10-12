@@ -1531,6 +1531,7 @@ fn spawn_pipe_drain_thread<R: std::io::Read + Send + 'static>(
 
 fn run_git_bounded(args: &[&str]) -> anyhow::Result<std::process::Output> {
     use wait_timeout::ChildExt;
+    let git_started = std::time::Instant::now();
     let mut cmd = std::process::Command::new("git");
     cmd.args(args)
         .stdin(std::process::Stdio::null())
@@ -1541,7 +1542,8 @@ fn run_git_bounded(args: &[&str]) -> anyhow::Result<std::process::Output> {
     let timeout_ms = agentplug_host::git_subprocess_timeout_ms();
     let stdout_drain_thread = child.stdout.take().map(spawn_pipe_drain_thread);
     let stderr_drain_thread = child.stderr.take().map(spawn_pipe_drain_thread);
-    match child.wait_timeout(Duration::from_millis(timeout_ms))? {
+    let argv: Vec<String> = args.iter().map(|a| (*a).to_string()).collect();
+    let output = match child.wait_timeout(Duration::from_millis(timeout_ms))? {
         Some(status) => {
             let stdout = stdout_drain_thread
                 .and_then(|h| h.join().ok())
@@ -1560,7 +1562,9 @@ fn run_git_bounded(args: &[&str]) -> anyhow::Result<std::process::Output> {
             let _ = child.wait();
             anyhow::bail!("git {args:?} exceeded {timeout_ms}ms with no completion -- killed to avoid wedging the daemon's own main loop, which runs this call sequentially ahead of every project's dispatch");
         }
-    }
+    };
+    agentplug_host::git_call_stats_note(&argv, true, git_started.elapsed().as_millis() as u64);
+    output
 }
 
 fn sync_instruction_source_if_configured(root: &Path) -> anyhow::Result<()> {

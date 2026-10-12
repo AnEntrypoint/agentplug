@@ -74,7 +74,7 @@ fn git_layout_dirs_overlap(a: &str, b: &str) -> bool {
     a == b || a.starts_with(&format!("{b}/")) || b.starts_with(&format!("{a}/"))
 }
 
-fn git_layout_question(cwd: &Path, argv: &[String]) -> Option<(PathBuf, String)> {
+fn git_argv_fold(cwd: &Path, argv: &[String]) -> Option<(PathBuf, Vec<&str>)> {
     let mut dir = cwd.to_path_buf();
     let mut rest: Vec<&str> = Vec::with_capacity(argv.len());
     let mut i = 0usize;
@@ -93,10 +93,73 @@ fn git_layout_question(cwd: &Path, argv: &[String]) -> Option<(PathBuf, String)>
             }
         }
     }
+    Some((dir, rest))
+}
+
+fn git_layout_question(cwd: &Path, argv: &[String]) -> Option<(PathBuf, String)> {
+    let (dir, rest) = git_argv_fold(cwd, argv)?;
     if rest.len() != 2 || rest[0] != "rev-parse" || !GIT_LAYOUT_QUESTION_FLAGS.contains(&rest[1]) {
         return None;
     }
     Some((dir, format!("rev-parse {}", rest[1])))
+}
+
+fn git_head_question(cwd: &Path, argv: &[String]) -> Option<PathBuf> {
+    let (dir, rest) = git_argv_fold(cwd, argv)?;
+    match rest.as_slice() {
+        ["rev-parse", "HEAD"] | ["rev-parse", "--verify", "HEAD"] => Some(dir),
+        _ => None,
+    }
+}
+
+// `git rev-parse HEAD` asks which commit HEAD names. Where HEAD is a loose symbolic ref that
+// commit is already written on disk by git itself, so it is read from the files git writes
+// rather than answered from a remembered value: the bytes on disk are the answer, so there is
+// no cache and nothing that can go stale, while a repo whose refs are packed, whose HEAD is a
+// symref chain, or whose .git is not plainly readable answers None and falls through to git.
+fn git_head_ref_contents(git_dir: &Path, reference: &str) -> Option<String> {
+    let direct = git_dir.join(reference);
+    if direct.is_file() {
+        return fs::read_to_string(&direct).ok();
+    }
+    let common = fs::read_to_string(git_dir.join("commondir")).ok()?;
+    let common = PathBuf::from(common.trim());
+    let common = if common.is_absolute() {
+        common
+    } else {
+        git_dir.join(common)
+    };
+    fs::read_to_string(common.join(reference)).ok()
+}
+
+fn git_head_sha_from_disk(dir: &Path) -> Option<String> {
+    let dot_git = dir.join(".git");
+    let git_dir = if dot_git.is_dir() {
+        dot_git
+    } else if dot_git.is_file() {
+        let text = fs::read_to_string(&dot_git).ok()?;
+        let rest = text.trim().strip_prefix("gitdir:")?.trim();
+        let given = PathBuf::from(rest);
+        if given.is_absolute() {
+            given
+        } else {
+            dir.join(given)
+        }
+    } else {
+        return None;
+    };
+    let head = fs::read_to_string(git_dir.join("HEAD")).ok()?;
+    let head = head.trim();
+    let sha = match head.strip_prefix("ref:") {
+        Some(reference) => git_head_ref_contents(&git_dir, reference.trim())?,
+        None => head.to_string(),
+    };
+    let sha = sha.trim();
+    if sha.len() == 40 && sha.bytes().all(|b| b.is_ascii_hexdigit()) {
+        Some(sha.to_string())
+    } else {
+        None
+    }
 }
 
 fn git_layout_recall(dir: &Path, question: &str) -> Option<GitLayoutAnswer> {
@@ -147,6 +210,11 @@ fn git_call_stats_counts(reached: bool) -> &'static Mutex<HashMap<String, usize>
     }
 }
 
+fn git_call_stats_ms() -> &'static Mutex<HashMap<String, u64>> {
+    static MS: OnceLock<Mutex<HashMap<String, u64>>> = OnceLock::new();
+    MS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 fn git_call_stats_last_flush() -> &'static Mutex<Instant> {
     static LAST_FLUSH: OnceLock<Mutex<Instant>> = OnceLock::new();
     LAST_FLUSH.get_or_init(|| Mutex::new(Instant::now()))
@@ -170,7 +238,21 @@ fn git_call_stats_key(argv: &[String]) -> String {
     key
 }
 
-fn git_call_stats_note(argv: &[String], reached: bool) {
+fn git_call_stats_add_ms(argv: &[String], elapsed_ms: u64) {
+    if elapsed_ms == 0 {
+        return;
+    }
+    let key = git_call_stats_key(argv);
+    let mut ms = match git_call_stats_ms().lock() {
+        Ok(ms) => ms,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if ms.len() < GIT_CALL_STATS_MAX_KEYS || ms.contains_key(&key) {
+        *ms.entry(key).or_insert(0) += elapsed_ms;
+    }
+}
+
+pub fn git_call_stats_note(argv: &[String], reached: bool, elapsed_ms: u64) {
     let key = git_call_stats_key(argv);
     {
         let mut counts = match git_call_stats_counts(reached).lock() {
@@ -189,12 +271,16 @@ fn git_call_stats_note(argv: &[String], reached: bool) {
         return;
     }
     *last_flush = Instant::now();
-    let asked = match git_call_stats_counts(false).lock() {
-        Ok(counts) => counts.clone(),
-        Err(poisoned) => poisoned.into_inner().clone(),
+    let mut asked = match git_call_stats_counts(false).lock() {
+        Ok(counts) => counts,
+        Err(poisoned) => poisoned.into_inner(),
     };
     let mut reached_counts = match git_call_stats_counts(true).lock() {
         Ok(counts) => counts,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let mut ms_by_key = match git_call_stats_ms().lock() {
+        Ok(ms) => ms,
         Err(poisoned) => poisoned.into_inner(),
     };
     if asked.is_empty() && reached_counts.is_empty() {
@@ -202,17 +288,22 @@ fn git_call_stats_note(argv: &[String], reached: bool) {
     }
     let asked_total: usize = asked.values().sum();
     let reached_total: usize = reached_counts.values().sum();
+    let ms_total: u64 = ms_by_key.values().sum();
     eprintln!(
-        "[agentplug host] git calls: {asked_total} asked, {reached_total} reached a git process, {} answered from the layout memo",
+        "[agentplug host] git calls this minute: {asked_total} asked, {reached_total} spawned a git process, {ms_total}ms of wall time in them, {} answered without spawning git",
         asked_total.saturating_sub(reached_total)
     );
-    let mut ranked: Vec<(String, usize)> = asked.into_iter().collect();
+    let mut ranked: Vec<(String, usize)> = asked.drain().collect();
     ranked.sort_by(|a, b| b.1.cmp(&a.1));
     for (key, count) in ranked.into_iter().take(8) {
         let reached = reached_counts.remove(&key).unwrap_or(0);
-        eprintln!("[agentplug host]   asked {count:>5} reached {reached:>5} : git {key}");
+        let ms = ms_by_key.remove(&key).unwrap_or(0);
+        eprintln!(
+            "[agentplug host]   asked {count:>5} spawned {reached:>5} {ms:>7}ms : git {key}"
+        );
     }
     reached_counts.clear();
+    ms_by_key.clear();
 }
 
 #[derive(serde::Deserialize)]
@@ -1391,7 +1482,7 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
                 });
                 return write_guest_json(&mut caller, v);
                 }
-                    git_call_stats_note(&argv, false);
+                    git_call_stats_note(&argv, false, 0);
                     let layout_question = git_layout_question(&cwd, &argv);
                     if let Some((dir, question)) = layout_question.as_ref() {
                         if let Some(answer) = git_layout_recall(dir, question) {
@@ -1404,7 +1495,19 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
                             }));
                         }
                     }
-                    git_call_stats_note(&argv, true);
+                    if let Some(dir) = git_head_question(&cwd, &argv) {
+                        if let Some(sha) = git_head_sha_from_disk(&dir) {
+                            return write_guest_json(&mut caller, serde_json::json!({
+                                "stdout": format!("{sha}\n"),
+                                "stderr": "",
+                                "exit_code": 0,
+                                "stdout_truncated": false,
+                                "stderr_truncated": false,
+                            }));
+                        }
+                    }
+                    git_call_stats_note(&argv, true, 0);
+                    let git_started = Instant::now();
                     let mut git_cmd = std::process::Command::new("git");
                     git_cmd.args(&argv).current_dir(&cwd).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
                     configure_github_git_credentials(&mut git_cmd, &argv);
@@ -1510,6 +1613,7 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
                 }
                 Err(e) => serde_json::json!({"stdout": "", "stderr": e.to_string(), "exit_code": 1}),
             };
+            git_call_stats_add_ms(&argv, git_started.elapsed().as_millis() as u64);
             write_guest_json(&mut caller, v)
         },
     )?;
