@@ -70,6 +70,7 @@ pub fn gc_stale_tmp_files(min_age: Duration) {
         }
     }
     enforce_install_dir_backup_retention(true);
+    enforce_wasi_fs_retention(true);
 }
 
 // Bounded install-dir backup retention.
@@ -333,6 +334,159 @@ pub fn enforce_install_dir_backup_retention(apply: bool) -> Vec<BackupRetentionP
         );
     }
     plans
+}
+
+// Bounded install-dir retention for the retired per-instance WASI fs tree.
+//
+// `<install>/wasi-fs/<instance>/gm.db` was a full copy of a project's `.gm/gm.db` per WASI
+// instance: the host preopened that directory as the plugin's `/`, so the plugin read and
+// wrote the copy instead of the project's own store, and nothing ever removed one.
+// Measured on one machine: 52 instances holding 2113.0 MB, 16 of them a second copy of a
+// project another instance already held, none of the 52 written in 86 days. The host now
+// preopens the drive root (`host_fs_root` in `agentplug-host`), so no shipped build names
+// this tree: it is retained state with no reader, and the source of truth for every copy
+// is still that project's own `.gm/gm.db`.
+//
+// The liveness proof this rule can actually make is AGE, and nothing finer: an instance the
+// host still has mounted is written on every embed and reindex pass, so its newest mtime is
+// hours old, while an instance whose newest mtime is older than `WASI_FS_RETAIN_AGE` is one
+// no instance has touched since before that bound. A delete that fails -- a mounted instance
+// holds its db open, which Windows refuses -- is reported and left in place, never counted
+// as reclaimed, and an instance whose mtime cannot be read proves no age at all, so it is
+// kept too.
+//
+// The bound is AGE, and nothing coarser: every instance not written within
+// `WASI_FS_RETAIN_AGE` is removed, so the tree converges on the instances actually mounted
+// inside that window. There is no count or byte knob to keep a tail of dead instances as
+// the backup rule above keeps a tail of backups: a backup is the only copy of an older
+// image, while an instance here is a derived copy whose source of truth is still that
+// project's own `.gm/gm.db`, so a stale one has no evidentiary value to preserve.
+
+// An instance whose newest mtime is younger than this is live and is never touched.
+pub const WASI_FS_RETAIN_AGE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+
+// The name an instance directory gets: 16 lowercase hex digits.
+fn is_wasi_fs_instance_key(name: &str) -> bool {
+    name.len() == 16 && name.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// What retention decided over the whole retired instance tree.
+#[derive(Debug, Default, Clone)]
+pub struct WasiFsRetentionPlan {
+    pub delete: Vec<PathBuf>,
+    pub delete_bytes: u64,
+    /// Instances younger than `WASI_FS_RETAIN_AGE`, or whose mtime could not be read:
+    /// live until proven otherwise, and never touched.
+    pub live: Vec<PathBuf>,
+    pub live_bytes: u64,
+}
+
+/// Bytes and newest modified time under `dir`. A symlinked directory is not followed, so
+/// no link can walk this forever.
+fn wasi_fs_instance_stats(dir: &Path) -> (u64, u64) {
+    let mut bytes = 0u64;
+    let mut newest_ms = 0u64;
+    let Ok(entries) = fs::read_dir(dir) else {
+        return (bytes, newest_ms);
+    };
+    for entry in entries.flatten() {
+        let Ok(meta) = entry.metadata() else { continue };
+        if meta.is_dir() {
+            let (inner_bytes, inner_newest) = wasi_fs_instance_stats(&entry.path());
+            bytes = bytes.saturating_add(inner_bytes);
+            newest_ms = newest_ms.max(inner_newest);
+            continue;
+        }
+        bytes = bytes.saturating_add(meta.len());
+        newest_ms = newest_ms.max(modified_ms_of(&meta));
+    }
+    (bytes, newest_ms)
+}
+
+/// Bounded retention over the retired per-instance WASI fs tree, newest first so the dry
+/// run reads in a stable order: every instance last written at least `min_age` ago is
+/// removed, and every younger one is live and untouched.
+pub fn plan_wasi_fs_retention(dir: &Path, min_age: Duration) -> WasiFsRetentionPlan {
+    let mut plan = WasiFsRetentionPlan::default();
+    let Ok(entries) = fs::read_dir(dir) else {
+        return plan;
+    };
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .map(|age| age.as_millis() as u64)
+        .unwrap_or(0);
+    let mut rows: Vec<(PathBuf, u64, u64)> = Vec::new();
+    for entry in entries.flatten() {
+        let Ok(name) = entry.file_name().into_string() else {
+            continue;
+        };
+        if !is_wasi_fs_instance_key(&name) {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else { continue };
+        if !meta.is_dir() {
+            continue;
+        }
+        let path = entry.path();
+        let (bytes, newest_ms) = wasi_fs_instance_stats(&path);
+        rows.push((path, bytes, newest_ms.max(modified_ms_of(&meta))));
+    }
+    rows.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
+    let min_age_ms = min_age.as_millis() as u64;
+    for (path, bytes, newest_ms) in rows.into_iter() {
+        if newest_ms == 0 || now_ms.saturating_sub(newest_ms) < min_age_ms {
+            plan.live.push(path);
+            plan.live_bytes = plan.live_bytes.saturating_add(bytes);
+            continue;
+        }
+        plan.delete.push(path);
+        plan.delete_bytes = plan.delete_bytes.saturating_add(bytes);
+    }
+    plan
+}
+
+pub fn apply_wasi_fs_retention(
+    dir: &Path,
+    min_age: Duration,
+    apply: bool,
+) -> WasiFsRetentionPlan {
+    let plan = plan_wasi_fs_retention(dir, min_age);
+    for path in &plan.delete {
+        if !apply {
+            continue;
+        }
+        match fs::remove_dir_all(path) {
+            Ok(()) => eprintln!("[agentplug] wasi-fs retention: removed {}", path.display()),
+            Err(error) => eprintln!(
+                "[agentplug] wasi-fs retention: could not remove {}: {error} -- a live instance still holds it open, so it stays",
+                path.display()
+            ),
+        }
+    }
+    plan
+}
+
+/// Bounded retention over the retired per-instance WASI fs tree in the install dir.
+/// `apply: false` is the dry run: it plans and reports without deleting anything.
+pub fn enforce_wasi_fs_retention(apply: bool) -> WasiFsRetentionPlan {
+    let dir = install_dir().join("wasi-fs");
+    if !dir.exists() {
+        return WasiFsRetentionPlan::default();
+    }
+    let plan = apply_wasi_fs_retention(&dir, WASI_FS_RETAIN_AGE, apply);
+    if !plan.delete.is_empty() || !apply {
+        eprintln!(
+            "[agentplug] wasi-fs retention{}: {} {} instance(s) ({} bytes) reclaimed, {} live ({} bytes) kept; bound = instances written within {}s",
+            if apply { "" } else { " (dry run)" },
+            if apply { "removed" } else { "would remove" },
+            plan.delete.len(),
+            plan.delete_bytes,
+            plan.live.len(),
+            plan.live_bytes,
+            WASI_FS_RETAIN_AGE.as_secs(),
+        );
+    }
+    plan
 }
 
 fn release_version_from_tag(tag: &str) -> Option<String> {
