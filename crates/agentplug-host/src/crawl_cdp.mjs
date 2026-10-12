@@ -204,6 +204,15 @@ async function main() {
       } else if (step.op === 'eval') {
         const value = await evaluate(session, step.code);
         out.pages.push({ op: 'eval', code: step.code, value });
+      } else if (step.op === 'cdp') {
+        const sent = await session.send(step.method, step.params || {});
+        const page = sent && typeof sent === 'object' ? { ...sent } : { result: sent === undefined ? null : sent };
+        page.op = 'cdp';
+        page.method = step.method;
+        out.pages.push(page);
+      } else if (step.op === 'events') {
+        const captured = ctx.eventEntries.get(step);
+        out.pages.push(captured || { op: 'events', event: step.event, count: 0, dropped: 0, events: [] });
       } else if (TOOL_OPS.has(step.op)) {
         out.pages.push(await runToolStep(ctx, step));
       } else {
