@@ -113,6 +113,56 @@ fn system_artifact_path(engine: &Engine, plugin_name: &str, content_hash: &str) 
     })
 }
 
+// A compiled artifact is a pure function of the wasm bytes and the engine's compatibility
+// hash, so one copy serves every install dir. The system dir is READ before compiling
+// (above) but was never written, so every isolated home a witness or a lane booted
+// recompiled each plugin itself: measured 4051 ms and 73 MB for bert, once per install
+// dir, with ~30 scratch homes per session.
+//
+// Publishing hard-links the freshly compiled artifact into the system dir and then
+// re-points the local name at those bytes, so the artifact exists once on disk and the
+// next home deserializes it instead of compiling. Hard links are safe here only because
+// no writer mutates an artifact in place: write_precompiled_artifact stages a sibling and
+// renames it over the path, and a superseded artifact is removed by unlinking its name.
+// A failure at any step leaves the local artifact as compiled, so the load still succeeds.
+fn publish_artifact_to_system_dir(plugin_name: &str, system_path: &Path, artifact_path: &Path) {
+    if let Some(parent) = system_path.parent() {
+        if std::fs::create_dir_all(parent).is_err() {
+            return;
+        }
+    }
+    let staged = system_path.with_extension(format!(
+        "{PRECOMPILED_EXTENSION}.sys.{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&staged);
+    if std::fs::hard_link(artifact_path, &staged).is_err()
+        && std::fs::copy(artifact_path, &staged).is_err()
+    {
+        let _ = std::fs::remove_file(&staged);
+        return;
+    }
+    if std::fs::rename(&staged, system_path).is_err() {
+        let _ = std::fs::remove_file(&staged);
+        return;
+    }
+    let local = artifact_path.with_extension(format!(
+        "{PRECOMPILED_EXTENSION}.link.{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&local);
+    let linked = std::fs::hard_link(system_path, &local).is_ok()
+        && std::fs::rename(&local, artifact_path).is_ok();
+    if !linked {
+        let _ = std::fs::remove_file(&local);
+        return;
+    }
+    eprintln!(
+        "[agentplug precompiled] {plugin_name} published to the system artifact dir ({}) -- the next install dir deserializes it instead of compiling",
+        system_path.display()
+    );
+}
+
 pub fn load_module_file_backed(
     engine: &Engine,
     wasm_path: &Path,
@@ -148,6 +198,9 @@ pub fn load_module_file_backed(
     let started = std::time::Instant::now();
     write_precompiled_artifact(engine, wasm_path, &artifact_path)?;
     remove_superseded_artifacts_for(plugin_name, &artifact_path);
+    if let Some(system_artifact) = system_artifact_path(engine, plugin_name, content_hash) {
+        publish_artifact_to_system_dir(plugin_name, &system_artifact, &artifact_path);
+    }
     let artifact_len = std::fs::metadata(&artifact_path)
         .map(|m| m.len())
         .unwrap_or(0);
