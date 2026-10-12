@@ -42,11 +42,13 @@ pub(super) const LANE_HOLD_REPORT_MIN_MS: u64 = 120_000;
 /// readable line per minute instead of one per ledger refresh.
 pub(super) const LANE_HOLD_REPORT_INTERVAL_MS: u64 = 60_000;
 
-/// A hold past this long is no longer a slow operation: the holder is either gone or has never
-/// reached `Running`, and the lane is released with a named reason. A hold by a dispatch that IS
-/// running is never released -- the lane is what keeps two git writers out of one worktree, and a
-/// running holder is exactly the writer it protects. The env override exists only so the selfcheck
-/// can witness the release without a three-minute wait. No shipped path sets it.
+/// A hold past this long is no longer a slow operation: the holder is either gone, has never
+/// reached `Running`, or reached `Running` and then stopped being a live worker, and the lane is
+/// released with a named reason. A hold by a dispatch that IS running and still registered is never
+/// released here -- the lane is what keeps two git writers out of one worktree, and a live holder is
+/// exactly the writer it protects; that hold has its own absolute ceiling in
+/// `LANE_HOLD_RUNNING_MAX_MS_DEFAULT`. The env override exists only so the selfcheck can witness the
+/// release without a three-minute wait. No shipped path sets it.
 pub(super) const LANE_HOLD_STUCK_MIN_MS_DEFAULT: u64 = 180_000;
 
 /// A hold by a dispatch that IS running is released past this long, when at least one claim is
@@ -977,9 +979,22 @@ fn lane_holder_is_live(root: &Path, _lane: &'static str, verb: &str, task: &str)
     live_dispatch_wait_owner(&spool_dir, verb, task).is_some()
 }
 
+/// True while a worker is registered for this dispatch, which is the runner's own liveness ledger.
+///
+/// The in-flight entry is inserted before the dispatch thread spawns and removed only when that
+/// thread's scope ends, so it is present for exactly as long as a worker exists for the task. The
+/// stage map is not: a worker that dies after noting `Running` leaves the stage behind, and the
+/// stage alone then claims the lane is protecting a write that no longer exists.
+fn lane_holder_worker_registered(key: &InFlightKey) -> bool {
+    in_flight_map()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains_key(key)
+}
+
 /// Why this lane holder must give the lane up, or `None` while it must keep it.
 ///
-/// Three holds are pathological, and all are named so the ledger says which one fired:
+/// Four holds are pathological, and all are named so the ledger says which one fired:
 ///
 /// - `holder_dispatch_gone`: nothing live owns the dispatch any more. It cannot be running, so the
 ///   hold is a tombstone and the lane is free.
@@ -987,6 +1002,11 @@ fn lane_holder_is_live(root: &Path, _lane: &'static str, verb: &str, task: &str)
 ///   been for `LANE_HOLD_STUCK_MIN_MS`. It holds the lane while it waits for its tool-queue turn, so
 ///   it has not touched the worktree; the lane is taken from it and the displaced-holder check stops
 ///   it from running on a lane it no longer owns.
+/// - `holder_worker_not_alive`: the holder reached `Running`, but no worker is registered for it any
+///   more and has not been for `LANE_HOLD_STUCK_MIN_MS`. The stage map is bookkeeping the worker
+///   itself never clears when it dies, so a stage alone cannot say whether the lane still protects a
+///   write: the in-flight registration is what the runner drops when the worker's thread ends, and
+///   without it there is no writer left to protect.
 /// - `holder_running_past_max`: the holder IS executing, and has been for
 ///   `LANE_HOLD_RUNNING_MAX_MS`, with claims waiting behind it. Execution that long is a hung
 ///   holder, not slow work, and an unbounded hold stalls the project's whole lane; see the constant.
@@ -1013,6 +1033,12 @@ pub(crate) fn lane_holder_stuck_reason(
     // other stage means it holds the lane without having touched the worktree, and past the bound
     // that hold is over.
     match record {
+        Some((DispatchStage::Running, since_ms))
+            if now_ms().saturating_sub(since_ms) >= lane_hold_stuck_min_ms()
+                && !lane_holder_worker_registered(&key) =>
+        {
+            return Some("holder_worker_not_alive")
+        }
         Some((DispatchStage::Running, since_ms))
             if now_ms().saturating_sub(since_ms) >= lane_hold_running_max_ms()
                 && agentplug_host::registry::lane_waiter_count(root, lane) > 0 =>
@@ -1051,15 +1077,17 @@ pub(crate) struct ReleasedLaneHold {
     pub(crate) reason: &'static str,
 }
 
-/// Frees every lane whose holder is gone, stuck before running, or running past the ceiling with
-/// claims behind it.
+/// Frees every lane whose holder is gone, stuck before running, running past the ceiling with
+/// claims behind it, or running with no worker left to run it.
 ///
 /// This is the hold watchdog's action. A holder released as gone or stuck before running was not
 /// executing, so the lane stays single-writer: the displaced holder asks `still_owns()` before
 /// dispatching and answers starved instead of running. A holder released as running past the ceiling
 /// IS executing -- that release is the lane draining instead of stalling, and it only fires past
 /// `LANE_HOLD_RUNNING_MAX_MS` with waiters queued, so the single-writer property is spent only to
-/// unblock somebody and only on a hold no real git operation reaches.
+/// unblock somebody and only on a hold no real git operation reaches. A holder released as a worker
+/// that is gone protects no write at all: nothing is executing, so the lane is free and the dispatch
+/// is marked abandoned instead of being left to hold a lane and a claim forever.
 pub(crate) fn release_stuck_lane_holders(min_held_ms: u64) -> Vec<ReleasedLaneHold> {
     let owners = agentplug_host::release_dead_lane_owners(min_held_ms, &|root, lane, verb, task| {
         lane_holder_stuck_reason(root, lane, verb, task).is_none()
@@ -1069,6 +1097,13 @@ pub(crate) fn release_stuck_lane_holders(min_held_ms: u64) -> Vec<ReleasedLaneHo
         .map(|owner| {
             let reason = lane_holder_stuck_reason(&owner.root, owner.lane, &owner.verb, &owner.task)
                 .unwrap_or("holder_dispatch_gone");
+            // A worker that is gone never answers its own dispatch, so the stage record that has the
+            // ledger still naming it `claimed_running` is dropped here: the row becomes unowned, and
+            // the orphan sweep reaps the claim and answers `dispatch_orphaned` instead of leaving
+            // one dead dispatch in flight against the project cap forever.
+            if reason == "holder_worker_not_alive" {
+                forget_dispatch_wait_record(&owner.root, &owner.verb, &owner.task);
+            }
             ReleasedLaneHold {
                 lane: owner.lane,
                 verb: owner.verb,
@@ -2623,6 +2658,8 @@ pub(super) fn refresh_dispatch_wait_ledger(root: &Path) {
                             "the holder IS executing but has run past the {}ms ceiling with waiters behind it, so the lane was freed rather than left stalled -- its dispatch keeps running and no longer owns the lane, and the waiters stop being told to re-queue behind it",
                             lane_hold_running_max_ms()
                         )
+                    } else if released.reason == "holder_worker_not_alive" {
+                        "no worker is registered for the holder any more, so the lane protected no write: it was freed and the dispatch is marked abandoned for the orphan sweep to answer, instead of holding the lane and a claim for as long as the daemon lives".to_string()
                     } else {
                         "the holder was not executing, so the lane was freed and the holder's own still_owns() check answers starved instead of running it. Still one writer per lane.".to_string()
                     }

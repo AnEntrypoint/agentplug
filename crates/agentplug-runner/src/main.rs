@@ -1248,17 +1248,21 @@ fn strip_without_budget() -> bool {
 }
 
 /// A lane hold is bounded, witnessed live: past the bound a holder that is not executing loses the
-/// lane with a named reason and its claim is parked at the head of the queue, and a holder that IS
-/// running loses it too once it has run past the running ceiling with claims queued behind it, so a
-/// dispatch that never finishes cannot stall the project's whole lane indefinitely. A running holder
-/// with nothing waiting behind it keeps its lane however long it runs: that hold is what keeps two
-/// git writers out of one worktree.
+/// lane with a named reason and its claim is parked at the head of the queue, a holder that IS
+/// running loses it too once it has run past the running ceiling with claims queued behind it, and a
+/// holder whose worker is gone loses it as soon as the bound has passed, so a dispatch that never
+/// finishes or dies holding a lane cannot stall the project's whole lane indefinitely. A running
+/// holder that still has a worker and nothing waiting behind it keeps its lane however long it runs:
+/// that hold is what keeps two git writers out of one worktree.
 fn selfcheck_lane_hold_release() -> anyhow::Result<()> {
     use crate::daemon::{
-        lane_holder_stuck_reason, note_dispatch_stage, release_stuck_lane_holders, DispatchStage,
+        in_flight_map, lane_holder_stuck_reason, note_dispatch_stage, release_stuck_lane_holders,
+        DispatchStage, InFlightHandle,
     };
     use agentplug_host::GmFairnessGuard;
+    use std::sync::atomic::AtomicBool;
     use std::sync::mpsc;
+    use std::sync::Arc;
     use std::time::Duration;
 
     const NAME: &str = "selfcheck-lane-hold-release";
@@ -1273,9 +1277,11 @@ fn selfcheck_lane_hold_release() -> anyhow::Result<()> {
     let root_stuck = root.join("stuck");
     let root_running = root.join("running");
     let root_running_past = root.join("running-past-max");
+    let root_worker_gone = root.join("worker-gone");
     std::fs::create_dir_all(&root_stuck)?;
     std::fs::create_dir_all(&root_running)?;
     std::fs::create_dir_all(&root_running_past)?;
+    std::fs::create_dir_all(&root_worker_gone)?;
 
     /// Hold the git lane until `release` fires, then report whether this holder still owns it.
     fn hold_reporting_ownership(
@@ -1303,6 +1309,36 @@ fn selfcheck_lane_hold_release() -> anyhow::Result<()> {
         });
         (held_rx, release_tx, owns_rx)
     }
+
+    /// Register and unregister a worker for a holder, which is the runner's own liveness ledger: the
+    /// in-flight entry exists for exactly as long as a dispatch thread does, and the hold watchdog
+    /// reads its absence as a worker that is gone. A holder that is really running must carry one, or
+    /// the selfcheck would be measuring a hold no dispatch can produce.
+    let register_worker = |root: &std::path::Path, task: &str| {
+        in_flight_map()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(
+                (
+                    root.to_path_buf(),
+                    "git_commit".to_string(),
+                    task.to_string(),
+                ),
+                InFlightHandle {
+                    detach: Arc::new(AtomicBool::new(false)),
+                },
+            )
+    };
+    let unregister_worker = |root: &std::path::Path, task: &str| {
+        in_flight_map()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&(
+                root.to_path_buf(),
+                "git_commit".to_string(),
+                task.to_string(),
+            ))
+    };
 
     let outcome = (|| -> Result<String, String> {
         // A holder stuck before running: live, but its stage is not Running and has not been for the
@@ -1364,6 +1400,7 @@ fn selfcheck_lane_hold_release() -> anyhow::Result<()> {
         if !held_rx.recv_timeout(Duration::from_secs(10)).unwrap_or(false) {
             return Err("the running holder could not take the project git lane".into());
         }
+        register_worker(&root_running, "holder-running");
         note_dispatch_stage(
             &root_running,
             "git_commit",
@@ -1383,6 +1420,7 @@ fn selfcheck_lane_hold_release() -> anyhow::Result<()> {
         if !owns_rx.recv_timeout(Duration::from_secs(10)).unwrap_or(false) {
             return Err("the running holder lost ownership of its lane".into());
         }
+        unregister_worker(&root_running, "holder-running");
 
         // The ceiling that bounds a stall: a holder that IS running but has run past the running
         // ceiling, with a claim queued behind it, loses the lane so the queue drains instead of being
@@ -1394,6 +1432,7 @@ fn selfcheck_lane_hold_release() -> anyhow::Result<()> {
         if !held_rx.recv_timeout(Duration::from_secs(10)).unwrap_or(false) {
             return Err("the long-running holder could not take the project git lane".into());
         }
+        register_worker(&root_running_past, "holder-running-past-max");
         note_dispatch_stage(
             &root_running_past,
             "git_commit",
@@ -1445,8 +1484,80 @@ fn selfcheck_lane_hold_release() -> anyhow::Result<()> {
                     .into(),
             );
         }
+        unregister_worker(&root_running_past, "holder-running-past-max");
 
-        Ok("a holder stuck before running lost the lane as holder_stuck_before_running and knew it had, its claim parked at the head of the queue, while a running holder with nothing behind it kept the lane past the same bound and one running past the ceiling with a waiter behind it lost it and the lane drained to that waiter".into())
+        // A hold whose worker is gone: the holder noted `Running`, but nothing is registered for it
+        // any more, so the stage is a tombstone left by a dispatch that died and the lane must not
+        // wait on it. The stage alone cannot tell this from a live holder, which is why the
+        // registration -- not the stage -- is what settles it.
+        let (held_rx, release_tx, owns_rx) =
+            hold_reporting_ownership(&root_worker_gone, "holder-worker-gone");
+        if !held_rx.recv_timeout(Duration::from_secs(10)).unwrap_or(false) {
+            return Err("the holder whose worker is gone could not take the project git lane".into());
+        }
+        // No worker is registered for this holder: its thread ended and took the registration with
+        // it, leaving the Running stage behind. That is exactly the state a dispatch that died after
+        // noting Running leaves, and the stage alone cannot tell it from a live holder.
+        note_dispatch_stage(
+            &root_worker_gone,
+            "git_commit",
+            "holder-worker-gone",
+            DispatchStage::Running,
+            Some("git"),
+        );
+        std::thread::sleep(Duration::from_millis(700));
+        let reason_gone =
+            lane_holder_stuck_reason(&root_worker_gone, "git", "git_commit", "holder-worker-gone");
+        if reason_gone != Some("holder_worker_not_alive") {
+            return Err(format!(
+                "a hold whose worker is gone was not classified as stuck: got {reason_gone:?}"
+            ));
+        }
+        let released = release_stuck_lane_holders(100);
+        if !released
+            .iter()
+            .any(|released| released.task == "holder-worker-gone")
+        {
+            return Err(
+                "a hold whose worker is gone was not released from the lane".into(),
+            );
+        }
+        // Released as abandoned, not merely displaced: the stage the dead worker left is gone too, so
+        // the ledger stops naming this dispatch as running and the orphan sweep can reap its claim
+        // and answer the caller instead of leaving it in flight forever.
+        if lane_holder_stuck_reason(&root_worker_gone, "git", "git_commit", "holder-worker-gone")
+            != Some("holder_dispatch_gone")
+        {
+            return Err(
+                "the dead worker's dispatch is still named as running after the release -- the orphan sweep cannot reap a claim the ledger calls running"
+                    .into(),
+            );
+        }
+        let claimer = match GmFairnessGuard::acquire_within(
+            &root_worker_gone,
+            "git_commit",
+            "{}",
+            "claimer-after-worker-gone",
+            Duration::from_secs(3),
+        ) {
+            Ok(guard) => guard,
+            Err(report) => {
+                return Err(format!(
+                    "the lane was not free after the dead worker's hold was released (still held by {:?})",
+                    report.lane_holder_task
+                ))
+            }
+        };
+        let _ = release_tx.send(());
+        if owns_rx.recv_timeout(Duration::from_secs(10)).unwrap_or(true) {
+            return Err(
+                "the holder whose worker is gone still believed it owned the lane -- the lane did not really drain"
+                    .into(),
+            );
+        }
+        drop(claimer);
+
+        Ok("a holder stuck before running lost the lane as holder_stuck_before_running and knew it had, its claim parked at the head of the queue, while a running holder with nothing behind it kept the lane past the same bound, one running past the ceiling with a waiter behind it lost it and the lane drained to that waiter, and one whose worker was gone lost it as holder_worker_not_alive, was marked abandoned, and the lane drained".into())
     })();
 
     let _ = std::fs::remove_dir_all(&root);
