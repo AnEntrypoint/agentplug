@@ -69,6 +69,270 @@ pub fn gc_stale_tmp_files(min_age: Duration) {
             gc_stale_tmp_files_in(exe_dir, min_age);
         }
     }
+    enforce_install_dir_backup_retention(true);
+}
+
+// Bounded install-dir backup retention.
+//
+// A self-update leaves its predecessor beside the live asset under a fresh name --
+// `<exe>.prev`, `<exe>.new2`, `<exe>.bak-<label>-<timestamp>`, `<exe>.<label>.exe` --
+// and nothing removed them, so the install dir grew without limit (92 runner siblings
+// holding 1.3 GB was measured on one machine). `gc_stale_tmp_files_in` above only ever
+// matched `<name>.tmp.<digits>`, so it bounded neither these nor a finished backup.
+//
+// Retention here is ordered by modified time over the whole sibling set of an asset,
+// never by name pattern, so a name that compounds (`<exe>.new2.new2.new2.new`) is one
+// deletable sibling like any other.
+
+// Backups kept per installed asset, newest first. Together with the live asset, its
+// `.prev` rollback target and one in-flight staged copy, this bounds an asset family at
+// a handful of copies instead of one per update ever applied.
+pub const INSTALL_BACKUP_RETAIN: usize = 2;
+
+// Ceiling on the bytes one asset's retained backups may hold. The single newest backup
+// is kept even when it alone exceeds this, so the ceiling trims the tail instead of
+// emptying the set and leaving no rollback evidence at all.
+pub const INSTALL_BACKUP_BYTES_CEILING: u64 = 64 * 1024 * 1024;
+
+const INSTALL_ASSET_EXTS: [&str; 3] = ["exe", "wasm", "mjs"];
+
+/// What retention decided for one installed asset: the backups to keep, the siblings to
+/// remove, and the bytes each side accounts for.
+#[derive(Debug, Default, Clone)]
+pub struct BackupRetentionPlan {
+    pub stem: String,
+    pub keep: Vec<PathBuf>,
+    pub delete: Vec<PathBuf>,
+    pub keep_bytes: u64,
+    pub delete_bytes: u64,
+}
+
+fn file_extension_lower(name: &str) -> Option<String> {
+    name.rsplit_once('.')
+        .map(|(_, extension)| extension.to_ascii_lowercase())
+}
+
+/// The siblings that are current state rather than a backup: the version and checksum
+/// markers, every `<stem>.*.json` sidecar (build record, sideload marker, staged-exe
+/// marker), the in-flight staged copies and their rename scratch, the `.prev` rollback
+/// target, and an explicitly pinned copy. None of these is ever retention-deleted.
+fn install_backup_is_live(rest: &str) -> bool {
+    let rest = rest.to_ascii_lowercase();
+    matches!(
+        rest.as_str(),
+        "version" | "sha256" | "no-self-update" | "checked" | "prev" | "new" | "new2"
+    ) || rest.ends_with(".json")
+        || rest.starts_with("replace.")
+        || rest.starts_with("pinned")
+}
+
+/// The part of `name` that makes it a backup sibling of `stem`, or `None` when it is the
+/// live asset or belongs to another family. Both shapes occur on disk: `<stem>.<rest>`
+/// (`agentplug-runner.exe.bak-pre-durable-20261011-100752Z`) and
+/// `<stem-base>.<rest>.<ext>` (`agentplug-runner.preconsolefix.exe`).
+fn install_backup_sibling_rest(name: &str, stem: &str) -> Option<String> {
+    if name == stem {
+        return None;
+    }
+    let (stem_base, stem_ext) = stem.rsplit_once('.')?;
+    if let Some(rest) = name.strip_prefix(&format!("{stem}.")) {
+        return Some(rest.to_string());
+    }
+    let (name_base, name_ext) = name.rsplit_once('.')?;
+    if !name_ext.eq_ignore_ascii_case(stem_ext) {
+        return None;
+    }
+    name_base
+        .strip_prefix(&format!("{stem_base}."))
+        .map(str::to_string)
+}
+
+fn same_existing_path(a: &Path, b: &Path) -> bool {
+    if a == b {
+        return true;
+    }
+    match (fs::canonicalize(a), fs::canonicalize(b)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
+}
+
+/// The live asset names in `dir`: the shortest name of each (leading segment, extension)
+/// group, so `agentplug-runner.exe` is picked over `agentplug-runner.preconsolefix.exe`.
+/// Asset families are discovered, not hardcoded, so an asset added later is covered with
+/// no further edit -- including `gm-mcp-server.mjs`, whose `.bak-*` siblings are written
+/// by the gm-mcp host rather than by this runner.
+fn install_asset_stems(dir: &Path) -> Vec<String> {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut groups: std::collections::BTreeMap<(String, String), Vec<String>> =
+        std::collections::BTreeMap::new();
+    for entry in entries.flatten() {
+        let Ok(name) = entry.file_name().into_string() else {
+            continue;
+        };
+        if !entry.metadata().map(|meta| meta.is_file()).unwrap_or(false) {
+            continue;
+        }
+        let Some(extension) = file_extension_lower(&name) else {
+            continue;
+        };
+        if !INSTALL_ASSET_EXTS.contains(&extension.as_str()) {
+            continue;
+        }
+        let group = name.split('.').next().unwrap_or_default().to_ascii_lowercase();
+        groups.entry((group, extension)).or_default().push(name);
+    }
+    groups
+        .into_values()
+        .filter_map(|mut names| {
+            names.sort_by_key(|name| (name.matches('.').count(), name.len(), name.clone()));
+            names.into_iter().next()
+        })
+        .collect()
+}
+
+fn modified_ms_of(meta: &fs::Metadata) -> u64 {
+    meta.modified()
+        .ok()
+        .and_then(|modified| modified.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
+        .map(|age| age.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+pub fn plan_install_backup_retention(
+    dir: &Path,
+    stem: &str,
+    pinned: &[PathBuf],
+) -> BackupRetentionPlan {
+    let mut plan = BackupRetentionPlan {
+        stem: stem.to_string(),
+        ..Default::default()
+    };
+    let Ok(entries) = fs::read_dir(dir) else {
+        return plan;
+    };
+    let mut rows: Vec<(PathBuf, u64, u64)> = Vec::new();
+    for entry in entries.flatten() {
+        let Ok(name) = entry.file_name().into_string() else {
+            continue;
+        };
+        let Some(rest) = install_backup_sibling_rest(&name, stem) else {
+            continue;
+        };
+        if install_backup_is_live(&rest) {
+            continue;
+        }
+        let path = entry.path();
+        if pinned.iter().any(|pin| same_existing_path(pin, &path)) {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        if !meta.is_file() {
+            continue;
+        }
+        rows.push((path, meta.len(), modified_ms_of(&meta)));
+    }
+    rows.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
+    for (index, (path, bytes, _)) in rows.into_iter().enumerate() {
+        let over_count = index >= INSTALL_BACKUP_RETAIN;
+        let over_bytes = !plan.keep.is_empty()
+            && plan.keep_bytes.saturating_add(bytes) > INSTALL_BACKUP_BYTES_CEILING;
+        if over_count || over_bytes {
+            plan.delete.push(path);
+            plan.delete_bytes = plan.delete_bytes.saturating_add(bytes);
+        } else {
+            plan.keep_bytes = plan.keep_bytes.saturating_add(bytes);
+            plan.keep.push(path);
+        }
+    }
+    plan
+}
+
+pub fn apply_install_backup_retention(
+    dir: &Path,
+    stem: &str,
+    pinned: &[PathBuf],
+    apply: bool,
+) -> BackupRetentionPlan {
+    let plan = plan_install_backup_retention(dir, stem, pinned);
+    for path in &plan.delete {
+        if !apply {
+            continue;
+        }
+        match fs::remove_file(path) {
+            Ok(()) => eprintln!(
+                "[agentplug] install-dir backup retention: removed {}",
+                path.display()
+            ),
+            Err(error) => eprintln!(
+                "[agentplug] install-dir backup retention: could not remove {}: {error}",
+                path.display()
+            ),
+        }
+    }
+    plan
+}
+
+/// Paths retention must never delete: the image this process is running from, which on
+/// Windows cannot be unlinked while it is mapped, and the canonical install path it will
+/// be promoted to.
+pub fn install_dir_backup_pins() -> Vec<PathBuf> {
+    let mut pinned = Vec::new();
+    if let Ok(exe) = std::env::current_exe() {
+        pinned.push(exe);
+    }
+    if let Some(canonical) = canonical_runner_exe() {
+        pinned.push(canonical);
+    }
+    pinned
+}
+
+/// Bounded retention over every asset family in the install dir. `apply: false` is the
+/// dry run: it plans and reports without deleting anything.
+pub fn enforce_install_dir_backup_retention(apply: bool) -> Vec<BackupRetentionPlan> {
+    let install = install_dir();
+    let pinned = install_dir_backup_pins();
+    let mut plans = Vec::new();
+    for dir in [install.clone(), install.join("plugins")] {
+        for stem in install_asset_stems(&dir) {
+            plans.push(apply_install_backup_retention(&dir, &stem, &pinned, apply));
+        }
+    }
+    let kept_count: usize = plans.iter().map(|plan| plan.keep.len()).sum();
+    let deleted_count: usize = plans.iter().map(|plan| plan.delete.len()).sum();
+    let kept: u64 = plans.iter().map(|plan| plan.keep_bytes).sum();
+    let reclaimed: u64 = plans.iter().map(|plan| plan.delete_bytes).sum();
+    if deleted_count > 0 || !apply {
+        for plan in &plans {
+            if plan.delete.is_empty() {
+                continue;
+            }
+            eprintln!(
+                "[agentplug] install-dir backup retention{}: {} {} of {} ({} bytes)",
+                if apply { "" } else { " (dry run)" },
+                if apply { "removed" } else { "would remove" },
+                plan.delete.len(),
+                plan.stem,
+                plan.delete_bytes,
+            );
+        }
+        eprintln!(
+            "[agentplug] install-dir backup retention{}: {} {} backup(s) ({} bytes) reclaimed, {} kept ({} bytes); bound {} backup(s) and {} bytes per asset",
+            if apply { "" } else { " (dry run)" },
+            if apply { "removed" } else { "would remove" },
+            deleted_count,
+            reclaimed,
+            kept_count,
+            kept,
+            INSTALL_BACKUP_RETAIN,
+            INSTALL_BACKUP_BYTES_CEILING,
+        );
+    }
+    plans
 }
 
 fn release_version_from_tag(tag: &str) -> Option<String> {
@@ -647,7 +911,7 @@ fn running_from_staged_copy() -> bool {
             exe.extension()
                 .map(|e| e.to_string_lossy().to_ascii_lowercase())
         })
-        .map(|e| e == "new" || e == "new2")
+        .map(|e| is_staged_runner_suffix(&e))
         .unwrap_or(false)
 }
 
@@ -869,18 +1133,16 @@ pub fn stage_runner_self_update() -> anyhow::Result<Option<(PathBuf, String)>> {
     if marker_is_trustworthy_and_current(latest.as_str()) {
         return Ok(None);
     }
-    let running_from_staged_path = std::env::current_exe()?
-        .extension()
-        .map(|e| e.eq_ignore_ascii_case("new"))
-        .unwrap_or(false);
-    let mut current_exe = std::env::current_exe()?;
-    while current_exe
-        .extension()
-        .map(|e| e.eq_ignore_ascii_case("new"))
-        .unwrap_or(false)
-    {
-        current_exe = current_exe.with_extension("");
-    }
+    // Strip EVERY staged suffix, not just a trailing `.new`: staging used to peel a
+    // single `.new` off the running path and then append again, so a process started
+    // from `<exe>.new2` staged `<exe>.new2.new`, whose successor staged
+    // `<exe>.new2.new2`, and so on -- one never-reused ~17 MB file per update. Anchoring
+    // on the canonical path makes the staged name one of exactly two, `<exe>.new` or
+    // `<exe>.new2`, so a copy is overwritten instead of accumulating.
+    let running_from_staged_path = running_from_staged_copy();
+    let current_exe = canonical_runner_exe().ok_or_else(|| {
+        anyhow::anyhow!("cannot resolve the canonical runner path to stage {latest} beside")
+    })?;
     let staged_suffix = if running_from_staged_path {
         "new2"
     } else {
