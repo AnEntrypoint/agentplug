@@ -308,6 +308,15 @@ pub fn live_foreign_spool_sweeper(spool_dir: &Path) -> Option<u64> {
     let status = fs::read_to_string(spool_dir.join(".status.json")).ok()?;
     let value = serde_json::from_str::<serde_json::Value>(&status).ok()?;
     let pid = value.get("pid").and_then(|p| p.as_u64())?;
+    // A standalone watcher never sweeps (main.rs reads only `.txt` requests), so its heartbeat
+    // must not suppress this daemon's sweep.
+    if !value
+        .get("shared_process")
+        .and_then(|s| s.as_bool())
+        .unwrap_or(false)
+    {
+        return None;
+    }
     if pid == std::process::id() as u64 {
         return None;
     }
@@ -789,7 +798,12 @@ pub(super) fn write_spool_out_and_release_claim(
 ) {
     forget_in_flight_claim(in_dir, verb, task);
     if write_spool_out_confirmed(out_dir, verb, task, out_body) {
-        let _ = fs::remove_file(inflight_claim_path(in_dir, verb, task));
+        let claim = inflight_claim_path(in_dir, verb, task);
+        let spool_dir = in_dir
+            .parent()
+            .map(|parent| parent.to_path_buf())
+            .unwrap_or_else(|| in_dir.to_path_buf());
+        remove_claim_file(&spool_dir, verb, task, &claim);
     } else {
         eprintln!("[agentplug daemon] out-file write for {verb}/{task} did not confirm -- leaving the claim for the orphan sweep instead of deleting an unanswered request");
     }
@@ -832,6 +846,126 @@ pub(super) fn inflight_claim_path(in_dir: &Path, verb: &str, task: &str) -> Path
         })
 }
 
+/// A claim's liveness marker, and the cadence the dispatch that owns it renews on.
+///
+/// A claim is the request file renamed, and its mtime is what orders the lane queue, so liveness
+/// cannot ride on the claim itself: re-stamping it would send a long wait to the back of its own
+/// lane. The marker sits beside the claim instead, so a sweep in ANY process can tell a 120s
+/// `wait` from the corpse of a daemon that died holding one -- both used to read as one claim
+/// nobody had touched for a minute, which is why a bounded wait was reaped inside its own budget.
+pub(super) const CLAIM_HEARTBEAT_DIR: &str = "claim-live";
+
+pub(super) const CLAIM_HEARTBEAT_EXT: &str = "live";
+
+/// How often the owner re-stamps its marker. Well inside MIN_ORPHAN_CLAIM_AGE_MS, so a claim whose
+/// owner is running can never drift into the orphan window between two beats.
+pub(super) const CLAIM_HEARTBEAT_MS: u64 = 15_000;
+
+/// A marker older than this has missed three beats, so its owner is gone or wedged and the claim is
+/// judged on its own age, exactly as it was before claims had markers at all.
+pub(super) const CLAIM_HEARTBEAT_STALE_MS: u64 = 45_000;
+
+pub(super) fn claim_heartbeat_path(spool_dir: &Path, verb: &str, task: &str) -> PathBuf {
+    spool_dir
+        .join(CLAIM_HEARTBEAT_DIR)
+        .join(verb)
+        .join(format!("{task}.{CLAIM_HEARTBEAT_EXT}"))
+}
+
+/// One beat: the owning pid and the stamp, the same two-line record the store-owner heartbeat
+/// writes.
+fn write_claim_heartbeat(marker: &Path) {
+    if let Some(parent) = marker.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let _ = fs::write(marker, format!("{}\n{}\n", std::process::id(), now_ms()));
+}
+
+/// The pid that last renewed this claim and how long ago, or None when it carries no marker. No
+/// marker means no live dispatch ever renewed it, which is the orphan case this replaced.
+pub(super) fn claim_heartbeat(spool_dir: &Path, verb: &str, task: &str) -> Option<(u64, u64)> {
+    let raw = fs::read_to_string(claim_heartbeat_path(spool_dir, verb, task)).ok()?;
+    let mut lines = raw.lines();
+    let pid = lines.next()?.trim().parse::<u64>().ok()?;
+    let stamp = lines.next()?.trim().parse::<u64>().ok()?;
+    Some((pid, now_ms().saturating_sub(stamp)))
+}
+
+/// Deletes a claim together with its marker: a marker left behind keeps naming a live owner for a
+/// task id the spool reuses, and only its going stale would ever stop that.
+fn remove_claim_file(spool_dir: &Path, verb: &str, task: &str, claim_path: &Path) {
+    let _ = fs::remove_file(claim_heartbeat_path(spool_dir, verb, task));
+    let _ = fs::remove_file(claim_path);
+}
+
+/// Renews a claim's marker for as long as one dispatch runs.
+///
+/// Held from the moment a dispatch thread starts -- which is while it waits for its lane, not only
+/// while it executes -- until that thread returns, so the whole life of the dispatch is covered.
+/// Dropping it stops the beats and takes the marker with it, so a finished dispatch leaves nothing
+/// behind that could protect an unrelated claim later.
+pub(crate) struct ClaimHeartbeat {
+    stop: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+    marker: PathBuf,
+}
+
+impl ClaimHeartbeat {
+    pub(crate) fn start(in_dir: &Path, verb: &str, task: &str) -> ClaimHeartbeat {
+        let claim = inflight_claim_path(in_dir, verb, task);
+        let spool_dir = in_dir
+            .parent()
+            .map(|parent| parent.to_path_buf())
+            .unwrap_or_else(|| in_dir.to_path_buf());
+        let marker = claim_heartbeat_path(&spool_dir, verb, task);
+        let stop = Arc::new(AtomicBool::new(false));
+        write_claim_heartbeat(&marker);
+        let beat_stop = Arc::clone(&stop);
+        let beat_marker = marker.clone();
+        let beat_claim = claim;
+        let thread = std::thread::Builder::new()
+            .name(format!("claim-heartbeat-{task}"))
+            .spawn(move || {
+                let beat = std::time::Duration::from_millis(CLAIM_HEARTBEAT_MS);
+                let poll = std::time::Duration::from_millis(250);
+                let mut since = std::time::Duration::ZERO;
+                while !beat_stop.load(Ordering::Relaxed) {
+                    std::thread::sleep(poll);
+                    since += poll;
+                    if since < beat {
+                        continue;
+                    }
+                    since = std::time::Duration::ZERO;
+                    // The claim IS the dispatch: once it is gone the dispatch has answered, so stop
+                    // beating instead of renewing a claim nobody holds any more.
+                    if !beat_claim.exists() {
+                        break;
+                    }
+                    write_claim_heartbeat(&beat_marker);
+                }
+                let _ = fs::remove_file(&beat_marker);
+            })
+            .ok();
+        ClaimHeartbeat {
+            stop,
+            thread,
+            marker,
+        }
+    }
+}
+
+impl Drop for ClaimHeartbeat {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(thread) = self.thread.take() {
+            // Joined, not detached: a detached beat could re-create the marker this drop removes,
+            // which would leave a finished dispatch still claiming a live owner.
+            let _ = thread.join();
+        }
+        let _ = fs::remove_file(&self.marker);
+    }
+}
+
 pub(super) fn queued_request_path_with_extension(
     in_dir: &Path,
     verb: &str,
@@ -857,6 +991,13 @@ pub(super) fn requeue_claim(in_dir: &Path, verb: &str, task: &str) -> bool {
     let Some((claim, extension)) = existing_inflight_claim(in_dir, verb, task) else {
         return false;
     };
+    let spool_dir = in_dir
+        .parent()
+        .map(|parent| parent.to_path_buf())
+        .unwrap_or_else(|| in_dir.to_path_buf());
+    // This claim is being handed to another daemon, so the beats stop here: the successor's own
+    // marker is the only liveness evidence for the work from now on.
+    let _ = fs::remove_file(claim_heartbeat_path(&spool_dir, verb, task));
     if any_queued_request_exists(in_dir, verb, task) {
         let _ = fs::remove_file(&claim);
         return true;
@@ -1284,6 +1425,13 @@ pub fn sweep_orphaned_claims_across_roots(roots: &[PathBuf]) {
 
 pub(super) const MIN_ORPHAN_CLAIM_AGE_MS: u64 = 60_000;
 
+/// An absolute ceiling on how long a dispatch-wait ledger row may keep a claim alive. The row is
+/// written by whichever daemon refreshed the ledger last, so it can name a daemon that never owned
+/// the claim; past this age the row is no better evidence than the claim file itself, and the sweep
+/// must be allowed to answer the caller. A claim whose owner beats its own marker is not held to
+/// this: that marker is the owner's own statement, refreshed for as long as it runs.
+pub(super) const ORPHAN_CLAIM_MAX_AGE_MS: u64 = 120_000;
+
 pub(super) fn claim_age_ms(path: &Path) -> Option<u64> {
     let modified = fs::metadata(path).ok()?.modified().ok()?;
     Some(modified.elapsed().ok()?.as_millis() as u64)
@@ -1346,14 +1494,37 @@ pub(super) fn sweep_orphaned_claims_distinguishing_handoff_from_crash(
             {
                 continue;
             }
-            if let Some(owner_pid) = live_dispatch_wait_owner(&spool_dir, &verb, &task) {
-                eprintln!(
-                    "[agentplug daemon] leaving claim {verb}/{task} for {} alone -- the dispatch-wait ledger names it in flight under live daemon pid {owner_pid}, so it is owned work, not orphaned work",
-                    root.display()
-                );
-                continue;
+            if let Some((heartbeat_pid, heartbeat_age_ms)) =
+                claim_heartbeat(&spool_dir, &verb, &task)
+            {
+                if heartbeat_age_ms
+                    < env_ms_or("AGENTPLUG_CLAIM_HEARTBEAT_STALE_MS", CLAIM_HEARTBEAT_STALE_MS)
+                {
+                    eprintln!(
+                        "[agentplug daemon] leaving claim {verb}/{task} for {} alone -- its owner renewed it {heartbeat_age_ms}ms ago under pid {heartbeat_pid}, so the dispatch that claimed it is still running however long it takes",
+                        root.display()
+                    );
+                    continue;
+                }
             }
             let claim_age = claim_age_ms(&path);
+            let past_absolute_ceiling = claim_age
+                .map(|age| {
+                    age >= env_ms_or(
+                        "AGENTPLUG_ORPHAN_CLAIM_MAX_AGE_MS",
+                        ORPHAN_CLAIM_MAX_AGE_MS,
+                    )
+                })
+                .unwrap_or(false);
+            if !past_absolute_ceiling {
+                if let Some(owner_pid) = live_dispatch_wait_owner(&spool_dir, &verb, &task) {
+                    eprintln!(
+                        "[agentplug daemon] leaving claim {verb}/{task} for {} alone -- the dispatch-wait ledger names it in flight under live daemon pid {owner_pid}, so it is owned work, not orphaned work",
+                        root.display()
+                    );
+                    continue;
+                }
+            }
             if claim_age
                 .map(|age| {
                     age < env_ms_or(
@@ -1373,7 +1544,7 @@ pub(super) fn sweep_orphaned_claims_distinguishing_handoff_from_crash(
                         "[agentplug daemon] settled elapsed claim {verb}/{task} for {} -- {settled_note}",
                         root.display()
                     );
-                    let _ = fs::remove_file(&path);
+                    remove_claim_file(&spool_dir, &verb, &task, &path);
                 } else {
                     eprintln!("[agentplug daemon] could not confirm the settled out-file for {verb}/{task} -- leaving the claim for the next sweep rather than deleting it unanswered");
                 }
@@ -1387,8 +1558,10 @@ pub(super) fn sweep_orphaned_claims_distinguishing_handoff_from_crash(
                     "ok": false,
                     "error_code": "dispatch_orphaned",
                     "reaped": true,
-                    "reason": "claim file with no live dispatch in this daemon (the claiming daemon exited or was handed off) -- reaped by the periodic orphan sweep so it cannot hold the project busy",
+                    "reason": "claim file with no live dispatch renewing it -- a dispatch that is still running renews its claim every 15s, so no owner was renewing this one; reaped by the periodic orphan sweep so it cannot hold the project busy",
                     "claim_age_ms": claim_age,
+                    "claim_heartbeat_age_ms": claim_heartbeat(&spool_dir, &verb, &task)
+                        .map(|(_, age)| age),
                     "error": format!("verb {verb} (task {task}) was claimed by a daemon that stopped answering -- a wasm trap, an out-of-memory abort, or a shared-Store recycle during the call. A version handoff is NOT a cause of this error: a handoff re-queues its claims for the incoming daemon, which completes them. The outcome is UNVERIFIED, not known to be unperformed: a side-effecting verb (git_commit/git_finalize/git_push/fs_write/memorize-fire) may already have applied some or all of its work, so read the real state (git log, git status, the file, the store) before re-dispatching. Re-dispatch straight away only for a read-only verb."),
                     "verb": verb,
                     "task": task,
@@ -1399,7 +1572,7 @@ pub(super) fn sweep_orphaned_claims_distinguishing_handoff_from_crash(
                 confirmed
             };
             if out_confirmed {
-                let _ = fs::remove_file(&path);
+                remove_claim_file(&spool_dir, &verb, &task, &path);
             } else {
                 eprintln!("[agentplug daemon] could not confirm the dispatch_orphaned out-file for {verb}/{task} -- leaving the claim for the next sweep rather than deleting it unanswered");
             }
@@ -2177,6 +2350,11 @@ pub(crate) fn run_gm_dispatch_to_file(
     let lane = dispatch_serial_lane(tool_verb, body);
     let lane_wait_budget = lane_wait_max(tool_verb, caller_lane_wait_ms);
     let in_dir = root.join(".gm").join("exec-spool").join("in");
+    // Renew this dispatch's claim for as long as it runs: a wait {"ms":120000} was answered
+    // dispatch_orphaned at 64s because an untouched claim reads exactly like an abandoned one, so a
+    // bounded wait could be reaped inside its own budget by a sweep that could not see the owner.
+    // The guard covers the lane wait too, not only the execution.
+    let _claim_heartbeat = ClaimHeartbeat::start(&in_dir, verb, task);
     note_dispatch_stage(root, verb, task, DispatchStage::WaitingForLane, lane);
     let _fairness_guard = match GmFairnessGuard::acquire_within(
         root,
