@@ -2014,6 +2014,7 @@ pub(super) fn admission_starved_answer(
         "admission_limit": limit,
         "plugin_slots": slots,
         "admission_holders": holders,
+        "admission_hold_max_ms": agentplug_host::registry::admission_hold_max_ms(),
         "waited_ms": waited_ms,
         "daemon_pid": std::process::id(),
         "request_path": request_path.to_string_lossy(),
@@ -2622,7 +2623,7 @@ fn without_wait_volatile_fields(value: &serde_json::Value) -> serde_json::Value 
             }
         }
     }
-    for list in ["lane_holds", "lane_hold_released"] {
+    for list in ["lane_holds", "lane_hold_released", "admission_holds"] {
         for hold in map
             .get_mut(list)
             .and_then(serde_json::Value::as_array_mut)
@@ -2877,6 +2878,22 @@ pub(super) fn refresh_dispatch_wait_ledger(root: &Path) {
             })
             .collect::<Vec<serde_json::Value>>(),
         "lane_holds": lane_hold_rows,
+        // The band that actually refuses a dispatch is not a lane, and a caller reading only
+        // `lane_holds` sees an empty list while every verb in every project waits: the hold that
+        // blocks the daemon lives here, and it is listed here now, with the bound that ends it.
+        "admission_hold_max_ms": agentplug_host::registry::admission_hold_max_ms(),
+        "admission_holds": agentplug_host::registry::admission_holds()
+            .iter()
+            .map(|hold| {
+                serde_json::json!({
+                    "plugin": hold.plugin,
+                    "verb": hold.verb,
+                    "held_ms": hold.held_ms,
+                    "kind": hold.kind,
+                    "over_bound": hold.held_ms >= agentplug_host::registry::admission_hold_max_ms(),
+                })
+            })
+            .collect::<Vec<serde_json::Value>>(),
         "requests": rows,
     })
     .to_string();
