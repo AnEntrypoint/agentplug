@@ -228,6 +228,7 @@ fn main() -> anyhow::Result<()> {
         "selfcheck-idle-evict" => selfcheck_idle_evict(),
         "selfcheck-pool-fairness" => selfcheck_pool_fairness(),
         "selfcheck-git-admission" => selfcheck_git_admission(),
+        "selfcheck-admission-hold-reclaim" => selfcheck_admission_hold_reclaim(),
         "selfcheck-lane-release" => selfcheck_lane_release(),
         "selfcheck-lane-fifo" => selfcheck_lane_fifo(),
         "selfcheck-lane-budget" => selfcheck_lane_budget(),
@@ -467,6 +468,139 @@ fn selfcheck_pool_fairness() -> anyhow::Result<()> {
     let _ = extra_heavy.join();
     println!("[selfcheck-pool-fairness] witnessed live against the real SharedPluginPool: PASS");
     Ok(())
+}
+
+fn selfcheck_admission_hold_reclaim() -> anyhow::Result<()> {
+    use agentplug_host::registry::admission_holds;
+    use agentplug_host::{DispatchCostClass, SharedPluginPool};
+    use std::sync::{mpsc, Arc};
+    use std::time::{Duration, Instant};
+
+    const NAME: &str = "selfcheck-admission-hold-reclaim";
+    // The pool size the daemon actually runs (`POOL_SIZE` in main): 4 slots, general band 3. That is
+    // the size the measured stall happened at, and the size at which the git band subtracted to
+    // zero.
+    const POOL_SLOTS: usize = 4;
+    // Lowered so the selfcheck does not park for a minute: the reclaim is what is under test, not
+    // the constant.
+    std::env::set_var("AGENTPLUG_ADMISSION_HOLD_MAX_MS", "300");
+    let pool = Arc::new(SharedPluginPool::new("gm", POOL_SLOTS));
+    let general_limit = POOL_SLOTS - (POOL_SLOTS / 4).max(1);
+    let mut parked = Vec::new();
+    for _ in 0..general_limit {
+        let (ready_tx, ready_rx) = mpsc::channel::<bool>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let held = pool.clone();
+        let handle = std::thread::spawn(move || {
+            let Ok(admission) =
+                SharedPluginPool::admit_within(&held, DispatchCostClass::Cheap, Duration::from_secs(5))
+            else {
+                let _ = ready_tx.send(false);
+                return;
+            };
+            let (slot, _) = held.acquire_within_for_class(
+                SharedPluginPool::ACQUIRE_TIMEOUT_MS,
+                DispatchCostClass::Cheap,
+            );
+            let _ = ready_tx.send(true);
+            let _ = release_rx.recv();
+            drop(slot);
+            drop(admission);
+        });
+        parked.push((ready_rx, release_tx, handle));
+    }
+    let outcome = (|| -> Result<String, String> {
+        let mut all_parked = true;
+        for (ready_rx, _, _) in &parked {
+            all_parked &= ready_rx.recv_timeout(Duration::from_secs(10)).unwrap_or(false);
+        }
+        if !all_parked {
+            return Err(format!(
+                "only part of the {general_limit} general cheap dispatches could be parked"
+            ));
+        }
+        // Inside the hold bound the band still bounds concurrency: a fourth cheap dispatch is held
+        // out. Releasing this is not the fix -- the fix is that the refusal has an end.
+        if SharedPluginPool::admit_within(&pool, DispatchCostClass::Cheap, Duration::from_millis(300))
+            .is_ok()
+        {
+            return Err(format!(
+                "the general band admitted a {}th cheap dispatch while every holder was still inside the hold bound",
+                general_limit + 1
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(400));
+        // Same shape as the real dispatch path: the waiter takes a physical slot first, then asks
+        // for admission while holding it.
+        let (_slot, _) = pool.acquire_within_for_class(
+            SharedPluginPool::ACQUIRE_TIMEOUT_MS,
+            DispatchCostClass::Cheap,
+        );
+        let started = Instant::now();
+        let reclaimed = SharedPluginPool::admit_within(
+            &pool,
+            DispatchCostClass::Cheap,
+            Duration::from_secs(2),
+        )
+        .map_err(|report| {
+            format!(
+                "a cheap dispatch still starved at admission after the hold bound passed: waited_ms={} limit={} in_flight={} holders={}",
+                report.waited_ms, report.limit, report.in_flight, report.holders
+            )
+        })?;
+        let reclaim_ms = started.elapsed().as_millis();
+        if reclaim_ms >= 1_000 {
+            return Err(format!(
+                "the reclaimed admission took {reclaim_ms}ms -- it waited out its patience budget instead of taking the over-age counter back"
+            ));
+        }
+        // The git band exists at the pool size the daemon runs. At 4 slots its limit subtracted to
+        // zero, so a git dispatch that lost the general race had no way in at all.
+        let git = SharedPluginPool::admit_within_lane(
+            &pool,
+            DispatchCostClass::Cheap,
+            Some("git"),
+            Duration::from_millis(500),
+        )
+        .map_err(|report| {
+            format!(
+                "a git-lane dispatch was refused admission at the production pool size: waited_ms={} limit={} in_flight={} holders={}",
+                report.waited_ms, report.limit, report.in_flight, report.holders
+            )
+        })?;
+        let kinds = admission_holds()
+            .iter()
+            .map(|hold| hold.kind.to_string())
+            .collect::<Vec<_>>();
+        // The band is visible now: a lane hold was always listed in the wait ledger, and the hold
+        // that actually refused the dispatch was named only inside a reply two minutes late.
+        if !kinds.iter().any(|kind| kind == "general") {
+            return Err(format!(
+                "admission_holds() listed no general-band hold ({}) -- the stall would still be a phantom",
+                kinds.join(", ")
+            ));
+        }
+        drop(git);
+        drop(reclaimed);
+        drop(_slot);
+        Ok(format!(
+            "at the production pool size ({POOL_SLOTS} slots, general band {general_limit}) a cheap dispatch was admitted in {reclaim_ms}ms by taking back an over-age counter from {general_limit} parked holders; the git band admitted a git-lane dispatch; holds are listed as {}",
+            kinds.join(", ")
+        ))
+    })();
+    for (_, release_tx, handle) in parked {
+        let _ = release_tx.send(());
+        let _ = handle.join();
+    }
+    match outcome {
+        Ok(detail) => {
+            println!("[{NAME}] {detail}");
+            println!("[{NAME}] witnessed live against the real SharedPluginPool: PASS");
+            println!("RESULT: PASS");
+            Ok(())
+        }
+        Err(reason) => selfcheck_fail(NAME, &reason),
+    }
 }
 
 fn selfcheck_fail(name: &str, reason: &str) -> anyhow::Result<()> {

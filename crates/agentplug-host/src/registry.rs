@@ -623,6 +623,85 @@ pub fn admission_wait_max_for(class: DispatchCostClass) -> Duration {
     ))
 }
 
+/// How long a dispatch keeps the admission counter it took before a waiter that cannot get in
+/// reclaims it.
+///
+/// An admission hold is a lease on one of the band's counters, not a grant for the life of the
+/// dispatch, and the measured failure is a lease nobody could end: at the daemon's pool size the
+/// general band admits three, and a `git_push` blocked on a remote (measured 1417734ms) plus a
+/// `git_finalize` (measured 1164435ms) sat in it for over twenty minutes while a physical slot
+/// stood idle. Every other dispatch in every project -- `codesearch`, `git_status`, `fs_write`, in
+/// `C:\dev\spoint`, `C:\dev\gm` and `C:\dev\freddie` alike -- then waited out its own patience
+/// budget (120s cheap, 180s heavy) and was answered starved. Measured 2026-10-12 in
+/// `~/.agentplug/daemon.log.prev`: 20 admission starvations, every one of them reporting exactly
+/// three holders.
+///
+/// A minute is longer than any dispatch this band exists to protect -- the band reserves capacity
+/// so a responsive verb is not queued behind a long one, and a dispatch that has held a counter
+/// for a minute is the long one -- and it is under both patience budgets, so the counter is
+/// reclaimed while the waiter is still waiting instead of after it has given up. Reclaiming gives
+/// a counter back; it does not stop the holder, and it cannot raise concurrency past the physical
+/// pool, because running still needs a slot and the reclaim only fires while one is free.
+pub const ADMISSION_HOLD_MAX_MS_DEFAULT: u64 = 60_000;
+
+/// The bound is read once per call so the selfcheck can witness a reclaim without a minute of
+/// parking: an unset or unparseable value leaves the default in force. No shipped path sets it.
+pub fn admission_hold_max_ms() -> u64 {
+    env_u64_or("AGENTPLUG_ADMISSION_HOLD_MAX_MS", ADMISSION_HOLD_MAX_MS_DEFAULT)
+}
+
+/// One admission counter a dispatch currently holds.
+pub struct AdmissionHold {
+    pub plugin: String,
+    pub verb: String,
+    pub held_ms: u64,
+    pub kind: &'static str,
+}
+
+/// An admission counter handed back early, with the holder that lost it.
+pub struct ReleasedAdmissionHold {
+    pub plugin: String,
+    pub verb: String,
+    pub held_ms: u64,
+}
+
+fn holder_kind_label(kind: HolderKind) -> &'static str {
+    match kind {
+        HolderKind::General { heavy: true } => "general-heavy",
+        HolderKind::General { heavy: false } => "general",
+        HolderKind::GitBand => "git-band",
+        HolderKind::Blocking => "blocking",
+    }
+}
+
+/// Every admission counter held anywhere in this process, with its age.
+///
+/// This is what made the starvation a phantom: a lane hold is reported in `.dispatch-wait.json`
+/// under `lane_holds`, so a caller could see who held the git lane and how long, while the band
+/// that was actually refusing the dispatch named its holders only inside the error string of a
+/// reply that arrived two minutes later. Listing it next to `lane_holds` is what lets the next
+/// measurement read the stall off the ledger instead of off a log.
+pub fn admission_holds() -> Vec<AdmissionHold> {
+    let pools: Vec<Arc<SharedPluginPool>> = {
+        let mut known = live_pools().lock().unwrap_or_else(|e| e.into_inner());
+        known.retain(|weak| weak.upgrade().is_some());
+        known.iter().filter_map(|weak| weak.upgrade()).collect()
+    };
+    let mut holds = Vec::new();
+    for pool in pools {
+        let q = pool.ticket_queue.lock().unwrap_or_else(|e| e.into_inner());
+        for holder in &q.holders {
+            holds.push(AdmissionHold {
+                plugin: pool.plugin_name.clone(),
+                verb: holder.verb.clone(),
+                held_ms: holder.since.elapsed().as_millis() as u64,
+                kind: holder_kind_label(holder.kind),
+            });
+        }
+    }
+    holds
+}
+
 #[derive(Debug)]
 pub struct AdmissionWaitReport {
     pub kind: &'static str,
@@ -754,7 +833,59 @@ impl SharedPluginPool {
     }
 
     fn git_band_admission_limit(&self) -> usize {
-        self.short_reserved_slots().saturating_sub(1)
+        // `.max(1)`: `short_reserved_slots()` is 1 at the pool size the daemon actually runs
+        // (POOL_SIZE 4), so `1 - 1` admitted nobody and the band the git lane is meant to fall back
+        // on did not exist in production -- a git dispatch that lost the general race had no escape
+        // at all, and the selfcheck that covers this band runs at 8 slots where the subtraction
+        // happens to leave 1. One slot is also the right size: git verbs are the long ones, so their
+        // band is meant to hold hung git work away from the general band, never to run git in bulk.
+        self.short_reserved_slots().saturating_sub(1).max(1)
+    }
+
+    /// Gives back the admission counter of the oldest general-band holder past `min_held_ms`.
+    ///
+    /// The holder keeps running -- this returns a counter, it does not cancel work -- and its own
+    /// guard's `Drop` then finds no holder under that id, so the counter is handed back exactly
+    /// once.
+    ///
+    /// Only a general-band counter is reclaimed. That is the band a blocked `codesearch`,
+    /// `git_status` or `fs_write` is waiting on; reclaiming a git-band or blocking counter would
+    /// not let it in.
+    ///
+    /// It reclaims only while the counters out there are fewer than the physical slots, so the
+    /// band can spend the slot it reserves for short verbs but can never admit more work than the
+    /// pool can actually run. Counting free slots instead would be wrong: the waiter is holding a
+    /// slot of its own while it waits for admission (`SlotHeldAdmissionWait`), so a slot probe from
+    /// inside the gate reads zero every time and the reclaim would never fire.
+    pub fn release_over_age_admission_hold(
+        &self,
+        min_held_ms: u64,
+    ) -> Option<ReleasedAdmissionHold> {
+        let mut q = self.ticket_queue.lock().unwrap_or_else(|e| e.into_inner());
+        if q.non_short_inflight + q.git_band_inflight + q.blocking_inflight >= self.slots.len() {
+            return None;
+        }
+        let (held_ms, verb, id) = {
+            let oldest = q
+                .holders
+                .iter()
+                .filter(|holder| matches!(holder.kind, HolderKind::General { .. }))
+                .min_by_key(|holder| holder.since)?;
+            (
+                oldest.since.elapsed().as_millis() as u64,
+                oldest.verb.clone(),
+                oldest.id,
+            )
+        };
+        if held_ms < min_held_ms {
+            return None;
+        }
+        q.release_holder(id);
+        Some(ReleasedAdmissionHold {
+            plugin: self.plugin_name.clone(),
+            verb,
+            held_ms,
+        })
     }
 
     pub fn admit_blocking(pool: &Arc<SharedPluginPool>, verb: &str) -> BlockingDispatchAdmission {
@@ -919,6 +1050,21 @@ impl SharedPluginPool {
                 });
             }
             mark_admission_wait(kind, limit, in_flight);
+            // A full band of counters is not a busy pool: one counter is a lease, and past the
+            // bound it is a lease nobody can end while a physical slot stands idle behind it. The
+            // waiter takes the oldest over-age counter back instead of waiting out its own patience
+            // budget behind a holder that was measured at over twenty minutes -- and takes it only
+            // while a slot is free, so reclaiming never admits more work than the pool can run.
+            if let Some(released) = pool.release_over_age_admission_hold(admission_hold_max_ms()) {
+                eprintln!(
+                    "[admission-hold] {} {kind} band: reclaimed the counter {} held for {}ms -- past the {}ms admission hold bound with a slot still free, so it stops counting against the band while its dispatch keeps running",
+                    pool.plugin_name,
+                    released.verb,
+                    released.held_ms,
+                    admission_hold_max_ms(),
+                );
+                continue;
+            }
             if waited_ms > Self::ACQUIRE_TIMEOUT_MS
                 && waited_ms.saturating_sub(logged_at_ms) >= 5_000
             {
