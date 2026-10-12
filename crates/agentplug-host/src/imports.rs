@@ -35,6 +35,186 @@ fn fetch_agent(timeout: Duration) -> ureq::Agent {
 
 const GIT_SUBPROCESS_TIMEOUT_MS_DEFAULT_AMPLE_FOR_SLOW_PUSH_FETCH_OR_FIRST_CLONE: u64 = 300_000;
 
+// gm asks the same repo-layout question -- `rev-parse --show-toplevel` above all -- once per
+// project per daemon tick and once per MCP call, and every question is a process spawn. The
+// answer is a pure function of the on-disk gitdir layout, so it is answered once per
+// (directory, question) and asked again only after a git command that can move that layout
+// runs in a directory sharing a path prefix with the cached one. Nothing that gates a write
+// is in the flag list: `status --porcelain`, `hash-object` and gating `ls-files` still reach
+// git every single time, and each of them drops the answers it can invalidate.
+const GIT_LAYOUT_QUESTION_FLAGS: &[&str] = &[
+    "--show-toplevel",
+    "--show-prefix",
+    "--show-cdup",
+    "--git-dir",
+    "--absolute-git-dir",
+    "--is-inside-work-tree",
+    "--is-inside-git-dir",
+];
+
+const GIT_LAYOUT_CACHE_MAX_ENTRIES: usize = 512;
+
+#[derive(Clone)]
+struct GitLayoutAnswer {
+    stdout: String,
+    stderr: String,
+    exit_code: i32,
+}
+
+fn git_layout_cache() -> &'static Mutex<HashMap<String, (String, GitLayoutAnswer)>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, (String, GitLayoutAnswer)>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn git_layout_dir_key(dir: &Path) -> String {
+    dir.to_string_lossy().replace('\\', "/").trim_end_matches('/').to_lowercase()
+}
+
+fn git_layout_dirs_overlap(a: &str, b: &str) -> bool {
+    a == b || a.starts_with(&format!("{b}/")) || b.starts_with(&format!("{a}/"))
+}
+
+fn git_layout_question(cwd: &Path, argv: &[String]) -> Option<(PathBuf, String)> {
+    let mut dir = cwd.to_path_buf();
+    let mut rest: Vec<&str> = Vec::with_capacity(argv.len());
+    let mut i = 0usize;
+    while i < argv.len() {
+        match argv[i].as_str() {
+            "-c" => i += 2,
+            "-C" => {
+                let value = argv.get(i + 1)?;
+                let given = PathBuf::from(value);
+                dir = if given.is_absolute() { given } else { dir.join(given) };
+                i += 2;
+            }
+            other => {
+                rest.push(other);
+                i += 1;
+            }
+        }
+    }
+    if rest.len() != 2 || rest[0] != "rev-parse" || !GIT_LAYOUT_QUESTION_FLAGS.contains(&rest[1]) {
+        return None;
+    }
+    Some((dir, format!("rev-parse {}", rest[1])))
+}
+
+fn git_layout_recall(dir: &Path, question: &str) -> Option<GitLayoutAnswer> {
+    let key = format!("{}\u{0}{}", git_layout_dir_key(dir), question);
+    let cache = match git_layout_cache().lock() {
+        Ok(cache) => cache,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    cache.get(&key).map(|(_, answer)| answer.clone())
+}
+
+fn git_layout_remember(dir: PathBuf, question: &str, answer: GitLayoutAnswer) {
+    let dir_key = git_layout_dir_key(&dir);
+    let key = format!("{dir_key}\u{0}{question}");
+    let mut cache = match git_layout_cache().lock() {
+        Ok(cache) => cache,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if cache.len() >= GIT_LAYOUT_CACHE_MAX_ENTRIES && !cache.contains_key(&key) {
+        cache.clear();
+    }
+    cache.insert(key, (dir_key, answer));
+}
+
+fn git_layout_forget_dir(dir: &Path) {
+    let key = git_layout_dir_key(dir);
+    let mut cache = match git_layout_cache().lock() {
+        Ok(cache) => cache,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    cache.retain(|_, (dir_key, _)| !git_layout_dirs_overlap(dir_key, &key));
+}
+
+// Every git question gm asks, and how many of them actually reached a git process, printed
+// once a minute. A thrashing box shows up here as one argv asked hundreds of times per minute;
+// the reached count beside it is what the layout memo is buying.
+const GIT_CALL_STATS_FLUSH_INTERVAL: Duration = Duration::from_secs(60);
+
+const GIT_CALL_STATS_MAX_KEYS: usize = 256;
+
+fn git_call_stats_counts(reached: bool) -> &'static Mutex<HashMap<String, usize>> {
+    static ASKED: OnceLock<Mutex<HashMap<String, usize>>> = OnceLock::new();
+    static REACHED: OnceLock<Mutex<HashMap<String, usize>>> = OnceLock::new();
+    if reached {
+        REACHED.get_or_init(|| Mutex::new(HashMap::new()))
+    } else {
+        ASKED.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+}
+
+fn git_call_stats_last_flush() -> &'static Mutex<Instant> {
+    static LAST_FLUSH: OnceLock<Mutex<Instant>> = OnceLock::new();
+    LAST_FLUSH.get_or_init(|| Mutex::new(Instant::now()))
+}
+
+fn git_call_stats_key(argv: &[String]) -> String {
+    let mut key = String::new();
+    let mut i = 0usize;
+    while i < argv.len() && key.len() < 160 {
+        if argv[i] == "-c" {
+            i += 2;
+            continue;
+        }
+        key.push_str(&argv[i]);
+        key.push(' ');
+        i += 1;
+    }
+    if i < argv.len() {
+        key.push_str("...");
+    }
+    key
+}
+
+fn git_call_stats_note(argv: &[String], reached: bool) {
+    let key = git_call_stats_key(argv);
+    {
+        let mut counts = match git_call_stats_counts(reached).lock() {
+            Ok(counts) => counts,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if counts.len() < GIT_CALL_STATS_MAX_KEYS || counts.contains_key(&key) {
+            *counts.entry(key).or_insert(0) += 1;
+        }
+    }
+    let mut last_flush = match git_call_stats_last_flush().lock() {
+        Ok(last) => last,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if last_flush.elapsed() < GIT_CALL_STATS_FLUSH_INTERVAL {
+        return;
+    }
+    *last_flush = Instant::now();
+    let asked = match git_call_stats_counts(false).lock() {
+        Ok(counts) => counts.clone(),
+        Err(poisoned) => poisoned.into_inner().clone(),
+    };
+    let mut reached_counts = match git_call_stats_counts(true).lock() {
+        Ok(counts) => counts,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if asked.is_empty() && reached_counts.is_empty() {
+        return;
+    }
+    let asked_total: usize = asked.values().sum();
+    let reached_total: usize = reached_counts.values().sum();
+    eprintln!(
+        "[agentplug host] git calls: {asked_total} asked, {reached_total} reached a git process, {} answered from the layout memo",
+        asked_total.saturating_sub(reached_total)
+    );
+    let mut ranked: Vec<(String, usize)> = asked.into_iter().collect();
+    ranked.sort_by(|a, b| b.1.cmp(&a.1));
+    for (key, count) in ranked.into_iter().take(8) {
+        let reached = reached_counts.remove(&key).unwrap_or(0);
+        eprintln!("[agentplug host]   asked {count:>5} reached {reached:>5} : git {key}");
+    }
+    reached_counts.clear();
+}
+
 #[derive(serde::Deserialize)]
 struct CapabilityAllowlistConfig {
     #[serde(flatten)]
@@ -1211,6 +1391,20 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
                 });
                 return write_guest_json(&mut caller, v);
                 }
+                    git_call_stats_note(&argv, false);
+                    let layout_question = git_layout_question(&cwd, &argv);
+                    if let Some((dir, question)) = layout_question.as_ref() {
+                        if let Some(answer) = git_layout_recall(dir, question) {
+                            return write_guest_json(&mut caller, serde_json::json!({
+                                "stdout": answer.stdout,
+                                "stderr": answer.stderr,
+                                "exit_code": answer.exit_code,
+                                "stdout_truncated": false,
+                                "stderr_truncated": false,
+                            }));
+                        }
+                    }
+                    git_call_stats_note(&argv, true);
                     let mut git_cmd = std::process::Command::new("git");
                     git_cmd.args(&argv).current_dir(&cwd).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
                     configure_github_git_credentials(&mut git_cmd, &argv);
@@ -1273,6 +1467,23 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
                         let stderr = String::from_utf8_lossy(&stderr);
                         let output_limit_error =
                             format!("git {argv:?} output exceeded the host capture limit");
+                        if let Some((dir, question)) = layout_question.as_ref() {
+                            if timed_out || output_truncated || exit_code != 0 {
+                                git_layout_forget_dir(dir);
+                            } else {
+                                git_layout_remember(
+                                    dir.clone(),
+                                    question,
+                                    GitLayoutAnswer {
+                                        stdout: String::from_utf8_lossy(&stdout).into_owned(),
+                                        stderr: stderr.to_string(),
+                                        exit_code,
+                                    },
+                                );
+                            }
+                        } else {
+                            git_layout_forget_dir(&cwd);
+                        }
                         if timed_out {
                             serde_json::json!({
                                 "stdout": String::from_utf8_lossy(&stdout),
