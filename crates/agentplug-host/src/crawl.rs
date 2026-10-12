@@ -109,7 +109,7 @@ pub(crate) fn reap_stale_crawl_browsers(profile: &Path) {
         }
     } else {
         let mut cmd = Command::new("pkill");
-        cmd.args(["-f", &format!("--user-data-dir={marker}")]);
+        cmd.args(["-f", &format!("user-data-dir={marker}")]);
         let _ = cmd.status();
     }
 }
