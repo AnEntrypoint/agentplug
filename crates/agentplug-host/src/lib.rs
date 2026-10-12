@@ -38,8 +38,8 @@ pub use github_auth::{github_cli_token, invalidate_github_cli_token};
 pub use host_state::HostState;
 pub use http_agent::{build_agent, download_agent, shared_agent};
 pub use imports::{
-    git_subprocess_timeout_ms, github_cli_config_dir, register_env_imports, register_wasi,
-    set_github_cli_config_dir,
+    git_call_stats_note, git_subprocess_timeout_ms, github_cli_config_dir, register_env_imports,
+    register_wasi, set_github_cli_config_dir,
 };
 pub use install::{install_dir, plugins_dir, precompiled_dir};
 pub use memory_pressure::{
