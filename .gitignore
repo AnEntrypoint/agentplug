@@ -1,6 +1,4 @@
 /target
-Cargo.lock
 .gm/
 node_modules
-.agentplug-kv/codeinsight-manifest/
-.agentplug-kv/codeinsight/
+.agentplug-kv/

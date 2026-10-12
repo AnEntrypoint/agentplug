@@ -3,6 +3,14 @@ name: release
 on:
   push:
     branches: [main]
+    paths:
+      - 'crates/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/release.yml'
+
+permissions:
+  contents: read
 
 concurrency:
   group: agentplug-release
@@ -13,11 +21,12 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.bump.outputs.version }}
+      commit: ${{ steps.bump.outputs.commit }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
         with:
-          token: ${{ secrets.PUBLISHER_TOKEN }}
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Auto-bump patch version BEFORE build
         id: bump
@@ -25,16 +34,18 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.PUBLISHER_TOKEN }}
         run: |
-          set -e
-          git config user.name "agentplug-bot"
-          git config user.email "noreply@github.com"
+          set -euo pipefail
+          git config user.name "lanmower"
+          git config user.email "lanmower@users.noreply.github.com"
           git config url."https://${GH_TOKEN}:x-oauth-basic@github.com/".insteadOf "https://github.com/"
           CURRENT=$(grep '^version' Cargo.toml | head -1 | sed 's/.*= *"//;s/"//')
           IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT"
-          NEW_PATCH=$((PATCH + 1))
-          NEW_VERSION="$MAJOR.$MINOR.$NEW_PATCH"
-          sed -i "0,/^version = \".*\"/{s/^version = \".*\"/version = \"$NEW_VERSION\"/}" Cargo.toml
-          git add Cargo.toml
+              NEW_PATCH=$((PATCH + 1))
+              NEW_VERSION="$MAJOR.$MINOR.$NEW_PATCH"
+              sed -i "0,/^version = \".*\"/{s/^version = \".*\"/version = \"$NEW_VERSION\"/}" Cargo.toml
+                  cargo generate-lockfile
+              cargo metadata --locked --offline --format-version=1 --no-deps >/dev/null
+              git add Cargo.toml Cargo.lock
           if git diff --cached --quiet; then
             echo "version=$CURRENT" >> "$GITHUB_OUTPUT"
           else
@@ -42,6 +53,7 @@ jobs:
             git push origin HEAD:main
             echo "version=$NEW_VERSION" >> "$GITHUB_OUTPUT"
           fi
+          echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
   build:
     needs: bump
@@ -52,11 +64,6 @@ jobs:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             asset: agentplug-runner-linux-x64
-          # macos-13 (Intel-hosted) GitHub runners are capacity-constrained
-          # to the point of queuing indefinitely (confirmed live: 26+ minutes
-          # queued, never started). Cross-compiling x86_64 from the arm64
-          # macos-14 runner is the standard, reliable alternative -- Xcode's
-          # linker and SDK on Apple Silicon already support both slices.
           - os: macos-14
             target: x86_64-apple-darwin
             asset: agentplug-runner-macos-x64
@@ -71,17 +78,48 @@ jobs:
             asset: agentplug-runner-windows-arm64.exe
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
         with:
-          ref: main
+          ref: ${{ needs.bump.outputs.commit }}
+          persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Add target (the runner image already ships rustup and stable)
+        shell: bash
+        run: rustup target add ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@63fed3e2fecf6f7b51dc6f043341b79ef82a9ae7
         with:
-          targets: ${{ matrix.target }}
+          key: ${{ matrix.target }}
 
       - name: Build
         shell: bash
+        env:
+          AGENTPLUG_RELEASE_BUILD: "1"
         run: cargo build -p agentplug-runner --bin agentplug-runner --release --target ${{ matrix.target }}
+
+      - name: Lane selfchecks against the freshly built runner
+        # aarch64-pc-windows-msvc is cross-compiled on an x64 host, so its binary cannot run there.
+        if: ${{ matrix.target != 'aarch64-pc-windows-msvc' }}
+        shell: bash
+        run: |
+          set -e
+          bin="target/${{ matrix.target }}/release/agentplug-runner"
+          if [[ "${{ matrix.asset }}" == *.exe ]]; then bin="$bin.exe"; fi
+          for check in selfcheck-git-admission selfcheck-admission-hold-reclaim selfcheck-lane-release selfcheck-lane-fifo selfcheck-lane-budget selfcheck-lane-hold-release selfcheck-lane-network-yield selfcheck-browser-lease; do
+            set +e
+            out=$("$bin" "$check" 2>&1)
+            code=$?
+            set -e
+            printf '%s\n' "$out" | sed "s/^/[$check] /"
+            if [ "$code" -ne 0 ]; then
+              echo "::error::$check exited $code"
+              exit 1
+            fi
+            if ! printf '%s\n' "$out" | grep -q "RESULT: PASS"; then
+              echo "::error::$check did not print RESULT: PASS"
+              exit 1
+            fi
+          done
 
       - name: Stage asset with checksum
         shell: bash
@@ -98,47 +136,52 @@ jobs:
             shasum -a 256 "${{ matrix.asset }}" | sed 's/ \*/  /' > "${{ matrix.asset }}.sha256"
           fi
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: ${{ matrix.asset }}
           path: release-assets/*
           retention-days: 1
 
-  publish-host-linux-arm64:
+  build-host-linux-arm64:
     needs: bump
     runs-on: ubuntu-24.04-arm
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
         with:
-          ref: main
-      - uses: dtolnay/rust-toolchain@stable
+          ref: ${{ needs.bump.outputs.commit }}
+          persist-credentials: false
+
+      - name: Add target (the runner image already ships rustup and stable)
+        run: rustup target add aarch64-unknown-linux-gnu
+
+      - uses: Swatinem/rust-cache@63fed3e2fecf6f7b51dc6f043341b79ef82a9ae7
         with:
-          targets: aarch64-unknown-linux-gnu
+          key: host-linux-arm64
+
       - name: Build host runner
-        run: cargo build -p agentplug-runner --bin agentplug-runner --release --target aarch64-unknown-linux-gnu
-      - name: Publish host release asset
         env:
-          GH_TOKEN: ${{ secrets.PUBLISHER_TOKEN }}
-          VER: ${{ needs.bump.outputs.version }}
-          REPO: AnEntrypoint/agentplug-bin
-          SHA: ${{ github.sha }}
+          AGENTPLUG_RELEASE_BUILD: "1"
+        run: cargo build -p agentplug-runner --bin agentplug-runner --release --target aarch64-unknown-linux-gnu
+
+      - name: Stage host release asset with checksum
         run: |
           set -e
           mkdir -p release-assets
           cp target/aarch64-unknown-linux-gnu/release/agentplug-runner release-assets/agentplug-runner-linux-arm64
           cd release-assets
           sha256sum agentplug-runner-linux-arm64 | sed 's/ \*/  /' > agentplug-runner-linux-arm64.sha256
-          if ! gh release view "v$VER" --repo "$REPO" >/dev/null 2>&1; then
-            gh release create "v$VER" --repo "$REPO" --title "agentplug-runner v$VER" --notes "Auto-published from agentplug CI at $SHA"
-          fi
-          gh release upload "v$VER" --repo "$REPO" --clobber *
-          for f in *; do test "$(curl -sL -o /dev/null -w '%{http_code}' "https://github.com/$REPO/releases/download/v$VER/$f")" = 200; done
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: agentplug-runner-linux-arm64
+          path: release-assets/*
+          retention-days: 1
 
   publish:
-    needs: [bump, build, publish-host-linux-arm64]
+    needs: [bump, build, build-host-linux-arm64]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
           path: release-assets
           merge-multiple: true
@@ -148,17 +191,23 @@ jobs:
           GH_TOKEN: ${{ secrets.PUBLISHER_TOKEN }}
           VER: ${{ needs.bump.outputs.version }}
           REPO: AnEntrypoint/agentplug-bin
-          SHA: ${{ github.sha }}
+          SHA: ${{ needs.bump.outputs.commit }}
         run: |
-          set -e
+          set -euo pipefail
           ls -la release-assets
-          if ! gh release view "v$VER" --repo "$REPO" >/dev/null 2>&1; then
-            gh release create "v$VER" \
-              --repo "$REPO" \
-              --title "agentplug-runner v$VER" \
-              --notes "Auto-published from agentplug CI at $SHA"
+          gh release create "v$VER" \
+            --repo "$REPO" \
+            --title "agentplug-runner v$VER" \
+            --notes "Auto-published from agentplug CI at $SHA" \
+            --draft
+          gh release upload "v$VER" --repo "$REPO" release-assets/*
+          expected=$(for f in release-assets/*; do basename "$f"; done | sort)
+          uploaded=$(gh release view "v$VER" --repo "$REPO" --json assets --jq '.assets[].name' | sort)
+          if [ "$expected" != "$uploaded" ]; then
+            echo "::error::draft release v$VER does not contain exactly the built asset set" >&2
+            exit 1
           fi
-          gh release upload "v$VER" --repo "$REPO" --clobber release-assets/*
+          gh release edit "v$VER" --repo "$REPO" --draft=false
 
       - name: Verify every uploaded asset is actually fetchable
         env:
@@ -167,12 +216,32 @@ jobs:
         run: |
           set -e
           base="https://github.com/$REPO/releases/download/v$VER"
+          # GitHub's release CDN answers 504 transiently in the seconds right after an
+          # upload, and one probe per asset with no retry red-published a release whose asset
+          # set had already been verified -- which also skipped the gm submodule-pin dispatch
+          # below, the step that makes a freshly published runner reach machines. Retry only
+          # what can recover (connection failure, 429, 5xx) and still fail on the code read
+          # after the last attempt: an asset that is genuinely absent answers 404 on all five.
           for f in release-assets/*; do
             name=$(basename "$f")
-            code=$(curl -sL -o /dev/null -w '%{http_code}' "$base/$name")
+            code=000
+            for attempt in 1 2 3 4 5; do
+              code=$(curl -sL -o /dev/null -w '%{http_code}' "$base/$name")
+              case "$code" in
+                200) break ;;
+                000|429|5??) sleep $((attempt * 5)); continue ;;
+                *) break ;;
+              esac
+            done
             if [ "$code" != "200" ]; then
-              echo "::error::published release v$VER's $name is not fetchable (HTTP $code)"
+              echo "::error::published release v$VER's $name is not fetchable (HTTP $code after $attempt attempts)" >&2
               exit 1
             fi
           done
           echo "[ok] all $(ls release-assets | wc -l) release assets confirmed fetchable at $base"
+
+      - name: Ask gm to advance its submodule pins
+        env:
+          GH_TOKEN: ${{ secrets.PUBLISHER_TOKEN }}
+        shell: bash
+        run: gh api repos/AnEntrypoint/gm/dispatches -f event_type=submodule-released || echo "::warning::gm dispatch failed; bump-pins will pick this up on its next schedule"

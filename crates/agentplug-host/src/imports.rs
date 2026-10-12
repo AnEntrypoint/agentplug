@@ -11,11 +11,371 @@ use wasmtime::{AsContextMut, Caller, Linker, Memory};
 
 use crate::host_state::HostState;
 
+const HOST_FS_READ_EMPTY_SUCCESS: u64 = 1;
+
+const HOST_BINARY_READ_MAX_BYTES: u64 = 20 * 1024 * 1024;
+
+fn base64_encode(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+        out.push(ALPHABET[(n >> 18) as usize & 63] as char);
+        out.push(ALPHABET[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 { ALPHABET[(n >> 6) as usize & 63] as char } else { '=' });
+        out.push(if chunk.len() > 2 { ALPHABET[n as usize & 63] as char } else { '=' });
+    }
+    out
+}
+
 fn fetch_agent(timeout: Duration) -> ureq::Agent {
     crate::http_agent::build_agent(timeout)
 }
 
 const GIT_SUBPROCESS_TIMEOUT_MS_DEFAULT_AMPLE_FOR_SLOW_PUSH_FETCH_OR_FIRST_CLONE: u64 = 300_000;
+
+// gm asks the same repo-layout question -- `rev-parse --show-toplevel` above all -- once per
+// project per daemon tick and once per MCP call, and every question is a process spawn. The
+// answer is a pure function of the on-disk gitdir layout, so it is answered once per
+// (directory, question) and asked again only after a git command that can move that layout
+// runs in a directory sharing a path prefix with the cached one. Nothing that gates a write
+// is in the flag list: `status --porcelain`, `hash-object` and gating `ls-files` still reach
+// git every single time, and each of them drops the unguarded answers it can invalidate. An
+// answer guarded by a file identity is dropped by that identity alone, never by another
+// command: `ls-files --stage` and `ls-files --others` run in the same scan pass over the same
+// directory, so forgetting the guarded listing on the unguarded call would delete every
+// listing before it is ever served again.
+const GIT_LAYOUT_QUESTION_FLAGS: &[&str] = &[
+    "--show-toplevel",
+    "--show-prefix",
+    "--show-cdup",
+    "--git-dir",
+    "--absolute-git-dir",
+    "--is-inside-work-tree",
+    "--is-inside-git-dir",
+];
+
+const GIT_LAYOUT_CACHE_MAX_ENTRIES: usize = 512;
+
+/// An index listing bigger than this is served from git every time rather than held in the memo:
+/// the memo is a spawn saver, not a second copy of the index.
+const GIT_INDEX_ANSWER_MAX_BYTES: usize = 1 << 20;
+
+#[derive(Clone)]
+struct GitLayoutAnswer {
+    stdout: String,
+    stderr: String,
+    exit_code: i32,
+    /// Some(identity) where the answer is a pure function of one file on disk: the answer is
+    /// served again only while that file still carries the identity it had when the answer was
+    /// produced, so a memo can never outlive the bytes it was computed from.
+    fingerprint: Option<String>,
+}
+
+fn git_layout_cache() -> &'static Mutex<HashMap<String, (String, GitLayoutAnswer)>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, (String, GitLayoutAnswer)>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn git_layout_dir_key(dir: &Path) -> String {
+    dir.to_string_lossy().replace('\\', "/").trim_end_matches('/').to_lowercase()
+}
+
+fn git_layout_dirs_overlap(a: &str, b: &str) -> bool {
+    a == b || a.starts_with(&format!("{b}/")) || b.starts_with(&format!("{a}/"))
+}
+
+fn git_argv_fold<'a>(cwd: &'a Path, argv: &'a [String]) -> Option<(PathBuf, Vec<&'a str>)> {
+    let mut dir = cwd.to_path_buf();
+    let mut rest: Vec<&str> = Vec::with_capacity(argv.len());
+    let mut i = 0usize;
+    while i < argv.len() {
+        match argv[i].as_str() {
+            "-c" => i += 2,
+            "-C" => {
+                let value = argv.get(i + 1)?;
+                let given = PathBuf::from(value);
+                dir = if given.is_absolute() { given } else { dir.join(given) };
+                i += 2;
+            }
+            other => {
+                rest.push(other);
+                i += 1;
+            }
+        }
+    }
+    Some((dir, rest))
+}
+
+fn git_layout_question(cwd: &Path, argv: &[String]) -> Option<(PathBuf, String)> {
+    let (dir, rest) = git_argv_fold(cwd, argv)?;
+    if rest.len() != 2 || rest[0] != "rev-parse" || !GIT_LAYOUT_QUESTION_FLAGS.contains(&rest[1]) {
+        return None;
+    }
+    Some((dir, format!("rev-parse {}", rest[1])))
+}
+
+fn git_index_question(cwd: &Path, argv: &[String]) -> Option<(PathBuf, String)> {
+    let (dir, rest) = git_argv_fold(cwd, argv)?;
+    if rest.len() != 4 && !(rest.len() == 6 && rest[4] == "--") {
+        return None;
+    }
+    if rest[0] != "--literal-pathspecs" || rest[1] != "ls-files" || rest[2] != "-z" || rest[3] != "--stage" {
+        return None;
+    }
+    Some((dir, rest.join(" ")))
+}
+
+fn git_head_question(cwd: &Path, argv: &[String]) -> Option<PathBuf> {
+    let (dir, rest) = git_argv_fold(cwd, argv)?;
+    match rest.as_slice() {
+        ["rev-parse", "HEAD"] | ["rev-parse", "--verify", "HEAD"] => Some(dir),
+        _ => None,
+    }
+}
+
+fn git_dir_of(dir: &Path) -> Option<PathBuf> {
+    let dot_git = dir.join(".git");
+    if dot_git.is_dir() {
+        return Some(dot_git);
+    }
+    if !dot_git.is_file() {
+        return None;
+    }
+    let text = fs::read_to_string(&dot_git).ok()?;
+    let rest = text.trim().strip_prefix("gitdir:")?.trim();
+    let given = PathBuf::from(rest);
+    Some(if given.is_absolute() {
+        given
+    } else {
+        dir.join(given)
+    })
+}
+
+fn git_file_identity(path: &Path) -> Option<String> {
+    let meta = fs::metadata(path).ok()?;
+    let mtime_ms = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis())?;
+    Some(format!("{mtime_ms}:{}", meta.len()))
+}
+
+// `ls-files --stage` prints the index: mode, sha, stage number and path for every staged entry.
+// That is a pure function of .git/index, so the answer is kept only while the index still carries
+// the mtime and length it had when git produced it -- a `git add`, checkout, reset or merge
+// rewrites the index and changes that identity, and a repo with no index answers nothing.
+fn git_index_identity(dir: &Path) -> Option<String> {
+    git_file_identity(&git_dir_of(dir)?.join("index"))
+}
+
+// `git rev-parse HEAD` asks which commit HEAD names. Where HEAD is a loose symbolic ref that
+// commit is already written on disk by git itself, so it is read from the files git writes
+// rather than answered from a remembered value: the bytes on disk are the answer, so there is
+// no cache and nothing that can go stale, while a repo whose refs are packed, whose HEAD is a
+// symref chain, or whose .git is not plainly readable answers None and falls through to git.
+fn git_head_ref_contents(git_dir: &Path, reference: &str) -> Option<String> {
+    let direct = git_dir.join(reference);
+    if direct.is_file() {
+        return fs::read_to_string(&direct).ok();
+    }
+    let common = fs::read_to_string(git_dir.join("commondir")).ok()?;
+    let common = PathBuf::from(common.trim());
+    let common = if common.is_absolute() {
+        common
+    } else {
+        git_dir.join(common)
+    };
+    fs::read_to_string(common.join(reference)).ok()
+}
+
+fn git_head_sha_from_disk(dir: &Path) -> Option<String> {
+    let git_dir = git_dir_of(dir)?;
+    let head = fs::read_to_string(git_dir.join("HEAD")).ok()?;
+    let head = head.trim();
+    let sha = match head.strip_prefix("ref:") {
+        Some(reference) => git_head_ref_contents(&git_dir, reference.trim())?,
+        None => head.to_string(),
+    };
+    let sha = sha.trim();
+    if sha.len() == 40 && sha.bytes().all(|b| b.is_ascii_hexdigit()) {
+        Some(sha.to_string())
+    } else {
+        None
+    }
+}
+
+fn git_layout_recall(dir: &Path, question: &str, live: Option<String>) -> Option<GitLayoutAnswer> {
+    let key = format!("{}\u{0}{}", git_layout_dir_key(dir), question);
+    let mut cache = match git_layout_cache().lock() {
+        Ok(cache) => cache,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let answer = cache.get(&key).map(|(_, answer)| answer.clone());
+    let Some(answer) = answer else {
+        return None;
+    };
+    match (answer.fingerprint.as_ref(), live.as_ref()) {
+        (Some(kept), Some(now)) if kept != now => {
+            cache.remove(&key);
+            None
+        }
+        (Some(_), None) => {
+            cache.remove(&key);
+            None
+        }
+        _ => Some(answer),
+    }
+}
+
+fn git_layout_remember(dir: PathBuf, question: &str, answer: GitLayoutAnswer) {
+    let dir_key = git_layout_dir_key(&dir);
+    let key = format!("{dir_key}\u{0}{question}");
+    let mut cache = match git_layout_cache().lock() {
+        Ok(cache) => cache,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if cache.len() >= GIT_LAYOUT_CACHE_MAX_ENTRIES && !cache.contains_key(&key) {
+        cache.clear();
+    }
+    cache.insert(key, (dir_key, answer));
+}
+
+fn git_layout_forget_dir(dir: &Path) {
+    let key = git_layout_dir_key(dir);
+    let mut cache = match git_layout_cache().lock() {
+        Ok(cache) => cache,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    cache.retain(|_, (dir_key, answer)| {
+        answer.fingerprint.is_some() || !git_layout_dirs_overlap(dir_key, &key)
+    });
+}
+
+// Every git question gm asks, and how many of them actually reached a git process, printed
+// once a minute. A thrashing box shows up here as one argv asked hundreds of times per minute;
+// the reached count beside it is what the layout memo is buying.
+const GIT_CALL_STATS_FLUSH_INTERVAL: Duration = Duration::from_secs(60);
+
+const GIT_CALL_STATS_MAX_KEYS: usize = 256;
+
+fn git_call_stats_counts(reached: bool) -> &'static Mutex<HashMap<String, usize>> {
+    static ASKED: OnceLock<Mutex<HashMap<String, usize>>> = OnceLock::new();
+    static REACHED: OnceLock<Mutex<HashMap<String, usize>>> = OnceLock::new();
+    if reached {
+        REACHED.get_or_init(|| Mutex::new(HashMap::new()))
+    } else {
+        ASKED.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+}
+
+fn git_call_stats_ms() -> &'static Mutex<HashMap<String, u64>> {
+    static MS: OnceLock<Mutex<HashMap<String, u64>>> = OnceLock::new();
+    MS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn git_call_stats_last_flush() -> &'static Mutex<Instant> {
+    static LAST_FLUSH: OnceLock<Mutex<Instant>> = OnceLock::new();
+    LAST_FLUSH.get_or_init(|| Mutex::new(Instant::now()))
+}
+
+fn git_call_stats_key(argv: &[String]) -> String {
+    let mut key = String::new();
+    let mut i = 0usize;
+    while i < argv.len() && key.len() < 160 {
+        if argv[i] == "-c" {
+            i += 2;
+            continue;
+        }
+        key.push_str(&argv[i]);
+        key.push(' ');
+        i += 1;
+    }
+    if i < argv.len() {
+        key.push_str("...");
+    }
+    key
+}
+
+fn git_call_stats_add_ms(argv: &[String], elapsed_ms: u64) {
+    if elapsed_ms == 0 {
+        return;
+    }
+    let key = git_call_stats_key(argv);
+    let mut ms = match git_call_stats_ms().lock() {
+        Ok(ms) => ms,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if ms.len() < GIT_CALL_STATS_MAX_KEYS || ms.contains_key(&key) {
+        *ms.entry(key).or_insert(0) += elapsed_ms;
+    }
+}
+
+pub fn git_call_stats_note(argv: &[String], reached: bool, elapsed_ms: u64) {
+    let key = git_call_stats_key(argv);
+    git_call_stats_add_ms(argv, elapsed_ms);
+    {
+        let mut counts = match git_call_stats_counts(reached).lock() {
+            Ok(counts) => counts,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if counts.len() < GIT_CALL_STATS_MAX_KEYS || counts.contains_key(&key) {
+            *counts.entry(key).or_insert(0) += 1;
+        }
+    }
+    let mut last_flush = match git_call_stats_last_flush().lock() {
+        Ok(last) => last,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if last_flush.elapsed() < GIT_CALL_STATS_FLUSH_INTERVAL {
+        return;
+    }
+    *last_flush = Instant::now();
+    let mut asked = match git_call_stats_counts(false).lock() {
+        Ok(counts) => counts,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let mut reached_counts = match git_call_stats_counts(true).lock() {
+        Ok(counts) => counts,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let mut ms_by_key = match git_call_stats_ms().lock() {
+        Ok(ms) => ms,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if asked.is_empty() && reached_counts.is_empty() {
+        return;
+    }
+    let asked_total: usize = asked.values().sum();
+    let reached_total: usize = reached_counts.values().sum();
+    let ms_total: u64 = ms_by_key.values().sum();
+    eprintln!(
+        "[agentplug host] git calls this minute: {asked_total} asked, {reached_total} spawned a git process, {ms_total}ms of wall time in them, {} answered without spawning git",
+        asked_total.saturating_sub(reached_total)
+    );
+    let mut ranked: Vec<(String, usize)> = asked
+        .iter()
+        .map(|(key, count)| (key.clone(), *count))
+        .collect();
+    for (key, count) in reached_counts.iter() {
+        if !asked.contains_key(key) {
+            ranked.push((key.clone(), *count));
+        }
+    }
+    ranked.sort_by(|a, b| b.1.cmp(&a.1));
+    for (key, count) in ranked.into_iter().take(8) {
+        let reached = reached_counts.remove(&key).unwrap_or(0);
+        let ms = ms_by_key.remove(&key).unwrap_or(0);
+        eprintln!(
+            "[agentplug host]   asked {count:>5} spawned {reached:>5} {ms:>7}ms : git {key}"
+        );
+    }
+    reached_counts.clear();
+    ms_by_key.clear();
+    asked.clear();
+}
 
 #[derive(serde::Deserialize)]
 struct CapabilityAllowlistConfig {
@@ -25,39 +385,62 @@ struct CapabilityAllowlistConfig {
 
 fn compiled_default_capability_allowlist(caller_plugin: &str, callee_plugin: &str) -> bool {
     match caller_plugin {
-        "gm" => matches!(callee_plugin, "bert" | "libsql" | "treesitter" | "liqology" | "crux"),
+        "gm" => matches!(callee_plugin, "bert" | "libsql" | "treesitter" | "crux" | "lightpanda"),
         _ => false,
     }
 }
 
 fn load_capability_allowlist_config(cwd: &Path) -> Option<CapabilityAllowlistConfig> {
     let path = cwd.join(".agentplug").join("capability-allowlist.json");
-    fs::read_to_string(&path).ok().and_then(|s| serde_json::from_str::<CapabilityAllowlistConfig>(&s).ok())
+    fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<CapabilityAllowlistConfig>(&s).ok())
 }
 
 fn plugin_call_capability_allowed(cwd: &Path, caller_plugin: &str, callee_plugin: &str) -> bool {
     match load_capability_allowlist_config(cwd) {
-        Some(cfg) => cfg.allow.get(caller_plugin).map(|allowed| allowed.iter().any(|p| p == callee_plugin)).unwrap_or(false),
+        Some(cfg) => cfg
+            .allow
+            .get(caller_plugin)
+            .map(|allowed| allowed.iter().any(|p| p == callee_plugin))
+            .unwrap_or(false),
         None => compiled_default_capability_allowlist(caller_plugin, callee_plugin),
     }
 }
 
 fn is_well_formed_plugin_name(name: &str) -> bool {
-    !name.is_empty() && name.len() <= 64 && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
 fn is_well_formed_verb(verb: &str) -> bool {
-    !verb.is_empty() && verb.len() <= 128 && verb.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+    !verb.is_empty()
+        && verb.len() <= 128
+        && verb
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
 }
 
-fn validate_plugin_call_body(body: &str) -> Result<(), String> {
+fn plugin_call_takes_plain_text(plugin: &str, verb: &str) -> bool {
+    matches!((plugin, verb), ("lightpanda", "crawl"))
+}
+
+fn validate_plugin_call_body(plugin: &str, verb: &str, body: &str) -> Result<(), String> {
     if body.is_empty() {
         return Ok(());
     }
     if body.len() > 64 * 1024 * 1024 {
         return Err("body_exceeds_max_size".to_string());
     }
-    serde_json::from_str::<serde_json::Value>(body).map(|_| ()).map_err(|e| format!("body_not_valid_json: {e}"))
+    if plugin_call_takes_plain_text(plugin, verb) {
+        return Ok(());
+    }
+    serde_json::from_str::<serde_json::Value>(body)
+        .map(|_| ())
+        .map_err(|e| format!("body_not_valid_json: {e}"))
 }
 
 pub fn git_subprocess_timeout_ms() -> u64 {
@@ -68,19 +451,9 @@ pub fn git_subprocess_timeout_ms() -> u64 {
         .unwrap_or(GIT_SUBPROCESS_TIMEOUT_MS_DEFAULT_AMPLE_FOR_SLOW_PUSH_FETCH_OR_FIRST_CLONE)
 }
 
-// A git child on a large working tree writes far more than the ~64 KB OS pipe buffer holds.
-// If the host waits for the child before it reads the pipe, the child blocks on the full pipe,
-// never exits, and the wait runs to its whole timeout -- the git_diff hang. These caps let a
-// reader thread drain each pipe as the child writes, so the child always makes progress, while
-// the stored bytes stay bounded. The stdout cap sits well above the git_diff verb's own
-// 60000-char truncation, so a normal status/log/diff is returned in full and only a pathological
-// diff is cut short (reported through stdout_truncated).
 const HOST_GIT_STDOUT_CAP_BYTES: usize = 1_048_576;
 const HOST_GIT_STDERR_CAP_BYTES: usize = 262_144;
 
-// Read a child pipe on its own thread, stopping at `cap` bytes. On reaching the cap it sets
-// `cap_hit` so the caller can kill the child at once instead of draining a huge stream in full.
-// Returns the collected bytes and whether the cap fired.
 fn drain_reader_capped<R: std::io::Read + Send + 'static>(
     mut reader: R,
     cap: usize,
@@ -129,11 +502,111 @@ fn normalize_lexically(path: &std::path::Path) -> Option<PathBuf> {
             other => out.push(other.as_os_str()),
         }
     }
+
     Some(out)
 }
 
+fn github_cli_config_dir_slot() -> &'static Mutex<Option<PathBuf>> {
+    static SLOT: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
+    SLOT.get_or_init(|| Mutex::new(None))
+}
+
+pub fn set_github_cli_config_dir(directory: Option<PathBuf>) {
+    *github_cli_config_dir_slot()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = directory;
+}
+
+pub fn github_cli_config_dir() -> Option<PathBuf> {
+    github_cli_config_dir_slot()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
+#[cfg(windows)]
+const EMPTY_GIT_CONFIG_OR_HOOK_PATH: &str = "NUL";
+
+#[cfg(not(windows))]
+const EMPTY_GIT_CONFIG_OR_HOOK_PATH: &str = "/dev/null";
+
+fn is_inherited_git_config_key(key: &std::ffi::OsStr) -> bool {
+    let key = key.to_string_lossy().to_ascii_uppercase();
+    matches!(
+        key.as_str(),
+        "GIT_CONFIG_COUNT"
+            | "GIT_CONFIG_GLOBAL"
+            | "GIT_CONFIG_NOSYSTEM"
+            | "GIT_CONFIG_PARAMETERS"
+            | "GIT_CONFIG_SYSTEM"
+    ) || key.starts_with("GIT_CONFIG_KEY_")
+        || key.starts_with("GIT_CONFIG_VALUE_")
+}
+
+const GIT_SUBCOMMANDS_APPLYING_CONTENT_FILTERS: &[&str] = &[
+    "add", "status", "diff", "checkout", "commit", "stash",
+];
+
+const GIT_GLOBAL_OPTIONS_TAKING_A_VALUE: &[&str] = &[
+    "-c",
+    "-C",
+    "--git-dir",
+    "--work-tree",
+    "--namespace",
+    "--super-prefix",
+    "--config-env",
+    "--exec-path",
+];
+
+fn git_argv_subcommand(argv: &[String]) -> Option<&str> {
+    let mut tokens = argv.iter().map(String::as_str);
+    while let Some(token) = tokens.next() {
+        if GIT_GLOBAL_OPTIONS_TAKING_A_VALUE.contains(&token) {
+            tokens.next();
+            continue;
+        }
+        if token.starts_with('-') {
+            continue;
+        }
+        return Some(token);
+    }
+    None
+}
+
+fn git_argv_applies_content_filters(argv: &[String]) -> bool {
+    git_argv_subcommand(argv)
+        .is_some_and(|subcommand| GIT_SUBCOMMANDS_APPLYING_CONTENT_FILTERS.contains(&subcommand))
+}
+
+fn configure_github_git_credentials(command: &mut std::process::Command, argv: &[String]) {
+    for (key, _) in std::env::vars_os() {
+        if is_inherited_git_config_key(&key) {
+            command.env_remove(key);
+        }
+    }
+    if let Some(directory) = github_cli_config_dir() {
+        command.env("GH_CONFIG_DIR", directory);
+    }
+    command
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GCM_INTERACTIVE", "Never")
+        .env("GIT_CONFIG_COUNT", "2")
+        .env("GIT_CONFIG_KEY_0", "core.hooksPath")
+        .env("GIT_CONFIG_VALUE_0", EMPTY_GIT_CONFIG_OR_HOOK_PATH)
+        .env("GIT_CONFIG_KEY_1", "credential.https://github.com.helper")
+        .env("GIT_CONFIG_VALUE_1", "!gh auth git-credential");
+    if git_argv_applies_content_filters(argv) {
+        return;
+    }
+    command
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", EMPTY_GIT_CONFIG_OR_HOOK_PATH);
+}
+
 fn user_gm_root() -> Option<PathBuf> {
-    let home = std::env::var("HOME").ok().or_else(|| std::env::var("USERPROFILE").ok())?;
+    let home = std::env::var("HOME")
+        .ok()
+        .or_else(|| std::env::var("USERPROFILE").ok())?;
     let home = home.trim();
     if home.is_empty() {
         return None;
@@ -141,33 +614,19 @@ fn user_gm_root() -> Option<PathBuf> {
     normalize_lexically(&std::path::Path::new(home).join(".gm"))
 }
 
-/// Process-wide per-path locks for host_fs_write. The shared plugin pool
-/// dispatches guest writes from multiple wasmtime Store instances on
-/// separate OS threads with no serialization of their own (see
-/// registry.rs's SHARED_PLUGINS pool, keyed by plugin name across every
-/// project the daemon serves, not by file path) -- a plain fs::write here
-/// raced two concurrent guest writers to the same path (e.g. two
-/// back-to-back prd-add dispatches performing a read-modify-write cycle
-/// against .gm/prd.yml) into a lost update, even though the guest side
-/// (orchestrator/cas.rs's cas_retry_write) already does an optimistic
-/// recheck/confirm around its own read-modify-write. This lock closes the
-/// gap the guest-side optimistic check cannot see: true interleaving of
-/// two independent fs::write calls at the host layer.
-static FS_WRITE_LOCKS: OnceLock<Mutex<HashMap<PathBuf, std::sync::Arc<Mutex<()>>>>> = OnceLock::new();
+static FS_WRITE_LOCKS: OnceLock<Mutex<HashMap<PathBuf, std::sync::Arc<Mutex<()>>>>> =
+    OnceLock::new();
 
 fn fs_write_lock_for(path: &Path) -> std::sync::Arc<Mutex<()>> {
     let key = canonicalize_path_separators_for_stable_keying(path);
     let registry = FS_WRITE_LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
     let mut guard = registry.lock().unwrap_or_else(|e| e.into_inner());
-    guard.entry(key).or_insert_with(|| std::sync::Arc::new(Mutex::new(()))).clone()
+    guard
+        .entry(key)
+        .or_insert_with(|| std::sync::Arc::new(Mutex::new(())))
+        .clone()
 }
 
-/// Serializes writers to the same path, then writes via temp-file + rename
-/// so a reader can never observe a torn/partial write either (matching the
-/// atomic_write pattern already used for .gm/memories/*.md in
-/// crates/plugkit-core/src/memory_md.rs's rename_batch, ported to the host
-/// side where the real fs::write call lives for the guest's host_fs_write
-/// import).
 fn atomic_write_locked(full: &Path, data: &str) -> std::io::Result<()> {
     let lock = fs_write_lock_for(full);
     let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -175,14 +634,31 @@ fn atomic_write_locked(full: &Path, data: &str) -> std::io::Result<()> {
 }
 
 fn atomic_write_under_held_lock(full: &Path, data: &str) -> std::io::Result<()> {
+    if fs::read(full).is_ok_and(|existing| existing == data.as_bytes()) {
+        return Ok(());
+    }
     let tmp = full.with_extension(format!(
         "{}.tmp-{}",
         full.extension().and_then(|e| e.to_str()).unwrap_or(""),
         std::process::id()
     ));
     fs::write(&tmp, data)?;
+    // A rename is only durable for the bytes it renames once those bytes are on
+    // disk and the directory entry that names them is too: without both syncs a
+    // crash or a power loss can leave the target holding the old or empty file
+    // while this call has already reported success.
+    if let Ok(f) = fs::File::open(&tmp) {
+        let _ = f.sync_all();
+    }
     match fs::rename(&tmp, full) {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            if let Some(dir) = full.parent() {
+                if let Ok(d) = fs::File::open(dir) {
+                    let _ = d.sync_all();
+                }
+            }
+            Ok(())
+        }
         Err(e) => {
             let _ = fs::remove_file(&tmp);
             Err(e)
@@ -190,21 +666,6 @@ fn atomic_write_under_held_lock(full: &Path, data: &str) -> std::io::Result<()> 
     }
 }
 
-/// Compare-and-swap write: read-compare-write as ONE critical section under
-/// the same per-path lock atomic_write_locked uses. atomic_write_locked
-/// alone only serializes the write half of a read-modify-write cycle --
-/// two guest callers can each read the same "before" content (via a
-/// separate, unlocked host_fs_read call), independently compute a new
-/// document, and then both call host_fs_write: the lock stops their writes
-/// from interleaving/tearing, but NOT from one silently clobbering the
-/// other's already-landed change, since neither write re-validates the
-/// content it was based on is still current. The guest's own optimistic
-/// recheck/confirm (orchestrator/cas.rs) can't close this gap either,
-/// because its recheck read and its write are two independent host calls
-/// with no shared lock scope. This function closes it by doing the
-/// "is `expected` still current" check and the write inside one lock hold.
-/// Returns Ok(true) on a successful swap, Ok(false) on a CAS mismatch (the
-/// guest should re-read and retry), Err on a real I/O failure.
 fn atomic_cas_write_locked(full: &Path, expected: &str, data: &str) -> std::io::Result<bool> {
     let lock = fs_write_lock_for(full);
     let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -216,26 +677,23 @@ fn atomic_cas_write_locked(full: &Path, expected: &str, data: &str) -> std::io::
     Ok(true)
 }
 
-/// A directory is only grantable via `host_fs_allow_root` when it carries a
-/// recognizable project marker -- a bare existence check would let a guest
-/// name any real directory on the machine (a home folder, `.ssh`, anything),
-/// which is a materially larger capability grant than "reach another real
-/// project" actually requires. `.git`/`.gm` cover the two markers every gm
-/// project and every plain git repo already has; a manifest file covers a
-/// project this host has never run gm against but is still a real codebase.
 fn has_project_marker(dir: &std::path::Path) -> bool {
     const MARKERS: &[&str] = &[
-        ".git", ".gm", "package.json", "Cargo.toml", "go.mod", "pyproject.toml",
+        ".git",
+        ".gm",
+        "package.json",
+        "Cargo.toml",
+        "go.mod",
+        "pyproject.toml",
     ];
     MARKERS.iter().any(|m| dir.join(m).exists())
 }
 
-/// Resolves a guest-supplied path to a real host path if it falls under
-/// `cwd`, `~/.gm`, or a caller-supplied set of additional roots the guest
-/// has explicitly named this session (see `HostState::allow_extra_root`) --
-/// a project only becomes reachable when a real dispatch names it as a
-/// target, never a standing blanket grant.
-fn sandboxed_guest_path_with_extra_roots(cwd: &std::path::Path, path: &str, extra_roots: &[PathBuf]) -> Option<PathBuf> {
+fn sandboxed_guest_path_with_extra_roots(
+    cwd: &std::path::Path,
+    path: &str,
+    extra_roots: &[PathBuf],
+) -> Option<PathBuf> {
     let requested = std::path::Path::new(path);
     let joined = if requested.is_absolute() || requested.has_root() {
         requested.to_path_buf()
@@ -252,7 +710,9 @@ fn sandboxed_guest_path_with_extra_roots(cwd: &std::path::Path, path: &str, extr
         return Some(normalized);
     }
     for extra in extra_roots {
-        let Some(extra_normalized) = normalize_lexically(extra) else { continue };
+        let Some(extra_normalized) = normalize_lexically(extra) else {
+            continue;
+        };
         if normalized == extra_normalized || normalized.starts_with(&extra_normalized) {
             return Some(normalized);
         }
@@ -321,21 +781,12 @@ fn write_guest_bytes(caller: &mut Caller<'_, HostState>, bytes: &[u8]) -> u64 {
         .get_typed_func::<u32, u32>(&mut *caller, "plugkit_alloc")
         .expect("plugkit_alloc export missing on wasm module");
     const RESPONSE_HANDOFF_GRACE_SECS: u64 = 5;
-    // The dispatch's own real deadline (default or caller-supplied override,
-    // set once in dispatch_on) -- captured before narrowing to the short
-    // handoff grace window below, so it can be restored afterward rather than
-    // left at 5s for the remainder of the guest's execution. A dispatch that
-    // makes several sequential host calls (memorize-fire's embed, then its
-    // dedup-check read, then its md/vector writes) crosses this handoff many
-    // times per call; leaving the deadline at RESPONSE_HANDOFF_GRACE_SECS
-    // after the first one silently shrank every caller-supplied deadline
-    // override (deadline_secs:180, :700, whatever) down to a de facto 5s
-    // budget for everything after the first host response -- the actual
-    // cause of memorize-fire's persistent plugin_call_deadline_exceeded
-    // failures under real embed latency, previously misread as bert-pool
-    // contention or a stuck holder.
     let real_deadline_secs = caller.data().call_deadline_secs();
-    caller.as_context_mut().set_epoch_deadline(crate::registry::epoch_ticks_for_seconds(RESPONSE_HANDOFF_GRACE_SECS));
+    caller
+        .as_context_mut()
+        .set_epoch_deadline(crate::registry::epoch_ticks_for_seconds(
+            RESPONSE_HANDOFF_GRACE_SECS,
+        ));
     match alloc.call(&mut *caller, bytes.len() as u32) {
         Ok(ptr) => {
             let memory = guest_memory(caller);
@@ -346,14 +797,21 @@ fn write_guest_bytes(caller: &mut Caller<'_, HostState>, bytes: &[u8]) -> u64 {
                 );
                 eprintln!("[agentplug host] write_guest_bytes: {reason} -- returning 0, which the guest reads as a null response");
                 caller.data().note_lost_response(reason);
-                caller.as_context_mut().set_epoch_deadline(crate::registry::epoch_ticks_for_seconds(real_deadline_secs));
+                caller.as_context_mut().set_epoch_deadline(
+                    crate::registry::epoch_ticks_for_seconds(real_deadline_secs),
+                );
                 return 0;
             }
-            caller.as_context_mut().set_epoch_deadline(crate::registry::epoch_ticks_for_seconds(real_deadline_secs));
+            caller
+                .as_context_mut()
+                .set_epoch_deadline(crate::registry::epoch_ticks_for_seconds(real_deadline_secs));
             pack_guest_ptr_len(ptr, bytes.len())
         }
         Err(e) => {
-            let interrupted = matches!(e.downcast_ref::<wasmtime::Trap>(), Some(wasmtime::Trap::Interrupt));
+            let interrupted = matches!(
+                e.downcast_ref::<wasmtime::Trap>(),
+                Some(wasmtime::Trap::Interrupt)
+            );
             let reason = if interrupted {
                 format!("plugkit_alloc({}) hit the epoch deadline while handing the host response back to the guest", bytes.len())
             } else {
@@ -361,7 +819,9 @@ fn write_guest_bytes(caller: &mut Caller<'_, HostState>, bytes: &[u8]) -> u64 {
             };
             eprintln!("[agentplug host] write_guest_bytes: {reason} -- returning 0, which the guest reads as a null response");
             caller.data().note_lost_response(reason);
-            caller.as_context_mut().set_epoch_deadline(crate::registry::epoch_ticks_for_seconds(real_deadline_secs));
+            caller
+                .as_context_mut()
+                .set_epoch_deadline(crate::registry::epoch_ticks_for_seconds(real_deadline_secs));
             0
         }
     }
@@ -390,7 +850,9 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
         "host_fs_allow_root",
         |mut caller: Caller<'_, HostState>, path_ptr: u32, path_len: u32| -> u32 {
             let path = read_guest_string(&mut caller, path_ptr, path_len);
-            let Some(normalized) = normalize_lexically(std::path::Path::new(&path)) else { return 0 };
+            let Some(normalized) = normalize_lexically(std::path::Path::new(&path)) else {
+                return 0;
+            };
             match fs::metadata(&normalized) {
                 Ok(md) if md.is_dir() && has_project_marker(&normalized) => {
                     caller.data().allow_extra_root(normalized);
@@ -406,8 +868,13 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
         |mut caller: Caller<'_, HostState>, path_ptr: u32, path_len: u32| -> u64 {
             let path = read_guest_string(&mut caller, path_ptr, path_len);
             let extra_roots = caller.data().extra_readable_roots();
-            let Some(full) = sandboxed_guest_path_with_extra_roots(&caller.data().cwd(), &path, &extra_roots) else { return 0 };
+            let Some(full) =
+                sandboxed_guest_path_with_extra_roots(&caller.data().cwd(), &path, &extra_roots)
+            else {
+                return 0;
+            };
             match fs::read_to_string(&full) {
+                Ok(content) if content.is_empty() => HOST_FS_READ_EMPTY_SUCCESS,
                 Ok(content) => write_guest_bytes(&mut caller, content.as_bytes()),
                 Err(_) => 0,
             }
@@ -416,12 +883,50 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
 
     linker.func_wrap(
         "env",
+        "host_fs_read_base64",
+        |mut caller: Caller<'_, HostState>, path_ptr: u32, path_len: u32| -> u64 {
+            use std::io::Read;
+            let path = read_guest_string(&mut caller, path_ptr, path_len);
+            let extra_roots = caller.data().extra_readable_roots();
+            let Some(full) =
+                sandboxed_guest_path_with_extra_roots(&caller.data().cwd(), &path, &extra_roots)
+            else {
+                return 0;
+            };
+            let Ok(file) = fs::File::open(&full) else {
+                return 0;
+            };
+            let mut bytes = Vec::new();
+            if file
+                .take(HOST_BINARY_READ_MAX_BYTES + 1)
+                .read_to_end(&mut bytes)
+                .is_err()
+                || bytes.is_empty()
+                || bytes.len() as u64 > HOST_BINARY_READ_MAX_BYTES
+            {
+                return 0;
+            }
+            write_guest_bytes(&mut caller, base64_encode(&bytes).as_bytes())
+        },
+    )?;
+
+    linker.func_wrap(
+        "env",
         "host_fs_write",
-        |mut caller: Caller<'_, HostState>, path_ptr: u32, path_len: u32, data_ptr: u32, data_len: u32| -> u32 {
+        |mut caller: Caller<'_, HostState>,
+         path_ptr: u32,
+         path_len: u32,
+         data_ptr: u32,
+         data_len: u32|
+         -> u32 {
             let path = read_guest_string(&mut caller, path_ptr, path_len);
             let data = read_guest_string(&mut caller, data_ptr, data_len);
             let extra_roots = caller.data().extra_readable_roots();
-            let Some(full) = sandboxed_guest_path_with_extra_roots(&caller.data().cwd(), &path, &extra_roots) else { return 0 };
+            let Some(full) =
+                sandboxed_guest_path_with_extra_roots(&caller.data().cwd(), &path, &extra_roots)
+            else {
+                return 0;
+            };
             if let Some(parent) = full.parent() {
                 let _ = fs::create_dir_all(parent);
             }
@@ -435,12 +940,23 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
     linker.func_wrap(
         "env",
         "host_fs_cas_write",
-        |mut caller: Caller<'_, HostState>, path_ptr: u32, path_len: u32, expected_ptr: u32, expected_len: u32, data_ptr: u32, data_len: u32| -> u32 {
+        |mut caller: Caller<'_, HostState>,
+         path_ptr: u32,
+         path_len: u32,
+         expected_ptr: u32,
+         expected_len: u32,
+         data_ptr: u32,
+         data_len: u32|
+         -> u32 {
             let path = read_guest_string(&mut caller, path_ptr, path_len);
             let expected = read_guest_string(&mut caller, expected_ptr, expected_len);
             let data = read_guest_string(&mut caller, data_ptr, data_len);
             let extra_roots = caller.data().extra_readable_roots();
-            let Some(full) = sandboxed_guest_path_with_extra_roots(&caller.data().cwd(), &path, &extra_roots) else { return 0 };
+            let Some(full) =
+                sandboxed_guest_path_with_extra_roots(&caller.data().cwd(), &path, &extra_roots)
+            else {
+                return 0;
+            };
             if let Some(parent) = full.parent() {
                 let _ = fs::create_dir_all(parent);
             }
@@ -458,7 +974,11 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
         |mut caller: Caller<'_, HostState>, path_ptr: u32, path_len: u32| -> u32 {
             let path = read_guest_string(&mut caller, path_ptr, path_len);
             let extra_roots = caller.data().extra_readable_roots();
-            let Some(full) = sandboxed_guest_path_with_extra_roots(&caller.data().cwd(), &path, &extra_roots) else { return 0 };
+            let Some(full) =
+                sandboxed_guest_path_with_extra_roots(&caller.data().cwd(), &path, &extra_roots)
+            else {
+                return 0;
+            };
             match fs::metadata(&full) {
                 Ok(md) if md.is_dir() => 0,
                 Ok(_) => match fs::remove_file(&full) {
@@ -476,10 +996,17 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
         |mut caller: Caller<'_, HostState>, path_ptr: u32, path_len: u32| -> u64 {
             let path = read_guest_string(&mut caller, path_ptr, path_len);
             let extra_roots = caller.data().extra_readable_roots();
-            let Some(full) = sandboxed_guest_path_with_extra_roots(&caller.data().cwd(), &path, &extra_roots) else { return 0 };
-            let entries: Vec<String> = fs::read_dir(&full)
-                .map(|rd| rd.filter_map(|e| e.ok()).map(|e| e.file_name().to_string_lossy().into_owned()).collect())
-                .unwrap_or_default();
+            let Some(full) =
+                sandboxed_guest_path_with_extra_roots(&caller.data().cwd(), &path, &extra_roots)
+            else {
+                return 0;
+            };
+            let Ok(entries) = fs::read_dir(&full).and_then(|rd| {
+                rd.map(|entry| entry.map(|entry| entry.file_name().to_string_lossy().into_owned()))
+                    .collect::<std::io::Result<Vec<String>>>()
+            }) else {
+                return 0;
+            };
             write_guest_json(&mut caller, serde_json::json!(entries))
         },
     )?;
@@ -510,10 +1037,17 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
         },
     )?;
 
-    linker.func_wrap("env", "host_now_ms", |_caller: Caller<'_, HostState>| -> u64 {
-        use std::time::{SystemTime, UNIX_EPOCH};
-        SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
-    })?;
+    linker.func_wrap(
+        "env",
+        "host_now_ms",
+        |_caller: Caller<'_, HostState>| -> u64 {
+            use std::time::{SystemTime, UNIX_EPOCH};
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0)
+        },
+    )?;
 
     linker.func_wrap(
         "env",
@@ -523,14 +1057,7 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
             let plugin = caller.data().plugin_name.clone();
             if let Some(evt_line) = msg.strip_prefix("evt: ") {
                 let cwd = caller.data().cwd.lock().unwrap().clone();
-                let log_path = cwd.join(".gm").join("exec-spool").join(".watcher.log");
-                if let Some(parent) = log_path.parent() {
-                    let _ = fs::create_dir_all(parent);
-                }
-                if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(&log_path) {
-                    use std::io::Write;
-                    let _ = writeln!(f, "evt: {evt_line}");
-                }
+                crate::watcher_log::append_watcher_line(&cwd, &format!("evt: {evt_line}"));
                 return 1;
             }
             eprintln!("[agentplug:{plugin} L{level}] {msg}");
@@ -543,6 +1070,12 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
         "host_env_get",
         |mut caller: Caller<'_, HostState>, key_ptr: u32, key_len: u32| -> u64 {
             let key = read_guest_string(&mut caller, key_ptr, key_len);
+            if let Some(dispatch_value) = crate::dispatch_origin::dispatch_env_value(&key) {
+                return match dispatch_value {
+                    Some(val) => write_guest_bytes(&mut caller, val.as_bytes()),
+                    None => 0,
+                };
+            }
             match std::env::var(&key) {
                 Ok(val) => write_guest_bytes(&mut caller, val.as_bytes()),
                 Err(_) => 0,
@@ -578,19 +1111,36 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
     linker.func_wrap(
         "env",
         "host_fetch",
-        |mut caller: Caller<'_, HostState>, url_ptr: u32, url_len: u32, opts_ptr: u32, opts_len: u32| -> u64 {
+        |mut caller: Caller<'_, HostState>,
+         url_ptr: u32,
+         url_len: u32,
+         opts_ptr: u32,
+         opts_len: u32|
+         -> u64 {
             let url = read_guest_string(&mut caller, url_ptr, url_len);
             let opts_str = read_guest_string(&mut caller, opts_ptr, opts_len);
-            let opts: serde_json::Value =
-                if opts_str.is_empty() { serde_json::json!({}) } else { serde_json::from_str(&opts_str).unwrap_or(serde_json::json!({})) };
-            let method = opts.get("method").and_then(|v| v.as_str()).unwrap_or("GET").to_uppercase();
+            let opts: serde_json::Value = if opts_str.is_empty() {
+                serde_json::json!({})
+            } else {
+                serde_json::from_str(&opts_str).unwrap_or(serde_json::json!({}))
+            };
+            let method = opts
+                .get("method")
+                .and_then(|v| v.as_str())
+                .unwrap_or("GET")
+                .to_uppercase();
             let body = opts.get("body").and_then(|v| v.as_str());
             let timeout = opts
                 .get("timeoutMs")
                 .and_then(|v| v.as_u64())
                 .map(Duration::from_millis)
                 .unwrap_or(Duration::from_secs(10));
-            let fetch_agent = fetch_agent(timeout);
+            let binary_response = opts.get("responseEncoding").and_then(|v| v.as_str()) == Some("base64");
+            let fetch_agent = if binary_response {
+                crate::http_agent::build_agent_without_redirects(timeout)
+            } else {
+                fetch_agent(timeout)
+            };
             let mut req = fetch_agent.request(&method, &url);
             if let Some(headers) = opts.get("headers").and_then(|v| v.as_object()) {
                 for (k, v) in headers {
@@ -605,14 +1155,31 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
                 None => req.call(),
             };
             let result = match resp {
+                Ok(r) if binary_response => {
+                    use std::io::Read;
+                    let status = r.status();
+                    let content_type = r.header("content-type").unwrap_or("").to_string();
+                    let location = r.header("location").map(String::from);
+                    let mut bytes = Vec::new();
+                    match r
+                        .into_reader()
+                        .take(HOST_BINARY_READ_MAX_BYTES + 1)
+                        .read_to_end(&mut bytes)
+                    {
+                        Ok(_) if bytes.len() as u64 > HOST_BINARY_READ_MAX_BYTES => serde_json::json!({"ok": false, "status": status, "error": "response_exceeds_binary_limit", "limit_bytes": HOST_BINARY_READ_MAX_BYTES}),
+                        Ok(_) => serde_json::json!({"ok": true, "status": status, "content_type": content_type, "location": location, "body": base64_encode(&bytes), "encoding": "base64"}),
+                        Err(e) => serde_json::json!({"ok": false, "status": status, "error": e.to_string()}),
+                    }
+                }
                 Ok(r) => {
                     let status = r.status();
                     let text = r.into_string().unwrap_or_default();
                     serde_json::json!({"ok": true, "status": status, "body": text})
                 }
                 Err(ureq::Error::Status(code, r)) => {
+                    let location = r.header("location").map(String::from);
                     let text = r.into_string().unwrap_or_default();
-                    serde_json::json!({"ok": false, "status": code, "body": text})
+                    serde_json::json!({"ok": false, "status": code, "body": text, "location": location})
                 }
                 Err(e) => serde_json::json!({"ok": false, "status": 0, "error": e.to_string()}),
             };
@@ -623,7 +1190,12 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
     linker.func_wrap(
         "env",
         "host_kv_get",
-        |mut caller: Caller<'_, HostState>, ns_ptr: u32, ns_len: u32, key_ptr: u32, key_len: u32| -> u64 {
+        |mut caller: Caller<'_, HostState>,
+         ns_ptr: u32,
+         ns_len: u32,
+         key_ptr: u32,
+         key_len: u32|
+         -> u64 {
             let ns = read_guest_string(&mut caller, ns_ptr, ns_len);
             let key = read_guest_string(&mut caller, key_ptr, key_len);
             if ns.is_empty() || key.is_empty() {
@@ -639,7 +1211,14 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
     linker.func_wrap(
         "env",
         "host_kv_put",
-        |mut caller: Caller<'_, HostState>, ns_ptr: u32, ns_len: u32, key_ptr: u32, key_len: u32, val_ptr: u32, val_len: u32| -> u32 {
+        |mut caller: Caller<'_, HostState>,
+         ns_ptr: u32,
+         ns_len: u32,
+         key_ptr: u32,
+         key_len: u32,
+         val_ptr: u32,
+         val_len: u32|
+         -> u32 {
             let ns = read_guest_string(&mut caller, ns_ptr, ns_len);
             let key = read_guest_string(&mut caller, key_ptr, key_len);
             let val = read_guest_string(&mut caller, val_ptr, val_len);
@@ -659,7 +1238,12 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
     linker.func_wrap(
         "env",
         "host_kv_delete",
-        |mut caller: Caller<'_, HostState>, ns_ptr: u32, ns_len: u32, key_ptr: u32, key_len: u32| -> u32 {
+        |mut caller: Caller<'_, HostState>,
+         ns_ptr: u32,
+         ns_len: u32,
+         key_ptr: u32,
+         key_len: u32|
+         -> u32 {
             let ns = read_guest_string(&mut caller, ns_ptr, ns_len);
             let key = read_guest_string(&mut caller, key_ptr, key_len);
             if ns.is_empty() || key.is_empty() {
@@ -675,7 +1259,12 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
     linker.func_wrap(
         "env",
         "host_kv_query",
-        |mut caller: Caller<'_, HostState>, ns_ptr: u32, ns_len: u32, q_ptr: u32, q_len: u32| -> u64 {
+        |mut caller: Caller<'_, HostState>,
+         ns_ptr: u32,
+         ns_len: u32,
+         q_ptr: u32,
+         q_len: u32|
+         -> u64 {
             let ns = read_guest_string(&mut caller, ns_ptr, ns_len);
             let q = read_guest_string(&mut caller, q_ptr, q_len).to_lowercase();
             if ns.is_empty() {
@@ -691,7 +1280,11 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
                     }
                     if let Ok(content) = fs::read_to_string(&path) {
                         if q.is_empty() || content.to_lowercase().contains(&q) {
-                            let key = path.file_stem().and_then(|s| s.to_str()).unwrap_or_default().to_string();
+                            let key = path
+                                .file_stem()
+                                .and_then(|s| s.to_str())
+                                .unwrap_or_default()
+                                .to_string();
                             results.push(serde_json::json!({"key": key, "value": content}));
                         }
                     }
@@ -704,7 +1297,12 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
     linker.func_wrap(
         "env",
         "host_exec_js",
-        |mut caller: Caller<'_, HostState>, code_ptr: u32, code_len: u32, opts_ptr: u32, opts_len: u32| -> u64 {
+        |mut caller: Caller<'_, HostState>,
+         code_ptr: u32,
+         code_len: u32,
+         opts_ptr: u32,
+         opts_len: u32|
+         -> u64 {
             let code = read_guest_string(&mut caller, code_ptr, code_len);
             let opts_str = read_guest_string(&mut caller, opts_ptr, opts_len);
             let opts: serde_json::Value = if opts_str.is_empty() {
@@ -729,7 +1327,12 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
     linker.func_wrap(
         "env",
         "host_task_proc",
-        |mut caller: Caller<'_, HostState>, a_ptr: u32, a_len: u32, p_ptr: u32, p_len: u32| -> u64 {
+        |mut caller: Caller<'_, HostState>,
+         a_ptr: u32,
+         a_len: u32,
+         p_ptr: u32,
+         p_len: u32|
+         -> u64 {
             let action = read_guest_string(&mut caller, a_ptr, a_len);
             let params_str = read_guest_string(&mut caller, p_ptr, p_len);
             let params: serde_json::Value = if params_str.is_empty() {
@@ -738,45 +1341,14 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
                 serde_json::from_str(&params_str).unwrap_or(serde_json::json!({}))
             };
             let cwd = caller.data().cwd();
-            let result = crate::task::handle(&action, &params, &cwd);
-            write_guest_json(&mut caller, result)
-        },
-    )?;
-    linker.func_wrap(
-        "env",
-        "host_browser_exec",
-        |mut caller: Caller<'_, HostState>, body_ptr: u32, body_len: u32, cwd_ptr: u32, cwd_len: u32, sid_ptr: u32, sid_len: u32, opts_ptr: u32, opts_len: u32| -> u64 {
-            let body = read_guest_string(&mut caller, body_ptr, body_len);
-            let cwd_str = read_guest_string(&mut caller, cwd_ptr, cwd_len);
-            let sid = read_guest_string(&mut caller, sid_ptr, sid_len);
-            let opts = read_guest_string(&mut caller, opts_ptr, opts_len);
-            let cwd = if cwd_str.trim().is_empty() {
-                caller.data().cwd()
+            let result = if action == crate::fs_prewarm::ACTION {
+                let extra_roots = caller.data().extra_readable_roots();
+                crate::fs_prewarm::run(&params, |p| {
+                    sandboxed_guest_path_with_extra_roots(&cwd, p, &extra_roots)
+                })
             } else {
-                std::path::PathBuf::from(cwd_str)
+                crate::task::handle(&action, &params, &cwd)
             };
-            let cwd = canonicalize_path_separators_for_stable_keying(&cwd);
-            let result = crate::browser::run(&body, &opts, &cwd, &sid);
-            write_guest_json(&mut caller, result)
-        },
-    )?;
-
-    linker.func_wrap(
-        "env",
-        "host_oxi_exec",
-        |mut caller: Caller<'_, HostState>, body_ptr: u32, body_len: u32, cwd_ptr: u32, cwd_len: u32, sid_ptr: u32, sid_len: u32, opts_ptr: u32, opts_len: u32| -> u64 {
-            let body = read_guest_string(&mut caller, body_ptr, body_len);
-            let cwd_str = read_guest_string(&mut caller, cwd_ptr, cwd_len);
-            let sid = read_guest_string(&mut caller, sid_ptr, sid_len);
-            let opts = read_guest_string(&mut caller, opts_ptr, opts_len);
-            let cwd = if cwd_str.trim().is_empty() {
-                caller.data().cwd()
-            } else {
-                std::path::PathBuf::from(cwd_str)
-            };
-            let cwd = canonicalize_path_separators_for_stable_keying(&cwd);
-            let siblings = caller.data().siblings();
-            let result = crate::oxibrowser_driver::run(&body, &opts, &cwd, &sid, siblings);
             write_guest_json(&mut caller, result)
         },
     )?;
@@ -809,7 +1381,7 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
                     serde_json::json!({"ok": false, "error": "invalid_verb", "verb": verb}),
                 );
             }
-            if let Err(reason) = validate_plugin_call_body(&body) {
+            if let Err(reason) = validate_plugin_call_body(&plugin, &verb, &body) {
                 return write_guest_json(
                     &mut caller,
                     serde_json::json!({"ok": false, "error": "invalid_body", "reason": reason}),
@@ -823,7 +1395,15 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
             }
 
             let caller_siblings = caller.data().siblings();
+            let caller_root = caller.data().cwd();
             let sibling_pool = { caller_siblings.lock().unwrap().get(&plugin).cloned() };
+            let sibling_pool = match sibling_pool {
+                Some(pool) => Some(pool),
+                None if crate::registry::ensure_sibling_registered(&caller_root, &plugin, &caller_siblings) => {
+                    caller_siblings.lock().unwrap().get(&plugin).cloned()
+                }
+                None => None,
+            };
             let Some(sibling_pool) = sibling_pool else {
                 return write_guest_json(
                     &mut caller,
@@ -831,12 +1411,12 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
                 );
             };
 
-            let caller_root = caller.data().cwd();
             let acquire_start = std::time::Instant::now();
             let acquire_timeout_ms = crate::registry::SharedPluginPool::ACQUIRE_TIMEOUT_MS;
             let mut guard = sibling_pool.acquire().expect("acquire() always returns Some -- FIFO wait never denies");
             if guard.is_none() {
                 drop(guard);
+                crate::registry::ensure_sibling_registered(&caller_root, &plugin, &caller_siblings);
                 let remaining_ms = acquire_timeout_ms.saturating_sub(acquire_start.elapsed().as_millis() as u64);
                 sibling_pool.any_instantiated_within(remaining_ms);
                 let remaining_ms = acquire_timeout_ms.saturating_sub(acquire_start.elapsed().as_millis() as u64);
@@ -846,7 +1426,6 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
                 None => Err(anyhow::anyhow!("plugin_not_loaded_yet")),
                 Some(handle) => crate::registry::dispatch_on(&mut handle.store, handle.instance, &verb, &body, &caller_root, caller_siblings.clone()),
             };
-            // Complete any version swap that deferred behind this call.
             sibling_pool.evict_if_swap_pending(&mut guard);
             drop(guard);
 
@@ -878,22 +1457,23 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
             let body = serde_json::json!({"text": text}).to_string();
 
             let caller_siblings = caller.data().siblings();
-            let sibling_pool = { caller_siblings.lock().unwrap_or_else(|e| e.into_inner()).get("bert").cloned() };
             let caller_root = caller.data().cwd();
+            let sibling_pool = { caller_siblings.lock().unwrap_or_else(|e| e.into_inner()).get("bert").cloned() };
+            let sibling_pool = match sibling_pool {
+                Some(pool) => Some(pool),
+                None if crate::registry::ensure_sibling_registered(&caller_root, "bert", &caller_siblings) => {
+                    caller_siblings.lock().unwrap_or_else(|e| e.into_inner()).get("bert").cloned()
+                }
+                None => {
+                    let registered: Vec<String> = caller_siblings.lock().unwrap_or_else(|e| e.into_inner()).keys().cloned().collect();
+                    eprintln!(
+                        "[agentplug:host_vec_embed] no `bert` sibling registered for {} (caller plugin {caller_plugin}); this process has {registered:?} loaded -- the embedder is unreachable, so every embedding-dependent verb will fail until bert is loaded into the SAME siblings map as the caller",
+                        caller_root.display()
+                    );
+                    None
+                }
+            };
             let Some(sibling_pool) = sibling_pool else {
-                // Previously a bare `return -1` with nothing logged anywhere, which
-                // made it the one failure mode of this import that left no trace at
-                // all: the guest only sees rc != EMBED_DIM and a slim gm build then
-                // reports "host_vec_embed must be implemented by the host", blaming
-                // the host's candle path rather than a missing sibling registration.
-                // The live case is a standalone spool watcher that loaded only `gm`
-                // into its project: every embedding-dependent verb hard-fails for as
-                // long as it serves that project.
-                let registered: Vec<String> = caller_siblings.lock().unwrap_or_else(|e| e.into_inner()).keys().cloned().collect();
-                eprintln!(
-                    "[agentplug:host_vec_embed] no `bert` sibling registered for {} (caller plugin {caller_plugin}); this process has {registered:?} loaded -- the embedder is unreachable, so every embedding-dependent verb will fail until bert is loaded into the SAME siblings map as the caller",
-                    caller_root.display()
-                );
                 return -1;
             };
             const EMBED_RETRY_ATTEMPTS: u32 = 3;
@@ -912,7 +1492,6 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
                 if result.is_err() {
                     *guard = None;
                 } else {
-                    // Complete any version swap that deferred behind this call.
                     sibling_pool.evict_if_swap_pending(&mut guard);
                 }
                 drop(guard);
@@ -920,7 +1499,7 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
                     break;
                 }
                 if attempt + 1 < EMBED_RETRY_ATTEMPTS {
-                    std::thread::sleep(std::time::Duration::from_millis(EMBED_RETRY_BACKOFF_MS));
+                    sibling_pool.any_instantiated_within(EMBED_RETRY_BACKOFF_MS);
                 }
             }
 
@@ -973,19 +1552,75 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
                     "exit_code": -1,
                 });
                 return write_guest_json(&mut caller, v);
-            }
-            let mut git_cmd = std::process::Command::new("git");
-            git_cmd.args(&argv).current_dir(&cwd).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
-            #[cfg(windows)]
-            {
-                use std::os::windows::process::CommandExt;
-                const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-                git_cmd.creation_flags(CREATE_NO_WINDOW);
-            }
-            let spawn_started = Instant::now();
-            let v = match git_cmd.spawn() {
-                Ok(mut child) => {
-                    let cap_hit = Arc::new(AtomicBool::new(false));
+                }
+                    git_call_stats_note(&argv, false, 0);
+                    let layout_question = git_layout_question(&cwd, &argv);
+                    let index_question = git_index_question(&cwd, &argv);
+                    let index_identity =
+                        index_question.as_ref().and_then(|(dir, _)| git_index_identity(dir));
+                    if let Some((dir, question)) = layout_question.as_ref() {
+                        if let Some(answer) = git_layout_recall(dir, question, None) {
+                            return write_guest_json(&mut caller, serde_json::json!({
+                                "stdout": answer.stdout,
+                                "stderr": answer.stderr,
+                                "exit_code": answer.exit_code,
+                                "stdout_truncated": false,
+                                "stderr_truncated": false,
+                            }));
+                        }
+                    }
+                    if let Some((dir, question)) = index_question.as_ref() {
+                        if let Some(answer) = git_layout_recall(dir, question, index_identity.clone()) {
+                            return write_guest_json(&mut caller, serde_json::json!({
+                                "stdout": answer.stdout,
+                                "stderr": answer.stderr,
+                                "exit_code": answer.exit_code,
+                                "stdout_truncated": false,
+                                "stderr_truncated": false,
+                            }));
+                        }
+                    }
+                    if let Some(dir) = git_head_question(&cwd, &argv) {
+                        if let Some(sha) = git_head_sha_from_disk(&dir) {
+                            return write_guest_json(&mut caller, serde_json::json!({
+                                "stdout": format!("{sha}\n"),
+                                "stderr": "",
+                                "exit_code": 0,
+                                "stdout_truncated": false,
+                                "stderr_truncated": false,
+                            }));
+                        }
+                    }
+                    git_call_stats_note(&argv, true, 0);
+                    let git_started = Instant::now();
+                    let mut git_cmd = std::process::Command::new("git");
+                    git_cmd.args(&argv).current_dir(&cwd).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+                    configure_github_git_credentials(&mut git_cmd, &argv);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::process::CommandExt;
+                    git_cmd.process_group(0);
+                }
+                #[cfg(windows)]
+                {
+                    crate::windowless::apply_windowless(&mut git_cmd);
+                }
+                let v = match git_cmd.spawn() {
+                    Ok(mut child) => {
+                        let containment = match crate::process_tree::establish_containment(&child) {
+                            Ok(containment) => containment,
+                            Err(error) => {
+                                crate::process_tree::kill_tree(child.id());
+                                let _ = child.kill();
+                                let _ = child.wait();
+                                return write_guest_json(&mut caller, serde_json::json!({
+                                    "stdout": "",
+                                    "stderr": format!("git process containment failed: {error}"),
+                                    "exit_code": -1,
+                                }));
+                            }
+                        };
+                        let cap_hit = Arc::new(AtomicBool::new(false));
                     let out_handle = child.stdout.take().map(|o| drain_reader_capped(o, HOST_GIT_STDOUT_CAP_BYTES, cap_hit.clone()));
                     let err_handle = child.stderr.take().map(|e| drain_reader_capped(e, HOST_GIT_STDERR_CAP_BYTES, cap_hit.clone()));
                     let timeout_ms = git_subprocess_timeout_ms();
@@ -994,9 +1629,9 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
                     let mut timed_out = false;
                     let mut cap_stopped = false;
                     loop {
-                        if cap_hit.load(Ordering::SeqCst) {
-                            let _ = child.kill();
-                            let _ = child.wait();
+                            if cap_hit.load(Ordering::SeqCst) {
+                                crate::process_tree::terminate_containment(&containment, child.id());
+                                let _ = child.wait();
                             cap_stopped = true;
                             break;
                         }
@@ -1005,43 +1640,113 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
                             Ok(None) => {}
                             Err(_) => break,
                         }
-                        if Instant::now() >= deadline {
-                            let _ = child.kill();
-                            let _ = child.wait();
+                            if Instant::now() >= deadline {
+                                crate::process_tree::terminate_containment(&containment, child.id());
+                                let _ = child.wait();
                             timed_out = true;
                             break;
                         }
-                    }
-                    let (stdout, out_trunc_read) = out_handle.and_then(|h| h.join().ok()).unwrap_or_default();
-                    let (stderr, _err_trunc) = err_handle.and_then(|h| h.join().ok()).unwrap_or_default();
-                    if timed_out {
-                        serde_json::json!({
-                            "stdout": String::from_utf8_lossy(&stdout),
-                            "stderr": format!("git {argv:?} timed out after {timeout_ms}ms, killed"),
-                            "exit_code": -1,
-                        })
-                    } else {
-                        // A cap-stopped read is a deliberate, successful truncation, not a failure:
-                        // report exit 0 so a verb that errors on a nonzero code (git_diff) still gets
-                        // its (truncated) output rather than an error.
-                        serde_json::json!({
-                            "stdout": String::from_utf8_lossy(&stdout),
-                            "stderr": String::from_utf8_lossy(&stderr),
-                            "exit_code": if cap_stopped { 0 } else { exit_code },
-                            "stdout_truncated": out_trunc_read || cap_stopped,
-                        })
-                    }
+                        }
+                        let (stdout, out_trunc_read) =
+                            out_handle.and_then(|h| h.join().ok()).unwrap_or_default();
+                        let (stderr, err_trunc_read) =
+                            err_handle.and_then(|h| h.join().ok()).unwrap_or_default();
+                        let output_truncated = out_trunc_read || err_trunc_read || cap_stopped;
+                        let stderr = String::from_utf8_lossy(&stderr);
+                        let output_limit_error =
+                            format!("git {argv:?} output exceeded the host capture limit");
+                        if let Some((dir, question)) = layout_question.as_ref() {
+                            if timed_out || output_truncated || exit_code != 0 {
+                                git_layout_forget_dir(dir);
+                            } else {
+                                git_layout_remember(
+                                    dir.clone(),
+                                    question,
+                                    GitLayoutAnswer {
+                                        stdout: String::from_utf8_lossy(&stdout).into_owned(),
+                                        stderr: stderr.to_string(),
+                                        exit_code,
+                                        fingerprint: None,
+                                    },
+                                );
+                            }
+                        } else if let Some((dir, question)) = index_question.as_ref() {
+                            if timed_out || output_truncated || exit_code != 0 {
+                                git_layout_forget_dir(dir);
+                            } else if let Some(identity) = index_identity.as_ref() {
+                                if stdout.len() <= GIT_INDEX_ANSWER_MAX_BYTES {
+                                    git_layout_remember(
+                                        dir.clone(),
+                                        question,
+                                        GitLayoutAnswer {
+                                            stdout: String::from_utf8_lossy(&stdout).into_owned(),
+                                            stderr: stderr.to_string(),
+                                            exit_code,
+                                            fingerprint: Some(identity.clone()),
+                                        },
+                                    );
+                                }
+                            }
+                        } else {
+                            git_layout_forget_dir(&cwd);
+                        }
+                        if timed_out {
+                            serde_json::json!({
+                                "stdout": String::from_utf8_lossy(&stdout),
+                                "stderr": format!("git {argv:?} timed out after {timeout_ms}ms, killed"),
+                                "exit_code": -1,
+                            })
+                        } else {
+                            serde_json::json!({
+                                "stdout": String::from_utf8_lossy(&stdout),
+                                "stderr": if output_truncated {
+                                    if stderr.is_empty() {
+                                        output_limit_error
+                                    } else {
+                                        format!("{stderr}\n{output_limit_error}")
+                                    }
+                                } else {
+                                    stderr.into_owned()
+                                },
+                                "exit_code": if output_truncated { -1 } else { exit_code },
+                                "stdout_truncated": out_trunc_read,
+                                "stderr_truncated": err_trunc_read,
+                            })
+                        }
                 }
                 Err(e) => serde_json::json!({"stdout": "", "stderr": e.to_string(), "exit_code": 1}),
             };
+            git_call_stats_add_ms(&argv, git_started.elapsed().as_millis() as u64);
             if std::env::var_os("GM_GIT_TRACE").is_some() {
                 eprintln!(
                     "[agentplug:git_trace] argv={argv:?} cwd={} elapsed_ms={:.1}",
                     cwd.display(),
-                    spawn_started.elapsed().as_secs_f64() * 1000.0
+                    git_started.elapsed().as_secs_f64() * 1000.0
                 );
             }
             write_guest_json(&mut caller, v)
+        },
+    )?;
+
+    linker.func_wrap(
+        "env",
+        "crawl_cdp",
+        |mut caller: Caller<'_, HostState>, body_ptr: u32, body_len: u32| -> u64 {
+            let body = read_guest_string(&mut caller, body_ptr, body_len);
+            let cwd = caller.data().cwd();
+            let reply = crate::crawl::crawl_cdp(&cwd, &body);
+            write_guest_json(&mut caller, reply)
+        },
+    )?;
+
+    linker.func_wrap(
+        "env",
+        "host_lightpanda_crawl",
+        |mut caller: Caller<'_, HostState>, body_ptr: u32, body_len: u32| -> u64 {
+            let body = read_guest_string(&mut caller, body_ptr, body_len);
+            let cwd = caller.data().cwd();
+            let reply = crate::crawl::lightpanda_crawl(&cwd, &body);
+            write_guest_json(&mut caller, reply)
         },
     )?;
 
@@ -1057,5 +1762,43 @@ fn kv_file_path(cwd: &std::path::Path, ns: &str, key: &str) -> PathBuf {
 }
 
 fn safe_name(s: &str) -> String {
-    s.chars().map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-' { c } else { '_' }).collect()
+    s.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    static CREDENTIAL_CONFIG_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn scopes_the_github_cli_store_and_helper_to_git_children() {
+        let _guard = CREDENTIAL_CONFIG_LOCK.lock().unwrap();
+        let credential_dir = PathBuf::from("/tmp/agentplug-gh-config");
+        set_github_cli_config_dir(Some(credential_dir.clone()));
+        let mut command = std::process::Command::new("git");
+        configure_github_git_credentials(&mut command, &["push".to_string()]);
+        let envs: HashMap<_, _> = command.get_envs().collect();
+        assert_eq!(
+            envs.get(std::ffi::OsStr::new("GH_CONFIG_DIR"))
+                .and_then(|value| *value),
+            Some(credential_dir.as_os_str())
+        );
+        let helper_present = envs.iter().any(|(key, value)| {
+            key.to_string_lossy().starts_with("GIT_CONFIG_KEY_")
+                && value.is_some_and(|value| {
+                    value == std::ffi::OsStr::new("credential.https://github.com.helper")
+                })
+        });
+        assert!(helper_present);
+        set_github_cli_config_dir(None);
+    }
 }
