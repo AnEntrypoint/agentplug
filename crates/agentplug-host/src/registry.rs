@@ -2497,7 +2497,30 @@ pub struct LaneQueueState {
     pub lane_holder_age_ms: Option<u64>,
     pub lane_holder_task: Option<String>,
     pub lane_holder_verb: Option<String>,
+    /// Claims queued behind this lane's holder that are still contending for it: a caller polling
+    /// right now, or one that re-dispatched within `LANE_TICKET_STALE_MS`. Parked claims past that
+    /// window are counted in `lane_waiters_stale` instead, so a depth that reads 1 with a busy lane
+    /// is never a queue that silently forgot its waiters.
     pub lane_waiters: usize,
+    pub lane_waiters_active: usize,
+    pub lane_waiters_stale: usize,
+}
+
+/// Splits one lane queue into the depth that is actually contending for the lane.
+///
+/// A raw `queue.len()` is not a backlog: a parked ticket whose caller stopped re-dispatching stops
+/// contending after `LANE_TICKET_STALE_MS` but keeps its `last_seen_ms`, so it keeps inflating the
+/// count long after its caller gave up, while a caller that IS inside `acquire_within` right now is
+/// the only thing the count is meant to report. So `lane_waiters` counts contending claims -- live
+/// in `acquire_within`, or re-dispatched within the stale window -- and the parked remainder is
+/// reported beside it instead of being silently added or silently dropped.
+fn lane_queue_depth(queue: &VecDeque<LaneWaiter>, now: u64) -> (usize, usize, usize) {
+    let contending = queue
+        .iter()
+        .filter(|entry| entry.active || now.saturating_sub(entry.last_seen_ms) < LANE_TICKET_STALE_MS)
+        .count();
+    let active = queue.iter().filter(|entry| entry.active).count();
+    (contending, active, queue.len().saturating_sub(contending))
 }
 
 pub fn lane_queue_state(root: &Path, lane: Option<&str>, task: &str) -> LaneQueueState {
@@ -2507,6 +2530,8 @@ pub fn lane_queue_state(root: &Path, lane: Option<&str>, task: &str) -> LaneQueu
         lane_holder_task: None,
         lane_holder_verb: None,
         lane_waiters: 0,
+        lane_waiters_active: 0,
+        lane_waiters_stale: 0,
     };
     let Some(lane) = lane.and_then(lane_name) else {
         return unassigned;
@@ -2527,7 +2552,9 @@ pub fn lane_queue_state(root: &Path, lane: Option<&str>, task: &str) -> LaneQueu
     let lane_position = queue
         .and_then(|queue| queue.iter().position(|entry| entry.task == task))
         .map(|index| index as u64 + 1);
-    let lane_waiters = queue.map(|queue| queue.len()).unwrap_or(0);
+    let (lane_waiters, lane_waiters_active, lane_waiters_stale) = queue
+        .map(|queue| lane_queue_depth(queue, now))
+        .unwrap_or((0, 0, 0));
     drop(waiters);
     let (lane_holder_age_ms, lane_holder_task, lane_holder_verb) = match holder {
         Some((age, task, verb)) => (
@@ -2543,6 +2570,8 @@ pub fn lane_queue_state(root: &Path, lane: Option<&str>, task: &str) -> LaneQueu
         lane_holder_task,
         lane_holder_verb,
         lane_waiters,
+        lane_waiters_active,
+        lane_waiters_stale,
     }
 }
 
@@ -2552,18 +2581,12 @@ pub struct LaneHold {
     pub verb: String,
     pub task: String,
     pub held_ms: u64,
+    /// Claims still contending for this lane, counted the same way as `LaneQueueState::lane_waiters`.
     pub waiters: usize,
+    pub waiters_active: usize,
+    pub waiters_stale: usize,
 }
 
-/// Every lane this project holds, with how long it has been held and how many claims wait on it.
-///
-/// A lane is single-writer, so a hold far longer than any real operation is the signature of a
-/// stalled holder freezing the project's whole lane. This is the watchdog's read: it names the
-/// holder and its hold duration. It never releases a live holder -- one writer per lane is the
-/// property that keeps concurrent git writers on one worktree serialized, and dropping it would
-/// trade a visible stall for a corrupted index.
-///
-/// Lock order is owners-then-waiters, matching `acquire_within`.
 /// How many claims are waiting on this lane right now.
 ///
 /// The hold watchdog reads it so the absolute ceiling on a running holder only spends the
@@ -2578,6 +2601,15 @@ pub fn lane_waiter_count(root: &Path, lane: &str) -> usize {
     waiters.get(&key).map(|queue| queue.len()).unwrap_or(0)
 }
 
+/// Every lane this project holds, with how long it has been held and how many claims wait on it.
+///
+/// A lane is single-writer, so a hold far longer than any real operation is the signature of a
+/// stalled holder freezing the project's whole lane. This is the watchdog's read: it names the
+/// holder and its hold duration. It never releases a live holder -- one writer per lane is the
+/// property that keeps concurrent git writers on one worktree serialized, and dropping it would
+/// trade a visible stall for a corrupted index.
+///
+/// Lock order is owners-then-waiters, matching `acquire_within`.
 pub fn lane_holds(root: &Path) -> Vec<LaneHold> {
     let now = crate::now_ms();
     let owners = gm_lane_owners().lock().unwrap_or_else(|e| e.into_inner());
@@ -2585,18 +2617,20 @@ pub fn lane_holds(root: &Path) -> Vec<LaneHold> {
         .iter()
         .filter(|((owner_root, _), _)| owner_root == root)
         .map(|((_, lane), owner)| {
-            let waiters = gm_lane_waiters()
+            let (waiters, waiters_active, waiters_stale) = gm_lane_waiters()
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .get(&(root.to_path_buf(), *lane))
-                .map(|queue| queue.len())
-                .unwrap_or(0);
+                .map(|queue| lane_queue_depth(queue, now))
+                .unwrap_or((0, 0, 0));
             LaneHold {
                 lane,
                 verb: owner.verb.clone(),
                 task: owner.task.clone(),
                 held_ms: now.saturating_sub(owner.acquired_ms),
                 waiters,
+                waiters_active,
+                waiters_stale,
             }
         })
         .collect();
@@ -2616,7 +2650,14 @@ pub struct LaneWaitReport {
     pub lane: &'static str,
     pub lane_position: Option<u64>,
     pub waited_ms: u64,
+    /// Claims still contending for this lane, this dispatch's own parked ticket included.
     pub waiters: usize,
+    /// Contending claims inside `acquire_within` at this instant: the ones whose budgets are
+    /// actually running.
+    pub waiters_active: usize,
+    /// Parked claims whose caller stopped re-dispatching. Reported, never counted into `waiters`, so
+    /// a backlog cannot be inflated by callers that already gave up.
+    pub waiters_stale: usize,
     pub lane_holder_task: Option<String>,
 }
 
@@ -2764,7 +2805,7 @@ impl GmFairnessGuard {
             owners = next;
         };
         drop(owners);
-        let (waiters, lane_position) = {
+        let (waiters, waiters_active, waiters_stale, lane_position) = {
             let mut waiters = gm_lane_waiters().lock().unwrap_or_else(|e| e.into_inner());
             let key = (owned_root.clone(), lane);
             let position = waiters
@@ -2786,8 +2827,11 @@ impl GmFairnessGuard {
                     entry.active = false;
                 }
             }
-            let remaining = waiters.get(&key).map(|queue| queue.len()).unwrap_or(0);
-            (remaining, position)
+            let (waiters, waiters_active, waiters_stale) = waiters
+                .get(&key)
+                .map(|queue| lane_queue_depth(queue, crate::now_ms()))
+                .unwrap_or((0, 0, 0));
+            (waiters, waiters_active, waiters_stale, position)
         };
         if !acquired {
             let (holder_task, holder_verb, holder_held_ms) = gm_lane_owners()
@@ -2811,6 +2855,8 @@ impl GmFairnessGuard {
                 lane,
                 waited_ms: started.elapsed().as_millis() as u64,
                 waiters,
+                waiters_active,
+                waiters_stale,
                 lane_position,
                 lane_holder_task,
                 lane_holder_verb,
