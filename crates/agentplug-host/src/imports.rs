@@ -54,11 +54,19 @@ const GIT_LAYOUT_QUESTION_FLAGS: &[&str] = &[
 
 const GIT_LAYOUT_CACHE_MAX_ENTRIES: usize = 512;
 
+/// An index listing bigger than this is served from git every time rather than held in the memo:
+/// the memo is a spawn saver, not a second copy of the index.
+const GIT_INDEX_ANSWER_MAX_BYTES: usize = 1 << 20;
+
 #[derive(Clone)]
 struct GitLayoutAnswer {
     stdout: String,
     stderr: String,
     exit_code: i32,
+    /// Some(identity) where the answer is a pure function of one file on disk: the answer is
+    /// served again only while that file still carries the identity it had when the answer was
+    /// produced, so a memo can never outlive the bytes it was computed from.
+    fingerprint: Option<String>,
 }
 
 fn git_layout_cache() -> &'static Mutex<HashMap<String, (String, GitLayoutAnswer)>> {
@@ -104,12 +112,59 @@ fn git_layout_question(cwd: &Path, argv: &[String]) -> Option<(PathBuf, String)>
     Some((dir, format!("rev-parse {}", rest[1])))
 }
 
+fn git_index_question(cwd: &Path, argv: &[String]) -> Option<(PathBuf, String)> {
+    let (dir, rest) = git_argv_fold(cwd, argv)?;
+    if rest.len() != 4 && !(rest.len() == 6 && rest[4] == "--") {
+        return None;
+    }
+    if rest[0] != "--literal-pathspecs" || rest[1] != "ls-files" || rest[2] != "-z" || rest[3] != "--stage" {
+        return None;
+    }
+    Some((dir, rest.join(" ")))
+}
+
 fn git_head_question(cwd: &Path, argv: &[String]) -> Option<PathBuf> {
     let (dir, rest) = git_argv_fold(cwd, argv)?;
     match rest.as_slice() {
         ["rev-parse", "HEAD"] | ["rev-parse", "--verify", "HEAD"] => Some(dir),
         _ => None,
     }
+}
+
+fn git_dir_of(dir: &Path) -> Option<PathBuf> {
+    let dot_git = dir.join(".git");
+    if dot_git.is_dir() {
+        return Some(dot_git);
+    }
+    if !dot_git.is_file() {
+        return None;
+    }
+    let text = fs::read_to_string(&dot_git).ok()?;
+    let rest = text.trim().strip_prefix("gitdir:")?.trim();
+    let given = PathBuf::from(rest);
+    Some(if given.is_absolute() {
+        given
+    } else {
+        dir.join(given)
+    })
+}
+
+fn git_file_identity(path: &Path) -> Option<String> {
+    let meta = fs::metadata(path).ok()?;
+    let mtime_ms = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis())?;
+    Some(format!("{mtime_ms}:{}", meta.len()))
+}
+
+// `ls-files --stage` prints the index: mode, sha, stage number and path for every staged entry.
+// That is a pure function of .git/index, so the answer is kept only while the index still carries
+// the mtime and length it had when git produced it -- a `git add`, checkout, reset or merge
+// rewrites the index and changes that identity, and a repo with no index answers nothing.
+fn git_index_identity(dir: &Path) -> Option<String> {
+    git_file_identity(&git_dir_of(dir)?.join("index"))
 }
 
 // `git rev-parse HEAD` asks which commit HEAD names. Where HEAD is a loose symbolic ref that
@@ -133,21 +188,7 @@ fn git_head_ref_contents(git_dir: &Path, reference: &str) -> Option<String> {
 }
 
 fn git_head_sha_from_disk(dir: &Path) -> Option<String> {
-    let dot_git = dir.join(".git");
-    let git_dir = if dot_git.is_dir() {
-        dot_git
-    } else if dot_git.is_file() {
-        let text = fs::read_to_string(&dot_git).ok()?;
-        let rest = text.trim().strip_prefix("gitdir:")?.trim();
-        let given = PathBuf::from(rest);
-        if given.is_absolute() {
-            given
-        } else {
-            dir.join(given)
-        }
-    } else {
-        return None;
-    };
+    let git_dir = git_dir_of(dir)?;
     let head = fs::read_to_string(git_dir.join("HEAD")).ok()?;
     let head = head.trim();
     let sha = match head.strip_prefix("ref:") {
@@ -162,13 +203,27 @@ fn git_head_sha_from_disk(dir: &Path) -> Option<String> {
     }
 }
 
-fn git_layout_recall(dir: &Path, question: &str) -> Option<GitLayoutAnswer> {
+fn git_layout_recall(dir: &Path, question: &str, live: Option<String>) -> Option<GitLayoutAnswer> {
     let key = format!("{}\u{0}{}", git_layout_dir_key(dir), question);
-    let cache = match git_layout_cache().lock() {
+    let mut cache = match git_layout_cache().lock() {
         Ok(cache) => cache,
         Err(poisoned) => poisoned.into_inner(),
     };
-    cache.get(&key).map(|(_, answer)| answer.clone())
+    let answer = cache.get(&key).map(|(_, answer)| answer.clone());
+    let Some(answer) = answer else {
+        return None;
+    };
+    match (answer.fingerprint.as_ref(), live.as_ref()) {
+        (Some(kept), Some(now)) if kept != now => {
+            cache.remove(&key);
+            None
+        }
+        (Some(_), None) => {
+            cache.remove(&key);
+            None
+        }
+        _ => Some(answer),
+    }
 }
 
 fn git_layout_remember(dir: PathBuf, question: &str, answer: GitLayoutAnswer) {
@@ -1494,8 +1549,22 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
                 }
                     git_call_stats_note(&argv, false, 0);
                     let layout_question = git_layout_question(&cwd, &argv);
+                    let index_question = git_index_question(&cwd, &argv);
+                    let index_identity =
+                        index_question.as_ref().and_then(|(dir, _)| git_index_identity(dir));
                     if let Some((dir, question)) = layout_question.as_ref() {
-                        if let Some(answer) = git_layout_recall(dir, question) {
+                        if let Some(answer) = git_layout_recall(dir, question, None) {
+                            return write_guest_json(&mut caller, serde_json::json!({
+                                "stdout": answer.stdout,
+                                "stderr": answer.stderr,
+                                "exit_code": answer.exit_code,
+                                "stdout_truncated": false,
+                                "stderr_truncated": false,
+                            }));
+                        }
+                    }
+                    if let Some((dir, question)) = index_question.as_ref() {
+                        if let Some(answer) = git_layout_recall(dir, question, index_identity.clone()) {
                             return write_guest_json(&mut caller, serde_json::json!({
                                 "stdout": answer.stdout,
                                 "stderr": answer.stderr,
@@ -1591,8 +1660,26 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
                                         stdout: String::from_utf8_lossy(&stdout).into_owned(),
                                         stderr: stderr.to_string(),
                                         exit_code,
+                                        fingerprint: None,
                                     },
                                 );
+                            }
+                        } else if let Some((dir, question)) = index_question.as_ref() {
+                            if timed_out || output_truncated || exit_code != 0 {
+                                git_layout_forget_dir(dir);
+                            } else if let Some(identity) = index_identity.as_ref() {
+                                if stdout.len() <= GIT_INDEX_ANSWER_MAX_BYTES {
+                                    git_layout_remember(
+                                        dir.clone(),
+                                        question,
+                                        GitLayoutAnswer {
+                                            stdout: String::from_utf8_lossy(&stdout).into_owned(),
+                                            stderr: stderr.to_string(),
+                                            exit_code,
+                                            fingerprint: Some(identity.clone()),
+                                        },
+                                    );
+                                }
                             }
                         } else {
                             git_layout_forget_dir(&cwd);
