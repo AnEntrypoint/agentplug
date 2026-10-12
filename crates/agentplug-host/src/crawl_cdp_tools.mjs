@@ -95,7 +95,41 @@ function createToolContext({ session, host, cwd, timeoutMs, textLimit }) {
     dialogPolicy: { accept: true, promptText: '' },
     loadWaiters: [],
     trace: null,
+    eventEntries: new Map(),
   };
+}
+
+function eventField(params, field) {
+  let value = params;
+  for (const part of field.split('.')) {
+    if (value === null || typeof value !== 'object') return undefined;
+    value = value[part];
+  }
+  return value;
+}
+
+function eventMatches(filter, params) {
+  if (!filter) return true;
+  const value = eventField(params, filter.field);
+  if (value === undefined || value === null) return false;
+  const text = typeof value === 'string' ? value : JSON.stringify(value);
+  if (filter.op === 'contains') return text.includes(filter.value);
+  if (filter.op === 'not_equals') return text !== filter.value;
+  return text === filter.value;
+}
+
+function armEventCapture(s, step, entry) {
+  s.on(step.event, (params) => {
+    if (!eventMatches(step.where || null, params)) return;
+    if (entry.events.length >= step.limit) {
+      entry.dropped += 1;
+      return;
+    }
+    entry.events.push({ method: step.event, params });
+    entry.count = entry.events.length;
+  });
+  const domain = step.event.split('.')[0];
+  return domain ? s.send(`${domain}.enable`).catch(() => {}) : Promise.resolve();
 }
 
 function restoreUidState(ctx, state) {
@@ -602,6 +636,20 @@ async function attachCapture(ctx, steps) {
   if (steps.some((step) => NETWORK_OPS.has(step.op))) {
     attachNetwork(ctx, s);
     await s.send('Network.enable');
+  }
+  const eventSteps = steps.filter((step) => step.op === 'events');
+  for (const step of eventSteps) {
+    ctx.eventEntries.set(step, {
+      op: 'events',
+      event: step.event,
+      where: step.where || null,
+      count: 0,
+      dropped: 0,
+      events: [],
+    });
+  }
+  for (const step of eventSteps) {
+    await armEventCapture(s, step, ctx.eventEntries.get(step));
   }
 }
 

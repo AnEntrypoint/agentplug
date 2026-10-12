@@ -18,6 +18,10 @@ pub(crate) const CDP_READY_DEADLINE: Duration = Duration::from_secs(30);
 pub(crate) const CDP_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const CDP_HELPER_BUDGET: Duration = Duration::from_secs(100);
 const MAX_WAIT_MS: u64 = 60_000;
+const MAX_EVENT_LIMIT: u64 = 10_000;
+const DEFAULT_EVENT_LIMIT: u64 = 200;
+const MAX_CDP_PARAMS_LINES: usize = 64;
+type StepLines<'a> = std::iter::Peekable<std::iter::Enumerate<std::str::Lines<'a>>>;
 const URL_SCHEMES: [&str; 5] = ["http://", "https://", "about:blank", "file://", "data:"];
 
 pub struct ParsedCrawl {
@@ -207,14 +211,7 @@ fn parse_step(line: &str) -> Result<Value, String> {
         return goto_step(line);
     }
     if let Some(ms) = line.strip_prefix("wait=") {
-        let ms = ms.trim();
-        let parsed: u64 = ms
-            .parse()
-            .map_err(|_| format!("wait= needs whole milliseconds, got '{ms}'"))?;
-        if parsed > MAX_WAIT_MS {
-            return Err(format!("wait={parsed} exceeds the {MAX_WAIT_MS}ms limit"));
-        }
-        return Ok(json!({"op": "wait", "ms": parsed}));
+        return parse_wait_ms(ms.trim());
     }
     if let Some(code) = line.strip_prefix("eval=") {
         let code = code.trim();
@@ -227,6 +224,16 @@ fn parse_step(line: &str) -> Result<Value, String> {
         "unrecognized crawl step '{}' (expected url=<url>, a bare URL, wait=<ms> or eval=<js>)",
         line.chars().take(80).collect::<String>()
     ))
+}
+
+fn parse_wait_ms(ms: &str) -> Result<Value, String> {
+    let parsed: u64 = ms
+        .parse()
+        .map_err(|_| format!("wait needs whole milliseconds, got '{ms}'"))?;
+    if parsed > MAX_WAIT_MS {
+        return Err(format!("wait={parsed} exceeds the {MAX_WAIT_MS}ms limit"));
+    }
+    Ok(json!({"op": "wait", "ms": parsed}))
 }
 
 fn goto_step(url: &str) -> Result<Value, String> {
@@ -244,13 +251,14 @@ pub struct CdpCrawl {
     pub headful: bool,
 }
 
-const TOOL_STEP_GRAMMAR: &str ="snapshot, click=<uid>, dblclick=<uid>, hover=<uid>, click_at=<x>,<y>, fill=<uid> <value>, type=<text>, press=<key>, press_uid=<uid> <key>, upload=<uid> <path>[;<path>], wait_for=<text>, reload, back, forward, console, network[=<reqid>], dialog=accept|dismiss, screenshot=<path>, screenshot_full=<path>, screenshot_uid=<uid> <path>, trace_start, trace_stop[=<path>]";
+const TOOL_STEP_GRAMMAR: &str ="snapshot, click=<uid>, dblclick=<uid>, hover=<uid>, click_at=<x>,<y>, fill=<uid> <value>, type=<text>, press=<key>, press_uid=<uid> <key>, upload=<uid> <path>[;<path>], wait_for=<text>, reload, back, forward, console, network[=<reqid>], dialog=accept|dismiss, screenshot=<path>, screenshot_full=<path>, screenshot_uid=<uid> <path>, trace_start, trace_stop[=<path>], cdp <Domain.method> (+ JSON params on the next line), events <Domain.event> [where <field>~<value>] [limit=N], wait <ms>";
 
 pub fn parse_cdp_crawl_body(body: &str) -> Result<CdpCrawl, String> {
     let mut session = None;
     let mut headful = env_flag("GM_CRAWL_CDP_HEADFUL");
     let mut steps = Vec::new();
-    for (index, raw) in body.lines().enumerate() {
+    let mut lines = body.lines().enumerate().peekable();
+    while let Some((index, raw)) = lines.next() {
         let line = raw.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
@@ -266,9 +274,14 @@ pub fn parse_cdp_crawl_body(body: &str) -> Result<CdpCrawl, String> {
                 }
                 continue;
             }
-            if let Some(value) = line.strip_prefix("session=") {
+            if let Some(value) = line
+                .strip_prefix("session=")
+                .or_else(|| line.strip_prefix("sessionId="))
+            {
                 if session.is_some() {
-                    return Err(format!("line {number}: session= is given twice"));
+                    return Err(format!(
+                        "line {number}: session= is given twice; session= and sessionId= name the same session"
+                    ));
                 }
                 session =
                     Some(session_name(value.trim()).map_err(|e| format!("line {number}: {e}"))?);
@@ -287,7 +300,7 @@ pub fn parse_cdp_crawl_body(body: &str) -> Result<CdpCrawl, String> {
                 "line {number}: headless/headful is a leading directive and must come before the first step"
             ));
         }
-        steps.push(parse_cdp_step(line).map_err(|e| format!("line {number}: {e}"))?);
+        steps.push(parse_cdp_step(line, &mut lines).map_err(|e| format!("line {number}: {e}"))?);
     }
     if steps.is_empty() {
         return Err(
@@ -331,7 +344,32 @@ fn session_name(name: &str) -> Result<String, String> {
     }
 }
 
-fn parse_cdp_step(line: &str) -> Result<Value, String> {
+/// Splits a `keyword argument` line into its argument, so `wait 500` and
+/// `cdp Page.navigate` read the same way.
+fn keyword_arg<'a>(line: &'a str, keyword: &str) -> Option<&'a str> {
+    match line.split_once(char::is_whitespace) {
+        Some((head, rest)) if head == keyword => {
+            let rest = rest.trim_start();
+            if rest.is_empty() {
+                None
+            } else {
+                Some(rest)
+            }
+        }
+        _ => None,
+    }
+}
+
+fn parse_cdp_step(line: &str, lines: &mut StepLines<'_>) -> Result<Value, String> {
+    if let Some(arg) = keyword_arg(line, "cdp") {
+        return parse_raw_cdp_step(arg, lines);
+    }
+    if let Some(arg) = keyword_arg(line, "events") {
+        return parse_events_step(arg);
+    }
+    if let Some(arg) = keyword_arg(line, "wait") {
+        return parse_wait_ms(arg.trim_end());
+    }
     let legacy = line.starts_with("url=")
         || line.starts_with("wait=")
         || line.starts_with("eval=")
@@ -340,6 +378,158 @@ fn parse_cdp_step(line: &str) -> Result<Value, String> {
         return parse_step(line);
     }
     parse_tool_step(line)
+}
+
+/// `cdp <Domain.method>` sends one raw CDP command. Its params are the JSON
+/// object on the following line; a command that takes no params omits it.
+fn parse_raw_cdp_step(method: &str, lines: &mut StepLines<'_>) -> Result<Value, String> {
+    let method = require_cdp_method(method, "cdp")?;
+    let params = read_cdp_params(lines)?;
+    Ok(json!({"op": "cdp", "method": method, "params": params}))
+}
+
+fn require_cdp_method<'a>(method: &'a str, what: &str) -> Result<&'a str, String> {
+    let parts: Vec<&str> = method.split('.').collect();
+    let valid = parts.len() == 2
+        && parts.iter().all(|part| {
+            !part.is_empty()
+                && part
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+        });
+    if valid {
+        Ok(method)
+    } else {
+        Err(format!(
+            "{what} needs one Domain.method name, got '{method}'"
+        ))
+    }
+}
+
+fn read_cdp_params(lines: &mut StepLines<'_>) -> Result<Value, String> {
+    let starts_object = match lines.peek() {
+        Some((_, raw)) => raw.trim_start().starts_with('{'),
+        None => false,
+    };
+    if !starts_object {
+        return Ok(json!({}));
+    }
+    let mut text = String::new();
+    let mut consumed = 0usize;
+    while let Some((index, raw)) = lines.next() {
+        consumed += 1;
+        text.push_str(raw);
+        match serde_json::from_str::<Value>(&text) {
+            Ok(value) if value.is_object() => return Ok(value),
+            Ok(value) => {
+                return Err(format!(
+                    "line {}: cdp params must be a JSON object, got {value}",
+                    index + 1
+                ))
+            }
+            Err(_) if consumed < MAX_CDP_PARAMS_LINES => {}
+            Err(e) => {
+                return Err(format!(
+                    "line {}: cdp params are not valid JSON: {e}",
+                    index + 1
+                ))
+            }
+        }
+    }
+    Err("cdp params started with '{' but the JSON object never closed".to_string())
+}
+
+/// `events <Domain.event> [where <field>~<value>] [limit=N]` captures CDP
+/// events from the moment the call attaches, not from the line's position.
+fn parse_events_step(arg: &str) -> Result<Value, String> {
+    let mut tokens = arg.split_whitespace().peekable();
+    let name = tokens
+        .next()
+        .ok_or_else(|| "events needs an event name, e.g. events Debugger.scriptParsed".to_string())?;
+    let event = require_cdp_method(name, "events")?;
+    let mut filter = None;
+    let mut limit = None;
+    while let Some(token) = tokens.next() {
+        if token == "where" {
+            if filter.is_some() {
+                return Err("events: where is given twice".to_string());
+            }
+            let mut parts: Vec<&str> = Vec::new();
+            loop {
+                let is_limit = match tokens.peek() {
+                    Some(next) => next.starts_with("limit="),
+                    None => false,
+                };
+                if is_limit {
+                    break;
+                }
+                match tokens.next() {
+                    Some(part) => parts.push(part),
+                    None => break,
+                }
+            }
+            if parts.is_empty() {
+                return Err(
+                    "events: where needs a filter, e.g. where url~mapspinner".to_string()
+                );
+            }
+            filter = Some(parse_event_filter(&parts.join(" "))?);
+        } else if let Some(value) = token.strip_prefix("limit=") {
+            if limit.is_some() {
+                return Err("events: limit= is given twice".to_string());
+            }
+            limit = Some(require_event_limit(value)?);
+        } else {
+            return Err(format!(
+                "events: unexpected '{token}' (expected where <filter> or limit=N)"
+            ));
+        }
+    }
+    let mut step = json!({"op": "events", "event": event, "limit": limit.unwrap_or(DEFAULT_EVENT_LIMIT)});
+    if let Some(filter) = filter {
+        step["where"] = filter;
+    }
+    Ok(step)
+}
+
+fn parse_event_filter(expr: &str) -> Result<Value, String> {
+    let (token, op, at) = [("!=", "not_equals"), ("~", "contains"), ("=", "equals")]
+        .iter()
+        .filter_map(|(token, op)| expr.find(*token).map(|at| (*token, *op, at)))
+        .min_by_key(|(_, _, at)| *at)
+        .ok_or_else(|| {
+            format!("events: where needs <field>~<value>, <field>=<value> or <field>!=<value>, got '{expr}'")
+        })?;
+    let field = expr[..at].trim();
+    let value = expr[at + token.len()..].trim();
+    let field_ok = !field.is_empty()
+        && field.split('.').all(|part| {
+            !part.is_empty()
+                && part
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+        });
+    if !field_ok {
+        return Err(format!(
+            "events: where field must be a dotted path of names, got '{field}'"
+        ));
+    }
+    if value.is_empty() {
+        return Err(format!("events: where needs a value after '{token}'"));
+    }
+    Ok(json!({"field": field, "op": op, "value": value}))
+}
+
+fn require_event_limit(value: &str) -> Result<u64, String> {
+    let parsed: u64 = value
+        .parse()
+        .map_err(|_| format!("events: limit must be a whole number, got '{value}'"))?;
+    if parsed < 1 || parsed > MAX_EVENT_LIMIT {
+        return Err(format!(
+            "events: limit must be 1..{MAX_EVENT_LIMIT}, got {parsed}"
+        ));
+    }
+    Ok(parsed)
 }
 
 fn parse_tool_step(line: &str) -> Result<Value, String> {
