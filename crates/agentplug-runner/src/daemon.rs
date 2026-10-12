@@ -786,24 +786,185 @@ fn intentional_exit_marker_age_ms() -> Option<u64> {
         .map(|ts| now_ms().saturating_sub(ts))
 }
 
+// One install dir has exactly one daemon and exactly one daemon-guard. Two watchers cannot see
+// each other's claims: each one's orphan sweep answers `dispatch_orphaned` for the other's running
+// work and deletes the claim under it, so a second guard is never a spare, it is a claim shredder.
+// The invariant is enforced by `install_dir()/daemon-guard.lock` (the owner pid) together with
+// `install_dir()/daemon-guard.owner.json` (its identity: pid, exe, version, install_dir, heartbeat
+// ts).
+//
+// The lock file stays a bare integer on purpose. An older runner image reads that same file and
+// must keep understanding it, so a build that never heard of the owner record still refuses to
+// start a second guard; the identity therefore lives beside the lock, never inside it. New builds
+// read both, which is what makes the invariant hold across exe generations instead of only across
+// a clean shutdown.
+//
+// Old state, at every start: a lock whose pid is dead is always reclaimable. A lock whose pid is
+// alive is reclaimed only when the holder cannot prove its mandate -- it has no owner record, the
+// record names some other pid, or the record has not been refreshed for GUARD_HEARTBEAT_STALE_MS.
+// A live guard refreshes it, so a stale one is wedged, or the pid was recycled.
+//
+// Proof, not seniority, is what keeps the lock. An older runner's guard never writes an owner
+// record and never re-reads the lock, so honouring it would hand the install dir to a watcher that
+// can neither retire itself nor be retired; a build that proves nothing for longer than the claim
+// grace is superseded instead. This is the only path that lets a current build take over a home an
+// older build is squatting on.
+
+/// A guard that stops refreshing its owner record for this long has lost its mandate: the record
+/// is what distinguishes a live watcher from a recycled pid, so a stale one is reclaimable.
+const GUARD_HEARTBEAT_STALE_MS: u64 = 120_000;
+/// How often a healthy guard rewrites its owner record. Refreshing every poll would trade a claim
+/// shredder for needless writes to the install dir, so the heartbeat is coarse and the liveness
+/// window above is several times wider than it.
+const GUARD_HEARTBEAT_WRITE_MS: u64 = 30_000;
+/// A guard whose install dir has no live daemon owner and has published no fresh daemon heartbeat
+/// for this long stands down instead of lingering. It was armed by a daemon that is gone, and a
+/// guard that keeps restarting a daemon into a home nothing dispatches through is itself a second
+/// daemon -- the same failure class as a second watcher. A genuinely dead shared daemon is still
+/// restarted within seconds, so this bound only ever fires on a home nobody is using.
+const GUARD_STAND_DOWN_AFTER_STALE_MS: u64 = 600_000;
+/// A claimant writes the lock and then the owner record within the same millisecond, so a lock
+/// that has sat unproven for longer than this grace is not a claim in progress -- it is a holder
+/// that cannot prove anything.
+const GUARD_CLAIM_GRACE_MS: u64 = 60_000;
+/// An install dir that publishes `active_projects: 0` for this long is a home nothing dispatches
+/// through: a witness scratch dir, or a lane that has moved on. Its guard asks the daemon to stop
+/// and retires with it instead of sustaining an idle daemon by restarting it forever. This applies
+/// only to an overridden install dir (AGENTPLUG_HOME set), never to the shared default home, whose
+/// daemon already self-recycles on its own idle clock.
+const GUARD_STAND_DOWN_IDLE_MS: u64 = 600_000;
+/// How long a guard waits for a daemon to honour a stop request before retiring anyway. The daemon
+/// exits by design on its own loop, so this is a grace, not a kill.
+const GUARD_STOP_GRACE_MS: u64 = 30_000;
+
 fn guard_lock_path() -> PathBuf {
     install_dir().join("daemon-guard.lock")
 }
 
-fn live_guard_pid() -> Option<u64> {
-    let pid = fs::read_to_string(guard_lock_path())
+fn guard_owner_path() -> PathBuf {
+    install_dir().join("daemon-guard.owner.json")
+}
+
+/// The install dir this guard watches was named by AGENTPLUG_HOME rather than derived from the
+/// home directory, i.e. it is a per-witness or per-lane scratch home and not the shared one.
+fn home_is_isolated() -> bool {
+    matches!(std::env::var("AGENTPLUG_HOME"), Ok(over) if !over.trim().is_empty())
+}
+
+fn guard_lock_age_ms() -> Option<u64> {
+    let modified = fs::metadata(guard_lock_path()).ok()?.modified().ok()?;
+    let at = modified.duration_since(std::time::UNIX_EPOCH).ok()?;
+    Some(now_ms().saturating_sub(at.as_millis() as u64))
+}
+
+/// Projects the daemon is actually serving, as it published them itself. Zero means nothing has
+/// dispatched through this install dir, which is the only disuse signal a guard can trust -- a
+/// guard cannot see another process's claims.
+fn daemon_active_projects() -> Option<u64> {
+    let raw = fs::read_to_string(daemon_status_path()).ok()?;
+    let value = serde_json::from_str::<serde_json::Value>(&raw).ok()?;
+    value.get("active_projects").and_then(|n| n.as_u64())
+}
+
+/// The guard never kills its daemon. It writes this marker and the daemon stops itself on its own
+/// loop, which is what a stop has to look like when the two processes share claims: the process
+/// holding the work is the one that decides when it is safe to let go.
+fn stop_request_path() -> PathBuf {
+    install_dir().join("daemon-stop-request.json")
+}
+
+pub(crate) fn write_stop_request(reason: &str) {
+    let path = stop_request_path();
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let payload = serde_json::json!({
+        "ts": now_ms(),
+        "reason": reason,
+        "pid": std::process::id(),
+    })
+    .to_string();
+    let tmp = path.with_extension(format!("json.tmp.{}", std::process::id()));
+    if fs::write(&tmp, payload).is_ok() && fs::rename(&tmp, &path).is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+}
+
+fn stop_request_age_ms() -> Option<u64> {
+    fs::read_to_string(stop_request_path())
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .and_then(|v| v.get("ts").and_then(|t| t.as_u64()))
+        .map(|ts| now_ms().saturating_sub(ts))
+}
+
+fn read_guard_lock_pid() -> Option<u64> {
+    fs::read_to_string(guard_lock_path())
         .ok()?
         .trim()
         .parse::<u64>()
-        .ok()?;
+        .ok()
+}
+
+fn read_guard_owner() -> Option<(u64, u64)> {
+    let raw = fs::read_to_string(guard_owner_path()).ok()?;
+    let value = serde_json::from_str::<serde_json::Value>(&raw).ok()?;
+    let pid = value.get("pid").and_then(|p| p.as_u64())?;
+    let ts = value.get("ts").and_then(|t| t.as_u64())?;
+    Some((pid, ts))
+}
+
+fn write_guard_owner() {
+    let path = guard_owner_path();
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let payload = serde_json::json!({
+        "pid": std::process::id(),
+        "exe": std::env::current_exe()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| "unknown".to_string()),
+        "version": env!("CARGO_PKG_VERSION"),
+        "install_dir": install_dir().display().to_string(),
+        "ts": now_ms(),
+    })
+    .to_string();
+    let tmp = path.with_extension(format!("json.tmp.{}", std::process::id()));
+    if fs::write(&tmp, payload).is_ok() && fs::rename(&tmp, &path).is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+}
+
+fn live_guard_pid() -> Option<u64> {
+    let pid = read_guard_lock_pid()?;
     if pid == std::process::id() as u64 {
         return None;
     }
-    if pid_is_alive(pid) {
-        Some(pid)
-    } else {
-        None
+    if !pid_is_alive(pid) {
+        return None;
     }
+    let lock_age_ms = guard_lock_age_ms();
+    match read_guard_owner() {
+        Some((owner_pid, ts)) if owner_pid == pid => {
+            if now_ms().saturating_sub(ts) >= GUARD_HEARTBEAT_STALE_MS {
+                None
+            } else {
+                Some(pid)
+            }
+        }
+        // No owner record, or one naming some other pid: the holder proves nothing. A guard that
+        // cannot prove its mandate can neither retire itself nor be retired, so it is superseded
+        // once the claim grace has passed rather than owning this install dir forever.
+        _ if lock_age_ms.map_or(true, |age| age >= GUARD_CLAIM_GRACE_MS) => None,
+        _ => Some(pid),
+    }
+}
+
+/// True while this process is still the watcher the lock names. A surplus guard re-checks this
+/// every poll, so a guard that loses the lock retires itself instead of running alongside the one
+/// that took it -- no process has to be killed from outside to restore the invariant.
+fn guard_still_owns_lock() -> bool {
+    read_guard_lock_pid() == Some(std::process::id() as u64)
 }
 
 fn claim_guard_lock() -> bool {
@@ -822,15 +983,24 @@ fn claim_guard_lock() -> bool {
         let _ = fs::remove_file(&tmp);
         return false;
     }
-    fs::read_to_string(&path)
-        .ok()
-        .and_then(|s| s.trim().parse::<u64>().ok())
-        == Some(std::process::id() as u64)
+    if read_guard_lock_pid() != Some(std::process::id() as u64) {
+        return false;
+    }
+    write_guard_owner();
+    true
 }
 
 pub fn ensure_daemon_guard() {
     if live_guard_pid().is_some() {
         return;
+    }
+    // Only the daemon that owns this install dir arms its watcher. Arming is otherwise a side
+    // effect of reaching the daemon body, and a boot that never wins the ownership lock would
+    // leave a guard behind for a daemon that does not exist.
+    if let Some(owner) = read_owner_pid() {
+        if owner != std::process::id() as u64 {
+            return;
+        }
     }
     let exe = match std::env::current_exe() {
         Ok(exe) => exe,
@@ -863,19 +1033,67 @@ pub fn run_daemon_guard() -> anyhow::Result<()> {
         std::process::id()
     );
     let mut restarts = 0u32;
+    let mut last_fresh_ms = now_ms();
+    let mut last_heartbeat_write_ms = 0u64;
+    let mut last_busy_ms = now_ms();
     loop {
         std::thread::sleep(Duration::from_millis(GUARD_POLL_MS));
+        if !guard_still_owns_lock() {
+            eprintln!(
+                "[agentplug daemon-guard] another guard took the guard lock -- exiting so exactly one watcher remains"
+            );
+            return Ok(());
+        }
+        let now = now_ms();
+        if now.saturating_sub(last_heartbeat_write_ms) >= GUARD_HEARTBEAT_WRITE_MS {
+            last_heartbeat_write_ms = now;
+            write_guard_owner();
+        }
+        // Disuse is checked before freshness, not after it: a live daemon publishes a fresh
+        // heartbeat every poll, so a check placed behind `is_daemon_fresh()` can never accumulate
+        // an idle interval -- guard and daemon would sustain each other forever in a home that
+        // serves nothing.
+        if daemon_active_projects().map_or(false, |n| n > 0) {
+            last_busy_ms = now;
+        } else if home_is_isolated() && now.saturating_sub(last_busy_ms) >= GUARD_STAND_DOWN_IDLE_MS
+        {
+            eprintln!(
+                "[agentplug daemon-guard] nothing has dispatched through this install dir for {}ms -- asking the daemon to stop and standing down with it; the next dispatch boots both, so no claim outlives this",
+                now.saturating_sub(last_busy_ms)
+            );
+            write_stop_request("guard-stand-down-idle");
+            for _ in 0..(GUARD_STOP_GRACE_MS / GUARD_POLL_MS) {
+                std::thread::sleep(Duration::from_millis(GUARD_POLL_MS));
+                if !is_daemon_fresh() {
+                    break;
+                }
+            }
+            return Ok(());
+        }
         if is_daemon_fresh() {
+            last_fresh_ms = now;
             continue;
         }
         if let Some(age) = intentional_exit_marker_age_ms() {
-            if age < INTENTIONAL_EXIT_HONOR_MS {
+            if age < INTENTIONAL_EXIT_HONOR_MS || age < now.saturating_sub(last_fresh_ms) {
                 eprintln!(
                     "[agentplug daemon-guard] daemon stopped by design (intentional-exit marker {age}ms old) -- standing down; the next dispatch starts a fresh daemon"
                 );
-                let _ = fs::remove_file(intentional_exit_path());
+                // The marker is left in place on purpose. Several guards can watch one install
+                // dir, and the first to see the marker used to delete it, so the others saw a
+                // stale heartbeat with no marker and restarted the daemon that had just retired
+                // itself. Leaving it lets every watcher stand down; an old marker is inert because
+                // both arms of the test above are age-bounded.
                 return Ok(());
             }
+        }
+        let owner_live = read_owner_pid().map_or(false, pid_is_alive);
+        let stale_for_ms = now.saturating_sub(last_fresh_ms);
+        if !owner_live && stale_for_ms >= GUARD_STAND_DOWN_AFTER_STALE_MS {
+            eprintln!(
+                "[agentplug daemon-guard] no live daemon owner and no fresh heartbeat for {stale_for_ms}ms -- standing down instead of restarting a daemon into this install dir; the next dispatch boots a fresh daemon and arms a fresh guard"
+            );
+            return Ok(());
         }
         if restarts >= GUARD_MAX_RESTARTS {
             eprintln!(
@@ -3361,6 +3579,10 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
     let mut per_root_plugin_scan_walk = RegistryWalk { cursor: 0 };
 
     const SELF_RECYCLE_IDLE_MS: u64 = 60 * 60 * 1000;
+    /// A stop request is honoured only after the daemon's own quiet period. The guard measures
+    /// disuse from `active_projects`; this measures it from dispatch work, and the daemon is the
+    /// side that can see work the guard cannot, so it is the side that refuses an unsafe stop.
+    const STOP_REQUEST_MIN_IDLE_MS: u64 = 60_000;
     let mut last_any_dispatch = Instant::now();
 
     const IDLE_WAIT_MIN_MS: u64 = 25;
@@ -3874,6 +4096,23 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
                 );
             }
             last_shared_release = Instant::now();
+        }
+
+        // A guard that watched this install dir go unused asks for a stop instead of killing this
+        // process: the process holding the claims is the one that decides when it is safe to let
+        // go. The file read is last in the condition on purpose, so a home nobody asked to stop
+        // never pays for it.
+        if last_any_dispatch.elapsed() >= Duration::from_millis(STOP_REQUEST_MIN_IDLE_MS)
+            && !detached_still_running
+            && stop_request_age_ms().is_some()
+        {
+            let _ = fs::remove_file(stop_request_path());
+            eprintln!(
+                "[agentplug daemon] honoring a stop request after {}ms idle -- the watcher for this install dir is standing down with it; the next dispatch starts a fresh daemon",
+                STOP_REQUEST_MIN_IDLE_MS
+            );
+            mark_intentional_exit("guard-stand-down");
+            return Ok(());
         }
 
         if any_work {

@@ -45,6 +45,37 @@ version, builds each runner target, writes a `.sha256` next to every built asset
 publishes the release only after the draft holds exactly the built asset set. Each
 published asset is then checked for HTTP 200.
 
+## Daemon and guard counts per install dir
+
+An install dir is `install_dir()`: `AGENTPLUG_HOME` when it is set, otherwise
+`~/.agentplug`. One install dir runs **at most one daemon and at most one
+daemon-guard**, so N live install dirs legitimately mean N daemons and N guards.
+A second watcher in one install dir is never a spare: each watcher's orphan sweep
+answers `dispatch_orphaned` for the other's running work and deletes the claim
+under it.
+
+- `daemon-owner.lock` elects the single daemon. A boot that does not win it exits
+  before touching any shared plugin state.
+- `daemon-guard.lock` names the guard's pid. It stays a **bare integer** so an
+  older runner image still understands it and still refuses to start a second
+  guard; the guard's identity (pid, exe, version, install dir, heartbeat ts)
+  lives beside it in `daemon-guard.owner.json`.
+- A guard re-reads the lock every poll and **retires itself** when it no longer
+  holds it, so a surplus guard exits on its own. Nothing is killed from outside.
+- A lock whose pid is dead is always reclaimable. A lock whose pid is alive is
+  reclaimed only when the holder cannot prove its mandate: no owner record, a
+  record naming some other pid, or a heartbeat older than 120 s. Proof, not
+  seniority, is what keeps the lock.
+- A guard in an **overridden** install dir (`AGENTPLUG_HOME` set) whose daemon has
+  published `active_projects: 0` for 10 minutes asks the daemon to stop
+  (`daemon-stop-request.json`) and retires with it. The daemon exits by design on
+  its own loop, and only after 60 s of its own quiet, so a stop never lands under
+  dispatch work the guard cannot see. The shared default home is never torn down
+  this way; its daemon self-recycles on its own idle clock.
+- A daemon that stops by design leaves `daemon-intentional-exit.json` in place.
+  Every watcher of that home reads it and stands down, instead of the first one
+  deleting it and the rest restarting the daemon that just retired.
+
 ## Where updater decisions are recorded
 
 - `~/.agentplug/daemon-status.json`: runner version parity, the last completed runner
