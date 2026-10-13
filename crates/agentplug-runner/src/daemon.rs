@@ -3627,7 +3627,7 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
 
     let instruction_source_poll_interval = daemon_cfg.instruction_source_poll_interval();
     let staged_runner_rx = spawn_update_poll_worker(daemon_cfg.clone());
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     let mut idle_in_dir_watch = IdleInDirWatch::new();
     let mut pending_self_update: Option<(PathBuf, String)> = None;
     let mut pending_self_update_staged_at: Option<Instant> = None;
@@ -4170,13 +4170,13 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
         if any_work {
             idle_wait_ms = IDLE_WAIT_MIN_MS;
         }
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "linux"))]
         wait_for_in_dir_change(
             &mut idle_in_dir_watch,
             &known_roots,
             Duration::from_millis(idle_wait_ms),
         );
-        #[cfg(not(windows))]
+        #[cfg(not(any(windows, target_os = "linux")))]
         std::thread::sleep(Duration::from_millis(idle_wait_ms));
         if !any_work {
             let cap_ms = if pending_work_exists_before_idle_wait {
