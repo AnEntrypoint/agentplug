@@ -865,6 +865,19 @@ pub(super) const CLAIM_HEARTBEAT_MS: u64 = 15_000;
 /// judged on its own age, exactly as it was before claims had markers at all.
 pub(super) const CLAIM_HEARTBEAT_STALE_MS: u64 = 45_000;
 
+fn claim_heartbeat_stale_ms() -> u64 {
+    static CLAMP_LOGGED: AtomicBool = AtomicBool::new(false);
+    let configured = env_ms_or("AGENTPLUG_CLAIM_HEARTBEAT_STALE_MS", CLAIM_HEARTBEAT_STALE_MS);
+    let floor = CLAIM_HEARTBEAT_MS * 3;
+    if configured >= floor {
+        return configured;
+    }
+    if !CLAMP_LOGGED.swap(true, Ordering::Relaxed) {
+        eprintln!("[agentplug daemon] AGENTPLUG_CLAIM_HEARTBEAT_STALE_MS={configured} is below three beats; clamping to {floor}ms so a live claim is not judged stale between beats");
+    }
+    floor
+}
+
 pub(super) fn claim_heartbeat_path(spool_dir: &Path, verb: &str, task: &str) -> PathBuf {
     spool_dir
         .join(CLAIM_HEARTBEAT_DIR)
@@ -878,7 +891,9 @@ fn write_claim_heartbeat(marker: &Path) {
     if let Some(parent) = marker.parent() {
         let _ = fs::create_dir_all(parent);
     }
-    let _ = fs::write(marker, format!("{}\n{}\n", std::process::id(), now_ms()));
+    if let Err(e) = fs::write(marker, format!("{}\n{}\n", std::process::id(), now_ms())) {
+        eprintln!("[agentplug daemon] could not write claim heartbeat {}: {e} -- the claim is kept, but the orphan sweep will judge it on its age alone", marker.display());
+    }
 }
 
 /// The pid that last renewed this claim and how long ago, or None when it carries no marker. No
@@ -1498,7 +1513,7 @@ pub(super) fn sweep_orphaned_claims_distinguishing_handoff_from_crash(
                 claim_heartbeat(&spool_dir, &verb, &task)
             {
                 if heartbeat_age_ms
-                    < env_ms_or("AGENTPLUG_CLAIM_HEARTBEAT_STALE_MS", CLAIM_HEARTBEAT_STALE_MS)
+                    < claim_heartbeat_stale_ms()
                 {
                     eprintln!(
                         "[agentplug daemon] leaving claim {verb}/{task} for {} alone -- its owner renewed it {heartbeat_age_ms}ms ago under pid {heartbeat_pid}, so the dispatch that claimed it is still running however long it takes",
