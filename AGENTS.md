@@ -109,6 +109,12 @@ and the `agentplug-host` imports. Work on `main` as GitHub user `lanmower`.
   runner over a channel); and re-reading every empty verb dir each pass (now skipped with one `stat`
   while its mtime is unchanged and at least 2 s old). A new synchronous call in the main loop needs the
   same measurement.
+- Every Windows child spawn in `agentplug` goes through `windowless::apply_windowless`, and
+  `agentplug-runner` calls `ensure_hidden_console()` before anything else. `CREATE_NO_WINDOW` alone
+  leaves each console-subsystem child (git, node, powershell) console-less, so its own console
+  children allocate a fresh conhost and flash a window. A console the runner owns and hides is
+  inherited by the whole subtree; `apply_windowless` falls back to `CREATE_NO_WINDOW` only when no
+  console exists. Source: `agentplug/crates/agentplug-host/src/windowless.rs`.
 
 ## Configuration and compatibility
 
