@@ -90,6 +90,7 @@ pub fn build_engine() -> anyhow::Result<Engine> {
     let mut config = Config::new();
     config.wasm_backtrace_details(wasmtime::WasmBacktraceDetails::Enable);
     config.epoch_interruption(true);
+    config.macos_use_mach_ports(false);
     let engine = Engine::new(&config).map_err(|e| anyhow::anyhow!(e))?;
     start_epoch_ticker(engine.clone());
     Ok(engine)
