@@ -1,4 +1,5 @@
 mod broker;
+mod child_pids;
 mod crawl;
 mod crawl_lease;
 mod dispatch_origin;

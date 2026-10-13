@@ -330,6 +330,15 @@ pub fn run(code: &str, opts: &Value, cwd: &Path) -> Value {
             });
         }
     };
+    // Attribution: the pid this dispatch is about to leave behind, written before anything can
+    // fail, so a later sweep can say which dispatch owns a leaked process instead of guessing.
+    crate::child_pids::record(
+        cwd,
+        "exec",
+        lang,
+        opts.get("session_id").and_then(|v| v.as_str()),
+        child.id(),
+    );
     let containment = match crate::process_tree::establish_containment(&child) {
         Ok(containment) => containment,
         Err(error) => {
