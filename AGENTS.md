@@ -36,6 +36,17 @@ and the `agentplug-host` imports. Work on `main` as GitHub user `lanmower`.
 
 ## Runtime invariants
 
+- `pid_is_alive` never counts a zombie as alive, and every process this binary spawns detached
+  (daemon-guard, guard-spawned daemon, takeover successor) is reaped by its parent: the guard on
+  every poll, the daemon from its heartbeat ticker. A dead guard child must never hold
+  `daemon-owner.lock` as a live owner. The restart window is published, not inferred: the guard
+  stamps the `restarting` marker fields named in `docs/SIGNED-UPDATES.md` into every status file
+  until the replacement heartbeats, and the daemon's heartbeat writer is the only thing that clears
+  them.
+- The wasm engine uses Unix signal traps on macOS (`macos_use_mach_ports(false)`). The Mach-port
+  handler thread aborts the whole process when `mach_msg` returns `MACH_RCV_INTERRUPTED`, which is
+  what every silent shared-daemon death logged as `mach_msg failed with 268451845 (10004005)`.
+
 - Dream observation maintenance queues only registered `dream-replay-cycle` for the
   actual owner through canonical `session_id`. Private atomic per-owner state is
   persisted before its fixed pending request is published; recover that same request,

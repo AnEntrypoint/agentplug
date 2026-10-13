@@ -1009,9 +1009,12 @@ pub fn ensure_daemon_guard() {
             return;
         }
     };
-    if let Err(e) = spawn_detached(&exe, &["daemon-guard"]) {
-        eprintln!("[agentplug daemon] guard not armed: spawning it failed ({e})");
-        return;
+    match spawn_detached(&exe, &["daemon-guard"]) {
+        Ok(child) => remember_detached_child(child),
+        Err(e) => {
+            eprintln!("[agentplug daemon] guard not armed: spawning it failed ({e})");
+            return;
+        }
     }
     eprintln!(
         "[agentplug daemon] guard armed: a heartbeat that stops without an intentional-exit marker is restarted automatically"
@@ -1036,8 +1039,11 @@ pub fn run_daemon_guard() -> anyhow::Result<()> {
     let mut last_fresh_ms = now_ms();
     let mut last_heartbeat_write_ms = 0u64;
     let mut last_busy_ms = now_ms();
+    let mut daemon_child: Option<std::process::Child> = None;
+    let mut window_started_ms: Option<u64> = None;
     loop {
         std::thread::sleep(Duration::from_millis(GUARD_POLL_MS));
+        reap_detached_children();
         if !guard_still_owns_lock() {
             eprintln!(
                 "[agentplug daemon-guard] another guard took the guard lock -- exiting so exactly one watcher remains"
@@ -1070,8 +1076,20 @@ pub fn run_daemon_guard() -> anyhow::Result<()> {
             }
             return Ok(());
         }
+        let child_exit = take_exited_child(&mut daemon_child);
+        if let Some((pid, exit)) = &child_exit {
+            eprintln!(
+                "[agentplug daemon-guard] daemon child pid {pid} exited ({exit}) and was reaped -- restarting on this poll instead of waiting for its heartbeat to age out"
+            );
+        }
         if is_daemon_fresh() {
             last_fresh_ms = now;
+            if window_started_ms.take().is_some() {
+                eprintln!(
+                    "[agentplug daemon-guard] a fresh daemon heartbeat is back -- restart window closed after {} attempt(s)",
+                    restarts
+                );
+            }
             continue;
         }
         if let Some(age) = intentional_exit_marker_age_ms() {
@@ -1096,31 +1114,56 @@ pub fn run_daemon_guard() -> anyhow::Result<()> {
             return Ok(());
         }
         if restarts >= GUARD_MAX_RESTARTS {
+            let cleared = clear_restart_marker("guard-gave-up");
             eprintln!(
-                "[agentplug daemon-guard] gave up after {restarts} restart attempt(s) -- exiting so a later daemon boot arms a fresh guard"
+                "[agentplug daemon-guard] gave up after {restarts} restart attempt(s) -- restarting marker withdrawn from {cleared} status file(s), exiting so a later daemon boot arms a fresh guard"
             );
             return Ok(());
         }
         restarts += 1;
+        let previous_pid = read_owner_pid().unwrap_or(0);
+        let window_ms = *window_started_ms.get_or_insert(now);
+        let reason = if child_exit.is_some() {
+            "daemon-exit"
+        } else {
+            "stale-heartbeat"
+        };
+        let stamped =
+            stamp_restart_marker(reason, restarts, GUARD_MAX_RESTARTS, previous_pid, window_ms);
         clear_wasted_daemon_start_backoff();
         eprintln!(
-            "[agentplug daemon-guard] daemon heartbeat is stale with no intentional-exit marker -- restarting it (attempt {restarts}/{GUARD_MAX_RESTARTS})"
+            "[agentplug daemon-guard] daemon heartbeat is stale with no intentional-exit marker -- restarting it (attempt {restarts}/{GUARD_MAX_RESTARTS}); restarting marker ({reason}, previous pid {previous_pid}) stamped on {stamped} status file(s)"
         );
-        if let Err(e) = spawn_detached_daemon() {
-            eprintln!(
-                "[agentplug daemon-guard] restart attempt {restarts} could not spawn a daemon: {e}"
-            );
-            continue;
+        match spawn_detached_daemon() {
+            Ok(child) => daemon_child = Some(child),
+            Err(e) => {
+                eprintln!(
+                    "[agentplug daemon-guard] restart attempt {restarts} could not spawn a daemon: {e}"
+                );
+                continue;
+            }
         }
         let mut became_fresh = false;
-        for _ in 0..(GUARD_START_WAIT_MS / 500) {
+        let mut exited_early = None;
+        for tick in 0..(GUARD_START_WAIT_MS / 500) {
             std::thread::sleep(Duration::from_millis(500));
             if is_daemon_fresh() {
                 became_fresh = true;
                 break;
             }
+            if let Some(exit) = take_exited_child(&mut daemon_child) {
+                exited_early = Some(exit);
+                break;
+            }
+            if tick % 4 == 3 {
+                stamp_restart_marker(reason, restarts, GUARD_MAX_RESTARTS, previous_pid, window_ms);
+            }
         }
-        if !became_fresh {
+        if let Some((pid, exit)) = exited_early {
+            eprintln!(
+                "[agentplug daemon-guard] restart attempt {restarts}: daemon pid {pid} exited ({exit}) before publishing a heartbeat -- reaped, retrying on the next poll"
+            );
+        } else if !became_fresh {
             eprintln!(
                 "[agentplug daemon-guard] restart attempt {restarts} published no heartbeat within {GUARD_START_WAIT_MS}ms -- retrying"
             );
@@ -1161,7 +1204,8 @@ pub fn ensure_daemon_running() -> anyhow::Result<bool> {
     }
     let spawn_result = spawn_detached_daemon();
     let result = match spawn_result {
-        Ok(()) => {
+        Ok(child) => {
+            remember_detached_child(child);
             let mut fresh = false;
             for _ in 0..50 {
                 std::thread::sleep(Duration::from_millis(200));
@@ -1319,13 +1363,45 @@ pub fn arm_spool_launcher_deadline() -> Arc<std::sync::atomic::AtomicBool> {
 
 #[cfg(not(windows))]
 fn pid_is_alive(pid: u64) -> bool {
-    let mut command = std::process::Command::new("kill");
-    command
-        .args(["-0", &pid.to_string()])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-    command.status().map(|s| s.success()).unwrap_or(true)
+    let Ok(raw) = libc::pid_t::try_from(pid) else {
+        return false;
+    };
+    if raw <= 0 {
+        return false;
+    }
+    let signalled = unsafe { libc::kill(raw, 0) };
+    let exists = signalled == 0
+        || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+    exists && !pid_is_zombie(raw)
+}
+
+#[cfg(target_os = "macos")]
+fn pid_is_zombie(pid: libc::pid_t) -> bool {
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    let written = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            &mut info as *mut libc::proc_bsdinfo as *mut libc::c_void,
+            size,
+        )
+    };
+    if written == size {
+        return info.pbi_status == libc::SZOMB;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn pid_is_zombie(pid: libc::pid_t) -> bool {
+    let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return false;
+    };
+    stat.rsplit_once(')')
+        .and_then(|(_, after_comm)| after_comm.split_whitespace().next())
+        .is_some_and(|state| state == "Z" || state == "X")
 }
 
 fn daemon_log_path() -> PathBuf {
@@ -1352,7 +1428,7 @@ fn daemon_log_sink() -> Option<fs::File> {
         .ok()
 }
 
-fn spawn_detached(exe: &Path, args: &[&str]) -> anyhow::Result<()> {
+fn spawn_detached(exe: &Path, args: &[&str]) -> anyhow::Result<std::process::Child> {
     let mut cmd = std::process::Command::new(exe);
     cmd.args(args);
     cmd.stdin(std::process::Stdio::null());
@@ -1378,13 +1454,142 @@ fn spawn_detached(exe: &Path, args: &[&str]) -> anyhow::Result<()> {
             });
         }
     }
-    cmd.spawn()?;
-    Ok(())
+    Ok(cmd.spawn()?)
 }
 
-fn spawn_detached_daemon() -> anyhow::Result<()> {
+fn detached_children() -> &'static Mutex<Vec<std::process::Child>> {
+    static SLOT: OnceLock<Mutex<Vec<std::process::Child>>> = OnceLock::new();
+    SLOT.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn remember_detached_child(child: std::process::Child) {
+    detached_children()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(child);
+}
+
+pub(crate) fn reap_detached_children() -> Vec<(u32, String)> {
+    let mut children = detached_children()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut reaped = Vec::new();
+    children.retain_mut(|child| match child.try_wait() {
+        Ok(None) => true,
+        Ok(Some(status)) => {
+            reaped.push((child.id(), status.to_string()));
+            false
+        }
+        Err(e) => {
+            reaped.push((child.id(), format!("wait failed: {e}")));
+            false
+        }
+    });
+    reaped
+}
+
+fn take_exited_child(slot: &mut Option<std::process::Child>) -> Option<(u32, String)> {
+    let child = slot.as_mut()?;
+    let pid = child.id();
+    let exit = match child.try_wait() {
+        Ok(None) => return None,
+        Ok(Some(status)) => status.to_string(),
+        Err(e) => format!("wait failed: {e}"),
+    };
+    *slot = None;
+    Some((pid, exit))
+}
+
+fn spawn_detached_daemon() -> anyhow::Result<std::process::Child> {
     let exe = std::env::current_exe()?;
     spawn_detached(&exe, &["daemon"])
+}
+
+const RESTART_MARKER_KEYS: [&str; 7] = [
+    "restarting",
+    "restart_reason",
+    "restart_attempt",
+    "restart_max_attempts",
+    "previous_pid",
+    "restart_started_ts",
+    "restart_ts",
+];
+
+fn merge_marker_into_status_file(
+    path: &Path,
+    fields: &serde_json::Map<String, serde_json::Value>,
+) -> bool {
+    let mut payload = match fs::read_to_string(path)
+        .ok()
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+    {
+        Some(serde_json::Value::Object(map)) => serde_json::Value::Object(map),
+        _ => serde_json::json!({}),
+    };
+    let Some(map) = payload.as_object_mut() else {
+        return false;
+    };
+    for key in RESTART_MARKER_KEYS {
+        map.remove(key);
+    }
+    for (key, value) in fields {
+        map.insert(key.clone(), value.clone());
+    }
+    let tmp = path.with_extension(format!("json.tmp.{}", std::process::id()));
+    if fs::write(&tmp, payload.to_string()).is_err() {
+        return false;
+    }
+    if fs::rename(&tmp, path).is_err() {
+        let _ = fs::remove_file(&tmp);
+        return false;
+    }
+    true
+}
+
+fn stamp_marker_everywhere(fields: &serde_json::Map<String, serde_json::Value>) -> usize {
+    let mut stamped = 0usize;
+    if merge_marker_into_status_file(&daemon_status_path(), fields) {
+        stamped += 1;
+    }
+    for root in read_registry() {
+        let spool_dir = spool_dir_of(&root);
+        if !spool_dir.is_dir() {
+            continue;
+        }
+        if merge_marker_into_status_file(&spool_dir.join(".status.json"), fields) {
+            stamped += 1;
+        }
+    }
+    stamped
+}
+
+pub(crate) fn stamp_restart_marker(
+    reason: &str,
+    attempt: u32,
+    max_attempts: u32,
+    previous_pid: u64,
+    started_ts: u64,
+) -> usize {
+    let mut fields = serde_json::Map::new();
+    fields.insert("restarting".to_string(), serde_json::json!(true));
+    fields.insert("restart_reason".to_string(), serde_json::json!(reason));
+    fields.insert("restart_attempt".to_string(), serde_json::json!(attempt));
+    fields.insert(
+        "restart_max_attempts".to_string(),
+        serde_json::json!(max_attempts),
+    );
+    fields.insert("previous_pid".to_string(), serde_json::json!(previous_pid));
+    fields.insert("restart_started_ts".to_string(), serde_json::json!(started_ts));
+    fields.insert("restart_ts".to_string(), serde_json::json!(now_ms()));
+    stamp_marker_everywhere(&fields)
+}
+
+pub(crate) fn clear_restart_marker(reason: &str) -> usize {
+    let mut fields = serde_json::Map::new();
+    fields.insert("restarting".to_string(), serde_json::json!(false));
+    fields.insert("restart_reason".to_string(), serde_json::json!(reason));
+    fields.insert("restart_ts".to_string(), serde_json::json!(now_ms()));
+    stamp_marker_everywhere(&fields)
 }
 
 fn takeover_ready_path() -> PathBuf {
@@ -1492,6 +1697,8 @@ fn hand_off_to_ready_successor() -> Option<(String, usize)> {
     let claims = snapshot_in_flight_claims();
     write_handoff_inherited_claims(&version, &claims);
     release_ownership_for_handoff();
+    let stamped = stamp_restart_marker("runner-handoff", 1, 1, std::process::id() as u64, now_ms());
+    eprintln!("[agentplug daemon] restarting marker (runner-handoff to ready successor {version}, pid {successor_pid}) stamped on {stamped} status file(s) until its first heartbeat replaces it");
     task_handoff.commit();
     let requeued = requeue_claims_for_live_successor(&claims);
     mark_intentional_exit("ready-takeover");
@@ -1697,12 +1904,15 @@ fn attempt_self_update_handoff(staged_exe: &Path, version: &str) -> bool {
     }
     let ready_path = takeover_ready_path();
     let _ = fs::remove_file(&ready_path);
-    if let Err(e) = spawn_detached(staged_exe, &["takeover", version]) {
-        record_handoff_failure(
-            version,
-            format!("spawn_detached of staged {version} failed: {e}"),
-        );
-        return false;
+    match spawn_detached(staged_exe, &["takeover", version]) {
+        Ok(child) => remember_detached_child(child),
+        Err(e) => {
+            record_handoff_failure(
+                version,
+                format!("spawn_detached of staged {version} failed: {e}"),
+            );
+            return false;
+        }
     }
     for _ in 0..40 {
         std::thread::sleep(Duration::from_millis(250));
@@ -1722,6 +1932,14 @@ fn attempt_self_update_handoff(staged_exe: &Path, version: &str) -> bool {
                     record_handoff_attempt(None);
                     clear_handoff_escalation(version);
                     release_ownership_for_handoff();
+                    let stamped = stamp_restart_marker(
+                        "runner-handoff",
+                        1,
+                        1,
+                        std::process::id() as u64,
+                        now_ms(),
+                    );
+                    eprintln!("[agentplug daemon] restarting marker (runner-handoff to {version}, successor pid {successor_pid}) stamped on {stamped} status file(s) until the successor's first heartbeat replaces it");
                     return true;
                 }
             }
@@ -2412,6 +2630,11 @@ fn write_project_heartbeat_with_queue_info(
         .unwrap_or_else(|e| e.into_inner())
         .clone());
     payload["queue_wait_ms"] = serde_json::json!(last_measured_dispatch_queue_wait_ms());
+    if let Some(map) = payload.as_object_mut() {
+        for key in RESTART_MARKER_KEYS {
+            map.remove(key);
+        }
+    }
     if let Some((staged_at_ms, _len)) = cached_staged_runner() {
         payload["runner_update_in_progress"] = serde_json::json!(true);
         payload["runner_update_waiting_ms"] =
@@ -3068,6 +3291,9 @@ fn spawn_heartbeat_ticker(heartbeat_interval: Duration) -> std::thread::JoinHand
         let mut next_global_at = Instant::now() + heartbeat_interval;
         loop {
             std::thread::sleep(tick);
+            for (pid, exit) in reap_detached_children() {
+                eprintln!("[agentplug daemon] detached child pid {pid} exited ({exit}) and was reaped");
+            }
             if heartbeat_authority_lost() {
                 let requeued = hand_claims_to_live_successor("heartbeat-authority-holder");
                 eprintln!("[agentplug daemon] heartbeat ticker: authority was already handed to the live successor -- re-queued {requeued} in-flight claim(s) and exiting, because a daemon that no longer refreshes heartbeats is invisible to every MCP preflight while it keeps executing dispatches");

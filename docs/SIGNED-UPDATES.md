@@ -75,6 +75,29 @@ under it.
 - A daemon that stops by design leaves `daemon-intentional-exit.json` in place.
   Every watcher of that home reads it and stands down, instead of the first one
   deleting it and the rest restarting the daemon that just retired.
+- Liveness is zombie-aware. `pid_is_alive` answers false for an exited child
+  nobody has waited on. On macOS a zombie still answers `kill(pid, 0)` with
+  success while `proc_pidinfo(PROC_PIDTBSDINFO)` answers `ESRCH` (measured; a
+  live pid answers the full record and a reaped pid fails both), so that pair,
+  or a record whose status is `SZOMB`, is the zombie signature. On Linux the
+  state after the last `)` in `/proc/<pid>/stat` is `Z` or `X`. A guard-spawned
+  daemon that died used to pass `kill -0` as a live owner, so every restart lost
+  the ownership claim to the corpse for 20 attempts.
+- The guard holds the child handle of the daemon it spawns. It reaps the child
+  on every poll and restarts on the poll that sees the exit, instead of waiting
+  for the heartbeat to age out. A restart attempt whose daemon exits before its
+  first heartbeat is reaped at once and retried on the next poll. The daemon
+  reaps the guard and takeover children it spawns from its heartbeat ticker.
+- A restart window is visible. From the poll that decides to restart until the
+  new daemon's first heartbeat, the guard stamps `restarting: true`,
+  `restart_reason` (`daemon-exit` or `stale-heartbeat`), `restart_attempt`,
+  `restart_max_attempts`, `previous_pid`, `restart_started_ts` and a
+  `restart_ts` refreshed every 2 s into `daemon-status.json` and every leased
+  project's `.gm/exec-spool/.status.json`. The outgoing daemon of a runner
+  handoff stamps the same shape with `restart_reason: runner-handoff` after it
+  releases ownership. The daemon's own heartbeat write removes the fields, and
+  a guard that gives up writes `restarting: false`. A reader treats a marker
+  older than its refresh cadence as absent.
 
 ## Where updater decisions are recorded
 
