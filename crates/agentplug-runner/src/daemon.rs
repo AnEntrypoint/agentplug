@@ -1025,6 +1025,11 @@ const GUARD_POLL_MS: u64 = 2_000;
 const GUARD_START_WAIT_MS: u64 = 45_000;
 const GUARD_MAX_RESTARTS: u32 = 20;
 const INTENTIONAL_EXIT_HONOR_MS: u64 = 10_000;
+/// A daemon whose heartbeat is stale but whose pid is still a live, non-zombie process is
+/// starved, not dead: under host load the ticker falls behind long before the process exits.
+/// The daemon's own stall watchdog exits it after four missed ticks (floor 30 s), which turns the
+/// pid dead and restarts it on the next poll; the guard only overrides that after this bound.
+const GUARD_STARVED_OWNER_GRACE_MS: u64 = 120_000;
 
 pub fn run_daemon_guard() -> anyhow::Result<()> {
     if !claim_guard_lock() {
@@ -1105,8 +1110,19 @@ pub fn run_daemon_guard() -> anyhow::Result<()> {
                 return Ok(());
             }
         }
-        let owner_live = read_owner_pid().map_or(false, pid_is_alive);
+        let owner_pid = read_owner_pid();
+        let owner_live = owner_pid.map_or(false, pid_is_alive);
         let stale_for_ms = now.saturating_sub(last_fresh_ms);
+        if owner_live && child_exit.is_none() && stale_for_ms < GUARD_STARVED_OWNER_GRACE_MS {
+            if window_started_ms.is_none() {
+                eprintln!(
+                    "[agentplug daemon-guard] heartbeat is {stale_for_ms}ms stale but owner pid {} is a live non-zombie process -- treating it as starved, not dead; its own stall watchdog exits it if the ticker stays stuck, and this guard restarts only after {GUARD_STARVED_OWNER_GRACE_MS}ms",
+                    owner_pid.unwrap_or(0)
+                );
+                window_started_ms = Some(now);
+            }
+            continue;
+        }
         if !owner_live && stale_for_ms >= GUARD_STAND_DOWN_AFTER_STALE_MS {
             eprintln!(
                 "[agentplug daemon-guard] no live daemon owner and no fresh heartbeat for {stale_for_ms}ms -- standing down instead of restarting a daemon into this install dir; the next dispatch boots a fresh daemon and arms a fresh guard"
