@@ -103,6 +103,7 @@ const GM_SPOOL_VERBS: &[&str] = &[
     "git_fetch",
     "git_pull",
     "ci-status",
+    "ci-log",
     "git_branch",
     "git_checkout",
     "git_merge",
