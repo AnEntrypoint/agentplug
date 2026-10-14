@@ -2326,6 +2326,7 @@ const UNSERIALIZED_VERBS: &[&str] = &[
     "git_diff",
     "git_show",
     "ci-status",
+    "ci-log",
     "git_poll",
     "status",
     "wait",
