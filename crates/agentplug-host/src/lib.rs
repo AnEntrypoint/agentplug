@@ -4,6 +4,7 @@ mod crawl;
 mod crawl_lease;
 mod dispatch_origin;
 mod exec_js;
+mod exec_pool;
 mod fs_prewarm;
 mod github_auth;
 mod host_state;

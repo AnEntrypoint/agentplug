@@ -46,13 +46,13 @@ struct SharedBrowser {
 const CDP_LAUNCH_ATTEMPTS: usize = 2;
 
 /// How long a shared Chrome with no lease stays hot for reuse before housekeeping closes it.
-const DEFAULT_IDLE_MS: u64 = 300_000;
+const BROWSER_HOT_IDLE_MS: u64 = 600_000;
 
 fn idle_window_ms() -> u64 {
     std::env::var("GM_BROWSER_IDLE_MS")
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
-        .unwrap_or(DEFAULT_IDLE_MS)
+        .unwrap_or(BROWSER_HOT_IDLE_MS)
 }
 
 static BROWSERS: OnceLock<Mutex<HashMap<PathBuf, SharedBrowser>>> = OnceLock::new();

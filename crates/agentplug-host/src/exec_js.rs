@@ -291,6 +291,7 @@ pub fn run(code: &str, opts: &Value, cwd: &Path) -> Value {
             return json!({"ok": false, "error": error, "error_code": "task_handoff_pending", "execution_started": false})
         }
     };
+    let worker = crate::exec_pool::acquire();
     let t0 = Instant::now();
     let mut command = Command::new(&built.cmd);
     command
@@ -363,7 +364,38 @@ pub fn run(code: &str, opts: &Value, cwd: &Path) -> Value {
     let stdout_pipe = child.stdout.take().map(crate::task::drain_in_background);
     let stderr_pipe = child.stderr.take().map(crate::task::drain_in_background);
 
-    let waited = child.wait_timeout(Duration::from_millis(limit_ms));
+    let handover_ms = limit_ms.min(crate::exec_pool::BACKGROUND_AFTER_MS);
+    let waited = child.wait_timeout(Duration::from_millis(handover_ms));
+    if matches!(waited, Ok(None)) && handover_ms < limit_ms {
+        drop(worker);
+        let partial_stdout = stdout_pipe
+            .as_ref()
+            .map(crate::task::DrainedPipe::snapshot)
+            .unwrap_or_default();
+        let partial_stderr = stderr_pipe
+            .as_ref()
+            .map(crate::task::DrainedPipe::snapshot)
+            .unwrap_or_default();
+        return match crate::task::adopt_running(child, containment, lang, t0, stdout_pipe, stderr_pipe) {
+            Ok(task_id) => json!({
+                "ok": true,
+                "background": true,
+                "in_progress": true,
+                "task_id": task_id,
+                "handover_after_ms": crate::exec_pool::BACKGROUND_AFTER_MS,
+                "limit_ms": limit_ms,
+                "elapsed_ms": t0.elapsed().as_millis() as u64,
+                "stdout": String::from_utf8_lossy(&partial_stdout),
+                "stderr": String::from_utf8_lossy(&partial_stderr),
+                "decision_required": "the call ran past the foreground window and moved to background management; its worker was released. task-output with {\"id\":\"<task_id>\"} returns the output so far and the final result once it exits; task-stop with that id terminates it."
+            }),
+            Err(error) => json!({
+                "ok": false,
+                "error": error,
+                "error_code": "task_registration_failed",
+            }),
+        };
+    }
     if matches!(waited, Ok(None)) {
         crate::process_tree::terminate_containment(&containment, child.id());
         let _ = child.kill();
