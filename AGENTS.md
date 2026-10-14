@@ -120,6 +120,14 @@ and the `agentplug-host` imports. Work on `main` as GitHub user `lanmower`.
   runner over a channel); and re-reading every empty verb dir each pass (now skipped with one `stat`
   while its mtime is unchanged and at least 2 s old). A new synchronous call in the main loop needs the
   same measurement.
+- No verb that waits for an outside holder runs inside `dispatch_project`. `browser_lease_acquire`
+  waits up to `WAIT_MS` (600 s) for a live holder and up to the 120 s TTL for a dead one. Each lease
+  verb runs on its own thread (`spawn_browser_lease_reply`) and stays in `in_flight_map` until it
+  answers. Acquires for one root share one gate. `browser_lease_release` and `browser_lease_status`
+  never take the gate, so a holder can always release. Measured on a scratch daemon with two
+  projects, one acquire waited 30 s. A status ticket in the other project waited 24.5 s before the
+  change and 0.7 s after. A claim pass of 5 s or more logs `claim pass for <root> ran <ms>ms` with a
+  `ts=` field.
 - Every Windows child spawn in `agentplug` goes through `windowless::apply_windowless`, and
   `agentplug-runner` calls `ensure_hidden_console()` before anything else. `CREATE_NO_WINDOW` alone
   leaves each console-subsystem child (git, node, powershell) console-less, so its own console

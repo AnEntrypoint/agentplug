@@ -3173,6 +3173,80 @@ pub(super) fn project_has_pending_dispatch_work(root: &Path) -> bool {
         && project_has_queued_spool_work_cached(root)
 }
 
+fn browser_lease_acquire_gates() -> &'static Mutex<HashMap<PathBuf, Arc<Mutex<()>>>> {
+    static SLOT: OnceLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> = OnceLock::new();
+    SLOT.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn browser_lease_acquire_gate(target_root: &Path) -> Arc<Mutex<()>> {
+    browser_lease_acquire_gates()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .entry(target_root.to_path_buf())
+        .or_default()
+        .clone()
+}
+
+fn browser_lease_target_root(dispatch_root: &Path, body: &str) -> PathBuf {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("root")
+                .and_then(|root| root.as_str())
+                .map(PathBuf::from)
+        })
+        .unwrap_or_else(|| dispatch_root.to_path_buf())
+}
+
+fn browser_lease_reply_or_panic_answer(dispatch_root: &Path, verb: &str, body: &str) -> String {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        agentplug_host::lease_reply(verb, dispatch_root, body)
+    }))
+    .unwrap_or_else(|_| {
+        serde_json::json!({"ok": false, "error": "the browser lease handler panicked", "verb": verb})
+            .to_string()
+    })
+}
+
+pub(super) fn spawn_browser_lease_reply(
+    root: &Path,
+    in_dir: &Path,
+    out_dir: &Path,
+    verb: String,
+    task: String,
+    body: String,
+) {
+    let key: InFlightKey = (root.to_path_buf(), verb.clone(), task.clone());
+    let thread_root = root.to_path_buf();
+    let thread_in_dir = in_dir.to_path_buf();
+    let thread_out_dir = out_dir.to_path_buf();
+    let (thread_verb, thread_task) = (verb.clone(), task.clone());
+    let spawned = std::thread::Builder::new()
+        .name(format!("lease-dispatch-{task}"))
+        .spawn(move || {
+            let _release_in_flight_entry = InFlightEntryRelease { key };
+            let acquire_gate = (thread_verb == "browser_lease_acquire")
+                .then(|| browser_lease_acquire_gate(&browser_lease_target_root(&thread_root, &body)));
+            let _acquire_gate_held = acquire_gate
+                .as_ref()
+                .map(|gate| gate.lock().unwrap_or_else(|e| e.into_inner()));
+            let out_body = browser_lease_reply_or_panic_answer(&thread_root, &thread_verb, &body);
+            write_spool_out_and_release_claim(
+                &thread_out_dir,
+                &thread_in_dir,
+                &thread_verb,
+                &thread_task,
+                &out_body,
+            );
+        });
+    if let Err(e) = spawned {
+        eprintln!("[agentplug daemon] could not spawn a lease thread for {}: {e} -- answering {verb}/{task} with an error instead of leaving it claimed", root.display());
+        let out_body = serde_json::json!({"ok": false, "error": format!("daemon could not start a lease thread: {e}"), "verb": verb}).to_string();
+        write_spool_out_and_release_claim(out_dir, in_dir, &verb, &task, &out_body);
+    }
+}
+
 pub(super) fn dispatch_project(
     root: &Path,
     project: &mut ProjectPlugins,
@@ -3314,8 +3388,7 @@ pub(super) fn dispatch_project(
         }
     }
     for req in lease_requests {
-        let out_body = agentplug_host::lease_reply(&req.verb, root, &req.body);
-        write_spool_out_and_release_claim(&out_dir, &in_dir, &req.verb, &req.task, &out_body);
+        spawn_browser_lease_reply(root, &in_dir, &out_dir, req.verb, req.task, req.body);
         did_work = true;
     }
 

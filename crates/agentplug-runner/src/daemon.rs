@@ -2533,6 +2533,8 @@ fn write_project_heartbeat(root: &Path, busy_until: Option<u64>) {
 
 const DISPATCH_HEARTBEAT_MIN_GAP: Duration = Duration::from_secs(3);
 
+const SLOW_CLAIM_PASS_REPORT: Duration = Duration::from_secs(5);
+
 /// One instruction-source sync per slot: with one pass over every leased project, an unbounded
 /// per-root thread would spawn on each interval, so the fan-out is capped and a root that finds no
 /// free slot stays due for the next pass instead of queueing.
@@ -4170,8 +4172,18 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
                         let Some((root, mut project)) = next else {
                             break;
                         };
+                        let pass_started = Instant::now();
                         let did_work =
                             dispatch_project(root.as_path(), &mut project, plugin_modules_ref);
+                        let pass_elapsed = pass_started.elapsed();
+                        if pass_elapsed >= SLOW_CLAIM_PASS_REPORT {
+                            eprintln!(
+                                "[agentplug daemon] claim pass for {} ran {}ms and every project waited for it; ts={}",
+                                root.display(),
+                                pass_elapsed.as_millis(),
+                                now_ms()
+                            );
+                        }
                         done_ref
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
