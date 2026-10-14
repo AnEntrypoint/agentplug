@@ -3173,6 +3173,122 @@ pub(super) fn project_has_pending_dispatch_work(root: &Path) -> bool {
         && project_has_queued_spool_work_cached(root)
 }
 
+fn write_plugin_dispatch_out(
+    pd_out: &Path,
+    claim_path: &Path,
+    verb: &str,
+    task: &str,
+    out_name: &str,
+    out_body: &str,
+) {
+    let out_body = stamp_dispatch_id(pd_out, verb, task, out_body);
+    let tmp = pd_out.join(format!("{out_name}.tmp.{}", std::process::id()));
+    if fs::write(&tmp, out_body).is_ok() {
+        let _ = fs::rename(&tmp, pd_out.join(out_name));
+        let _ = fs::write(pd_out.join(format!("{out_name}.ready")), b"");
+    }
+    let _ = fs::remove_file(claim_path);
+}
+
+struct PluginDispatchJob {
+    root: PathBuf,
+    pd_out: PathBuf,
+    claim_path: PathBuf,
+    plugin_name: String,
+    verb: String,
+    task: String,
+    body: String,
+}
+
+fn run_plugin_dispatch_job(job: &PluginDispatchJob, handle: &DispatchHandle) {
+    let PluginDispatchJob {
+        root,
+        pd_out,
+        claim_path,
+        plugin_name,
+        verb,
+        task,
+        body,
+    } = job;
+    if let Some(reason) =
+        shared_store_recycle_reason_independent_of_daemon_idle_state(&DaemonConfig::load())
+    {
+        let mut released: Vec<&str> = Vec::new();
+        for shared_name in agentplug_host::RELEASABLE_SHARED_PLUGINS {
+            if shared_name != plugin_name && agentplug_host::release_shared_plugin(shared_name) {
+                released.push(shared_name);
+            }
+        }
+        agentplug_host::reset_shared_dispatch_count();
+        if !released.is_empty() {
+            eprintln!(
+                "[agentplug daemon] pre-dispatch release of shared Stores {released:?} before {plugin_name}/{verb} -- {reason}"
+            );
+        }
+    }
+
+    let _tool_guard = ToolDispatchGuard::acquire(root, plugin_name, verb, body);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        handle.dispatch(plugin_name, verb, body)
+    }));
+    let out_name = format!("{plugin_name}-{verb}-{task}.json");
+    let out_body = match result {
+        Ok(Ok(s)) if !s.is_empty() => s,
+        Ok(Ok(_)) => serde_json::json!({"ok": false, "error": "empty dispatch result"}).to_string(),
+        Ok(Err(e)) => serde_json::json!({"ok": false, "error": describe_dispatch_error_naming_wasm_trap_kind_distinctly_from_a_guest_logic_error(&e)}).to_string(),
+        Err(panic_payload) => {
+            let msg = panic_payload
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| panic_payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "panic with non-string payload".to_string());
+            eprintln!("[agentplug daemon] plugin {plugin_name} verb {verb} PANICKED for {}: {msg}", root.display());
+            serde_json::json!({"ok": false, "error": format!("dispatch panicked: {msg}"), "verb": verb}).to_string()
+        }
+    };
+    let out_body = patch_update_available_from_escalation(plugin_name, verb, out_body);
+    write_plugin_dispatch_out(pd_out, claim_path, verb, task, &out_name, &out_body);
+}
+
+fn spawn_plugin_dispatch_job(job: PluginDispatchJob, handle: DispatchHandle) {
+    let key: InFlightKey = (job.root.clone(), job.verb.clone(), job.task.clone());
+    in_flight_map()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(
+            key.clone(),
+            InFlightHandle {
+                detach: Arc::new(AtomicBool::new(false)),
+            },
+        );
+    let failed_out_name = format!("{}-{}-{}.json", job.plugin_name, job.verb, job.task);
+    let (failed_pd_out, failed_claim_path) = (job.pd_out.clone(), job.claim_path.clone());
+    let (failed_verb, failed_task) = (job.verb.clone(), job.task.clone());
+    let thread_key = key.clone();
+    let spawned = std::thread::Builder::new()
+        .name(format!("plugin-dispatch-{}", job.task))
+        .spawn(move || {
+            let _release_in_flight_entry = InFlightEntryRelease { key: thread_key };
+            run_plugin_dispatch_job(&job, &handle);
+        });
+    if let Err(e) = spawned {
+        eprintln!("[agentplug daemon] could not spawn a plugin-dispatch thread for {failed_out_name}: {e} -- answering the request with an error instead of leaving it claimed");
+        in_flight_map()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&key);
+        let out_body = serde_json::json!({"ok": false, "error": format!("daemon could not start a plugin-dispatch thread: {e}"), "verb": failed_verb}).to_string();
+        write_plugin_dispatch_out(
+            &failed_pd_out,
+            &failed_claim_path,
+            &failed_verb,
+            &failed_task,
+            &failed_out_name,
+            &out_body,
+        );
+    }
+}
+
 fn browser_lease_acquire_gates() -> &'static Mutex<HashMap<PathBuf, Arc<Mutex<()>>>> {
     static SLOT: OnceLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> = OnceLock::new();
     SLOT.get_or_init(|| Mutex::new(HashMap::new()))
@@ -3584,13 +3700,7 @@ pub(super) fn dispatch_project(
                 let body = fs::read_to_string(&claim_path).unwrap_or_default();
 
                 let write_pd_out = |out_name: &str, out_body: &str| {
-                    let out_body = stamp_dispatch_id(&pd_out, &verb, &task, out_body);
-                    let tmp = pd_out.join(format!("{out_name}.tmp.{}", std::process::id()));
-                    if fs::write(&tmp, out_body).is_ok() {
-                        let _ = fs::rename(&tmp, pd_out.join(out_name));
-                        let _ = fs::write(pd_out.join(format!("{out_name}.ready")), b"");
-                    }
-                    let _ = fs::remove_file(&claim_path);
+                    write_plugin_dispatch_out(&pd_out, &claim_path, &verb, &task, out_name, out_body)
                 };
 
                 {
@@ -3621,47 +3731,23 @@ pub(super) fn dispatch_project(
                     }
                 }
 
-                if let Some(reason) = shared_store_recycle_reason_independent_of_daemon_idle_state(
-                    &DaemonConfig::load(),
-                ) {
-                    let mut released: Vec<&str> = Vec::new();
-                    for shared_name in agentplug_host::RELEASABLE_SHARED_PLUGINS {
-                        if shared_name != plugin_name
-                            && agentplug_host::release_shared_plugin(shared_name)
-                        {
-                            released.push(shared_name);
-                        }
-                    }
-                    agentplug_host::reset_shared_dispatch_count();
-                    if !released.is_empty() {
-                        eprintln!(
-                            "[agentplug daemon] pre-dispatch release of shared Stores {released:?} before {plugin_name}/{verb} -- {reason}"
-                        );
-                    }
-                }
-
-                let _tool_guard = ToolDispatchGuard::acquire(root, &plugin_name, &verb, &body);
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    project.dispatch(&plugin_name, &verb, &body)
-                }));
-                let out_name = format!("{plugin_name}-{verb}-{task}.json");
-                let out_body = match result {
-                    Ok(Ok(s)) if !s.is_empty() => s,
-                    Ok(Ok(_)) => serde_json::json!({"ok": false, "error": "empty dispatch result"}).to_string(),
-                    Ok(Err(e)) => serde_json::json!({"ok": false, "error": describe_dispatch_error_naming_wasm_trap_kind_distinctly_from_a_guest_logic_error(&e)}).to_string(),
-                    Err(panic_payload) => {
-                        let msg = panic_payload
-                            .downcast_ref::<&str>()
-                            .map(|s| s.to_string())
-                            .or_else(|| panic_payload.downcast_ref::<String>().cloned())
-                            .unwrap_or_else(|| "panic with non-string payload".to_string());
-                        eprintln!("[agentplug daemon] plugin {plugin_name} verb {verb} PANICKED for {}: {msg}", root.display());
-                        serde_json::json!({"ok": false, "error": format!("dispatch panicked: {msg}"), "verb": verb}).to_string()
-                    }
-                };
-                let out_body =
-                    patch_update_available_from_escalation(&plugin_name, &verb, out_body);
-                write_pd_out(&out_name, &out_body);
+                let handle = project.dispatch_handle_with_reload(Some((
+                    plugin_modules.engine.clone(),
+                    plugin_modules.modules_with_hashes(),
+                )));
+                project.last_active = Instant::now();
+                spawn_plugin_dispatch_job(
+                    PluginDispatchJob {
+                        root: root.to_path_buf(),
+                        pd_out: pd_out.clone(),
+                        claim_path,
+                        plugin_name,
+                        verb,
+                        task,
+                        body,
+                    },
+                    handle,
+                );
                 return true;
             }
         }
