@@ -36,6 +36,7 @@ and the `agentplug-host` imports. Work on `main` as GitHub user `lanmower`.
 
 ## Runtime invariants
 
+- The dream cycle trigger ticks every 60 s (`DREAM_RSI_CYCLE_TICK_INTERVAL_MS`, `spawn_dream_rsi_cycle_ticker` in `crates/agentplug-runner/src/daemon.rs`). Each queueing needs 20 new observations (`MIN_NEW_OBSERVATIONS`) and 15 min since the owner's last cycle reply or deferral (`COOLDOWN_MS`, `crates/agentplug-runner/src/dream_cycle.rs`).
 - Dream observation maintenance queues only registered `dream-replay-cycle` for the
   actual owner through canonical `session_id`. Private atomic per-owner state is
   persisted before its fixed pending request is published; recover that same request,
