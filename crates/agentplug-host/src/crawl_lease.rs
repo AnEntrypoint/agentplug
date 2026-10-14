@@ -40,9 +40,20 @@ struct SharedBrowser {
     profile: PathBuf,
     headful: bool,
     active: HashSet<String>,
+    idle_since_ms: Option<u64>,
 }
 
 const CDP_LAUNCH_ATTEMPTS: usize = 2;
+
+/// How long a shared Chrome with no lease stays hot for reuse before housekeeping closes it.
+const DEFAULT_IDLE_MS: u64 = 300_000;
+
+fn idle_window_ms() -> u64 {
+    std::env::var("GM_BROWSER_IDLE_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_IDLE_MS)
+}
 
 static BROWSERS: OnceLock<Mutex<HashMap<PathBuf, SharedBrowser>>> = OnceLock::new();
 static CLAIMED: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
@@ -515,6 +526,7 @@ pub fn acquire_session(
             return Err("shared Chrome vanished while attaching a lease".to_string());
         };
         browser.active.insert(agent.to_string());
+        browser.idle_since_ms = None;
         let port = browser.port;
         let chrome_pid = browser.pid;
         drop(map);
@@ -545,29 +557,30 @@ pub fn acquire_session(
             profile: browser.profile,
             headful,
             active,
+            idle_since_ms: None,
         },
     );
     publish_holder(root, port, chrome_pid)?;
     Ok((port, chrome_pid))
 }
 
-/// Detaches `agent`. When the last lease goes, the shared Chrome closes and the
-/// session claim is dropped so another process can take it.
+/// Detaches `agent`. When the last lease goes, the shared Chrome stays hot for its
+/// project profile: the session claim and heartbeat are kept, and housekeeping
+/// closes the browser once it has been idle for `idle_window_ms()`.
 pub fn release(root: &Path, agent: &str) {
-    let last_lease_gone = match browsers().get_mut(root) {
+    let attached = match browsers().get_mut(root) {
         Some(browser) => {
             browser.active.remove(agent);
-            browser.active.is_empty()
+            if browser.active.is_empty() {
+                browser.idle_since_ms = Some(now_ms());
+            }
+            true
         }
         None => false,
     };
-    if !last_lease_gone {
-        return;
+    if !attached {
+        release_session(root);
     }
-    if let Some(mut browser) = browsers().remove(root) {
-        close_browser(&mut browser);
-    }
-    release_session(root);
 }
 
 /// Session state for `root`: whether a claim is held, who holds it, how stale
@@ -689,6 +702,23 @@ pub fn housekeeping(_now: Instant) {
         }
     }
     for root in dead {
+        if let Some(mut browser) = browsers().remove(&root) {
+            close_browser(&mut browser);
+        }
+        release_session(&root);
+    }
+    let window = idle_window_ms();
+    let now = now_ms();
+    let expired: Vec<PathBuf> = browsers()
+        .iter()
+        .filter(|(_, browser)| {
+            browser
+                .idle_since_ms
+                .is_some_and(|since| now.saturating_sub(since) >= window)
+        })
+        .map(|(root, _)| root.clone())
+        .collect();
+    for root in expired {
         if let Some(mut browser) = browsers().remove(&root) {
             close_browser(&mut browser);
         }
