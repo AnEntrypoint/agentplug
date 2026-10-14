@@ -2153,7 +2153,18 @@ fn ensure_plugin_installed_via_github(
     if dest.exists() {
         if let Ok(installed) = fs::read_to_string(version_file) {
             if installed.trim() == version {
-                return Ok(dest.to_path_buf());
+                let sha_drifted = match (
+                    fetch_remote_wasm_sha256(plugin_name, &version),
+                    installed_wasm_sha256(plugin_name),
+                ) {
+                    (Ok(remote_sha), Some(local_sha)) => {
+                        !remote_sha.eq_ignore_ascii_case(&local_sha)
+                    }
+                    _ => false,
+                };
+                if !sha_drifted {
+                    return Ok(dest.to_path_buf());
+                }
             }
         }
     }
