@@ -1,7 +1,7 @@
 //! Headless crawl engine: one warm `lightpanda serve` per project root.
 //!
 //! The process is started on the first crawl, kept across dispatches, and
-//! reaped after GM_LIGHTPANDA_IDLE_SECONDS (default 300) without a crawl. The
+//! reaped after GM_LIGHTPANDA_IDLE_SECONDS (default 600) without a crawl. The
 //! CDP target id is remembered so repeat crawls reattach to the same page
 //! instead of creating a new one. A Linux server carries PR_SET_PDEATHSIG and
 //! dies with the runner; macOS has no pdeathsig, so there the idle reap and
@@ -29,7 +29,7 @@ use agentplug_host::{
 use serde_json::{json, Value};
 
 const ENGINE: &str = "lightpanda";
-const DEFAULT_IDLE_SECONDS: u64 = 300;
+const DEFAULT_IDLE_SECONDS: u64 = 600;
 const REAPER_TICK: Duration = Duration::from_secs(5);
 const READY_DEADLINE: Duration = Duration::from_secs(15);
 const WSL_READY_DEADLINE: Duration = Duration::from_secs(45);
