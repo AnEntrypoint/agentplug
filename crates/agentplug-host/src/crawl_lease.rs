@@ -458,6 +458,7 @@ fn launch(root: &Path, headful: bool) -> Result<SharedBrowser, String> {
             profile,
             headful,
             active: HashSet::new(),
+            idle_since_ms: None,
         };
         if endpoint_ready(port, Instant::now() + CDP_READY_DEADLINE, CDP_POLL_INTERVAL, true) {
             browser.pid = crawl_browser_pid(&browser.profile).unwrap_or(spawn_pid);
