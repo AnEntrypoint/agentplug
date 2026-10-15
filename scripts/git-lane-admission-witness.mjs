@@ -1,29 +1,4 @@
 #!/usr/bin/env node
-// Git-lane admission witness for the agentplug shared daemon.
-//
-// Builds the runner and runs three live self-checks against the real SharedPluginPool and
-// GmFairnessGuard. RESULT: PASS is printed only when all three exit 0 and print their own
-// RESULT: PASS:
-//   selfcheck-git-admission  with the general band of cheap dispatches full, a git-lane cheap
-//                            dispatch is admitted within 10 s, a second one is refused within its
-//                            bound, and a physical slot stays free for a short verb
-//   selfcheck-lane-release   a project lane held by a dispatch whose requester has no live lease is
-//                            released by the orphan sweep, and the abandoned holder cannot free the
-//                            lane once a successor owns it
-//   selfcheck-lane-fifo      three git dispatches queued behind one holder report lane positions
-//                            1, 2 and 3 through lane_queue_state and are admitted in claim order;
-//                            a refused waiter names its own position and the holder's age
-//
-// --mutant additionally drops the head-of-queue test from lane admission, so selfcheck-lane-fifo
-// faces a lane that admits any waiter and must print RESULT: FAIL.
-////   node scripts/git-lane-admission-witness.mjs [--root <agentplug dir>] [--mutant] [--scratch <dir>]
-//     [--timeout-ms 900000]
-//
-// --mutant copies crates/ and the workspace manifest into a scratch tree, disables the git band
-// there, builds it against the shared target dir (dependency artifacts are reused), and prints
-// RESULT: FAIL when the self-check detects the starved git lane. Exit 0 on PASS, 1 on FAIL, 2 on a
-// usage or setup error.
-
 import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -39,12 +14,11 @@ const SELFCHECKS = [
 ];
 const GIT_BAND_EXPRESSION = 'self.short_reserved_slots().saturating_sub(1)';
 const LANE_FIFO_EXPRESSION = '!owners.contains_key(&key) && lane_admissible(&owned_root, lane, token)';
-// Dropping `claimed_not_yet_tracked` from the unowned set is the regression the claim-reap
-// selfcheck exists to catch: the sweep's own ledger row starts protecting the claim again.
 const CLAIM_REAP_EXPRESSION =
   'pub(super) const LEDGER_UNOWNED_STATES: [&str; 2] = ["claimed_not_yet_tracked", "never_claimed"];';
 const CLAIM_REAP_MUTANT =
   'pub(super) const LEDGER_UNOWNED_STATES: [&str; 1] = ["never_claimed"];';
+const STALE_PACKAGES = ['agentplug-host', 'agentplug-runner'];
 const DEFAULT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const MAX_BUFFER = 64 * 1024 * 1024;
 
@@ -125,10 +99,7 @@ function prepareMutant(root, scratch) {
 function buildRunner(treeRoot, targetDir, timeoutMs) {
   const env = { ...process.env };
   if (targetDir) env.CARGO_TARGET_DIR = targetDir;
-  // A scratch tree and the real tree share a target dir and the same workspace-relative package
-  // hashes, so a previous build can leave the other tree's binary in place. Cleaning the two
-  // agentplug packages first forces this tree's own objects to be built and uplifted.
-  const cleaned = spawnSync('cargo', ['clean', '--quiet', '-p', 'agentplug-host', '-p', 'agentplug-runner'], {
+  const cleaned = spawnSync('cargo', ['clean', '--quiet', ...STALE_PACKAGES.flatMap((name) => ['-p', name])], {
     cwd: treeRoot,
     encoding: 'utf8',
     timeout: timeoutMs,

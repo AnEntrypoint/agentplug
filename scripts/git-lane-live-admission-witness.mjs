@@ -1,26 +1,4 @@
 #!/usr/bin/env node
-// Git-lane admission witness, node half. Neither mode builds the runner.
-//
-//   --static  reads crates/agentplug-host/src/registry.rs and checks the wiring that lets git verbs
-//             reach the git band: no production dispatch admits without a lane, both production
-//             dispatch paths pass the git lane for git_ verbs, and the git-lane gate and band limit
-//             exist once. A source check, so it cannot see a runtime regression; the cargo fixture in
-//             scripts/git-lane-admission-witness.mjs covers the band logic and needs a build.
-//   --live    dispatches one git_stash_list request (read-only, a git verb) into
-//             <root>/.gm/exec-spool (write .txt.tmp, rename to .txt), waits for its out file and
-//             checks the admission the running daemon names. It never builds, restarts or edits the
-//             daemon.
-//
-//   node scripts/git-lane-live-admission-witness.mjs --static [--root <agentplug dir>]
-//   node scripts/git-lane-live-admission-witness.mjs --live --root <project dir> [--max-ms 10000] [--cap-ms 120000]
-//
-// --live RESULT: PASS requires all of: the reply is ok; admission_decision is "admitted"; admission_band
-// is "general" or "git-band" (an idle project is admitted in the general band, and the git band is the
-// fallback when general is full); admission_waited_ms is a number; the reply arrives within --max-ms;
-// and the daemon reports runner_update_in_progress at dispatch, since the acceptance is a cheap verb
-// answered while a runner update is in progress. The status snapshot is printed before the dispatch.
-// Exit 0 on PASS, 1 on FAIL, 2 on a usage or setup error.
-
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -161,16 +139,18 @@ function dispatch(spoolDir, task) {
   return started;
 }
 
+function tryReadReply(outFile) {
+  try {
+    return { value: JSON.parse(fs.readFileSync(outFile, 'utf8')) };
+  } catch {
+    return null;
+  }
+}
+
 async function awaitReply(outFile, started, capMs) {
   while (performance.now() - started < capMs) {
-    if (fs.existsSync(outFile)) {
-      try {
-        const reply = JSON.parse(fs.readFileSync(outFile, 'utf8'));
-        return { reply, latencyMs: Math.round(performance.now() - started) };
-      } catch {
-        // The daemon finalizes the out file; a read that lands mid-write retries on the next poll.
-      }
-    }
+    const read = fs.existsSync(outFile) ? tryReadReply(outFile) : null;
+    if (read) return { reply: read.value, latencyMs: Math.round(performance.now() - started) };
     await new Promise((resolve) => setTimeout(resolve, POLL_MS));
   }
   return { reply: null, latencyMs: null };
