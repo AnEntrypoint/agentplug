@@ -7,6 +7,10 @@ pub struct LogicHost {
     lua: Lua,
 }
 
+fn lua_err(err: mlua::Error) -> anyhow::Error {
+    anyhow::anyhow!("{err}")
+}
+
 impl LogicHost {
     pub fn load(dir: &Path) -> Result<Self> {
         let lua = Lua::new();
@@ -23,6 +27,7 @@ impl LogicHost {
             lua.load(src.as_str())
                 .set_name(path.display().to_string())
                 .exec()
+                .map_err(lua_err)
                 .with_context(|| format!("load {}", path.display()))?;
         }
         Ok(Self { lua })
@@ -33,9 +38,10 @@ impl LogicHost {
             .lua
             .globals()
             .get(function)
+            .map_err(lua_err)
             .with_context(|| format!("lua function {function} not defined"))?;
-        let arg = self.lua.to_value(input)?;
-        let out: mlua::Value = f.call(arg)?;
-        Ok(self.lua.from_value(out)?)
+        let arg = self.lua.to_value(input).map_err(lua_err)?;
+        let out: mlua::Value = f.call(arg).map_err(lua_err)?;
+        self.lua.from_value(out).map_err(lua_err)
     }
 }
