@@ -497,12 +497,7 @@ fn selfcheck_admission_hold_reclaim() -> anyhow::Result<()> {
     use std::time::{Duration, Instant};
 
     const NAME: &str = "selfcheck-admission-hold-reclaim";
-    // The pool size the daemon actually runs (`POOL_SIZE` in main): 4 slots, general band 3. That is
-    // the size the measured stall happened at, and the size at which the git band subtracted to
-    // zero.
     const POOL_SLOTS: usize = 4;
-    // Lowered so the selfcheck does not park for a minute: the reclaim is what is under test, not
-    // the constant.
     std::env::set_var("AGENTPLUG_ADMISSION_HOLD_MAX_MS", "300");
     let pool = Arc::new(SharedPluginPool::new("gm", POOL_SLOTS));
     let general_limit = POOL_SLOTS - (POOL_SLOTS / 4).max(1);
@@ -539,8 +534,6 @@ fn selfcheck_admission_hold_reclaim() -> anyhow::Result<()> {
                 "only part of the {general_limit} general cheap dispatches could be parked"
             ));
         }
-        // Inside the hold bound the band still bounds concurrency: a fourth cheap dispatch is held
-        // out. Releasing this is not the fix -- the fix is that the refusal has an end.
         if SharedPluginPool::admit_within(&pool, DispatchCostClass::Cheap, Duration::from_millis(300))
             .is_ok()
         {
@@ -550,8 +543,6 @@ fn selfcheck_admission_hold_reclaim() -> anyhow::Result<()> {
             ));
         }
         std::thread::sleep(Duration::from_millis(400));
-        // Same shape as the real dispatch path: the waiter takes a physical slot first, then asks
-        // for admission while holding it.
         let (_slot, _) = pool.acquire_within_for_class(
             SharedPluginPool::ACQUIRE_TIMEOUT_MS,
             DispatchCostClass::Cheap,
@@ -574,8 +565,6 @@ fn selfcheck_admission_hold_reclaim() -> anyhow::Result<()> {
                 "the reclaimed admission took {reclaim_ms}ms -- it waited out its patience budget instead of taking the over-age counter back"
             ));
         }
-        // The git band exists at the pool size the daemon runs. At 4 slots its limit subtracted to
-        // zero, so a git dispatch that lost the general race had no way in at all.
         let git = SharedPluginPool::admit_within_lane(
             &pool,
             DispatchCostClass::Cheap,
@@ -592,8 +581,6 @@ fn selfcheck_admission_hold_reclaim() -> anyhow::Result<()> {
             .iter()
             .map(|hold| hold.kind.to_string())
             .collect::<Vec<_>>();
-        // The band is visible now: a lane hold was always listed in the wait ledger, and the hold
-        // that actually refused the dispatch was named only inside a reply two minutes late.
         if !kinds.iter().any(|kind| kind == "general") {
             return Err(format!(
                 "admission_holds() listed no general-band hold ({}) -- the stall would still be a phantom",
@@ -829,10 +816,6 @@ fn selfcheck_lane_release() -> anyhow::Result<()> {
     let _ = release_tx.send(());
     let _ = holder.join();
 
-    // The case the abandoned-root sweep can never reach: the project keeps its lease, so the
-    // only thing that can free its lane is proof that this one dispatch is gone. A holder that
-    // dies without dropping its guard -- a thread killed mid-git -- used to hold a live
-    // project's git lane for the life of the daemon.
     let live_root = root.join("live-project");
     std::fs::create_dir_all(&live_root)?;
     let (held2_tx, held2_rx) = mpsc::channel::<bool>();
@@ -902,8 +885,6 @@ fn selfcheck_lane_release() -> anyhow::Result<()> {
                 reaped.iter().map(|o| o.task.clone()).collect::<Vec<_>>()
             ));
         }
-        // Take the freed lane and KEEP it, then let the old holder drop its guard: a drop that
-        // released the lane by key would hand the repo to a second git at the same time.
         let successor = match GmFairnessGuard::acquire_within(
             &live_root,
             "git_commit",
@@ -944,10 +925,6 @@ fn selfcheck_lane_release() -> anyhow::Result<()> {
     })();
     let _ = release2_tx.send(());
 
-
-    // A dispatch that panics has no release call to reach: the lane comes back only because the
-    // guard drops. The daemon runs every dispatch inside catch_unwind, so this is the throw
-    // path, witnessed.
     let panic_root = root.join("panicking-project");
     std::fs::create_dir_all(&panic_root)?;
     let panic_root2 = panic_root.clone();
@@ -1000,18 +977,12 @@ fn selfcheck_lane_release() -> anyhow::Result<()> {
     }
 }
 
-/// The yield the lane gives a checkout-bound claim over a network-bound one, witnessed live: a
-/// commit queued behind a fresh push takes the lane ahead of it, and a push that has waited out its
-/// yield budget stops yielding and is not starved by later commits. One writer per worktree holds
-/// throughout -- the yield reorders the queue, it never admits a second writer.
 fn selfcheck_lane_network_yield() -> anyhow::Result<()> {
     use agentplug_host::GmFairnessGuard;
     use std::sync::mpsc;
     use std::time::Duration;
 
     const NAME: &str = "selfcheck-lane-network-yield";
-    // Read once per process, before any lane call: the real budget is minutes, so the aging half of
-    // this property is only witnessable against a shortened one.
     std::env::set_var("AGENTPLUG_LANE_NETWORK_YIELD_MS", "1000");
     let root = std::env::temp_dir().join(format!(
         "agentplug-selfcheck-lane-yield-{}-{}",
@@ -1019,8 +990,6 @@ fn selfcheck_lane_network_yield() -> anyhow::Result<()> {
         agentplug_host::now_ms()
     ));
     std::fs::create_dir_all(&root)?;
-    // One lane key per property: a claim parked by an earlier part sits in the queue until it goes
-    // stale, and would otherwise be read as the later part's blocker.
     let root_a = root.join("a");
     let root_b = root.join("b");
     let root_c = root.join("c");
@@ -1031,7 +1000,6 @@ fn selfcheck_lane_network_yield() -> anyhow::Result<()> {
     const PUSH_BODY: &str = "{\"SESSION_ID\":\"yield-push\",\"rev\":\"HEAD\"}";
     const COMMIT_BODY: &str = "{\"SESSION_ID\":\"yield-commit\",\"paths\":[\"a\"]}";
 
-    /// Hold the git lane until `release` fires, then let it go.
     fn hold(root: &std::path::Path, task: &'static str) -> (mpsc::Receiver<bool>, mpsc::Sender<()>) {
         let (held_tx, held_rx) = mpsc::channel::<bool>();
         let (release_tx, release_rx) = mpsc::channel::<()>();
@@ -1052,9 +1020,6 @@ fn selfcheck_lane_network_yield() -> anyhow::Result<()> {
     }
 
     let outcome = (|| -> Result<String, String> {
-        // A fresh push is queued, then a commit behind it. On release the commit is admitted first:
-        // the push's minutes-long remote round-trip is not allowed to make the checkout's own work
-        // queue behind it.
         let (held_rx, release_tx) = hold(&root_a, "holder-yield");
         if !held_rx.recv_timeout(Duration::from_secs(10)).unwrap_or(false) {
             return Err("the holder could not take the project git lane".into());
@@ -1109,7 +1074,6 @@ fn selfcheck_lane_network_yield() -> anyhow::Result<()> {
         };
         drop(commit);
 
-        // The mirror image: the yield is one-directional. A push behind a commit stays behind it.
         let (held_rx, release_tx) = hold(&root_b, "holder-fifo");
         if !held_rx.recv_timeout(Duration::from_secs(10)).unwrap_or(false) {
             return Err("the second holder could not take the project git lane".into());
@@ -1146,8 +1110,6 @@ fn selfcheck_lane_network_yield() -> anyhow::Result<()> {
         };
         drop(first);
 
-        // Aging: the push that has waited out its yield budget stops yielding, so a project that
-        // commits continuously still publishes instead of starving its pushes forever.
         let (held_rx, release_tx) = hold(&root_c, "holder-aged");
         if !held_rx.recv_timeout(Duration::from_secs(10)).unwrap_or(false) {
             return Err("the third holder could not take the project git lane".into());
@@ -1166,8 +1128,6 @@ fn selfcheck_lane_network_yield() -> anyhow::Result<()> {
             "commit-late",
             Duration::from_millis(150),
         );
-        // Aging: past its yield budget the push stops yielding, so a project that commits
-        // continuously still publishes instead of starving its pushes forever.
         std::thread::sleep(Duration::from_millis(1200));
         let _ = release_tx.send(());
         match GmFairnessGuard::acquire_within(
@@ -1216,13 +1176,6 @@ fn selfcheck_lane_network_yield() -> anyhow::Result<()> {
     }
 }
 
-/// The caller's own poll budget bounds the lane wait, witnessed live against the real guard.
-///
-/// The defect this fixes was measured, not imagined: a caller passing `timeout_seconds: 240` was
-/// still answered `dispatch_starved_waiting_for_serial_lane` at 120005ms, because the lane wait ran
-/// on a budget the caller had no way to raise. The budget now arrives in the body as one reserved
-/// member, is stripped before anything hashes or runs that body, and bounds the wait between a floor
-/// and the lane's own ceiling.
 fn selfcheck_lane_budget() -> anyhow::Result<()> {
     use crate::daemon::{
         lane_wait_ceiling_ms, lane_wait_default_ms, lane_wait_max, split_caller_lane_wait_ms,
@@ -1245,7 +1198,6 @@ fn selfcheck_lane_budget() -> anyhow::Result<()> {
         "{\"_agentplug_lane_wait_ms\":1200,\"SESSION_ID\":\"budget\",\"paths\":[\"a\"]}";
     const BODY_STRIPPED: &str = "{\"SESSION_ID\":\"budget\",\"paths\":[\"a\"]}";
 
-    /// Hold the git lane until `release` fires.
     fn hold(root: &std::path::Path, task: &'static str) -> (mpsc::Receiver<bool>, mpsc::Sender<()>) {
         let (held_tx, held_rx) = mpsc::channel::<bool>();
         let (release_tx, release_rx) = mpsc::channel::<()>();
@@ -1266,9 +1218,6 @@ fn selfcheck_lane_budget() -> anyhow::Result<()> {
     }
 
     let outcome = (|| -> Result<String, String> {
-        // The reserved member is removed byte-exactly, whichever side of the body it sits on: the
-        // plugin sees the body the caller wrote, and one request's FIFO identity cannot fork into two
-        // queue places just because the caller's poll budget happened to appear in one dispatch.
         let (stripped, budget) = split_caller_lane_wait_ms(BODY_WITH_BUDGET);
         if stripped != BODY_STRIPPED {
             return Err(format!(
@@ -1304,8 +1253,6 @@ fn selfcheck_lane_budget() -> anyhow::Result<()> {
             return Err("a caller-written lane_wait_ms overrode the reserved budget".into());
         }
 
-        // The budget bounds the wait between a floor and the lane's own ceiling, so a caller can
-        // raise it to what it asked for and no further.
         if lane_wait_max("git_commit", Some(0)) != Duration::from_millis(1_000) {
             return Err(format!(
                 "a sub-second caller budget was not raised to the floor: got {:?}",
@@ -1324,8 +1271,6 @@ fn selfcheck_lane_budget() -> anyhow::Result<()> {
             );
         }
 
-        // The default is a prompt answer for a caller that asked for nothing, and it no longer
-        // doubles as the ceiling: a codesearch caller that DID state a budget buys the ceiling.
         let codesearch_default = lane_wait_default_ms("codesearch");
         let codesearch_ceiling = lane_wait_ceiling_ms("codesearch");
         if codesearch_default >= codesearch_ceiling {
@@ -1348,8 +1293,6 @@ fn selfcheck_lane_budget() -> anyhow::Result<()> {
             ));
         }
 
-        // Live: a waiter whose caller budgeted 1200ms starves at ~1200ms, not at a budget it never
-        // set. Nothing ran, so `re_dispatch_safe` holds no matter how long the budget is.
         let (held_rx, release_tx) = hold(&root_budget, "holder-budget");
         if !held_rx.recv_timeout(Duration::from_secs(10)).unwrap_or(false) {
             return Err("the holder could not take the project git lane".into());
@@ -1401,13 +1344,6 @@ fn strip_without_budget() -> bool {
     stripped != body || budget.is_some()
 }
 
-/// A lane hold is bounded, witnessed live: past the bound a holder that is not executing loses the
-/// lane with a named reason and its claim is parked at the head of the queue, a holder that IS
-/// running loses it too once it has run past the running ceiling with claims queued behind it, and a
-/// holder whose worker is gone loses it as soon as the bound has passed, so a dispatch that never
-/// finishes or dies holding a lane cannot stall the project's whole lane indefinitely. A running
-/// holder that still has a worker and nothing waiting behind it keeps its lane however long it runs:
-/// that hold is what keeps two git writers out of one worktree.
 fn selfcheck_lane_hold_release() -> anyhow::Result<()> {
     use crate::daemon::{
         in_flight_map, lane_holder_stuck_reason, note_dispatch_stage, release_stuck_lane_holders,
@@ -1420,8 +1356,6 @@ fn selfcheck_lane_hold_release() -> anyhow::Result<()> {
     use std::time::Duration;
 
     const NAME: &str = "selfcheck-lane-hold-release";
-    // Read on every call, so the selfcheck can witness the release without a three-minute wait. No
-    // shipped path sets it.
     std::env::set_var("AGENTPLUG_LANE_HOLD_STUCK_MIN_MS", "400");
     let root = std::env::temp_dir().join(format!(
         "agentplug-selfcheck-lane-hold-{}-{}",
@@ -1437,7 +1371,6 @@ fn selfcheck_lane_hold_release() -> anyhow::Result<()> {
     std::fs::create_dir_all(&root_running_past)?;
     std::fs::create_dir_all(&root_worker_gone)?;
 
-    /// Hold the git lane until `release` fires, then report whether this holder still owns it.
     fn hold_reporting_ownership(
         root: &std::path::Path,
         task: &'static str,
@@ -1456,18 +1389,12 @@ fn selfcheck_lane_hold_release() -> anyhow::Result<()> {
             );
             let _ = held_tx.send(guard.is_ok());
             let _ = release_rx.recv();
-            // The displaced-holder check: a holder that lost the lane answers starved instead of
-            // running, so it never reaches the worktree.
             let _ = owns_tx.send(guard.as_ref().map(|g| g.still_owns()).unwrap_or(false));
             drop(guard);
         });
         (held_rx, release_tx, owns_rx)
     }
 
-    /// Register and unregister a worker for a holder, which is the runner's own liveness ledger: the
-    /// in-flight entry exists for exactly as long as a dispatch thread does, and the hold watchdog
-    /// reads its absence as a worker that is gone. A holder that is really running must carry one, or
-    /// the selfcheck would be measuring a hold no dispatch can produce.
     let register_worker = |root: &std::path::Path, task: &str| {
         in_flight_map()
             .lock()
@@ -1495,9 +1422,6 @@ fn selfcheck_lane_hold_release() -> anyhow::Result<()> {
     };
 
     let outcome = (|| -> Result<String, String> {
-        // A holder stuck before running: live, but its stage is not Running and has not been for the
-        // whole bound. It holds the lane while it waits for its tool-queue turn, so it has not
-        // touched the worktree and the lane is released with a named reason.
         let (held_rx, release_tx, owns_rx) = hold_reporting_ownership(&root_stuck, "holder-stuck");
         if !held_rx.recv_timeout(Duration::from_secs(10)).unwrap_or(false) {
             return Err("the stuck holder could not take the project git lane".into());
@@ -1520,8 +1444,6 @@ fn selfcheck_lane_hold_release() -> anyhow::Result<()> {
                 "a holder stuck before running was not released with a named reason: got {reason:?} over {released:?} released hold(s)"
             ));
         }
-        // The displaced holder is told while the lane is genuinely held by someone else, so a false
-        // below is the watchdog's release and not merely an empty lane.
         let claimer = match GmFairnessGuard::acquire_within(
             &root_stuck,
             "git_commit",
@@ -1546,9 +1468,6 @@ fn selfcheck_lane_hold_release() -> anyhow::Result<()> {
         }
         drop(claimer);
 
-        // The mirror image: a holder that IS running keeps the lane however long it holds, as long as
-        // nobody is waiting behind it. That hold is the lane's whole purpose -- it is what keeps two
-        // git writers out of one worktree.
         let (held_rx, release_tx, owns_rx) =
             hold_reporting_ownership(&root_running, "holder-running");
         if !held_rx.recv_timeout(Duration::from_secs(10)).unwrap_or(false) {
@@ -1576,10 +1495,6 @@ fn selfcheck_lane_hold_release() -> anyhow::Result<()> {
         }
         unregister_worker(&root_running, "holder-running");
 
-        // The ceiling that bounds a stall: a holder that IS running but has run past the running
-        // ceiling, with a claim queued behind it, loses the lane so the queue drains instead of being
-        // told to re-dispatch behind the same holder forever. Read on every call, so the selfcheck
-        // witnesses the release without a ten-minute wait. No shipped path sets it.
         std::env::set_var("AGENTPLUG_LANE_HOLD_RUNNING_MAX_MS", "400");
         let (held_rx, release_tx, owns_rx) =
             hold_reporting_ownership(&root_running_past, "holder-running-past-max");
@@ -1640,18 +1555,11 @@ fn selfcheck_lane_hold_release() -> anyhow::Result<()> {
         }
         unregister_worker(&root_running_past, "holder-running-past-max");
 
-        // A hold whose worker is gone: the holder noted `Running`, but nothing is registered for it
-        // any more, so the stage is a tombstone left by a dispatch that died and the lane must not
-        // wait on it. The stage alone cannot tell this from a live holder, which is why the
-        // registration -- not the stage -- is what settles it.
         let (held_rx, release_tx, owns_rx) =
             hold_reporting_ownership(&root_worker_gone, "holder-worker-gone");
         if !held_rx.recv_timeout(Duration::from_secs(10)).unwrap_or(false) {
             return Err("the holder whose worker is gone could not take the project git lane".into());
         }
-        // No worker is registered for this holder: its thread ended and took the registration with
-        // it, leaving the Running stage behind. That is exactly the state a dispatch that died after
-        // noting Running leaves, and the stage alone cannot tell it from a live holder.
         note_dispatch_stage(
             &root_worker_gone,
             "git_commit",
@@ -1676,9 +1584,6 @@ fn selfcheck_lane_hold_release() -> anyhow::Result<()> {
                 "a hold whose worker is gone was not released from the lane".into(),
             );
         }
-        // Released as abandoned, not merely displaced: the stage the dead worker left is gone too, so
-        // the ledger stops naming this dispatch as running and the orphan sweep can reap its claim
-        // and answer the caller instead of leaving it in flight forever.
         if lane_holder_stuck_reason(&root_worker_gone, "git", "git_commit", "holder-worker-gone")
             != Some("holder_dispatch_gone")
         {
@@ -1726,9 +1631,6 @@ fn selfcheck_lane_hold_release() -> anyhow::Result<()> {
     }
 }
 
-/// The FIFO property of a project serial lane, witnessed live against the real guard: the claim that
-/// arrived first is admitted first, and a re-dispatch of the same request keeps its place in the
-/// queue instead of going to the back of it.
 fn selfcheck_lane_fifo() -> anyhow::Result<()> {
     use agentplug_host::GmFairnessGuard;
     use std::sync::mpsc;
@@ -1743,8 +1645,6 @@ fn selfcheck_lane_fifo() -> anyhow::Result<()> {
     ));
     std::fs::create_dir_all(&root)?;
 
-    // One request, re-dispatched verbatim: the spool mints a fresh task id per dispatch, so only
-    // the verb and the body carry the request's identity across it.
     const BODY_A: &str = "{\"SESSION_ID\":\"fifo-first\",\"paths\":[\"a\"]}";
     const BODY_B: &str = "{\"SESSION_ID\":\"fifo-later\",\"paths\":[\"b\"]}";
 
@@ -1768,8 +1668,6 @@ fn selfcheck_lane_fifo() -> anyhow::Result<()> {
         if !held_rx.recv_timeout(Duration::from_secs(10)).unwrap_or(false) {
             return Err("the holder could not take the project git lane".into());
         }
-        // Waiter 1 arrives and starves. Nothing ran -- the lane is single-writer -- and it keeps
-        // its place in the queue.
         match GmFairnessGuard::acquire_within(
             &root,
             "git_commit",
@@ -1799,7 +1697,6 @@ fn selfcheck_lane_fifo() -> anyhow::Result<()> {
                 }
             }
         }
-        // Waiter 2 arrives later and must queue behind waiter 1, never ahead of it.
         match GmFairnessGuard::acquire_within(
             &root,
             "git_commit",
@@ -1816,9 +1713,6 @@ fn selfcheck_lane_fifo() -> anyhow::Result<()> {
             }
             Err(_) => {}
         }
-        // Waiter 1 is re-dispatched verbatim under a NEW task id. It is the same request, so it
-        // keeps position 1: an arrival-ordered queue would have sent it to the back, behind every
-        // later arrival, and one long holder would starve it forever.
         match GmFairnessGuard::acquire_within(
             &root,
             "git_commit",
@@ -1837,7 +1731,6 @@ fn selfcheck_lane_fifo() -> anyhow::Result<()> {
             }
             Err(_) => {}
         }
-        // The watchdog surface: who holds the lane, for how long, with how many claims behind it.
         let holds = agentplug_host::registry::lane_holds(&root);
         let named = holds.iter().any(|hold| {
             hold.lane == "git"
@@ -1854,8 +1747,6 @@ fn selfcheck_lane_fifo() -> anyhow::Result<()> {
                     .collect::<Vec<_>>()
             ));
         }
-        // The holder releases: waiter 1 is admitted first, although waiter 2 arrived before
-        // waiter 1's re-dispatch did.
         let _ = release_tx.send(());
         let first = match GmFairnessGuard::acquire_within(
             &root,
@@ -1905,9 +1796,6 @@ fn selfcheck_lane_fifo() -> anyhow::Result<()> {
             }
         }
 
-        // Three claims that arrive in order behind a fresh holder are admitted in claim order. A
-        // lane that admitted whichever waiter happened to poll would let the newest arrival
-        // overtake an older claim, which is the starvation the queue exists to prevent.
         let (held2_tx, held2_rx) = mpsc::channel::<bool>();
         let (release2_tx, release2_rx) = mpsc::channel::<()>();
         let holder2_root = root.clone();
@@ -1930,7 +1818,6 @@ fn selfcheck_lane_fifo() -> anyhow::Result<()> {
         let mut handles = Vec::new();
         for index in 1..=3 {
             let task = format!("claim-{index}");
-            // Distinct bodies: three separate claims of one verb, as three callers would send them.
             let body = format!("{{\"SESSION_ID\":\"fifo-claim-{index}\",\"paths\":[\"c{index}\"]}}");
             let waiter_root = root.clone();
             let order = Arc::clone(&order);
@@ -1954,8 +1841,6 @@ fn selfcheck_lane_fifo() -> anyhow::Result<()> {
                     }
                 }
             }));
-            // A claim is queued at the top of acquire_within, so a gap wider than a thread start
-            // makes "claim-N queued before claim-N+1" a fact rather than a hope.
             std::thread::sleep(Duration::from_millis(60));
         }
         std::thread::sleep(Duration::from_millis(20));
