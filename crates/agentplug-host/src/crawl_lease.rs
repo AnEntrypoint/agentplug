@@ -18,15 +18,10 @@ use crate::windowless::apply_windowless;
 
 pub const HOUSEKEEPING_TICK: Duration = Duration::from_secs(30);
 
-/// How often a holder restamps `heartbeatAt` while it owns a session.
 pub const HEARTBEAT_MS: u64 = 2_000;
-/// A holder whose newest heartbeat is older than this is dead, whatever its pid does.
 pub const TTL_MS: u64 = 120_000;
-/// How long one acquire waits for a live holder before it fails.
 pub const WAIT_MS: u64 = 600_000;
 const POLL_MS: u64 = 500;
-/// A claim file exists before its record is readable. A freshly created unreadable
-/// file is a claim being written by a peer, never a dead holder to kill for.
 const CLAIM_CREATE_GRACE_MS: u64 = 5_000;
 
 const SESSION: &str = "session";
@@ -45,7 +40,6 @@ struct SharedBrowser {
 
 const CDP_LAUNCH_ATTEMPTS: usize = 2;
 
-/// How long a shared Chrome with no lease stays hot for reuse before housekeeping closes it.
 const BROWSER_HOT_IDLE_MS: u64 = 600_000;
 
 fn idle_window_ms() -> u64 {
@@ -89,7 +83,6 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// One holder per project root: the exclusive claim file every process races for.
 pub fn session_dir(root: &Path) -> PathBuf {
     root.join(".gm").join("browser-lease").join(SESSION)
 }
@@ -102,7 +95,6 @@ pub fn profile_dir(root: &Path) -> PathBuf {
     session_dir(root).join(PROFILE)
 }
 
-/// The claim record, written as `owner.json` by whoever holds the session.
 #[derive(Clone)]
 pub struct LeaseHolder {
     pub owner: String,
@@ -140,7 +132,6 @@ impl LeaseHolder {
         })
     }
 
-    /// Milliseconds since the last heartbeat: the portable liveness signal.
     pub fn heartbeat_age_ms(&self) -> u64 {
         now_ms().saturating_sub(self.heartbeat_at_ms)
     }
@@ -226,9 +217,6 @@ fn file_age_ms(path: &Path) -> u64 {
     now_ms().saturating_sub(written)
 }
 
-/// Live means the holder restamped its heartbeat inside the TTL. Heartbeat
-/// freshness is the whole test: it is the only liveness signal that reads the
-/// same on macOS, Windows and Linux without a platform probe.
 pub fn holder_live(root: &Path, ttl_ms: u64) -> bool {
     match read_holder(root) {
         Some(holder) => holder.heartbeat_age_ms() < effective_ttl(ttl_ms),
@@ -242,8 +230,6 @@ fn claim_is_ours(root: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// Creates the claim file or reports that it already exists. `create_new` is the
-/// mutex: exactly one process in the race gets `true`.
 fn create_claim(root: &Path, holder: &LeaseHolder) -> Result<bool, String> {
     let dir = session_dir(root);
     std::fs::create_dir_all(&dir)
@@ -272,10 +258,7 @@ fn kill_tree(pid: u32) {
     kill_process_tree(pid);
 }
 
-/// Takes a claim whose holder stopped heartbeating: kills the holder it names,
-/// reaps whatever browser still owns the profile, then unlinks so the next
-/// create can win.
-fn evict_holder(root: &Path, prior: Option<&LeaseHolder>) {
+fn evict_stale_holder(root: &Path, prior: Option<&LeaseHolder>) {
     if let Some(holder) = prior {
         kill_tree(holder.browser_pid);
         if holder.pid != std::process::id() {
@@ -340,8 +323,6 @@ fn held_by_error(root: &Path, owner: &str, wait_ms: u64) -> String {
     }
 }
 
-/// Takes the one session claim for `root`, waiting out a live holder and taking
-/// over a dead one. Returns the record this process now owns.
 pub fn claim_session(
     root: &Path,
     owner: &str,
@@ -372,14 +353,12 @@ pub fn claim_session(
         }
         if !holder_live(root, ttl) {
             let prior = read_holder(root);
-            evict_holder(root, prior.as_ref());
+            evict_stale_holder(root, prior.as_ref());
         }
         std::thread::sleep(Duration::from_millis(POLL_MS));
     }
 }
 
-/// Drops this process's own claim, and only its own: a claim whose pid is not
-/// ours belongs to whoever took over, and is left alone.
 pub fn release_session(root: &Path) {
     claimed().remove(root);
     stop_heartbeat(root);
@@ -503,13 +482,10 @@ fn close_browser(browser: &mut SharedBrowser) {
     let _ = std::fs::remove_dir_all(&browser.profile);
 }
 
-/// Attaches `agent` to the shared Chrome for `root`, starting it on first use,
-/// and returns its DevTools port. Pair every successful call with `release`.
 pub fn acquire(root: &Path, agent: &str, headful: bool) -> Result<(u16, u32), String> {
     acquire_session(root, agent, headful, TTL_MS, WAIT_MS)
 }
 
-/// `acquire` with the wait and TTL the caller asked for.
 pub fn acquire_session(
     root: &Path,
     agent: &str,
@@ -565,9 +541,6 @@ pub fn acquire_session(
     Ok((port, chrome_pid))
 }
 
-/// Detaches `agent`. When the last lease goes, the shared Chrome stays hot for its
-/// project profile: the session claim and heartbeat are kept, and housekeeping
-/// closes the browser once it has been idle for `idle_window_ms()`.
 pub fn release(root: &Path, agent: &str) {
     let attached = match browsers().get_mut(root) {
         Some(browser) => {
@@ -584,8 +557,6 @@ pub fn release(root: &Path, agent: &str) {
     }
 }
 
-/// Session state for `root`: whether a claim is held, who holds it, how stale
-/// its heartbeat is, and whether that holder is live.
 pub fn status(root: &Path) -> Value {
     let mine = {
         let mut map = browsers();
@@ -636,10 +607,6 @@ pub fn status(root: &Path) -> Value {
     out
 }
 
-/// Serves the runner-native verbs `browser_lease_acquire`, `browser_lease_release`
-/// and `browser_lease_status`. Body: `{root, agent, ttl_ms, wait_ms}`; `root`
-/// defaults to the dispatching project root, and `agent` is required by acquire
-/// and release.
 pub fn lease_reply(verb: &str, dispatch_root: &Path, body: &str) -> String {
     #[derive(serde::Deserialize)]
     struct Req {
@@ -690,8 +657,6 @@ pub fn lease_reply(verb: &str, dispatch_root: &Path, body: &str) -> String {
     reply.to_string()
 }
 
-/// Closes a shared Chrome that has died or whose claim another process took,
-/// and drops the session claim with it.
 pub fn housekeeping(_now: Instant) {
     let mut dead: Vec<PathBuf> = Vec::new();
     {
@@ -741,8 +706,6 @@ pub fn housekeeping(_now: Instant) {
     }
 }
 
-/// Starts the housekeeping timer once per process. The runner calls this at
-/// startup, next to its other daemon timers.
 pub fn spawn_housekeeping_timer() {
     if HOUSEKEEPING.set(()).is_err() {
         return;
@@ -753,7 +716,6 @@ pub fn spawn_housekeeping_timer() {
     });
 }
 
-/// Closes every shared Chrome. Call at runner shutdown.
 pub fn shutdown_shared_browsers() {
     for (root, mut browser) in browsers().drain() {
         close_browser(&mut browser);

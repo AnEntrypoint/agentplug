@@ -68,9 +68,6 @@ mod platform {
     pub struct Job(usize);
 
     impl Job {
-        /// Members outlive this handle: the job carries no JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, so
-        /// dropping it when a dispatch returns leaves work the caller backgrounded running.
-        /// `terminate_job` is the only path through which this job kills anything.
         pub fn assign(child: &std::process::Child) -> Result<Self, String> {
             let handle = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
             if handle.is_null() {

@@ -35,17 +35,6 @@ fn fetch_agent(timeout: Duration) -> ureq::Agent {
 
 const GIT_SUBPROCESS_TIMEOUT_MS_DEFAULT_AMPLE_FOR_SLOW_PUSH_FETCH_OR_FIRST_CLONE: u64 = 300_000;
 
-// gm asks the same repo-layout question -- `rev-parse --show-toplevel` above all -- once per
-// project per daemon tick and once per MCP call, and every question is a process spawn. The
-// answer is a pure function of the on-disk gitdir layout, so it is answered once per
-// (directory, question) and asked again only after a git command that can move that layout
-// runs in a directory sharing a path prefix with the cached one. Nothing that gates a write
-// is in the flag list: `status --porcelain`, `hash-object` and gating `ls-files` still reach
-// git every single time, and each of them drops the unguarded answers it can invalidate. An
-// answer guarded by a file identity is dropped by that identity alone, never by another
-// command: `ls-files --stage` and `ls-files --others` run in the same scan pass over the same
-// directory, so forgetting the guarded listing on the unguarded call would delete every
-// listing before it is ever served again.
 const GIT_LAYOUT_QUESTION_FLAGS: &[&str] = &[
     "--show-toplevel",
     "--show-prefix",
@@ -58,8 +47,6 @@ const GIT_LAYOUT_QUESTION_FLAGS: &[&str] = &[
 
 const GIT_LAYOUT_CACHE_MAX_ENTRIES: usize = 512;
 
-/// An index listing bigger than this is served from git every time rather than held in the memo:
-/// the memo is a spawn saver, not a second copy of the index.
 const GIT_INDEX_ANSWER_MAX_BYTES: usize = 1 << 20;
 
 #[derive(Clone)]
@@ -67,9 +54,6 @@ struct GitLayoutAnswer {
     stdout: String,
     stderr: String,
     exit_code: i32,
-    /// Some(identity) where the answer is a pure function of one file on disk: the answer is
-    /// served again only while that file still carries the identity it had when the answer was
-    /// produced, so a memo can never outlive the bytes it was computed from.
     fingerprint: Option<String>,
 }
 
@@ -163,19 +147,10 @@ fn git_file_identity(path: &Path) -> Option<String> {
     Some(format!("{mtime_ms}:{}", meta.len()))
 }
 
-// `ls-files --stage` prints the index: mode, sha, stage number and path for every staged entry.
-// That is a pure function of .git/index, so the answer is kept only while the index still carries
-// the mtime and length it had when git produced it -- a `git add`, checkout, reset or merge
-// rewrites the index and changes that identity, and a repo with no index answers nothing.
 fn git_index_identity(dir: &Path) -> Option<String> {
     git_file_identity(&git_dir_of(dir)?.join("index"))
 }
 
-// `git rev-parse HEAD` asks which commit HEAD names. Where HEAD is a loose symbolic ref that
-// commit is already written on disk by git itself, so it is read from the files git writes
-// rather than answered from a remembered value: the bytes on disk are the answer, so there is
-// no cache and nothing that can go stale, while a repo whose refs are packed, whose HEAD is a
-// symref chain, or whose .git is not plainly readable answers None and falls through to git.
 fn git_head_ref_contents(git_dir: &Path, reference: &str) -> Option<String> {
     let direct = git_dir.join(reference);
     if direct.is_file() {
@@ -254,9 +229,6 @@ fn git_layout_forget_dir(dir: &Path) {
     });
 }
 
-// Every git question gm asks, and how many of them actually reached a git process, printed
-// once a minute. A thrashing box shows up here as one argv asked hundreds of times per minute;
-// the reached count beside it is what the layout memo is buying.
 const GIT_CALL_STATS_FLUSH_INTERVAL: Duration = Duration::from_secs(60);
 
 const GIT_CALL_STATS_MAX_KEYS: usize = 256;
@@ -643,10 +615,6 @@ fn atomic_write_under_held_lock(full: &Path, data: &str) -> std::io::Result<()> 
         std::process::id()
     ));
     fs::write(&tmp, data)?;
-    // A rename is only durable for the bytes it renames once those bytes are on
-    // disk and the directory entry that names them is too: without both syncs a
-    // crash or a power loss can leave the target holding the old or empty file
-    // while this call has already reported success.
     if let Ok(f) = fs::File::open(&tmp) {
         let _ = f.sync_all();
     }

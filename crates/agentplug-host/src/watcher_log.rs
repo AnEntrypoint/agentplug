@@ -14,10 +14,6 @@ fn backup_path(path: &Path, generation: u32) -> std::path::PathBuf {
     path.with_file_name(name)
 }
 
-// The prose promises rotation at 10MB and nothing ever did it, so one busy
-// project's log grew without bound (18MB measured on C:\dev\gm) and the spool
-// sweep kept stat-ing a file it never trimmed. Rotate before the append, oldest
-// generation first, and never let a rotation failure swallow the line.
 fn rotate_if_oversized(path: &Path) {
     let Ok(metadata) = fs::metadata(path) else {
         return;

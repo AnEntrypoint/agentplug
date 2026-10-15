@@ -401,8 +401,6 @@ struct AdmissionHolder {
     kind: HolderKind,
 }
 
-/// Which counters a holder took when it was admitted, so releasing it can give
-/// exactly those back.
 #[derive(Clone, Copy)]
 enum HolderKind {
     General { heavy: bool },
@@ -436,9 +434,6 @@ impl TicketQueue {
         id
     }
 
-    /// Gives back every counter the holder took. Returns false when the id is
-    /// already gone, so a dispatch can be reclaimed from outside its guard
-    /// without that guard's Drop giving the same counter back twice.
     fn release_holder(&mut self, id: u64) -> bool {
         let Some(index) = self.holders.iter().position(|holder| holder.id == id) else {
             return false;
@@ -512,13 +507,10 @@ fn record_admission(record: AdmissionRecord) {
     LAST_ADMISSION.with(|slot| slot.set(Some(record)));
 }
 
-/// The admission decision this thread last took; reading it clears it.
 pub fn take_last_admission() -> Option<AdmissionRecord> {
     LAST_ADMISSION.with(|slot| slot.take())
 }
 
-/// Every pool that has admitted at least one dispatch, so a finished dispatch can
-/// be reclaimed by thread without the caller knowing which pool owns the slot.
 fn live_pools() -> &'static Mutex<Vec<std::sync::Weak<SharedPluginPool>>> {
     static POOLS: OnceLock<Mutex<Vec<std::sync::Weak<SharedPluginPool>>>> = OnceLock::new();
     POOLS.get_or_init(|| Mutex::new(Vec::new()))
@@ -536,10 +528,6 @@ fn remember_pool(pool: &Arc<SharedPluginPool>) {
     known.push(Arc::downgrade(pool));
 }
 
-/// Gives back every admission slot still held by `thread`. A dispatch calls this
-/// once its result is written: under normal unwinding the guards already released
-/// and this is a no-op, but a dispatch whose thread died holding a slot leaves no
-/// guard to run, and that slot would otherwise starve every later dispatch.
 pub fn release_admission_for_thread(thread: std::thread::ThreadId) -> usize {
     let pools: Vec<Arc<SharedPluginPool>> = {
         let mut known = live_pools().lock().unwrap_or_else(|e| e.into_inner());
@@ -641,34 +629,12 @@ pub fn admission_wait_max_for(class: DispatchCostClass) -> Duration {
     ))
 }
 
-/// How long a dispatch keeps the admission counter it took before a waiter that cannot get in
-/// reclaims it.
-///
-/// An admission hold is a lease on one of the band's counters, not a grant for the life of the
-/// dispatch, and the measured failure is a lease nobody could end: at the daemon's pool size the
-/// general band admits three, and a `git_push` blocked on a remote (measured 1417734ms) plus a
-/// `git_finalize` (measured 1164435ms) sat in it for over twenty minutes while a physical slot
-/// stood idle. Every other dispatch in every project -- `codesearch`, `git_status`, `fs_write`, in
-/// `C:\dev\spoint`, `C:\dev\gm` and `C:\dev\freddie` alike -- then waited out its own patience
-/// budget (120s cheap, 180s heavy) and was answered starved. Measured 2026-10-12 in
-/// `~/.agentplug/daemon.log.prev`: 20 admission starvations, every one of them reporting exactly
-/// three holders.
-///
-/// A minute is longer than any dispatch this band exists to protect -- the band reserves capacity
-/// so a responsive verb is not queued behind a long one, and a dispatch that has held a counter
-/// for a minute is the long one -- and it is under both patience budgets, so the counter is
-/// reclaimed while the waiter is still waiting instead of after it has given up. Reclaiming gives
-/// a counter back; it does not stop the holder, and it cannot raise concurrency past the physical
-/// pool, because running still needs a slot and the reclaim only fires while one is free.
 pub const ADMISSION_HOLD_MAX_MS_DEFAULT: u64 = 60_000;
 
-/// The bound is read once per call so the selfcheck can witness a reclaim without a minute of
-/// parking: an unset or unparseable value leaves the default in force. No shipped path sets it.
 pub fn admission_hold_max_ms() -> u64 {
     env_u64_or("AGENTPLUG_ADMISSION_HOLD_MAX_MS", ADMISSION_HOLD_MAX_MS_DEFAULT)
 }
 
-/// One admission counter a dispatch currently holds.
 pub struct AdmissionHold {
     pub plugin: String,
     pub verb: String,
@@ -676,7 +642,6 @@ pub struct AdmissionHold {
     pub kind: &'static str,
 }
 
-/// An admission counter handed back early, with the holder that lost it.
 pub struct ReleasedAdmissionHold {
     pub plugin: String,
     pub verb: String,
@@ -692,13 +657,6 @@ fn holder_kind_label(kind: HolderKind) -> &'static str {
     }
 }
 
-/// Every admission counter held anywhere in this process, with its age.
-///
-/// This is what made the starvation a phantom: a lane hold is reported in `.dispatch-wait.json`
-/// under `lane_holds`, so a caller could see who held the git lane and how long, while the band
-/// that was actually refusing the dispatch named its holders only inside the error string of a
-/// reply that arrived two minutes later. Listing it next to `lane_holds` is what lets the next
-/// measurement read the stall off the ledger instead of off a log.
 pub fn admission_holds() -> Vec<AdmissionHold> {
     let pools: Vec<Arc<SharedPluginPool>> = {
         let mut known = live_pools().lock().unwrap_or_else(|e| e.into_inner());
@@ -821,9 +779,6 @@ impl SharedPluginPool {
 
     pub const ACQUIRE_TIMEOUT_MS: u64 = 60_000;
 
-    /// How long a dispatch that already holds a plugin slot waits for admission before
-    /// it gives the slot back and re-queues. Short on purpose: the slot stays available
-    /// to short verbs, and the gate never counts a dispatch that is only waiting.
     pub const SLOT_HELD_ADMISSION_WAIT_MS: u64 = 250;
 
     fn short_reserved_slots(&self) -> usize {
@@ -854,30 +809,9 @@ impl SharedPluginPool {
     }
 
     fn git_band_admission_limit(&self) -> usize {
-        // `.max(1)`: `short_reserved_slots()` is 1 at the pool size the daemon actually runs
-        // (POOL_SIZE 4), so `1 - 1` admitted nobody and the band the git lane is meant to fall back
-        // on did not exist in production -- a git dispatch that lost the general race had no escape
-        // at all, and the selfcheck that covers this band runs at 8 slots where the subtraction
-        // happens to leave 1. One slot is also the right size: git verbs are the long ones, so their
-        // band is meant to hold hung git work away from the general band, never to run git in bulk.
         self.short_reserved_slots().saturating_sub(1).max(1)
     }
 
-    /// Gives back the admission counter of the oldest general-band holder past `min_held_ms`.
-    ///
-    /// The holder keeps running -- this returns a counter, it does not cancel work -- and its own
-    /// guard's `Drop` then finds no holder under that id, so the counter is handed back exactly
-    /// once.
-    ///
-    /// Only a general-band counter is reclaimed. That is the band a blocked `codesearch`,
-    /// `git_status` or `fs_write` is waiting on; reclaiming a git-band or blocking counter would
-    /// not let it in.
-    ///
-    /// It reclaims only while the counters out there are fewer than the physical slots, so the
-    /// band can spend the slot it reserves for short verbs but can never admit more work than the
-    /// pool can actually run. Counting free slots instead would be wrong: the waiter is holding a
-    /// slot of its own while it waits for admission (`SlotHeldAdmissionWait`), so a slot probe from
-    /// inside the gate reads zero every time and the reclaim would never fire.
     pub fn release_over_age_admission_hold(
         &self,
         min_held_ms: u64,
@@ -909,9 +843,6 @@ impl SharedPluginPool {
         })
     }
 
-    /// The oldest holder past the admission hold bound, named on a waiter's refusal. A waiter that
-    /// finds one refuses at once instead of waiting out its patience budget: the reclaim above has
-    /// already declined (no slot is free), and the over-bound holder is left running.
     pub(crate) fn over_bound_refusal(&self, report: &AdmissionWaitReport, min_held_ms: u64) -> Option<String> {
         let q = self.ticket_queue.lock().unwrap_or_else(|e| e.into_inner());
         let holder = q
@@ -1088,11 +1019,6 @@ impl SharedPluginPool {
                 });
             }
             mark_admission_wait(kind, limit, in_flight);
-            // A full band of counters is not a busy pool: one counter is a lease, and past the
-            // bound it is a lease nobody can end while a physical slot stands idle behind it. The
-            // waiter takes the oldest over-age counter back instead of waiting out its own patience
-            // budget behind a holder that was measured at over twenty minutes -- and takes it only
-            // while a slot is free, so reclaiming never admits more work than the pool can run.
             if let Some(released) = pool.release_over_age_admission_hold(admission_hold_max_ms()) {
                 eprintln!(
                     "[admission-hold] {} {kind} band: reclaimed the counter {} held for {}ms -- past the {}ms admission hold bound with a slot still free, so it stops counting against the band while its dispatch keeps running",
@@ -1143,9 +1069,6 @@ impl SharedPluginPool {
         })
     }
 
-    /// Bounded form of `acquire_within_for_class`. Past `give_up_at` the waiter abandons its ticket
-    /// (so the FIFO skips it) and returns its elapsed wait instead of queueing behind eight held
-    /// slots forever; the caller answers it as admission-starved.
     pub fn acquire_slot_until(
         &self,
         timeout_ms: u64,
@@ -1339,12 +1262,6 @@ impl SharedPluginPool {
         self.note_pending_eviction_consumed(&content_hash);
     }
 
-    /// One slot has just dropped the superseded module, so one owed eviction is
-    /// discharged. A swap once inserted the hash and removed it only when a
-    /// LATER swap of the same bytes happened to name it, so the entry outlived
-    /// the slots it was inserted for and then emptied a slot after every
-    /// successful dispatch for as long as that module stayed loaded. Counting
-    /// owed evictions makes the entry disappear exactly when it is paid.
     pub fn note_pending_eviction_consumed(&self, hash: &str) {
         let mut pending = self
             .hashes_to_evict_when_their_in_flight_dispatch_completes
@@ -1613,13 +1530,6 @@ fn host_fs_root() -> PathBuf {
     }
 }
 
-/// What a slot was last actually built from. The daemon republishes
-/// `SIBLING_RELOAD_SOURCE` from its per-tick compile pass, so around a wasm
-/// recompile or a failed recompile the published map can transiently lack a
-/// plugin that is already running. A Store evicted in that window then refilled
-/// from nothing and reported "no reload source holds this plugin", leaving an
-/// empty slot that every later dispatch answered as unusable. Remembering the
-/// module the slot was built from lets the refill rebuild it in place.
 type RememberedPluginModule = (Engine, Module, String);
 
 static REMEMBERED_PLUGIN_MODULES: OnceLock<Mutex<HashMap<String, RememberedPluginModule>>> =
@@ -1802,12 +1712,6 @@ impl ProjectPlugins {
             plugin_name: plugin_name.to_string(),
         })?;
         let cost_class = cost_class_for_dispatch(verb, body);
-        // A dispatch holds an admission slot only while it is about to run: it takes a
-        // plugin slot first and then asks for admission, and when admission is not granted
-        // at once it hands the plugin slot back and re-queues. A dispatch that waits for a
-        // plugin slot while already admitted wedges the gate past its own wait cap, and a
-        // dispatch that waits for admission while holding a plugin slot takes the slot the
-        // gate reserves for short verbs.
         let mut _heavy_admission: Option<HeavyDispatchAdmission> = None;
         let mut _blocking_admission: Option<BlockingDispatchAdmission> = None;
         let admission_start = Instant::now();
@@ -2006,12 +1910,6 @@ impl DispatchHandle {
             plugin_name: plugin_name.to_string(),
         })?;
         let cost_class = cost_class_for_dispatch(verb, body);
-        // A dispatch holds an admission slot only while it is about to run: it takes a
-        // plugin slot first and then asks for admission, and when admission is not granted
-        // at once it hands the plugin slot back and re-queues. A dispatch that waits for a
-        // plugin slot while already admitted wedges the gate past its own wait cap, and a
-        // dispatch that waits for admission while holding a plugin slot takes the slot the
-        // gate reserves for short verbs.
         let mut _heavy_admission: Option<HeavyDispatchAdmission> = None;
         let mut _blocking_admission: Option<BlockingDispatchAdmission> = None;
         let admission_start = Instant::now();
@@ -2127,9 +2025,6 @@ fn global_reload_source() -> Option<Arc<SiblingReloadSource>> {
         .clone()
 }
 
-/// Every source a refill consults, named in the failure text: a refill that
-/// cannot rebuild a slot has to say where it looked, otherwise the only
-/// surviving evidence is "no reload source holds this plugin".
 fn reload_sources_summary(local: Option<&SiblingReloadSource>, plugin_name: &str) -> String {
     let local_state = match local {
         None => "this dispatch site carries no module map".to_string(),
@@ -2286,8 +2181,6 @@ fn dispatch_and_evict_on_error(
     match refill_evicted_slot(guard, local, root, plugin_name, verb) {
         Ok(()) => {
             log_poisoned_store_eviction_event(root, plugin_name, verb, true, &poisoning_detail);
-            // A run that hit the call deadline already spent its whole budget; a
-            // second identical run spends it again and holds the slot for both.
             if poisoning_detail.contains("plugin_call_deadline_exceeded") {
                 log_poisoned_store_recovery_event(
                     root,
@@ -2422,11 +2315,6 @@ const UNSERIALIZED_VERBS: &[&str] = &[
     "fs_read",
     "fs_readdir",
     "fs_stat",
-    // Every fs_write is already a per-path mutex plus an atomic temp-file rename
-    // (imports.rs atomic_write_locked), so two writes cannot interleave on one
-    // path. Holding a marker write in the project-wide state lane buys no extra
-    // safety and costs the caller a two-minute starvation answer for a write that
-    // finishes in milliseconds.
     "fs_write",
     "env_get",
     "kv_get",
@@ -2520,21 +2408,8 @@ const GIT_LANE_VERBS: &[&str] = &[
     "git_worktree_prune",
 ];
 
-/// Git verbs whose lane hold is set by the remote, not by the checkout: a push is measured in
-/// minutes (round-trips plus transient-rejection backoff) where a commit is measured in seconds.
-///
-/// They stay on the git lane -- one writer per worktree is the property that keeps concurrent git
-/// writers serialized, and `git_push` can `pull --rebase` the checkout it is publishing from
-/// (`rs-plugkit/crates/plugkit-core/src/wasm_dispatch/verbs/git.rs`, the rebase-retry branch) -- so
-/// what they give up is their place, not the guarantee: a claim here yields to a checkout-bound
-/// claim behind it until `LANE_NETWORK_YIELD_MS` of its own waiting has passed.
 const GIT_NETWORK_LANE_VERBS: &[&str] = &["git_push", "git_pull", "git_fetch"];
 
-/// How long a network-bound claim yields its place to checkout-bound claims behind it.
-///
-/// Measured against the claim's own arrival, not against its last poll, so a caller that keeps
-/// re-dispatching cannot hold the yield open forever: past this the network claim competes
-/// ordinary FIFO again and is admitted, so queueing commits never starve publication.
 const LANE_NETWORK_YIELD_MS: u64 = 120_000;
 
 const READ_LANE_VERBS: &[&str] = &["health", "recall"];
@@ -2575,15 +2450,8 @@ const STORE_LANE_VERBS: &[&str] = &[
 
 const TREE_SCAN_VERBS: &[&str] = &["grep", "codesearch"];
 
-/// Verbs that open and write gm.db but run outside the store lane: the codeinsight family is
-/// unserialized by design (a `callers` question must not queue behind an index pass), so it never
-/// passes through settle_store_lock. It still has to claim .gm/gm.db.lock.owner, or the store's
-/// liveness rule -- a lock with no owner record has no live writer -- would be a lie every time one
-/// of these is the writer holding it.
 const UNSERIALIZED_STORE_WRITER_VERBS: &[&str] = &["codeinsight", "callers", "callees", "impact"];
 
-/// True for every verb that can hold the libsql lock: the store lane plus the unserialized
-/// codeinsight family. Callers use it to record ownership of .gm/gm.db.lock, never to serialize.
 pub fn dispatch_claims_store_owner(verb: &str) -> bool {
     STORE_LANE_VERBS.contains(&verb) || UNSERIALIZED_STORE_WRITER_VERBS.contains(&verb)
 }
@@ -2618,26 +2486,6 @@ pub fn dispatch_serial_lane(verb: &str, body: &str) -> Option<&'static str> {
     serial_lane_for_dispatch(verb, body)
 }
 
-/// One dispatch waiting its turn on a project serial lane, in claim order.
-///
-/// Admission is FIFO by claim age with one exception, the network yield: a claim is admitted while
-/// it is the head, so a later arrival can never overtake an older one of its own class, and a
-/// network-bound claim (`GIT_NETWORK_LANE_VERBS`) additionally yields to a checkout-bound claim
-/// behind it until it has waited `LANE_NETWORK_YIELD_MS`. See `lane_admissible`. The token is drawn
-/// under the same lock that pushes the entry, so queue order and claim order cannot disagree.
-///
-/// `identity` is what makes FIFO survive re-dispatch. A starved caller re-dispatches its request
-/// verbatim, and the spool mints a fresh task id and a fresh token for it, so an arrival-ordered
-/// queue would put that waiter behind every newer arrival and one long holder would starve the same
-/// request forever while `lane_waiters` grew. The entry is keyed by the request's identity -- verb
-/// plus a hash of its body, both byte-identical across the re-dispatch -- so the re-dispatch
-/// re-claims the token it already held and keeps its place. The entry survives starvation and is
-/// dropped when its dispatch finally gets the lane, or by TTL on `last_seen_ms` once its caller
-/// stops re-dispatching.
-///
-/// `claimed_ms` is the arrival this place dates from and is deliberately NOT refreshed on
-/// re-dispatch: it bounds the network yield, so a claim that keeps polling its way to the front
-/// cannot hold the yield open indefinitely.
 struct LaneWaiter {
     token: u64,
     task: String,
@@ -2645,24 +2493,13 @@ struct LaneWaiter {
     verb: String,
     claimed_ms: u64,
     last_seen_ms: u64,
-    /// True while some dispatch is inside `acquire_within` under this ticket. A place is inherited
-    /// only from a PARKED ticket (`active == false`), so two callers that happen to send a
-    /// byte-identical body still get one ticket each: sharing one would let the first acquire remove
-    /// it from the queue and leave the second waiting on a token that is no longer queued, which
-    /// never becomes head and so starves until its budget runs out.
     active: bool,
 }
 
-/// A waiter that has not re-claimed its place within this long is no longer contending: the lane
-/// passes to the next ticket instead of idling until the TTL. This bounds the cost of a caller that
-/// starved once and never came back at 30s rather than at the TTL.
 const LANE_TICKET_STALE_MS: u64 = 30_000;
 
-/// A ticket not re-claimed within this long has been abandoned by its caller and leaves the queue.
 const LANE_TICKET_TTL_MS: u64 = 600_000;
 
-/// The stable identity of one request across re-dispatches: its verb plus a hash of its body.
-/// Never the task id -- the spool mints that fresh on every dispatch.
 fn lane_claim_identity(verb: &str, body: &str) -> String {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -2676,9 +2513,6 @@ fn gm_lane_waiters() -> &'static Mutex<HashMap<(PathBuf, &'static str), VecDeque
     WAITERS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// The yield budget, read once per process. The env override exists only so the selfcheck can
-/// witness the aging bound without a two-minute wait: an unset or unparseable value leaves the
-/// default in force. No shipped path sets it.
 fn lane_network_yield_ms() -> u64 {
     static OVERRIDE: OnceLock<Option<u64>> = OnceLock::new();
     OVERRIDE
@@ -2690,9 +2524,6 @@ fn lane_network_yield_ms() -> u64 {
         .unwrap_or(LANE_NETWORK_YIELD_MS)
 }
 
-/// Admission class of one claim: 0 for a verb whose lane hold is set by the remote, 1 for one whose
-/// hold is set by the checkout. Only the relative order inside one lane matters, so every non-git
-/// verb is class 1 and unaffected by the yield.
 fn lane_yield_class(verb: &str) -> u8 {
     if GIT_NETWORK_LANE_VERBS.contains(&verb) {
         0
@@ -2701,18 +2532,6 @@ fn lane_yield_class(verb: &str) -> u8 {
     }
 }
 
-/// True when `token` may take this lane now.
-///
-/// The claim is admissible when every claim ahead of it has either stopped contending or is
-/// outranked. Outranked means the claim ahead is network-bound while this one is checkout-bound,
-/// and the claim ahead has not yet waited `LANE_NETWORK_YIELD_MS` of its own: a minutes-long push
-/// therefore does not leave the commits behind it queueing once the lane frees, and a push stops
-/// yielding once its own wait passes the budget, so a project that commits continuously still
-/// publishes.
-///
-/// Callers hold the lane-owner lock across this check and the insert that follows it, so the head
-/// cannot change in between: exactly one waiter is admissible at a time, and one owner per
-/// `(project, lane)` is what keeps concurrent git writers on one worktree serialized.
 fn lane_admissible(root: &Path, lane: &'static str, token: u64) -> bool {
     let now = crate::now_ms();
     gm_lane_waiters()
@@ -2728,9 +2547,6 @@ fn lane_admissible(root: &Path, lane: &'static str, token: u64) -> bool {
         .map(|(queue, index)| {
             let mine = lane_yield_class(&queue[index].verb);
             queue.iter().take(index).all(|entry| {
-                // Every claim ahead of this one has stopped re-dispatching, so waiting for it would
-                // only idle the lane: this claim is admissible. A claim that is still contending
-                // stays ahead because its `last_seen_ms` keeps moving forward.
                 if now.saturating_sub(entry.last_seen_ms) >= LANE_TICKET_STALE_MS {
                     return true;
                 }
@@ -2738,9 +2554,6 @@ fn lane_admissible(root: &Path, lane: &'static str, token: u64) -> bool {
                 if theirs >= mine {
                     return false;
                 }
-                // The claim ahead is network-bound, so it yields -- but only for its own first
-                // `LANE_NETWORK_YIELD_MS` of waiting, measured from `claimed_ms` and never
-                // refreshed, so a caller that keeps re-dispatching cannot extend the yield.
                 now.saturating_sub(entry.claimed_ms) < lane_network_yield_ms()
             })
         })
@@ -2757,37 +2570,16 @@ fn lane_name(name: &str) -> Option<&'static str> {
     }
 }
 
-/// Where `task` stands on its project serial lane, and how long the lane's current holder has held it.
-///
-/// `lane_position` is 1-based over the FIFO queue and counts only dispatchers still waiting.
-/// Position 1 means the task is admitted the moment the current holder releases, with one
-/// exception: a network-bound claim (`git_push`, `git_pull`, `git_fetch`) yields its place to a
-/// checkout-bound claim behind it for its first `LANE_NETWORK_YIELD_MS` of waiting, so a commit at
-/// position 2 behind a fresh push is admitted before that push is. This is the cheap-poll surface
-/// behind `.dispatch-wait.json` -- read it instead of spending a whole dispatch budget to learn the
-/// caller would lose the race. Lock order is owners-then-waiters, matching `acquire_within`.
 pub struct LaneQueueState {
     pub lane_position: Option<u64>,
     pub lane_holder_age_ms: Option<u64>,
     pub lane_holder_task: Option<String>,
     pub lane_holder_verb: Option<String>,
-    /// Claims queued behind this lane's holder that are still contending for it: a caller polling
-    /// right now, or one that re-dispatched within `LANE_TICKET_STALE_MS`. Parked claims past that
-    /// window are counted in `lane_waiters_stale` instead, so a depth that reads 1 with a busy lane
-    /// is never a queue that silently forgot its waiters.
     pub lane_waiters: usize,
     pub lane_waiters_active: usize,
     pub lane_waiters_stale: usize,
 }
 
-/// Splits one lane queue into the depth that is actually contending for the lane.
-///
-/// A raw `queue.len()` is not a backlog: a parked ticket whose caller stopped re-dispatching stops
-/// contending after `LANE_TICKET_STALE_MS` but keeps its `last_seen_ms`, so it keeps inflating the
-/// count long after its caller gave up, while a caller that IS inside `acquire_within` right now is
-/// the only thing the count is meant to report. So `lane_waiters` counts contending claims -- live
-/// in `acquire_within`, or re-dispatched within the stale window -- and the parked remainder is
-/// reported beside it instead of being silently added or silently dropped.
 fn lane_queue_depth(queue: &VecDeque<LaneWaiter>, now: u64) -> (usize, usize, usize) {
     let contending = queue
         .iter()
@@ -2849,23 +2641,16 @@ pub fn lane_queue_state(root: &Path, lane: Option<&str>, task: &str) -> LaneQueu
     }
 }
 
-/// One lane this project currently holds.
 pub struct LaneHold {
     pub lane: &'static str,
     pub verb: String,
     pub task: String,
     pub held_ms: u64,
-    /// Claims still contending for this lane, counted the same way as `LaneQueueState::lane_waiters`.
     pub waiters: usize,
     pub waiters_active: usize,
     pub waiters_stale: usize,
 }
 
-/// How many claims are waiting on this lane right now.
-///
-/// The hold watchdog reads it so the absolute ceiling on a running holder only spends the
-/// single-writer property when somebody is actually blocked behind that hold: a hung holder nobody
-/// is waiting on keeps its lane.
 pub fn lane_waiter_count(root: &Path, lane: &str) -> usize {
     let Some(lane) = lane_name(lane) else {
         return 0;
@@ -2875,15 +2660,6 @@ pub fn lane_waiter_count(root: &Path, lane: &str) -> usize {
     waiters.get(&key).map(|queue| queue.len()).unwrap_or(0)
 }
 
-/// Every lane this project holds, with how long it has been held and how many claims wait on it.
-///
-/// A lane is single-writer, so a hold far longer than any real operation is the signature of a
-/// stalled holder freezing the project's whole lane. This is the watchdog's read: it names the
-/// holder and its hold duration. It never releases a live holder -- one writer per lane is the
-/// property that keeps concurrent git writers on one worktree serialized, and dropping it would
-/// trade a visible stall for a corrupted index.
-///
-/// Lock order is owners-then-waiters, matching `acquire_within`.
 pub fn lane_holds(root: &Path) -> Vec<LaneHold> {
     let now = crate::now_ms();
     let owners = gm_lane_owners().lock().unwrap_or_else(|e| e.into_inner());
@@ -2924,13 +2700,8 @@ pub struct LaneWaitReport {
     pub lane: &'static str,
     pub lane_position: Option<u64>,
     pub waited_ms: u64,
-    /// Claims still contending for this lane, this dispatch's own parked ticket included.
     pub waiters: usize,
-    /// Contending claims inside `acquire_within` at this instant: the ones whose budgets are
-    /// actually running.
     pub waiters_active: usize,
-    /// Parked claims whose caller stopped re-dispatching. Reported, never counted into `waiters`, so
-    /// a backlog cannot be inflated by callers that already gave up.
     pub waiters_stale: usize,
     pub lane_holder_task: Option<String>,
 }
@@ -3029,9 +2800,6 @@ impl GmFairnessGuard {
                 .iter()
                 .position(|entry| entry.identity == identity && !entry.active)
             {
-                // The same request re-dispatched after starving: keep its token, and so its place.
-                // `claimed_ms` is deliberately left at the original arrival: it caps the network
-                // yield, so re-dispatching cannot buy a fresh yield window.
                 Some(index) => {
                     let entry = &mut queue[index];
                     entry.last_seen_ms = now;
@@ -3087,8 +2855,6 @@ impl GmFairnessGuard {
                 .and_then(|queue| queue.iter().position(|entry| entry.token == token))
                 .map(|index| index as u64 + 1);
             if acquired {
-                // Served: the claim leaves the queue. A starved claim deliberately stays, so its
-                // caller's re-dispatch inherits this place instead of rejoining at the back.
                 if let Some(queue) = waiters.get_mut(&key) {
                     queue.retain(|entry| entry.token != token);
                     if queue.is_empty() {
@@ -3096,7 +2862,6 @@ impl GmFairnessGuard {
                     }
                 }
             } else if let Some(queue) = waiters.get_mut(&key) {
-                // Parked: this caller is going back to poll, and its place is held for it.
                 if let Some(entry) = queue.iter_mut().find(|entry| entry.token == token) {
                     entry.active = false;
                 }
@@ -3147,13 +2912,6 @@ impl GmFairnessGuard {
 }
 
 impl GmFairnessGuard {
-    /// True while this guard is still the lane's single writer.
-    ///
-    /// The hold watchdog takes the lane away from a holder that is stuck before it ever runs -- a
-    /// hold is bounded, so one stalled dispatch cannot freeze a project's lane forever. The holder
-    /// is not executing at that point (it holds the lane while it waits for its tool-queue turn),
-    /// so it asks this before dispatching and answers starved instead: the lane stays single-writer
-    /// because a holder that lost it never touches the worktree.
     pub fn still_owns(&self) -> bool {
         let Some(lane) = self.lane else {
             return true;
@@ -3166,13 +2924,6 @@ impl GmFairnessGuard {
     }
 }
 
-/// Puts a claim the hold watchdog displaced back at the head of its lane queue, parked.
-///
-/// A displaced holder never runs, so fairness owes it the place it had: it was the head when the
-/// watchdog took the lane, and without this its caller's re-dispatch would rejoin at the back and
-/// lose to every newer arrival. The ticket is parked (`active: false`) and keeps the claim's
-/// identity, so the re-dispatch -- byte-identical body, fresh task id -- inherits it instead of
-/// minting a new one.
 pub fn requeue_lane_claimer_front(
     root: &Path,
     lane: Option<&'static str>,
@@ -3217,9 +2968,6 @@ impl Drop for GmFairnessGuard {
     }
 }
 
-/// Frees each project lane whose owner has no live requester and has held the lane for at least
-/// `min_held_ms`. The owning dispatch keeps running; its guard then finds a different token (or
-/// none) on drop and leaves the lane alone.
 pub fn release_abandoned_lane_owners(
     live_roots: &[PathBuf],
     min_held_ms: u64,
@@ -3261,15 +3009,6 @@ pub fn release_abandoned_lane_owners(
     released
 }
 
-/// Frees each lane whose holder dispatch is provably gone, whatever the project's own liveness.
-///
-/// `release_abandoned_lane_owners` only fires once the whole project root drops out of the
-/// registry, so inside a leased project -- every project agents are actually working in -- a lane
-/// held by a dispatch that died without dropping its guard stayed held for the life of the daemon.
-/// This is the per-holder form: it asks the caller, which owns the dispatch ledger, whether that
-/// one dispatch is still live, and frees the lane when it is not. The owning dispatch keeps
-/// running either way; its guard then finds a different token on drop and leaves the new owner
-/// alone. A holder whose verb or task is unknown is never reaped, because it cannot be identified.
 pub fn release_dead_lane_owners<F>(min_held_ms: u64, holder_is_live: &F) -> Vec<AbandonedLaneOwner>
 where
     F: Fn(&Path, &'static str, &str, &str) -> bool,
