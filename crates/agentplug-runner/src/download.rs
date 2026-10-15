@@ -74,32 +74,12 @@ pub fn gc_stale_tmp_files(min_age: Duration) {
     enforce_plugin_cache_retention(true);
 }
 
-// Bounded install-dir backup retention.
-//
-// A self-update leaves its predecessor beside the live asset under a fresh name --
-// `<exe>.prev`, `<exe>.new2`, `<exe>.bak-<label>-<timestamp>`, `<exe>.<label>.exe` --
-// and nothing removed them, so the install dir grew without limit (92 runner siblings
-// holding 1.3 GB was measured on one machine). `gc_stale_tmp_files_in` above only ever
-// matched `<name>.tmp.<digits>`, so it bounded neither these nor a finished backup.
-//
-// Retention here is ordered by modified time over the whole sibling set of an asset,
-// never by name pattern, so a name that compounds (`<exe>.new2.new2.new2.new`) is one
-// deletable sibling like any other.
-
-// Backups kept per installed asset, newest first. Together with the live asset, its
-// `.prev` rollback target and one in-flight staged copy, this bounds an asset family at
-// a handful of copies instead of one per update ever applied.
 pub const INSTALL_BACKUP_RETAIN: usize = 2;
 
-// Ceiling on the bytes one asset's retained backups may hold. The single newest backup
-// is kept even when it alone exceeds this, so the ceiling trims the tail instead of
-// emptying the set and leaving no rollback evidence at all.
 pub const INSTALL_BACKUP_BYTES_CEILING: u64 = 64 * 1024 * 1024;
 
 const INSTALL_ASSET_EXTS: [&str; 3] = ["exe", "wasm", "mjs"];
 
-/// What retention decided for one installed asset: the backups to keep, the siblings to
-/// remove, and the bytes each side accounts for.
 #[derive(Debug, Default, Clone)]
 pub struct BackupRetentionPlan {
     pub stem: String,
@@ -114,10 +94,6 @@ fn file_extension_lower(name: &str) -> Option<String> {
         .map(|(_, extension)| extension.to_ascii_lowercase())
 }
 
-/// The siblings that are current state rather than a backup: the version and checksum
-/// markers, every `<stem>.*.json` sidecar (build record, sideload marker, staged-exe
-/// marker), the in-flight staged copies and their rename scratch, the `.prev` rollback
-/// target, and an explicitly pinned copy. None of these is ever retention-deleted.
 fn install_backup_is_live(rest: &str) -> bool {
     let rest = rest.to_ascii_lowercase();
     matches!(
@@ -128,10 +104,6 @@ fn install_backup_is_live(rest: &str) -> bool {
         || rest.starts_with("pinned")
 }
 
-/// The part of `name` that makes it a backup sibling of `stem`, or `None` when it is the
-/// live asset or belongs to another family. Both shapes occur on disk: `<stem>.<rest>`
-/// (`agentplug-runner.exe.bak-pre-durable-20261011-100752Z`) and
-/// `<stem-base>.<rest>.<ext>` (`agentplug-runner.preconsolefix.exe`).
 fn install_backup_sibling_rest(name: &str, stem: &str) -> Option<String> {
     if name == stem {
         return None;
@@ -159,11 +131,6 @@ fn same_existing_path(a: &Path, b: &Path) -> bool {
     }
 }
 
-/// The live asset names in `dir`: the shortest name of each (leading segment, extension)
-/// group, so `agentplug-runner.exe` is picked over `agentplug-runner.preconsolefix.exe`.
-/// Asset families are discovered, not hardcoded, so an asset added later is covered with
-/// no further edit -- including `gm-mcp-server.mjs`, whose `.bak-*` siblings are written
-/// by the gm-mcp host rather than by this runner.
 fn install_asset_stems(dir: &Path) -> Vec<String> {
     let Ok(entries) = fs::read_dir(dir) else {
         return Vec::new();
@@ -279,9 +246,6 @@ pub fn apply_install_backup_retention(
     plan
 }
 
-/// Paths retention must never delete: the image this process is running from, which on
-/// Windows cannot be unlinked while it is mapped, and the canonical install path it will
-/// be promoted to.
 pub fn install_dir_backup_pins() -> Vec<PathBuf> {
     let mut pinned = Vec::new();
     if let Ok(exe) = std::env::current_exe() {
@@ -293,14 +257,6 @@ pub fn install_dir_backup_pins() -> Vec<PathBuf> {
     pinned
 }
 
-/// The directories that actually hold installed assets, deduplicated.
-///
-/// `install_dir()` is `AGENTPLUG_HOME` or `~/.agentplug`, but the runner image, the plugin
-/// wasm and the trees written beside them live in the directory this process was launched
-/// from -- `~/.gm-tools` on the measured machine, a different directory. A retention rule
-/// scoped to `install_dir()` alone swept a subtree holding no assets and reclaimed
-/// nothing, which is how 92 runner siblings and a 2113.0 MB instance tree came to sit in
-/// one directory while the rule watched another.
 pub fn install_dir_roots() -> Vec<PathBuf> {
     let mut roots = vec![install_dir()];
     if let Ok(exe) = std::env::current_exe() {
@@ -314,7 +270,6 @@ pub fn install_dir_roots() -> Vec<PathBuf> {
     roots
 }
 
-/// Every directory retention scans: each install root and its plugin subdirectory.
 fn install_dir_retention_dirs() -> Vec<PathBuf> {
     let mut dirs: Vec<PathBuf> = Vec::new();
     for root in install_dir_roots() {
@@ -327,8 +282,6 @@ fn install_dir_retention_dirs() -> Vec<PathBuf> {
     dirs
 }
 
-/// Bounded retention over every asset family in the install dir. `apply: false` is the
-/// dry run: it plans and reports without deleting anything.
 pub fn enforce_install_dir_backup_retention(apply: bool) -> Vec<BackupRetentionPlan> {
     let pinned = install_dir_backup_pins();
     let mut plans = Vec::new();
@@ -370,53 +323,20 @@ pub fn enforce_install_dir_backup_retention(apply: bool) -> Vec<BackupRetentionP
     plans
 }
 
-// Bounded install-dir retention for the retired per-instance WASI fs tree.
-//
-// `<install>/wasi-fs/<instance>/gm.db` was a full copy of a project's `.gm/gm.db` per WASI
-// instance: the host preopened that directory as the plugin's `/`, so the plugin read and
-// wrote the copy instead of the project's own store, and nothing ever removed one.
-// Measured on one machine: 52 instances holding 2113.0 MB, 16 of them a second copy of a
-// project another instance already held, none of the 52 written in 86 days. The host now
-// preopens the drive root (`host_fs_root` in `agentplug-host`), so no shipped build names
-// this tree: it is retained state with no reader, and the source of truth for every copy
-// is still that project's own `.gm/gm.db`.
-//
-// The liveness proof this rule can actually make is AGE, and nothing finer: an instance the
-// host still has mounted is written on every embed and reindex pass, so its newest mtime is
-// hours old, while an instance whose newest mtime is older than `WASI_FS_RETAIN_AGE` is one
-// no instance has touched since before that bound. A delete that fails -- a mounted instance
-// holds its db open, which Windows refuses -- is reported and left in place, never counted
-// as reclaimed, and an instance whose mtime cannot be read proves no age at all, so it is
-// kept too.
-//
-// The bound is AGE, and nothing coarser: every instance not written within
-// `WASI_FS_RETAIN_AGE` is removed, so the tree converges on the instances actually mounted
-// inside that window. There is no count or byte knob to keep a tail of dead instances as
-// the backup rule above keeps a tail of backups: a backup is the only copy of an older
-// image, while an instance here is a derived copy whose source of truth is still that
-// project's own `.gm/gm.db`, so a stale one has no evidentiary value to preserve.
-
-// An instance whose newest mtime is younger than this is live and is never touched.
 pub const WASI_FS_RETAIN_AGE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 
-// The name an instance directory gets: 16 lowercase hex digits.
 fn is_wasi_fs_instance_key(name: &str) -> bool {
     name.len() == 16 && name.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
-/// What retention decided over the whole retired instance tree.
 #[derive(Debug, Default, Clone)]
 pub struct WasiFsRetentionPlan {
     pub delete: Vec<PathBuf>,
     pub delete_bytes: u64,
-    /// Instances younger than `WASI_FS_RETAIN_AGE`, or whose mtime could not be read:
-    /// live until proven otherwise, and never touched.
     pub live: Vec<PathBuf>,
     pub live_bytes: u64,
 }
 
-/// Bytes and newest modified time under `dir`. A symlinked directory is not followed, so
-/// no link can walk this forever.
 fn wasi_fs_instance_stats(dir: &Path) -> (u64, u64) {
     let mut bytes = 0u64;
     let mut newest_ms = 0u64;
@@ -437,9 +357,6 @@ fn wasi_fs_instance_stats(dir: &Path) -> (u64, u64) {
     (bytes, newest_ms)
 }
 
-/// Bounded retention over the retired per-instance WASI fs tree, newest first so the dry
-/// run reads in a stable order: every instance last written at least `min_age` ago is
-/// removed, and every younger one is live and untouched.
 pub fn plan_wasi_fs_retention(dir: &Path, min_age: Duration) -> WasiFsRetentionPlan {
     let mut plan = WasiFsRetentionPlan::default();
     let Ok(entries) = fs::read_dir(dir) else {
@@ -500,8 +417,6 @@ pub fn apply_wasi_fs_retention(
     plan
 }
 
-/// Bounded retention over the retired per-instance WASI fs tree in every install root.
-/// `apply: false` is the dry run: it plans and reports without deleting anything.
 pub fn enforce_wasi_fs_retention(apply: bool) -> WasiFsRetentionPlan {
     let mut plan = WasiFsRetentionPlan::default();
     for dir in install_dir_roots() {
@@ -530,28 +445,6 @@ pub fn enforce_wasi_fs_retention(apply: bool) -> WasiFsRetentionPlan {
     plan
 }
 
-// A shared, content-addressed payload cache for plugin wasm.
-//
-// `AGENTPLUG_HOME` selects the install dir, so every isolated home a witness or a lane
-// booted fetched its own full copy of every plugin: measured on one machine, six homes
-// held six byte-identical copies of a 130.2 MB `bert.wasm` and of a 53.7 MB
-// `treesitter.wasm`, 1537.3 MB of the 2790 MB of installed wasm on the machine being
-// duplicate bytes. A published wasm is immutable -- `download_and_verify` refuses any
-// payload whose sha256 differs from the release's own `.wasm.sha256` sidecar -- so that
-// hash IS the identity of the bytes, and one copy per hash serves every home.
-//
-// The cache sits under the real home and never under `install_dir()`, so an
-// `AGENTPLUG_HOME` override cannot move or fork it; that is the same reason
-// `system_precompiled_dir()` exists. A home's `plugins/<name>.wasm` is hard-linked to
-// the cache entry, so a home costs one directory entry per plugin rather than a copy,
-// and where a hard link is impossible -- another volume, a filesystem without them --
-// this falls back to a copy, which is correct and merely unshared.
-//
-// Hard links are safe here only because no writer mutates `plugins/<name>.wasm` in
-// place: `write_download_atomically` writes a temp and renames, and
-// `record_plugin_load_failure_and_rollback` below stages its restore the same way, so a
-// shared inode is only ever replaced, never written through.
-
 fn shared_plugin_cache_dir() -> Option<PathBuf> {
     home_dir().map(|home| home.join(".agentplug").join("plugin-cache"))
 }
@@ -566,10 +459,6 @@ fn plugin_payload_use_path(expected_sha256_hex: &str) -> Option<PathBuf> {
         .map(|dir| dir.join(format!("{}.used", expected_sha256_hex.to_ascii_lowercase())))
 }
 
-/// The cached payload for `expected_sha256_hex`, or `None` when there is none or when
-/// the file no longer hashes to it. An entry is handed out only once its bytes are
-/// proven, so a truncated or clobbered cache file falls back to a download rather than
-/// installing a payload the release never published.
 fn shared_plugin_payload(expected_sha256_hex: &str) -> Option<PathBuf> {
     let path = plugin_payload_cache_path(expected_sha256_hex)?;
     if !path.exists() {
@@ -581,8 +470,6 @@ fn shared_plugin_payload(expected_sha256_hex: &str) -> Option<PathBuf> {
         .then_some(path)
 }
 
-/// Record that an entry is still being handed out, so retention keys on use rather than
-/// on the age of the immutable blob itself.
 fn mark_shared_payload_used(expected_sha256_hex: &str) {
     let Some(path) = plugin_payload_use_path(expected_sha256_hex) else {
         return;
@@ -610,8 +497,6 @@ fn mark_shared_payload_used(expected_sha256_hex: &str) {
     }
 }
 
-/// Put `dest` in place from `src` without copying the bytes where the filesystem allows
-/// it: a hard link first, a copy only where a link is refused.
 fn link_or_copy_payload(src: &Path, dest: &Path) -> anyhow::Result<()> {
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent)?;
@@ -630,10 +515,6 @@ fn link_or_copy_payload(src: &Path, dest: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Restore `dest` from a staged copy by writing a temp and renaming it over `dest`.
-/// `fs::copy` straight onto `dest` would write THROUGH the live path, and `dest` may be a
-/// hard link to a shared cache entry, so an in-place write would clobber every other home
-/// linked to those bytes; a rename replaces this one directory entry instead.
 fn restore_wasm_atomically(prev: &Path, dest: &Path) -> anyhow::Result<()> {
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent)?;
@@ -645,9 +526,6 @@ fn restore_wasm_atomically(prev: &Path, dest: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Offer a payload that has just been verified to the cache. An entry already present is
-/// left alone and only marked used; a failure here costs sharing, never correctness, so
-/// it is reported and swallowed.
 fn populate_shared_plugin_payload(src: &Path, expected_sha256_hex: &str) {
     let Some(path) = plugin_payload_cache_path(expected_sha256_hex) else {
         return;
@@ -684,10 +562,6 @@ fn populate_shared_plugin_payload(src: &Path, expected_sha256_hex: &str) {
     }
 }
 
-// An entry nobody has been handed out within this bound is removed. Removing an entry a
-// live home still links costs that home nothing -- unlinking one name leaves the data
-// alive under the home's own link -- so this bounds the cache without risking any
-// installed plugin: the next home that needs those bytes fetches them again.
 pub const PLUGIN_CACHE_RETAIN_AGE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 
 fn shared_payload_newest_ms(blob: &Path, use_marker: &Path) -> u64 {
@@ -700,8 +574,6 @@ fn shared_payload_newest_ms(blob: &Path, use_marker: &Path) -> u64 {
     newest
 }
 
-/// Bounded retention over the shared payload cache. `apply: false` is the dry run: it
-/// plans and reports without deleting anything.
 pub fn enforce_plugin_cache_retention(apply: bool) -> (usize, u64) {
     let Some(dir) = shared_plugin_cache_dir() else {
         return (0, 0);
@@ -1228,10 +1100,6 @@ fn plugin_build_record_path(plugin_name: &str) -> PathBuf {
         .join(format!("{plugin_name}.build.json"))
 }
 
-// Names the installed plugin build and the commit it was built from, so
-// plugins/<name>.build.json tracks the bytes the daemon loaded. The release body
-// carries that commit as `source-head: <sha>`. A failure here is reported and
-// never fails an install that already succeeded.
 fn write_plugin_build_record(plugin_name: &str, repo: &str, version: &str, dest: &Path) {
     let bytes = match fs::read(dest) {
         Ok(bytes) => bytes,
@@ -1297,8 +1165,6 @@ pub fn local_build_pin_record() -> Option<serde_json::Value> {
     serde_json::from_str(&raw).ok()
 }
 
-/// A version file written with a UTF-8 BOM reads as "\u{feff}0.1.1520"; the BOM is an encoding
-/// artifact, not a developer sideload marker, so it is stripped before any semver test or compare.
 pub fn strip_version_file_bom(text: &str) -> &str {
     let trimmed = text.trim();
     trimmed.strip_prefix('\u{feff}').unwrap_or(trimmed).trim()
@@ -1339,8 +1205,6 @@ pub fn update_over_local_build_allowed() -> bool {
     env_flag_enabled(ALLOW_UPDATE_OVER_LOCAL_BUILD_ENV)
 }
 
-// Staged copies are named `<exe>.new`, `<exe>.new2`, and chains of those such as
-// `<exe>.new2.new2.new`; the canonical install is the bare `<exe>`.
 fn is_staged_runner_suffix(extension: &str) -> bool {
     extension
         .to_ascii_lowercase()
@@ -1585,12 +1449,6 @@ pub fn stage_runner_self_update() -> anyhow::Result<Option<(PathBuf, String)>> {
     if marker_is_trustworthy_and_current(latest.as_str()) {
         return Ok(None);
     }
-    // Strip EVERY staged suffix, not just a trailing `.new`: staging used to peel a
-    // single `.new` off the running path and then append again, so a process started
-    // from `<exe>.new2` staged `<exe>.new2.new`, whose successor staged
-    // `<exe>.new2.new2`, and so on -- one never-reused ~17 MB file per update. Anchoring
-    // on the canonical path makes the staged name one of exactly two, `<exe>.new` or
-    // `<exe>.new2`, so a copy is overwritten instead of accumulating.
     let running_from_staged_path = running_from_staged_copy();
     let current_exe = canonical_runner_exe().ok_or_else(|| {
         anyhow::anyhow!("cannot resolve the canonical runner path to stage {latest} beside")
@@ -1952,9 +1810,6 @@ fn discover_installed_skill_names(home: &Path) -> anyhow::Result<Vec<String>> {
     Ok(names.into_iter().collect())
 }
 
-// A link (a directory junction on Windows, a symlink elsewhere) means the
-// installed directory IS the source tree: overwriting its SKILL.md with the
-// published one would silently revert a local edit made through that link.
 fn is_link(path: &Path) -> bool {
     fs::symlink_metadata(path)
         .map(|meta| meta.file_type().is_symlink())
@@ -2310,8 +2165,6 @@ mod tests {
         assert!(!is_link(&dir), "a real directory is not a link");
         assert!(!is_link(&root.join("absent")), "an absent path is not a link");
 
-        // Symlink creation needs elevation on Windows, so only assert it where
-        // it is always available; the junction case is the same metadata flag.
         #[cfg(not(windows))]
         {
             let link = root.join("gm-link");

@@ -787,55 +787,11 @@ fn intentional_exit_marker_age_ms() -> Option<u64> {
         .map(|ts| now_ms().saturating_sub(ts))
 }
 
-// One install dir has exactly one daemon and exactly one daemon-guard. Two watchers cannot see
-// each other's claims: each one's orphan sweep answers `dispatch_orphaned` for the other's running
-// work and deletes the claim under it, so a second guard is never a spare, it is a claim shredder.
-// The invariant is enforced by `install_dir()/daemon-guard.lock` (the owner pid) together with
-// `install_dir()/daemon-guard.owner.json` (its identity: pid, exe, version, install_dir, heartbeat
-// ts).
-//
-// The lock file stays a bare integer on purpose. An older runner image reads that same file and
-// must keep understanding it, so a build that never heard of the owner record still refuses to
-// start a second guard; the identity therefore lives beside the lock, never inside it. New builds
-// read both, which is what makes the invariant hold across exe generations instead of only across
-// a clean shutdown.
-//
-// Old state, at every start: a lock whose pid is dead is always reclaimable. A lock whose pid is
-// alive is reclaimed only when the holder cannot prove its mandate -- it has no owner record, the
-// record names some other pid, or the record has not been refreshed for GUARD_HEARTBEAT_STALE_MS.
-// A live guard refreshes it, so a stale one is wedged, or the pid was recycled.
-//
-// Proof, not seniority, is what keeps the lock. An older runner's guard never writes an owner
-// record and never re-reads the lock, so honouring it would hand the install dir to a watcher that
-// can neither retire itself nor be retired; a build that proves nothing for longer than the claim
-// grace is superseded instead. This is the only path that lets a current build take over a home an
-// older build is squatting on.
-
-/// A guard that stops refreshing its owner record for this long has lost its mandate: the record
-/// is what distinguishes a live watcher from a recycled pid, so a stale one is reclaimable.
 const GUARD_HEARTBEAT_STALE_MS: u64 = 120_000;
-/// How often a healthy guard rewrites its owner record. Refreshing every poll would trade a claim
-/// shredder for needless writes to the install dir, so the heartbeat is coarse and the liveness
-/// window above is several times wider than it.
 const GUARD_HEARTBEAT_WRITE_MS: u64 = 30_000;
-/// A guard whose install dir has no live daemon owner and has published no fresh daemon heartbeat
-/// for this long stands down instead of lingering. It was armed by a daemon that is gone, and a
-/// guard that keeps restarting a daemon into a home nothing dispatches through is itself a second
-/// daemon -- the same failure class as a second watcher. A genuinely dead shared daemon is still
-/// restarted within seconds, so this bound only ever fires on a home nobody is using.
 const GUARD_STAND_DOWN_AFTER_STALE_MS: u64 = 600_000;
-/// A claimant writes the lock and then the owner record within the same millisecond, so a lock
-/// that has sat unproven for longer than this grace is not a claim in progress -- it is a holder
-/// that cannot prove anything.
 const GUARD_CLAIM_GRACE_MS: u64 = 60_000;
-/// An install dir that publishes `active_projects: 0` for this long is a home nothing dispatches
-/// through: a witness scratch dir, or a lane that has moved on. Its guard asks the daemon to stop
-/// and retires with it instead of sustaining an idle daemon by restarting it forever. This applies
-/// only to an overridden install dir (AGENTPLUG_HOME set), never to the shared default home, whose
-/// daemon already self-recycles on its own idle clock.
 const GUARD_STAND_DOWN_IDLE_MS: u64 = 600_000;
-/// How long a guard waits for a daemon to honour a stop request before retiring anyway. The daemon
-/// exits by design on its own loop, so this is a grace, not a kill.
 const GUARD_STOP_GRACE_MS: u64 = 30_000;
 
 fn guard_lock_path() -> PathBuf {
@@ -846,8 +802,6 @@ fn guard_owner_path() -> PathBuf {
     install_dir().join("daemon-guard.owner.json")
 }
 
-/// The install dir this guard watches was named by AGENTPLUG_HOME rather than derived from the
-/// home directory, i.e. it is a per-witness or per-lane scratch home and not the shared one.
 fn home_is_isolated() -> bool {
     matches!(std::env::var("AGENTPLUG_HOME"), Ok(over) if !over.trim().is_empty())
 }
@@ -858,18 +812,12 @@ fn guard_lock_age_ms() -> Option<u64> {
     Some(now_ms().saturating_sub(at.as_millis() as u64))
 }
 
-/// Projects the daemon is actually serving, as it published them itself. Zero means nothing has
-/// dispatched through this install dir, which is the only disuse signal a guard can trust -- a
-/// guard cannot see another process's claims.
 fn daemon_active_projects() -> Option<u64> {
     let raw = fs::read_to_string(daemon_status_path()).ok()?;
     let value = serde_json::from_str::<serde_json::Value>(&raw).ok()?;
     value.get("active_projects").and_then(|n| n.as_u64())
 }
 
-/// The guard never kills its daemon. It writes this marker and the daemon stops itself on its own
-/// loop, which is what a stop has to look like when the two processes share claims: the process
-/// holding the work is the one that decides when it is safe to let go.
 fn stop_request_path() -> PathBuf {
     install_dir().join("daemon-stop-request.json")
 }
@@ -953,17 +901,11 @@ fn live_guard_pid() -> Option<u64> {
                 Some(pid)
             }
         }
-        // No owner record, or one naming some other pid: the holder proves nothing. A guard that
-        // cannot prove its mandate can neither retire itself nor be retired, so it is superseded
-        // once the claim grace has passed rather than owning this install dir forever.
         _ if lock_age_ms.map_or(true, |age| age >= GUARD_CLAIM_GRACE_MS) => None,
         _ => Some(pid),
     }
 }
 
-/// True while this process is still the watcher the lock names. A surplus guard re-checks this
-/// every poll, so a guard that loses the lock retires itself instead of running alongside the one
-/// that took it -- no process has to be killed from outside to restore the invariant.
 fn guard_still_owns_lock() -> bool {
     read_guard_lock_pid() == Some(std::process::id() as u64)
 }
@@ -995,9 +937,6 @@ pub fn ensure_daemon_guard() {
     if live_guard_pid().is_some() {
         return;
     }
-    // Only the daemon that owns this install dir arms its watcher. Arming is otherwise a side
-    // effect of reaching the daemon body, and a boot that never wins the ownership lock would
-    // leave a guard behind for a daemon that does not exist.
     if let Some(owner) = read_owner_pid() {
         if owner != std::process::id() as u64 {
             return;
@@ -1050,10 +989,6 @@ pub fn run_daemon_guard() -> anyhow::Result<()> {
             last_heartbeat_write_ms = now;
             write_guard_owner();
         }
-        // Disuse is checked before freshness, not after it: a live daemon publishes a fresh
-        // heartbeat every poll, so a check placed behind `is_daemon_fresh()` can never accumulate
-        // an idle interval -- guard and daemon would sustain each other forever in a home that
-        // serves nothing.
         if daemon_active_projects().map_or(false, |n| n > 0) {
             last_busy_ms = now;
         } else if home_is_isolated() && now.saturating_sub(last_busy_ms) >= GUARD_STAND_DOWN_IDLE_MS
@@ -1080,11 +1015,6 @@ pub fn run_daemon_guard() -> anyhow::Result<()> {
                 eprintln!(
                     "[agentplug daemon-guard] daemon stopped by design (intentional-exit marker {age}ms old) -- standing down; the next dispatch starts a fresh daemon"
                 );
-                // The marker is left in place on purpose. Several guards can watch one install
-                // dir, and the first to see the marker used to delete it, so the others saw a
-                // stale heartbeat with no marker and restarted the daemon that had just retired
-                // itself. Leaving it lets every watcher stand down; an old marker is inert because
-                // both arms of the test above are age-bounded.
                 return Ok(());
             }
         }
@@ -1394,14 +1324,6 @@ fn takeover_ready_path() -> PathBuf {
 
 const TAKEOVER_READY_MAX_AGE_MS: u64 = 2 * 60 * 1000;
 
-/// How long a ready successor waits for an idle daemon before the daemon hands over anyway.
-///
-/// A shared daemon serving many callers rarely reaches a tick with nothing in flight, so an
-/// unconditional "nothing in flight" gate is a handoff that never happens: the successor exhausts
-/// its own wait window and aborts while the old daemon keeps serving the version it was staged to
-/// replace. Past this bound the handoff is forced and whatever is still in flight is re-queued for
-/// the incoming daemon -- the same rule the staged self-update path applies past its hard cap. It
-/// must stay below `TAKEOVER_READY_MAX_AGE_MS`, or the marker goes stale before it can fire.
 const TAKEOVER_FORCE_HANDOFF_AFTER_MS: u64 = 60 * 1000;
 
 fn write_takeover_ready(version: &str, force: bool) -> anyhow::Result<()> {
@@ -1419,12 +1341,6 @@ fn write_takeover_ready(version: &str, force: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The ready successor: its pid and version, how long its marker has waited, and whether it asked
-/// to be served without waiting for an idle tick.
-///
-/// The age is what bounds the handoff: a successor that has waited past
-/// `TAKEOVER_FORCE_HANDOFF_AFTER_MS`, or one staged with `--force`, is served even with dispatches
-/// in flight.
 fn ready_takeover_successor() -> Option<(u64, String, u64, bool)> {
     let path = takeover_ready_path();
     let ready = fs::read_to_string(&path)
@@ -1814,13 +1730,6 @@ fn promote_staged_exe_to_canonical(version: &str) -> bool {
     match promotion {
         Ok(()) => {
             record_completed_runner_swap(version);
-            // The replacement is on the canonical path and reached here only after
-            // `download_and_verify` matched its release sha256 and
-            // `staged_binary_self_check` matched its `--version`, so the update is
-            // verified in place and the older images beside it are retention-eligible
-            // rather than rollback targets. Retention hangs off that verification, not
-            // off the rename: the canonical path and this process's own image are pinned
-            // inside it, so a failure here can never strand the running daemon.
             crate::download::enforce_install_dir_backup_retention(true);
             eprintln!("[agentplug daemon] takeover: promoted {version} onto canonical exe path {} (previous version kept at {})", canonical.display(), prev.display());
             true
@@ -2225,8 +2134,6 @@ fn runner_version_parity_json() -> serde_json::Value {
     runner_version_parity().json()
 }
 
-// One definition of the canonical install path, shared with the self-update
-// staging names, so the parity probe and the swap record name the same file.
 fn canonical_runner_exe_path() -> Option<PathBuf> {
     crate::download::canonical_runner_exe()
 }
@@ -2300,9 +2207,6 @@ fn write_project_heartbeat(root: &Path, busy_until: Option<u64>) {
 
 const DISPATCH_HEARTBEAT_MIN_GAP: Duration = Duration::from_secs(3);
 
-/// One instruction-source sync per slot: with one pass over every leased project, an unbounded
-/// per-root thread would spawn on each interval, so the fan-out is capped and a root that finds no
-/// free slot stays due for the next pass instead of queueing.
 const INSTRUCTION_SOURCE_SYNC_SLOTS: usize = 2;
 
 fn instruction_source_sync_slots_taken() -> &'static std::sync::atomic::AtomicUsize {
@@ -3079,9 +2983,6 @@ fn heartbeat_authority_lost() -> bool {
     HEARTBEAT_AUTHORITY_LOST.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// One project-heartbeat refresh per write cadence: a shorter tick only re-scans the spool for a
-/// write `status_write_needed` then declines, and `write_project_heartbeat_with_queue_info` counts
-/// spool steps on every call.
 const PROJECT_HEARTBEAT_TICK: Duration = STATUS_LIVENESS_REFRESH;
 
 fn spawn_heartbeat_ticker(heartbeat_interval: Duration) -> std::thread::JoinHandle<()> {
@@ -3633,9 +3534,6 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
     let mut per_root_plugin_scan_walk = RegistryWalk { cursor: 0 };
 
     const SELF_RECYCLE_IDLE_MS: u64 = 60 * 60 * 1000;
-    /// A stop request is honoured only after the daemon's own quiet period. The guard measures
-    /// disuse from `active_projects`; this measures it from dispatch work, and the daemon is the
-    /// side that can see work the guard cannot, so it is the side that refuses an unsafe stop.
     const STOP_REQUEST_MIN_IDLE_MS: u64 = 60_000;
     let mut last_any_dispatch = Instant::now();
 
@@ -4041,15 +3939,10 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .is_empty();
-        // The backoff defers the handoff, it does not forgive the starve: the staged-at clock
-        // survives the backoff, so the first tick past it hands off without re-arming.
         let self_update_backed_off = pending_self_update
             .as_ref()
             .map(|(_, v)| handoff_backed_off(v))
             .unwrap_or(false);
-        // Bounded drain: once starved, in-flight dispatches run to completion and the swap waits
-        // for them. No claim is re-queued or abandoned; the handoff runs only when the daemon is
-        // idle (no admission claim, no detached dispatch).
         if let Some((_, version)) = pending_self_update.as_ref() {
             if self_update_starved
                 && (detached_still_running || any_work)
@@ -4148,10 +4041,6 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
             last_shared_release = Instant::now();
         }
 
-        // A guard that watched this install dir go unused asks for a stop instead of killing this
-        // process: the process holding the claims is the one that decides when it is safe to let
-        // go. The file read is last in the condition on purpose, so a home nobody asked to stop
-        // never pays for it.
         if last_any_dispatch.elapsed() >= Duration::from_millis(STOP_REQUEST_MIN_IDLE_MS)
             && !detached_still_running
             && stop_request_age_ms().is_some()
@@ -4181,9 +4070,6 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
         let pending_work_exists_before_idle_wait = known_roots
             .iter()
             .any(|root| project_has_pending_dispatch_work(root));
-        // Work that was claimed resets the wait to the minimum. Queued files that
-        // stay unclaimable (unsettled, unreadable, or stale) must not pin the loop
-        // at the minimum, so their wait backs off to a short cap instead.
         if any_work {
             idle_wait_ms = IDLE_WAIT_MIN_MS;
         }
