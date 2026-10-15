@@ -368,11 +368,28 @@ pub struct SharedPluginPool {
 struct ClassTicketQueue {
     next_ticket: u64,
     now_serving: u64,
+    abandoned: Vec<u64>,
 }
 
 impl ClassTicketQueue {
     fn waiting(&self) -> u64 {
         self.next_ticket.saturating_sub(self.now_serving)
+    }
+
+    fn skip_abandoned(&mut self) {
+        while let Some(pos) = self.abandoned.iter().position(|t| *t == self.now_serving) {
+            self.abandoned.swap_remove(pos);
+            self.now_serving += 1;
+        }
+    }
+
+    fn abandon(&mut self, ticket: u64) {
+        if ticket == self.now_serving {
+            self.now_serving += 1;
+            self.skip_abandoned();
+        } else {
+            self.abandoned.push(ticket);
+        }
     }
 }
 
@@ -779,14 +796,17 @@ impl SharedPluginPool {
                 cheap: ClassTicketQueue {
                     next_ticket: 0,
                     now_serving: 0,
+                    abandoned: Vec::new(),
                 },
                 heavy: ClassTicketQueue {
                     next_ticket: 0,
                     now_serving: 0,
+                    abandoned: Vec::new(),
                 },
                 short: ClassTicketQueue {
                     next_ticket: 0,
                     now_serving: 0,
+                    abandoned: Vec::new(),
                 },
                 heavy_inflight: 0,
                 non_short_inflight: 0,
@@ -1118,6 +1138,20 @@ impl SharedPluginPool {
         timeout_ms: u64,
         class: DispatchCostClass,
     ) -> (std::sync::MutexGuard<'_, Option<SiblingHandle>>, u64) {
+        self.acquire_slot_until(timeout_ms, class, None).unwrap_or_else(|_| {
+            unreachable!("a slot wait with no give-up deadline is never refused")
+        })
+    }
+
+    /// Bounded form of `acquire_within_for_class`. Past `give_up_at` the waiter abandons its ticket
+    /// (so the FIFO skips it) and returns its elapsed wait instead of queueing behind eight held
+    /// slots forever; the caller answers it as admission-starved.
+    pub fn acquire_slot_until(
+        &self,
+        timeout_ms: u64,
+        class: DispatchCostClass,
+        give_up_at: Option<std::time::Instant>,
+    ) -> Result<(std::sync::MutexGuard<'_, Option<SiblingHandle>>, u64), u64> {
         let start = std::time::Instant::now();
         let my_ticket = {
             let mut q = self.ticket_queue.lock().unwrap_or_else(|e| e.into_inner());
@@ -1129,16 +1163,26 @@ impl SharedPluginPool {
         loop {
             {
                 let mut q = self.ticket_queue.lock().unwrap_or_else(|e| e.into_inner());
+                q.class(class).skip_abandoned();
                 if q.class(class).now_serving == my_ticket {
                     for slot in &self.slots {
                         if let Some(guard) = try_lock_slot_recovering_from_poison(slot) {
                             q.class(class).now_serving += 1;
                             drop(q);
                             self.slot_released.notify_all();
-                            return (guard, start.elapsed().as_millis() as u64);
+                            return Ok((guard, start.elapsed().as_millis() as u64));
                         }
                     }
                 }
+            }
+            if give_up_at.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+                self.ticket_queue
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .class(class)
+                    .abandon(my_ticket);
+                self.slot_released.notify_all();
+                return Err(start.elapsed().as_millis() as u64);
             }
             let guard = self.ticket_queue.lock().unwrap_or_else(|e| e.into_inner());
             let _ = self
@@ -1770,8 +1814,29 @@ impl ProjectPlugins {
         let admission_deadline =
             Instant::now() + admission_wait_max_for(cost_class).max(admission_wait_max());
         let (mut guard, _waited_ms) = loop {
-            let (mut slot, waited) =
-                pool.acquire_within_for_class(SharedPluginPool::ACQUIRE_TIMEOUT_MS, cost_class);
+            let (mut slot, waited) = match pool.acquire_slot_until(
+                SharedPluginPool::ACQUIRE_TIMEOUT_MS,
+                cost_class,
+                Some(admission_deadline),
+            ) {
+                Ok(acquired) => acquired,
+                Err(waited_ms) => {
+                    let holders = pool
+                        .ticket_queue
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .holders_summary();
+                    return Err(admission_starved_error(AdmissionWaitReport {
+                        kind: "slot",
+                        waited_ms,
+                        limit: pool.slots.len(),
+                        in_flight: pool.slots.len(),
+                        slots: pool.slots.len(),
+                        holders,
+                    })
+                    .into());
+                }
+            };
             if slot.is_none() {
                 if let Err(detail) =
                     refill_evicted_slot(&mut slot, None, &self.root, plugin_name, verb)
@@ -1953,8 +2018,29 @@ impl DispatchHandle {
         let admission_deadline =
             Instant::now() + admission_wait_max_for(cost_class).max(admission_wait_max());
         let (mut guard, _waited_ms) = loop {
-            let (mut slot, waited) =
-                pool.acquire_within_for_class(SharedPluginPool::ACQUIRE_TIMEOUT_MS, cost_class);
+            let (mut slot, waited) = match pool.acquire_slot_until(
+                SharedPluginPool::ACQUIRE_TIMEOUT_MS,
+                cost_class,
+                Some(admission_deadline),
+            ) {
+                Ok(acquired) => acquired,
+                Err(waited_ms) => {
+                    let holders = pool
+                        .ticket_queue
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .holders_summary();
+                    return Err(admission_starved_error(AdmissionWaitReport {
+                        kind: "slot",
+                        waited_ms,
+                        limit: pool.slots.len(),
+                        in_flight: pool.slots.len(),
+                        slots: pool.slots.len(),
+                        holders,
+                    })
+                    .into());
+                }
+            };
             if slot.is_none() {
                 if let Err(detail) = refill_evicted_slot(
                     &mut slot,
