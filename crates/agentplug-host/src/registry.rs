@@ -2444,11 +2444,25 @@ const UNSERIALIZED_VERBS: &[&str] = &[
     "sleep",
     "close",
     "phase-status",
+    "instruction",
     "prd-list",
     "prd-status",
     "mutable-list",
     "filter",
 ];
+
+const STATE_READ_VERBS: &[&str] = &[
+    "instruction",
+    "phase-status",
+    "prd-list",
+    "prd-status",
+    "mutable-list",
+    "status",
+];
+
+pub fn is_state_read_verb(verb: &str) -> bool {
+    STATE_READ_VERBS.contains(&verb)
+}
 
 const BLOCKING_DISPATCH_VERBS: &[&str] = &[
     "exec_js",

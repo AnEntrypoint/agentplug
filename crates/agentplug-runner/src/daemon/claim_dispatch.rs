@@ -1168,6 +1168,9 @@ fn lane_holder_worker_registered(key: &InFlightKey) -> bool {
 ///   `LANE_HOLD_RUNNING_MAX_MS`, with claims waiting behind it. Execution that long is a hung
 ///   holder, not slow work, and an unbounded hold stalls the project's whole lane; see the constant.
 ///
+/// - `holder_read_only_past_stuck_min`: a read-only state verb is executing past
+///   `LANE_HOLD_STUCK_MIN_MS` with claims queued behind it. It writes nothing, so nothing is protected.
+///
 /// A holder this daemon cannot see the stage of -- owned by another daemon -- is never released,
 /// because there is no way to know whether it is mid-write.
 pub(crate) fn lane_holder_stuck_reason(
@@ -1201,6 +1204,13 @@ pub(crate) fn lane_holder_stuck_reason(
                 && agentplug_host::registry::lane_waiter_count(root, lane) > 0 =>
         {
             return Some("holder_running_past_max")
+        }
+        Some((DispatchStage::Running, since_ms))
+            if now_ms().saturating_sub(since_ms) >= lane_hold_stuck_min_ms()
+                && agentplug_host::registry::is_state_read_verb(verb)
+                && agentplug_host::registry::lane_waiter_count(root, lane) > 0 =>
+        {
+            return Some("holder_read_only_past_stuck_min")
         }
         Some((DispatchStage::Running, _)) => return None,
         Some((_, since_ms)) if now_ms().saturating_sub(since_ms) >= lane_hold_stuck_min_ms() => {
