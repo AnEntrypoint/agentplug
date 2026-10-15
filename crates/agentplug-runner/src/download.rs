@@ -1544,6 +1544,19 @@ pub fn fetch_latest_runner_version() -> anyhow::Result<Option<String>> {
         return Ok(None);
     }
     let url = format!("https://api.github.com/repos/{RUNNER_BIN_REPO}/releases/latest");
+    let Some(asset) = runner_asset_name() else {
+        return Ok(None);
+    };
+    let probe_url =
+        format!("https://github.com/{RUNNER_BIN_REPO}/releases/latest/download/{asset}.sha256");
+    if let Ok(resp) = agentplug_host::shared_agent().get(&probe_url).call() {
+        let resolved_url = resp.get_url().to_string();
+        if let Some(version) = extract_version_from_release_url(&resolved_url)
+            .or_else(|| resolve_latest_tag_via_release_page(RUNNER_BIN_REPO))
+        {
+            return Ok(Some(version));
+        }
+    }
     match github_api_call(&url) {
         Ok(resp) => {
             let body: serde_json::Value = serde_json::from_str(&resp.into_string()?)?;
@@ -1554,24 +1567,7 @@ pub fn fetch_latest_runner_version() -> anyhow::Result<Option<String>> {
                 None => Ok(None),
             }
         }
-        Err(api_err) => {
-            let Some(asset) = runner_asset_name() else {
-                return Err(describe_github_api_error(&url, api_err));
-            };
-            let probe_url = format!(
-                "https://github.com/{RUNNER_BIN_REPO}/releases/latest/download/{asset}.sha256"
-            );
-            match agentplug_host::shared_agent().get(&probe_url).call() {
-                Ok(resp) => {
-                    let resolved_url = resp.get_url().to_string();
-                    extract_version_from_release_url(&resolved_url)
-                        .or_else(|| resolve_latest_tag_via_release_page(RUNNER_BIN_REPO))
-                        .map(Some)
-                        .ok_or_else(|| describe_github_api_error(&url, api_err))
-                }
-                Err(_) => Err(describe_github_api_error(&url, api_err)),
-            }
-        }
+        Err(api_err) => Err(describe_github_api_error(&url, api_err)),
     }
 }
 
