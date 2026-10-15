@@ -1,26 +1,4 @@
 #!/usr/bin/env node
-// Runner-version parity witness for the gm-mcp release bridge (gm-mcp/src/release-bridge.js).
-//
-// Runs the bridge's real reconcile code inside an isolated AGENTPLUG_HOME and GM_TOOLS_DIR,
-// against a stubbed GitHub that serves a release runner and a release gm guest. A daemon this
-// script starts from the installed runner copy reports runner_version_parity, which must agree.
-//
-//   Phase A: the installed runner and gm guest are older; the bridge installs both.
-//   Phase B: the installed bytes already equal the release, but the records were left stale;
-//            the bridge must repair them on its current-build path.
-//
-// Both phases must leave plugins/gm.build.json naming the installed gm build with its source
-// sha, the runner swap record and version file naming the installed runner bytes, and the
-// daemon's parity agreeing. A bridge that does not record its installs keeps the stale
-// gm.build.json seeded here, and the witness prints RESULT: FAIL.
-//
-//   node scripts/runner-version-parity-witness.mjs --old-runner <exe> --new-runner <exe>
-//     --gm-wasm <wasm> --gm-version <x.y.z> --gm-source <40-hex sha>
-//     --src <gm-mcp/src> --node-modules <gm-mcp/node_modules> [--scratch <dir>] [--keep]
-//
-// Exit 0 on PASS, 1 on FAIL, 2 on a usage or setup error. The live AGENTPLUG_HOME and
-// GM_TOOLS_DIR are only read (inputs are copied out of them), never written.
-
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';

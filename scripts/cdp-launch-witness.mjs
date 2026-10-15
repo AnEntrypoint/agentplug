@@ -1,6 +1,3 @@
-// Headful contract for the cdp engine. Static checks read the crawl sources; live
-// checks drive the runner's browser lease and crawl verbs and inspect the Chrome they
-// start. Usage: node scripts/cdp-headful-witness.mjs [--static-only] [--src=<dir>] [--root=<project root>]
 import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
