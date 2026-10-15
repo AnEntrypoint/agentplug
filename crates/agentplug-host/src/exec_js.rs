@@ -2,7 +2,7 @@ use std::ffi::OsString;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::OnceLock;
+use std::sync::{Once, OnceLock};
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
@@ -72,18 +72,29 @@ struct LoginEnvironment {
     runtime_directory: Option<OsString>,
 }
 
+static LOGIN_ENVIRONMENT: OnceLock<LoginEnvironment> = OnceLock::new();
+static EMPTY_LOGIN_ENVIRONMENT: LoginEnvironment = LoginEnvironment {
+    path: None,
+    runtime_directory: None,
+};
+static LOGIN_PROBE: Once = Once::new();
+
 fn login_environment() -> &'static LoginEnvironment {
-    static LOGIN_ENVIRONMENT: OnceLock<LoginEnvironment> = OnceLock::new();
-    LOGIN_ENVIRONMENT.get_or_init(|| {
+    LOGIN_PROBE.call_once(|| {
         #[cfg(unix)]
         {
-            probe_login_environment().unwrap_or_default()
+            let _ = std::thread::Builder::new()
+                .name("gm-login-probe".into())
+                .spawn(|| {
+                    if let Some(environment) = probe_login_environment() {
+                        let _ = LOGIN_ENVIRONMENT.set(environment);
+                    }
+                });
         }
-        #[cfg(not(unix))]
-        {
-            LoginEnvironment::default()
-        }
-    })
+    });
+    LOGIN_ENVIRONMENT
+        .get()
+        .unwrap_or(&EMPTY_LOGIN_ENVIRONMENT)
 }
 
 fn login_shell_path() -> Option<OsString> {
@@ -139,15 +150,23 @@ fn current_user_login_shell() -> Option<OsString> {
 }
 
 #[cfg(unix)]
+const LOGIN_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[cfg(unix)]
 fn probe_login_environment() -> Option<LoginEnvironment> {
+    let shell = std::env::var_os("SHELL")
+        .or_else(current_user_login_shell)
+        .unwrap_or_else(|| OsString::from("/bin/sh"));
+    probe_login_shell(shell, LOGIN_PROBE_TIMEOUT)
+}
+
+#[cfg(unix)]
+fn probe_login_shell(shell: OsString, timeout: Duration) -> Option<LoginEnvironment> {
     use std::io::Read;
     use std::os::fd::AsRawFd;
     use std::os::unix::ffi::OsStringExt;
     use std::os::unix::process::CommandExt;
 
-    let shell = std::env::var_os("SHELL")
-        .or_else(current_user_login_shell)
-        .unwrap_or_else(|| OsString::from("/bin/sh"));
     let mut child = Command::new(shell)
         .args([
             "-lc",
@@ -175,7 +194,7 @@ fn probe_login_environment() -> Option<LoginEnvironment> {
         if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
             return None;
         }
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + timeout;
         let mut output = Vec::new();
         let mut chunk = [0u8; 4096];
         let mut status = None;
@@ -230,12 +249,9 @@ fn probe_login_environment() -> Option<LoginEnvironment> {
     result
 }
 
-fn exec_path() -> &'static OsString {
-    static EXEC_PATH: OnceLock<OsString> = OnceLock::new();
-    EXEC_PATH.get_or_init(|| {
-        std::env::join_paths(exec_path_dirs())
-            .unwrap_or_else(|_| std::env::var_os("PATH").unwrap_or_default())
-    })
+fn exec_path() -> OsString {
+    std::env::join_paths(exec_path_dirs())
+        .unwrap_or_else(|_| std::env::var_os("PATH").unwrap_or_default())
 }
 
 pub fn run(code: &str, opts: &Value, cwd: &Path) -> Value {
@@ -1090,6 +1106,43 @@ mod tests {
 
     fn bash_path(path: &std::path::Path) -> String {
         path.to_string_lossy().replace('\\', "/")
+    }
+
+    #[test]
+    fn exec_path_returns_without_waiting_for_the_login_probe() {
+        let started = Instant::now();
+        let path = super::exec_path();
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "exec_path waited on the login probe: {:?}",
+            started.elapsed()
+        );
+        assert!(!path.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn login_probe_gives_up_on_a_slow_shell_at_its_deadline() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let script = std::env::temp_dir().join(format!(
+            "gm-login-probe-{}-slow-shell.sh",
+            std::process::id()
+        ));
+        std::fs::write(&script, "#!/bin/sh\nsleep 5\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let started = Instant::now();
+        let environment = super::probe_login_shell(
+            script.clone().into_os_string(),
+            Duration::from_millis(500),
+        );
+        let elapsed = started.elapsed();
+        let _ = std::fs::remove_file(&script);
+        assert!(environment.is_none(), "a timed-out probe must store nothing");
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "login probe ignored its deadline: {elapsed:?}"
+        );
     }
 
     #[test]
