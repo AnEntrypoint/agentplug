@@ -1,19 +1,3 @@
-//! Headless crawl engine: one warm `lightpanda serve` per project root.
-//!
-//! The process is started on the first crawl, kept across dispatches, and
-//! reaped after GM_LIGHTPANDA_IDLE_SECONDS (default 600) without a crawl. The
-//! CDP target id is remembered so repeat crawls reattach to the same page
-//! instead of creating a new one. A Linux server carries PR_SET_PDEATHSIG and
-//! dies with the runner; macOS has no pdeathsig, so there the idle reap and
-//! `shutdown` are the only cleanup of a warm server whose runner was killed.
-//! PR_SET_PDEATHSIG fires when the spawning thread exits, so servers are spawned
-//! on one owner thread that lives as long as the runner (`spawn_owned`).
-//!
-//! Binary order: GM_LIGHTPANDA_PATH, then `<agentplug home>/bin/lightpanda-<arch>-<os>`
-//! (the lightpanda-io/browser release asset names), then `lightpanda` on PATH.
-//! lightpanda has no native Windows build; on Windows the server runs inside WSL2
-//! through `wsl.exe --exec`, the path the upstream README documents.
-
 use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -257,7 +241,7 @@ fn start_warm(key: &Path) -> Result<Warm, String> {
     };
     if !endpoint_ready(port, Instant::now() + ready_deadline, READY_POLL, false) {
         let tail = log_tail(&log_path);
-        stop(&mut warm);
+        kill_serve_process(&mut warm);
         return Err(format!(
             "lightpanda CDP endpoint on port {port} did not become ready within {}ms (recent output: {tail})",
             ready_deadline.as_millis()
@@ -266,35 +250,29 @@ fn start_warm(key: &Path) -> Result<Warm, String> {
     Ok(warm)
 }
 
-/// Kills the serve process. Under WSL the Linux-side server is a separate
-/// process that wsl.exe does not own, so it is also matched and killed inside
-/// the distribution.
-fn stop(warm: &mut Warm) {
+fn kill_serve_process(warm: &mut Warm) {
     let _ = warm.child.kill();
     let _ = warm.child.wait();
-    if let Launch::Wsl {
-        wsl,
-        distro,
-        binary,
-    } = &warm.launch
-    {
-        let pattern = format!("{binary} serve --host 127.0.0.1 --port {}", warm.port);
-        let mut cmd = Command::new(wsl);
-        if let Some(distro) = distro {
-            cmd.args(["--distribution", distro.as_str()]);
-        }
-        cmd.args(["--exec", "pkill", "-f", pattern.as_str()])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        apply_windowless(&mut cmd);
-        let _ = cmd.status();
+    if let Launch::Wsl { wsl, distro, binary } = &warm.launch {
+        kill_wsl_serve_process(wsl, distro.as_deref(), binary, warm.port);
     }
 }
 
-/// Returns the warm port and remembered target for `key`, starting the process
-/// when none is alive. Marks the entry busy until `release`.
-fn acquire(key: &Path) -> Result<(u16, Option<String>), String> {
+fn kill_wsl_serve_process(wsl: &Path, distro: Option<&str>, binary: &str, port: u16) {
+    let pattern = format!("{binary} serve --host 127.0.0.1 --port {port}");
+    let mut cmd = Command::new(wsl);
+    if let Some(distro) = distro {
+        cmd.args(["--distribution", distro]);
+    }
+    cmd.args(["--exec", "pkill", "-f", pattern.as_str()])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    apply_windowless(&mut cmd);
+    let _ = cmd.status();
+}
+
+fn claim_warm_server(key: &Path) -> Result<(u16, Option<String>), String> {
     let mut map = warm_map();
     if let Some(warm) = map.get_mut(key) {
         if warm.busy {
@@ -309,7 +287,7 @@ fn acquire(key: &Path) -> Result<(u16, Option<String>), String> {
         }
     }
     if let Some(mut stale) = map.remove(key) {
-        stop(&mut stale);
+        kill_serve_process(&mut stale);
     }
     let mut warm = start_warm(key)?;
     warm.busy = true;
@@ -319,7 +297,7 @@ fn acquire(key: &Path) -> Result<(u16, Option<String>), String> {
     Ok((port, None))
 }
 
-fn release(key: &Path, target_id: Option<String>) {
+fn release_warm_server(key: &Path, target_id: Option<String>) {
     if let Some(warm) = warm_map().get_mut(key) {
         warm.busy = false;
         warm.last_used = Instant::now();
@@ -348,14 +326,12 @@ fn start_reaper() {
             .collect();
         for key in expired {
             if let Some(mut warm) = map.remove(&key) {
-                stop(&mut warm);
+                kill_serve_process(&mut warm);
             }
         }
     });
 }
 
-/// Runs a crawl body on the warm lightpanda for `cwd`'s project root. The
-/// body may start with `engine=lightpanda`; `engine=cdp` is refused here.
 pub fn crawl(cwd: &Path, body: &str) -> Value {
     let started = Instant::now();
     let parsed = match parse_crawl_body(body) {
@@ -372,7 +348,7 @@ pub fn crawl(cwd: &Path, body: &str) -> Value {
         );
     }
     let key = canonical_project_root(cwd);
-    let (port, target_id) = match acquire(&key) {
+    let (port, target_id) = match claim_warm_server(&key) {
         Ok(acquired) => acquired,
         Err(e) => return crawl_error_reply(ENGINE, true, started, e),
     };
@@ -384,15 +360,13 @@ pub fn crawl(cwd: &Path, body: &str) -> Value {
         .and_then(|v| v.get("targetId"))
         .and_then(Value::as_str)
         .map(str::to_string);
-    release(&key, remembered.or(target_id));
+    release_warm_server(&key, remembered.or(target_id));
     match run {
         Ok(run) => crawl_reply_from_run(ENGINE, true, started, run),
         Err(e) => crawl_error_reply(ENGINE, true, started, e),
     }
 }
 
-/// Plugin verb dispatch. `crawl` takes a crawl body; any other verb answers
-/// unknown_verb.
 pub fn plugin_call(cwd: &Path, verb: &str, body: &str) -> Value {
     match verb {
         "crawl" => crawl(cwd, body),
@@ -400,9 +374,8 @@ pub fn plugin_call(cwd: &Path, verb: &str, body: &str) -> Value {
     }
 }
 
-/// Kills every warm lightpanda process. Call at runner shutdown.
 pub fn shutdown() {
     for (_, mut warm) in warm_map().drain() {
-        stop(&mut warm);
+        kill_serve_process(&mut warm);
     }
 }
