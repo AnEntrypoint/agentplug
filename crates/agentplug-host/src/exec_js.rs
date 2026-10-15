@@ -1127,6 +1127,7 @@ mod tests {
             "printf '%s' foreground-; {{ sleep 3; touch \"{}\"; }} &",
             bash_path(&marker)
         );
+        let _ = super::exec_path();
         let started = Instant::now();
         let result = super::run(
             &code,
@@ -1173,6 +1174,10 @@ mod tests {
             bash_path(&marker),
             bash_path(&log)
         );
+        // The first exec in a process probes the login shell for PATH (cached in a OnceLock,
+        // capped at 5s). That one-time cost is not what this test measures, so pay it before the
+        // clock starts; the 2s bound still catches a dispatch that waits on the 3s sleeper.
+        let _ = super::exec_path();
         let started = Instant::now();
         let result = super::run(
             &code,
