@@ -2,6 +2,7 @@ mod build_info;
 mod daemon;
 mod download;
 mod dream_cycle;
+mod logic;
 
 use std::path::PathBuf;
 
