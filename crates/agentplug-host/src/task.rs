@@ -112,6 +112,24 @@ fn drains_pending(entry: &TaskEntry) -> bool {
     entry.stdout_pipe.is_some() || entry.stderr_pipe.is_some()
 }
 
+fn is_handoff_blocking(entry: &TaskEntry) -> bool {
+    entry.finished_ms.is_none() || drains_pending(entry)
+}
+
+pub fn pending_task_ids() -> Vec<String> {
+    let mut reg = registry().lock().unwrap_or_else(|error| error.into_inner());
+    for entry in reg.values_mut() {
+        poll_entry(entry);
+    }
+    let mut ids: Vec<String> = reg
+        .iter()
+        .filter(|(_, entry)| is_handoff_blocking(entry))
+        .map(|(id, _)| id.clone())
+        .collect();
+    ids.sort();
+    ids
+}
+
 type Registry = Mutex<HashMap<String, TaskEntry>>;
 
 fn registry() -> &'static Registry {
@@ -157,10 +175,7 @@ pub fn prepare_task_handoff() -> Result<Option<TaskHandoff>, String> {
         poll_entry(entry);
     }
     expire_completed(&mut reg);
-    if reg
-        .values()
-        .any(|entry| entry.finished_ms.is_none() || drains_pending(entry))
-    {
+    if reg.values().any(is_handoff_blocking) {
         return Ok(None);
     }
     if reg.len() > crate::task_results::MAX_RECORDS {
@@ -620,6 +635,39 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use serde_json::json;
+
+    #[test]
+    fn unfinished_task_is_listed_as_pending_and_blocks_handoff() {
+        let _guard = super::test_registry_guard();
+        let spawned = super::handle(
+            "spawn",
+            &json!({
+                "lang": "bash",
+                "code": "sleep 30",
+                "timeoutMs": 60_000,
+            }),
+            Path::new("."),
+        );
+        assert_eq!(
+            spawned.get("ok").and_then(|value| value.as_bool()),
+            Some(true)
+        );
+        let id = spawned
+            .get("id")
+            .and_then(|value| value.as_str())
+            .unwrap()
+            .to_string();
+
+        assert!(super::pending_task_ids().contains(&id));
+        assert!(matches!(super::prepare_task_handoff(), Ok(None)));
+
+        if let Some(mut entry) = super::registry().lock().unwrap().remove(&id) {
+            crate::process_tree::terminate_containment(&entry.containment, entry.child.id());
+            let _ = entry.child.kill();
+            let _ = entry.child.wait();
+        }
+        assert!(!super::pending_task_ids().contains(&id));
+    }
 
     #[test]
     fn adopted_deadline_includes_elapsed_foreground_runtime() {
