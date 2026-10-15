@@ -889,6 +889,23 @@ impl SharedPluginPool {
         })
     }
 
+    /// The oldest holder past the admission hold bound, named on a waiter's refusal. A waiter that
+    /// finds one refuses at once instead of waiting out its patience budget: the reclaim above has
+    /// already declined (no slot is free), and the over-bound holder is left running.
+    pub(crate) fn over_bound_refusal(&self, report: &AdmissionWaitReport, min_held_ms: u64) -> Option<String> {
+        let q = self.ticket_queue.lock().unwrap_or_else(|e| e.into_inner());
+        let holder = q
+            .holders
+            .iter()
+            .filter(|holder| holder.since.elapsed().as_millis() as u64 >= min_held_ms)
+            .min_by_key(|holder| holder.since)?;
+        let held_ms = holder.since.elapsed().as_millis() as u64;
+        Some(format!(
+            "{}; over-bound holder #{} {} held {}ms, past the {}ms admission hold bound with no free slot to reclaim it into -- the holder is NOT stopped and keeps running",
+            report.holders, holder.id, holder.verb, held_ms, min_held_ms
+        ))
+    }
+
     pub fn admit_blocking(pool: &Arc<SharedPluginPool>, verb: &str) -> BlockingDispatchAdmission {
         Self::admit_blocking_within(pool, verb, Duration::from_secs(86_400))
             .unwrap_or(BlockingDispatchAdmission { pool: None, holder: 0 })
@@ -1790,9 +1807,13 @@ impl ProjectPlugins {
                 }
                 (Err(report), _) | (_, Err(report)) => {
                     drop(slot);
+                    let mut report = report;
+                    report.waited_ms = admission_start.elapsed().as_millis() as u64;
+                    if let Some(holders) = pool.over_bound_refusal(&report, admission_hold_max_ms()) {
+                        report.holders = holders;
+                        return Err(admission_starved_error(report).into());
+                    }
                     if Instant::now() >= admission_deadline {
-                        let mut report = report;
-                        report.waited_ms = admission_start.elapsed().as_millis() as u64;
                         return Err(admission_starved_error(report).into());
                     }
                     let ticket = pool.ticket_queue.lock().unwrap_or_else(|e| e.into_inner());
@@ -1973,9 +1994,13 @@ impl DispatchHandle {
                 }
                 (Err(report), _) | (_, Err(report)) => {
                     drop(slot);
+                    let mut report = report;
+                    report.waited_ms = admission_start.elapsed().as_millis() as u64;
+                    if let Some(holders) = pool.over_bound_refusal(&report, admission_hold_max_ms()) {
+                        report.holders = holders;
+                        return Err(admission_starved_error(report).into());
+                    }
                     if Instant::now() >= admission_deadline {
-                        let mut report = report;
-                        report.waited_ms = admission_start.elapsed().as_millis() as u64;
                         return Err(admission_starved_error(report).into());
                     }
                     let ticket = pool.ticket_queue.lock().unwrap_or_else(|e| e.into_inner());
@@ -3392,6 +3417,24 @@ mod admission_tests {
         assert_eq!(report.in_flight, 3);
         assert!(report.holders.contains("codesearch"));
         assert!(report.holders.contains("ms"));
+    }
+
+    #[test]
+    fn over_bound_holder_refuses_the_waiter_and_names_the_holder() {
+        let pool = pool();
+        let _held: Vec<_> = (0..3).map(|_| admit_cheap(&pool, "codesearch").unwrap()).collect();
+        let report = match admit_cheap(&pool, "kv_set") {
+            Err(report) => report,
+            Ok(_) => panic!("fourth cheap dispatch must starve"),
+        };
+        assert!(pool.over_bound_refusal(&report, 60_000).is_none());
+        std::thread::sleep(Duration::from_millis(30));
+        let named = pool
+            .over_bound_refusal(&report, 20)
+            .expect("a holder past the bound must refuse the waiter");
+        let id = pool.ticket_queue.lock().unwrap().holders[0].id;
+        assert!(named.contains(&format!("#{id} codesearch")), "{named}");
+        assert_eq!(pool.ticket_queue.lock().unwrap().holders.len(), 3);
     }
 
     #[test]

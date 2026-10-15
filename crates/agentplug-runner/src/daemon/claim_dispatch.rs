@@ -2987,7 +2987,6 @@ pub(super) fn verb_dir_has_claimable_request(verb_dir: &Path, verb: &str, langua
     false
 }
 
-#[cfg(windows)]
 fn spool_inbox_dirs_of(root: &Path) -> [PathBuf; 2] {
     [
         spool_dir_of(root).join("in"),
@@ -3130,6 +3129,175 @@ impl IdleInDirWatch {
 impl Drop for IdleInDirWatch {
     fn drop(&mut self) {
         self.close_all();
+    }
+}
+
+#[cfg(target_os = "linux")]
+const INBOX_WATCH_MASK: u32 =
+    libc::IN_CREATE | libc::IN_MODIFY | libc::IN_CLOSE_WRITE | libc::IN_MOVED_TO;
+
+#[cfg(target_os = "linux")]
+const INBOX_PARENT_WATCH_MASK: u32 = libc::IN_CREATE | libc::IN_MOVED_TO;
+
+#[cfg(target_os = "linux")]
+const INBOX_RESYNC_INTERVAL: Duration = Duration::from_millis(500);
+
+#[cfg(target_os = "linux")]
+const INOTIFY_EVENT_HEADER_LEN: usize = 16;
+
+#[cfg(target_os = "linux")]
+pub(super) struct IdleInDirWatch {
+    fd: i32,
+    watches: Vec<(i32, PathBuf)>,
+    wanted: Vec<(PathBuf, PathBuf, u32)>,
+    unwatched: Vec<PathBuf>,
+    synced_at: Option<Instant>,
+}
+
+#[cfg(target_os = "linux")]
+fn push_inbox_tree(root: &Path, dir: &Path, depth: u32, wanted: &mut Vec<(PathBuf, PathBuf, u32)>) {
+    wanted.push((root.to_path_buf(), dir.to_path_buf(), INBOX_WATCH_MASK));
+    if depth == 0 {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            push_inbox_tree(root, &entry.path(), depth - 1, wanted);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl IdleInDirWatch {
+    pub(super) fn new() -> Self {
+        Self {
+            fd: -1,
+            watches: Vec::new(),
+            wanted: Vec::new(),
+            unwatched: Vec::new(),
+            synced_at: None,
+        }
+    }
+
+    fn close(&mut self) {
+        if self.fd >= 0 {
+            unsafe {
+                libc::close(self.fd);
+            }
+            self.fd = -1;
+        }
+        self.watches.clear();
+    }
+
+    fn wanted_watches(roots: &[PathBuf]) -> Vec<(PathBuf, PathBuf, u32)> {
+        let mut wanted = Vec::new();
+        for root in roots {
+            for inbox in spool_inbox_dirs_of(root) {
+                if inbox.is_dir() {
+                    push_inbox_tree(root, &inbox, 2, &mut wanted);
+                } else if let Some(parent) = inbox.parent().filter(|p| p.is_dir()) {
+                    wanted.push((root.clone(), parent.to_path_buf(), INBOX_PARENT_WATCH_MASK));
+                }
+            }
+        }
+        wanted
+    }
+
+    fn sync(&mut self, roots: &[PathBuf]) {
+        use std::os::unix::ffi::OsStrExt;
+        if self
+            .synced_at
+            .is_some_and(|at| at.elapsed() < INBOX_RESYNC_INTERVAL)
+        {
+            return;
+        }
+        self.synced_at = Some(Instant::now());
+        let wanted = Self::wanted_watches(roots);
+        if self.fd >= 0 && self.wanted == wanted {
+            return;
+        }
+        self.close();
+        self.unwatched.clear();
+        self.wanted = wanted.clone();
+        let fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
+        if fd < 0 {
+            self.unwatched = roots.to_vec();
+            return;
+        }
+        self.fd = fd;
+        for (root, dir, mask) in wanted {
+            let Ok(path) = std::ffi::CString::new(dir.as_os_str().as_bytes()) else {
+                self.unwatched.push(root);
+                continue;
+            };
+            let wd = unsafe { libc::inotify_add_watch(fd, path.as_ptr(), mask) };
+            if wd < 0 {
+                self.unwatched.push(root);
+            } else {
+                self.watches.push((wd, root));
+            }
+        }
+    }
+
+    fn wait(&mut self, cap: Duration) -> Vec<PathBuf> {
+        if self.fd < 0 || self.watches.is_empty() {
+            std::thread::sleep(cap);
+            return Vec::new();
+        }
+        let mut pfd = libc::pollfd {
+            fd: self.fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let timeout_ms = cap.as_millis().min(i32::MAX as u128) as libc::c_int;
+        let ready = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
+        if ready <= 0 {
+            return Vec::new();
+        }
+        let mut changed: Vec<PathBuf> = Vec::new();
+        let mut buf = [0u8; 8192];
+        loop {
+            let got = unsafe { libc::read(self.fd, buf.as_mut_ptr().cast(), buf.len()) };
+            if got <= 0 {
+                break;
+            }
+            let got = got as usize;
+            let mut offset = 0usize;
+            while offset + INOTIFY_EVENT_HEADER_LEN <= got {
+                let wd = i32::from_ne_bytes(buf[offset..offset + 4].try_into().unwrap_or([0; 4]));
+                let name_len =
+                    u32::from_ne_bytes(buf[offset + 12..offset + 16].try_into().unwrap_or([0; 4]))
+                        as usize;
+                if let Some((_, root)) = self.watches.iter().find(|(w, _)| *w == wd) {
+                    changed.push(root.clone());
+                }
+                offset += INOTIFY_EVENT_HEADER_LEN + name_len;
+            }
+        }
+        changed.sort();
+        changed.dedup();
+        changed
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for IdleInDirWatch {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub(super) fn wait_for_in_dir_change(watch: &mut IdleInDirWatch, roots: &[PathBuf], cap: Duration) {
+    watch.sync(roots);
+    for unwatched_root in &watch.unwatched {
+        mark_spool_dirty(unwatched_root);
+    }
+    for changed_root in watch.wait(cap) {
+        mark_spool_dirty(&changed_root);
     }
 }
 

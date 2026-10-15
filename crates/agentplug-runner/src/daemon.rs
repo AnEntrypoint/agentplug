@@ -2840,6 +2840,27 @@ fn handoff_retry_backoff_slot() -> &'static Mutex<Option<(String, Instant)>> {
     SLOT.get_or_init(|| Mutex::new(None))
 }
 
+const HANDOFF_DEFERRAL_LOG_INTERVAL: Duration = Duration::from_secs(60);
+
+fn log_handoff_deferred(version: &str, last_logged: &mut Option<Instant>) {
+    if last_logged.is_some_and(|at| at.elapsed() < HANDOFF_DEFERRAL_LOG_INTERVAL) {
+        return;
+    }
+    *last_logged = Some(Instant::now());
+    let pending = agentplug_host::pending_task_ids();
+    if pending.is_empty() {
+        eprintln!(
+            "[agentplug daemon] staged self-update to {version} deferred: admission lock busy; the swap waits for it to clear (durable task results)"
+        );
+    } else {
+        eprintln!(
+            "[agentplug daemon] staged self-update to {version} deferred: {} unfinished task(s) {}; the swap waits for them to finish (durable task results)",
+            pending.len(),
+            pending.join(", ")
+        );
+    }
+}
+
 fn handoff_backed_off(version: &str) -> bool {
     let slot = handoff_retry_backoff_slot()
         .lock()
@@ -3628,10 +3649,11 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
 
     let instruction_source_poll_interval = daemon_cfg.instruction_source_poll_interval();
     let staged_runner_rx = spawn_update_poll_worker(daemon_cfg.clone());
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     let mut idle_in_dir_watch = IdleInDirWatch::new();
     let mut pending_self_update: Option<(PathBuf, String)> = None;
     let mut pending_self_update_staged_at: Option<Instant> = None;
+    let mut handoff_deferred_logged_at: Option<Instant> = None;
     const SELF_UPDATE_MAX_STARVED_MS: u64 = 60 * 1000;
 
     if let Some((staged_at_ms, _len)) = staged_runner_awaiting_handoff() {
@@ -4042,7 +4064,14 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
                 || force_handoff_never_idle)
         {
             match agentplug_host::prepare_task_handoff() {
-                Ok(guard) => guard,
+                Ok(guard) => {
+                    if guard.is_none() {
+                        if let Some((_, version)) = pending_self_update.as_ref() {
+                            log_handoff_deferred(version, &mut handoff_deferred_logged_at);
+                        }
+                    }
+                    guard
+                }
                 Err(error) => {
                     eprintln!("[agentplug daemon] task result preservation refuses staged runner handoff: {error}");
                     None
@@ -4171,13 +4200,13 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
         if any_work {
             idle_wait_ms = IDLE_WAIT_MIN_MS;
         }
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "linux"))]
         wait_for_in_dir_change(
             &mut idle_in_dir_watch,
             &known_roots,
             Duration::from_millis(idle_wait_ms),
         );
-        #[cfg(not(windows))]
+        #[cfg(not(any(windows, target_os = "linux")))]
         std::thread::sleep(Duration::from_millis(idle_wait_ms));
         if !any_work {
             let cap_ms = if pending_work_exists_before_idle_wait {
