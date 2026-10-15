@@ -61,6 +61,25 @@ fn main() -> anyhow::Result<()> {
     let cmd = args.get(1).map(|s| s.as_str()).unwrap_or("");
 
     let outcome = match cmd {
+        "lua-call" => {
+            let dir = args.get(2).cloned().unwrap_or_default();
+            let function = args.get(3).cloned().unwrap_or_default();
+            let input = args.get(4).cloned().unwrap_or_else(|| "{}".to_string());
+            let result = (|| -> anyhow::Result<serde_json::Value> {
+                let host = logic::LogicHost::load(std::path::Path::new(&dir))?;
+                host.call(&function, &serde_json::from_str(&input)?)
+            })();
+            match result {
+                Ok(value) => {
+                    println!("{value}");
+                    std::process::exit(0);
+                }
+                Err(err) => {
+                    eprintln!("lua-call: {err:#}");
+                    std::process::exit(1);
+                }
+            }
+        }
         "plugin" => {
             let name = args.get(2).cloned().unwrap_or_default();
             if name.is_empty() {
