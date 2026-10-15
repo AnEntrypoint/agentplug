@@ -69,9 +69,7 @@ pub(crate) fn kill_process_tree(pid: u32) {
     }
 }
 
-/// Closes every Chrome left running on the gm-owned crawl profile by an earlier
-/// call. The profile path is the marker: user Chrome never carries it.
-fn profile_markers(profile: &Path) -> Vec<String> {
+fn gm_profile_command_line_markers(profile: &Path) -> Vec<String> {
     let raw = profile.display().to_string();
     let back = raw.replace('/', "\\");
     let slash = back.replace('\\', "/");
@@ -96,7 +94,7 @@ fn like_any(markers: &[String]) -> String {
 pub(crate) fn reap_stale_crawl_browsers(profile: &Path) {
     let marker = profile.display().to_string();
     if cfg!(windows) {
-        let markers = profile_markers(profile);
+        let markers = gm_profile_command_line_markers(profile);
         let script = format!(
             "Get-CimInstance Win32_Process -Filter \"Name='chrome.exe'\" | Where-Object {{ ({}) -and $_.CommandLine -notlike '*--type=*' }} | ForEach-Object {{ $_.ProcessId }}",
             like_any(&markers)
@@ -152,8 +150,6 @@ pub(crate) fn process_exists(pid: u32) -> bool {
     }
 }
 
-/// Parses a crawl body. An optional first line `engine=cdp|lightpanda` is
-/// consumed; every other non-blank, non-`#` line is one step.
 pub fn parse_crawl_body(body: &str) -> Result<ParsedCrawl, String> {
     let mut engine = None;
     let mut steps = Vec::new();
@@ -344,8 +340,6 @@ fn session_name(name: &str) -> Result<String, String> {
     }
 }
 
-/// Splits a `keyword argument` line into its argument, so `wait 500` and
-/// `cdp Page.navigate` read the same way.
 fn keyword_arg<'a>(line: &'a str, keyword: &str) -> Option<&'a str> {
     match line.split_once(char::is_whitespace) {
         Some((head, rest)) if head == keyword => {
@@ -380,8 +374,6 @@ fn parse_cdp_step(line: &str, lines: &mut StepLines<'_>) -> Result<Value, String
     parse_tool_step(line)
 }
 
-/// `cdp <Domain.method>` sends one raw CDP command. Its params are the JSON
-/// object on the following line; a command that takes no params omits it.
 fn parse_raw_cdp_step(method: &str, lines: &mut StepLines<'_>) -> Result<Value, String> {
     let method = require_cdp_method(method, "cdp")?;
     let params = read_cdp_params(lines)?;
@@ -439,8 +431,6 @@ fn read_cdp_params(lines: &mut StepLines<'_>) -> Result<Value, String> {
     Err("cdp params started with '{' but the JSON object never closed".to_string())
 }
 
-/// `events <Domain.event> [where <field>~<value>] [limit=N]` captures CDP
-/// events from the moment the call attaches, not from the line's position.
 fn parse_events_step(arg: &str) -> Result<Value, String> {
     let mut tokens = arg.split_whitespace().peekable();
     let name = tokens
@@ -809,9 +799,6 @@ pub type LightpandaEngine = fn(&Path, &str) -> Value;
 
 static LIGHTPANDA_ENGINE: std::sync::OnceLock<LightpandaEngine> = std::sync::OnceLock::new();
 
-/// Registers the native lightpanda engine that the `host_lightpanda_crawl`
-/// import calls. The runner registers it once at startup, because the engine
-/// crate depends on this crate and cannot be linked here.
 pub fn set_lightpanda_engine(engine: LightpandaEngine) {
     let _ = LIGHTPANDA_ENGINE.set(engine);
 }
@@ -836,9 +823,6 @@ fn read_pipe<R: Read>(pipe: Option<R>) -> Vec<u8> {
     buf
 }
 
-/// Runs the Node CDP helper against an endpoint on `port`. The script is fed on
-/// stdin; the config travels in GM_CRAWL_CONFIG. The child is killed when the
-/// budget runs out.
 pub fn run_helper(
     port: u16,
     target_id: Option<&str>,
@@ -966,8 +950,6 @@ pub fn crawl_reply_from_run(
     })
 }
 
-/// Headful Chrome over CDP on the single browser shared by this project root.
-/// The call holds a lease on it and releases the lease on return.
 pub fn crawl_cdp(cwd: &Path, body: &str) -> Value {
     let started = Instant::now();
     let parsed = match parse_cdp_crawl_body(body) {

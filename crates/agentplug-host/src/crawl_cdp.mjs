@@ -1,13 +1,4 @@
-// CDP crawl helper. The host concatenates crawl_cdp_tools.mjs ahead of this file and
-// runs the result as `node --input-type=module` on stdin. Config arrives as JSON in the
-// GM_CRAWL_CONFIG environment variable:
-//   { port, targetId?, browserSession?, cwd?, session?: {name, file}, steps, pageTimeoutMs, textLimit }
-// browserSession selects the lightpanda protocol: targets are created and attached over
-// the browser websocket, because lightpanda serves no HTTP target endpoints.
-// A session keeps its tab and its uid map across calls; its file is written atomically.
-// It prints exactly one JSON object on stdout and exits 0 when every step ran.
-
-const cfg = JSON.parse(process.env.GM_CRAWL_CONFIG || '{}');
+const cfg =JSON.parse(process.env.GM_CRAWL_CONFIG || '{}');
 const endpoint = `http://127.0.0.1:${cfg.port}`;
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 

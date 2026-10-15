@@ -1,8 +1,3 @@
-//! Records the pid of every child a dispatch spawns, so a leaked process is attributed to the
-//! dispatch that made it instead of to a manual census. Attribution is also the reaper's safety
-//! predicate: a pid no ledger claims is never a reaping candidate, which is what keeps the reaper
-//! from becoming a bulk process filter. One JSON line per child, appended, so the host and the
-//! gm-mcp bundle can both write it without locking.
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::Path;

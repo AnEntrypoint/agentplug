@@ -113,18 +113,6 @@ fn system_artifact_path(engine: &Engine, plugin_name: &str, content_hash: &str) 
     })
 }
 
-// A compiled artifact is a pure function of the wasm bytes and the engine's compatibility
-// hash, so one copy serves every install dir. The system dir is READ before compiling
-// (above) but was never written, so every isolated home a witness or a lane booted
-// recompiled each plugin itself: measured 4051 ms and 73 MB for bert, once per install
-// dir, with ~30 scratch homes per session.
-//
-// Publishing hard-links the freshly compiled artifact into the system dir and then
-// re-points the local name at those bytes, so the artifact exists once on disk and the
-// next home deserializes it instead of compiling. Hard links are safe here only because
-// no writer mutates an artifact in place: write_precompiled_artifact stages a sibling and
-// renames it over the path, and a superseded artifact is removed by unlinking its name.
-// A failure at any step leaves the local artifact as compiled, so the load still succeeds.
 fn publish_artifact_to_system_dir(plugin_name: &str, system_path: &Path, artifact_path: &Path) {
     if let Some(parent) = system_path.parent() {
         if std::fs::create_dir_all(parent).is_err() {

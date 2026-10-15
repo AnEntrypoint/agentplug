@@ -98,7 +98,6 @@ fn current_user_login_shell() -> Option<OsString> {
 
     let mut buffer = vec![0u8; 4096];
     loop {
-        // SAFETY: passwd and its backing buffer remain live until the shell bytes are copied; only the current effective UID is queried.
         let (uid, status, shell) = unsafe {
             let uid = libc::geteuid();
             let mut account: libc::passwd = std::mem::zeroed();
@@ -172,9 +171,7 @@ fn probe_login_environment() -> Option<LoginEnvironment> {
     let result = (|| {
         let mut pipe = child.stdout.take().expect("login probe stdout is piped");
         let fd = pipe.as_raw_fd();
-        // SAFETY: the pipe owns this live descriptor, and fcntl changes only its read-side status flags.
         let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-        // SAFETY: the descriptor remains owned by pipe and O_NONBLOCK is a valid status flag.
         if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
             return None;
         }
@@ -331,8 +328,6 @@ pub fn run(code: &str, opts: &Value, cwd: &Path) -> Value {
             });
         }
     };
-    // Attribution: the pid this dispatch is about to leave behind, written before anything can
-    // fail, so a later sweep can say which dispatch owns a leaked process instead of guessing.
     crate::child_pids::record(
         cwd,
         "exec",
@@ -672,18 +667,7 @@ fn is_ident_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_' || b == b'$'
 }
 
-/// Splits `code` into its top-level `import`/`export` declarations and everything
-/// else. Those declarations are legal only at module top level, and node rejects
-/// them while evaluating a stdin body as CommonJS (`'import', and 'export' cannot
-/// be used outside of module code`), so a body carrying one runs with
-/// `--input-type=module` and the declarations are lifted back to the top of the
-/// module, ahead of the wrapper that captures the result. A CommonJS body yields
-/// an empty head and runs byte-identically to before. `require`, `module.exports`
-/// and `exports.x` carry an identifier tail after the keyword and never fire;
-/// `import(...)` is dynamic import, which CommonJS already supports. Comments and
-/// string bodies are skipped, so a mention of the word inside them is not read as
-/// syntax.
-fn module_head(code: &str) -> (String, String) {
+fn split_top_level_module_declarations(code: &str) -> (String, String) {
     let bytes = code.as_bytes();
     let mut head = String::new();
     let mut rest = String::new();
@@ -742,7 +726,7 @@ fn module_head(code: &str) -> (String, String) {
                         let tail = bytes.get(i + keyword.len()).copied();
                         let dynamic_import = keyword == b"import" && tail == Some(b'(');
                         if !tail.is_some_and(is_ident_byte) && !dynamic_import {
-                            let end = module_decl_end(code, i + keyword.len());
+                            let end = module_declaration_end(code, i + keyword.len());
                             rest.push_str(&code[copy_from..i]);
                             copy_from = end;
                             head.push_str(code[i..end].trim());
@@ -767,11 +751,7 @@ fn module_head(code: &str) -> (String, String) {
     }
 }
 
-/// End of one `import`/`export` declaration: the first `;` at bracket depth 0, else
-/// the first newline at depth 0. Quotes and comments are skipped, so a `;` inside
-/// a specifier string and the newlines of `import {\n a,\n b\n} from 'x';` do not
-/// end it early.
-fn module_decl_end(code: &str, from: usize) -> usize {
+fn module_declaration_end(code: &str, from: usize) -> usize {
     let bytes = code.as_bytes();
     let mut i = from;
     let mut depth = 0i32;
@@ -829,7 +809,7 @@ fn build_command_mode(
 ) -> Option<BuiltCommand> {
     match lang {
         "nodejs" | "js" => {
-            let (module_head_src, body) = module_head(code);
+            let (module_head_src, body) = split_top_level_module_declarations(code);
             let as_module = !module_head_src.is_empty();
             let wrapped = match mode {
                 ExecMode::Default => {
@@ -959,12 +939,6 @@ fn build_command_mode(
             ],
             stdin_payload: Some(code.to_string()),
         }),
-        // An agent-level spawn: `code` is the prompt for a headless Claude Code
-        // agent, so a subagent with no host Agent tool can start its own
-        // successor. Print mode cannot answer a permission prompt, and without a
-        // permissive mode the child burns its turns on a tool it is never
-        // allowed to call; bypassPermissions is the default for the same reason
-        // gm's own exec surface is ungated.
         "agent" | "claude" => {
             let permission_mode = opts
                 .get("permissionMode")
@@ -972,7 +946,7 @@ fn build_command_mode(
                 .filter(|mode| {
                     matches!(*mode, "default" | "acceptEdits" | "plan" | "bypassPermissions")
                 })
-                .unwrap_or("bypassPermissions");
+                .unwrap_or(DEFAULT_AGENT_PERMISSION_MODE);
             Some(BuiltCommand {
                 cmd: resolve_claude_cmd(),
                 args: vec![
@@ -1066,6 +1040,7 @@ fn resolve_claude_cmd() -> String {
     "claude".to_string()
 }
 
+const DEFAULT_AGENT_PERMISSION_MODE: &str = "bypassPermissions";
 const BASH_STDIN_EVAL: &str = "eval \"$(cat)\"";
 const PYTHON_STDIN_EVAL: &str = "import sys;exec(compile(sys.stdin.read(),\"<stdin>\",\"exec\"))";
 
@@ -1174,9 +1149,6 @@ mod tests {
             bash_path(&marker),
             bash_path(&log)
         );
-        // The first exec in a process probes the login shell for PATH (cached in a OnceLock,
-        // capped at 5s). That one-time cost is not what this test measures, so pay it before the
-        // clock starts; the 2s bound still catches a dispatch that waits on the 3s sleeper.
         let _ = super::exec_path();
         let started = Instant::now();
         let result = super::run(
