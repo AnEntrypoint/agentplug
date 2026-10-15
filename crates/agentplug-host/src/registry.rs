@@ -218,8 +218,8 @@ pub fn set_gm_pool_size(n: usize) -> bool {
     GM_POOL_SIZE.set(n.max(1)).is_ok()
 }
 
-fn gm_pool_size() -> usize {
-    *GM_POOL_SIZE.get_or_init(|| 4)
+pub(crate) fn gm_pool_size() -> usize {
+    *GM_POOL_SIZE.get_or_init(|| 8)
 }
 
 static SIDE_PLUGIN_POOL_SIZE: OnceLock<usize> = OnceLock::new();
