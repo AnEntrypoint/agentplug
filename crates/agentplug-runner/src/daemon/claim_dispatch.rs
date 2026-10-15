@@ -618,6 +618,10 @@ const STORE_LOCK_STALE_MS: u64 = 900_000;
 
 const STORE_OWNER_HEARTBEAT_MS: u64 = 15_000;
 
+fn owner_record_is_stale(ts: u64) -> bool {
+    ts > 0 && agentplug_host::now_ms().saturating_sub(ts) >= STORE_LOCK_STALE_MS
+}
+
 fn read_store_lock_owner(owner_file: &Path) -> Option<(u64, u64)> {
     let text = fs::read_to_string(owner_file).ok()?;
     let mut lines = text.lines();
@@ -670,7 +674,7 @@ fn settle_store_lock(root: &Path) -> StoreLockState {
                 "it has no owner record, and every dispatch that writes gm.db claims one, so no live writer holds it (a lock predating owner records)"
             ),
         ),
-        Some((pid, _)) if pid == own_pid => StoreLockState::Held {
+        Some((pid, ts)) if pid == own_pid && !owner_record_is_stale(ts) => StoreLockState::Held {
             lock_dir: lock_dir.clone(),
             owner_pid,
             detail: format!(
@@ -678,7 +682,7 @@ fn settle_store_lock(root: &Path) -> StoreLockState {
                 lock_dir.display()
             ),
         },
-        Some((pid, ts)) if pid_is_alive(pid) && !(ts > 0 && agentplug_host::now_ms().saturating_sub(ts) >= STORE_LOCK_STALE_MS) => {
+        Some((pid, ts)) if pid_is_alive(pid) && !owner_record_is_stale(ts) => {
             StoreLockState::Held {
                 lock_dir: lock_dir.clone(),
                 owner_pid,
@@ -703,85 +707,82 @@ fn settle_store_lock(root: &Path) -> StoreLockState {
     }
 }
 
-fn store_owner_refcounts() -> &'static Mutex<HashMap<PathBuf, usize>> {
-    static REFS: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
-    REFS.get_or_init(|| Mutex::new(HashMap::new()))
+#[derive(Default)]
+struct StoreOwnerHolds {
+    count: usize,
+    hold_until_ms: u64,
+    heartbeat_running: bool,
+}
+
+fn store_owner_holds() -> &'static Mutex<HashMap<PathBuf, StoreOwnerHolds>> {
+    static HOLDS: OnceLock<Mutex<HashMap<PathBuf, StoreOwnerHolds>>> = OnceLock::new();
+    HOLDS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 /// Ownership of .gm/gm.db.lock for the lifetime of one dispatch. Refcounted because the
 /// unserialized codeinsight family runs several store writes at once: the first claim writes the
 /// record and the last release removes it, so a concurrent sibling never sees a lock with no owner.
 /// The heartbeat re-stamps the timestamp so a long index pass is never judged stale.
+///
+/// The hold is bounded by the claiming dispatch's admission budget: each claim extends
+/// `hold_until_ms` to its own deadline, and the heartbeat stops re-stamping once no holder is
+/// inside its deadline. The owner record then ages past STORE_LOCK_STALE_MS and settle_store_lock
+/// reclaims it, so a stuck dispatch cannot hold the store lock for good.
 struct StoreOwnerRecord {
     path: PathBuf,
-    pid: u64,
-    stop: Arc<AtomicBool>,
 }
 
 impl StoreOwnerRecord {
-    fn claim(root: &Path) -> Self {
+    fn claim(root: &Path, admission_budget: std::time::Duration) -> Self {
         let path = root.join(".gm").join("gm.db.lock.owner");
         let pid = u64::from(std::process::id());
-        let stop = Arc::new(AtomicBool::new(false));
-        let first = {
-            let mut refs = store_owner_refcounts()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            let entry = refs.entry(path.clone()).or_insert(0);
-            *entry += 1;
-            *entry == 1
-        };
-        let record = Self {
-            path: path.clone(),
-            pid,
-            stop: stop.clone(),
-        };
-        record.stamp();
-        if first {
-            let heartbeat_path = path;
-            let heartbeat_stop = stop;
-            let heartbeat_pid = pid;
-            std::thread::spawn(move || {
-                while !heartbeat_stop.load(Ordering::Relaxed) {
-                    std::thread::sleep(std::time::Duration::from_millis(
-                        STORE_OWNER_HEARTBEAT_MS,
-                    ));
-                    if heartbeat_stop.load(Ordering::Relaxed) {
-                        break;
-                    }
-                    let _ = fs::write(
-                        &heartbeat_path,
-                        format!("{}\n{}\n", heartbeat_pid, agentplug_host::now_ms()),
-                    );
+        let hold_until_ms = agentplug_host::now_ms()
+            .saturating_add(admission_budget.as_millis() as u64);
+        let mut holds = store_owner_holds()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let entry = holds.entry(path.clone()).or_default();
+        entry.count += 1;
+        entry.hold_until_ms = entry.hold_until_ms.max(hold_until_ms);
+        let spawn_heartbeat = !entry.heartbeat_running;
+        entry.heartbeat_running = true;
+        let _ = fs::write(&path, format!("{}\n{}\n", pid, agentplug_host::now_ms()));
+        drop(holds);
+        if spawn_heartbeat {
+            let heartbeat_path = path.clone();
+            std::thread::spawn(move || loop {
+                std::thread::sleep(std::time::Duration::from_millis(STORE_OWNER_HEARTBEAT_MS));
+                let mut holds = store_owner_holds()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                let Some(entry) = holds.get_mut(&heartbeat_path) else {
+                    return;
+                };
+                if entry.count == 0 || agentplug_host::now_ms() >= entry.hold_until_ms {
+                    entry.heartbeat_running = false;
+                    return;
                 }
+                let _ = fs::write(
+                    &heartbeat_path,
+                    format!("{}\n{}\n", pid, agentplug_host::now_ms()),
+                );
             });
         }
-        record
-    }
-
-    fn stamp(&self) {
-        let _ = fs::write(&self.path, format!("{}\n{}\n", self.pid, agentplug_host::now_ms()));
+        Self { path }
     }
 }
 
 impl Drop for StoreOwnerRecord {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
-        let last = {
-            let mut refs = store_owner_refcounts()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            match refs.get_mut(&self.path) {
-                Some(count) => {
-                    *count = count.saturating_sub(1);
-                    let last = *count == 0;
-                    if last {
-                        refs.remove(&self.path);
-                    }
-                    last
-                }
-                None => true,
+        let mut holds = store_owner_holds()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let last = match holds.get_mut(&self.path) {
+            Some(entry) => {
+                entry.count = entry.count.saturating_sub(1);
+                entry.count == 0
             }
+            None => true,
         };
         if last {
             let _ = fs::remove_file(&self.path);
@@ -2399,39 +2400,6 @@ pub(crate) fn run_gm_dispatch_to_file(
             return;
         }
     };
-    let _store_owner = if lane == Some("store") {
-        match settle_store_lock(root) {
-            StoreLockState::Held { lock_dir, owner_pid, detail } => {
-                eprintln!(
-                    "[agentplug daemon] {verb}/{task} for {} refused: {detail}",
-                    root.display()
-                );
-                let out_body = serde_json::json!({
-                    "ok": false,
-                    "verb": verb,
-                    "error_code": "store_busy",
-                    "store_busy": true,
-                    "lock_dir": lock_dir.display().to_string(),
-                    "lock_owner_pid": owner_pid,
-                    "error": detail,
-                })
-                .to_string();
-                write_spool_out_and_release_claim(out_dir, &in_dir, verb, task, &out_body);
-                forget_dispatch_wait_record(root, verb, task);
-                refresh_dispatch_wait_ledger(root);
-                return;
-            }
-            StoreLockState::Clear | StoreLockState::Reclaimed => Some(StoreOwnerRecord::claim(root)),
-        }
-    } else if agentplug_host::dispatch_claims_store_owner(tool_verb) {
-        // Unserialized store writers (the codeinsight family) never reach settle_store_lock, so they
-        // must not settle -- a held lock there is answered by the guest from its persisted index, not
-        // refused -- but they do own the lock while they write, and claiming it is what lets the next
-        // settle tell a live writer from a directory an unclean exit left behind.
-        Some(StoreOwnerRecord::claim(root))
-    } else {
-        None
-    };
     note_dispatch_stage(root, verb, task, DispatchStage::WaitingForToolQueue, lane);
     let _tool_guard = match ToolDispatchGuard::acquire_within(
         root,
@@ -2472,6 +2440,42 @@ pub(crate) fn run_gm_dispatch_to_file(
         refresh_dispatch_wait_ledger(root);
         return;
     }
+    // The store owner is claimed only once the dispatch has won its queue place, so a dispatch
+    // still waiting never holds it. Its hold is bounded by its own admission budget (see
+    // StoreOwnerRecord::claim).
+    let _store_owner = if lane == Some("store") {
+        match settle_store_lock(root) {
+            StoreLockState::Held { lock_dir, owner_pid, detail } => {
+                eprintln!(
+                    "[agentplug daemon] {verb}/{task} for {} refused: {detail}",
+                    root.display()
+                );
+                let out_body = serde_json::json!({
+                    "ok": false,
+                    "verb": verb,
+                    "error_code": "store_busy",
+                    "store_busy": true,
+                    "lock_dir": lock_dir.display().to_string(),
+                    "lock_owner_pid": owner_pid,
+                    "error": detail,
+                })
+                .to_string();
+                write_spool_out_and_release_claim(out_dir, &in_dir, verb, task, &out_body);
+                forget_dispatch_wait_record(root, verb, task);
+                refresh_dispatch_wait_ledger(root);
+                return;
+            }
+            StoreLockState::Clear | StoreLockState::Reclaimed => Some(StoreOwnerRecord::claim(root, lane_wait_budget)),
+        }
+    } else if agentplug_host::dispatch_claims_store_owner(tool_verb) {
+        // Unserialized store writers (the codeinsight family) never reach settle_store_lock, so they
+        // must not settle -- a held lock there is answered by the guest from its persisted index, not
+        // refused -- but they do own the lock while they write, and claiming it is what lets the next
+        // settle tell a live writer from a directory an unclean exit left behind.
+        Some(StoreOwnerRecord::claim(root, lane_wait_budget))
+    } else {
+        None
+    };
     note_dispatch_stage(root, verb, task, DispatchStage::Running, lane);
     let _dispatch_origin_scope =
         agentplug_host::enter_dispatch_origin_scope(task, submitted_at_ms);
