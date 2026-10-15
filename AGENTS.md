@@ -36,6 +36,7 @@ and the `agentplug-host` imports. Work on `main` as GitHub user `lanmower`.
 
 ## Runtime invariants
 
+- The dream cycle trigger ticks every 60 s (`DREAM_RSI_CYCLE_TICK_INTERVAL_MS`, `spawn_dream_rsi_cycle_ticker` in `crates/agentplug-runner/src/daemon.rs`). Each queueing needs 20 new observations (`MIN_NEW_OBSERVATIONS`) and 15 min since the owner's last cycle reply or deferral (`COOLDOWN_MS`, `crates/agentplug-runner/src/dream_cycle.rs`).
 - Dream observation maintenance queues only registered `dream-replay-cycle` for the
   actual owner through canonical `session_id`. Private atomic per-owner state is
   persisted before its fixed pending request is published; recover that same request,
@@ -109,6 +110,12 @@ and the `agentplug-host` imports. Work on `main` as GitHub user `lanmower`.
   runner over a channel); and re-reading every empty verb dir each pass (now skipped with one `stat`
   while its mtime is unchanged and at least 2 s old). A new synchronous call in the main loop needs the
   same measurement.
+- Every Windows child spawn in `agentplug` goes through `windowless::apply_windowless`, and
+  `agentplug-runner` calls `ensure_hidden_console()` before anything else. `CREATE_NO_WINDOW` alone
+  leaves each console-subsystem child (git, node, powershell) console-less, so its own console
+  children allocate a fresh conhost and flash a window. A console the runner owns and hides is
+  inherited by the whole subtree; `apply_windowless` falls back to `CREATE_NO_WINDOW` only when no
+  console exists. Source: `agentplug/crates/agentplug-host/src/windowless.rs`.
 
 ## Configuration and compatibility
 
