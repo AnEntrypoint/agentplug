@@ -167,3 +167,48 @@ and the `agentplug-host` imports. Work on `main` as GitHub user `lanmower`.
 - `fs_write` is not on the state lane. Each write is a per-path mutex plus an atomic temp-file rename (`atomic_write_locked`), so writes cannot interleave on one path.
 - `LaneQueueState.lane_position` is 1-based and counts only waiting dispatchers. It is read through `.dispatch-wait.json`. Lock order is owners, then waiters.
 - Lane yield class: git-network verbs are class 0 and every other verb is class 1. Only the relative order inside one lane matters.
+
+## agentplug-runner comment sweep
+
+Moved from crates/agentplug-runner source comments (checked against source at 15c2ad21). Each bullet is a fact code does not state.
+
+### Daemon guard (src/daemon.rs)
+- One install dir = one daemon + one daemon-guard. Two guards shred each other's claims: the orphan sweep answers `dispatch_orphaned` for the other's live work.
+- Identity: `install_dir()/daemon-guard.lock` is a bare integer pid (older builds must still refuse a second guard); `install_dir()/daemon-guard.owner.json` holds pid, exe, version, install_dir and heartbeat ts. New builds read both.
+- Lock reclaim: a dead pid is always reclaimable. A live pid is reclaimed only when the owner record is missing, names another pid, or is older than `GUARD_HEARTBEAT_STALE_MS`. Proof, not seniority: a build that never writes an owner record is superseded after the claim grace.
+- A guard never kills its daemon. It writes a stop marker that the daemon honours on its own loop, and retires after a grace if unhonoured. The marker stays in place: deleting it lets another guard restart a daemon that just retired.
+- Stand-down: no fresh daemon heartbeat for the stale bound; or, for an `AGENTPLUG_HOME` override only (never the shared default home), `active_projects` 0 for the bound.
+- Disuse is checked before freshness, since a live daemon heartbeats every poll. A surplus guard re-checks lock ownership every poll and retires if it lost it. Only the owning daemon arms its watcher.
+- A stop is honoured only after the daemon's own quiet period.
+- Handoff: a ready successor waits for an idle tick up to `TAKEOVER_FORCE_HANDOFF_AFTER_MS` (or `--force`), then forces the handoff and re-queues in-flight work. That bound must stay below `TAKEOVER_READY_MAX_AGE_MS`. A backoff defers the handoff without forgiving the starve clock. Starved drain runs in-flight work to completion; nothing is abandoned.
+- The canonical install path is defined once and shared with self-update staging names.
+
+### Downloads and retention (src/download.rs)
+- Backup retention orders by mtime over each asset family's sibling set, never by name pattern. Families are discovered from the directory. Kept: newest backups, the live asset, `.prev`, one in-flight staged copy; the newest backup survives even above the byte ceiling.
+- Never deleted: current-state siblings (version and checksum markers, `<stem>.*.json` sidecars, staged copies, `.prev`, pinned copy), the running image (unlinkable on Windows while mapped), the canonical install path.
+- Retention scans every install root and its plugin subdirectory, not only `install_dir()`.
+- Retired `wasi-fs/<instance>` trees are removed by age only (`WASI_FS_RETAIN_AGE`): each is a derived copy of the project's `.gm/gm.db`. Entries that cannot be deleted (mounted; Windows refuses) are reported, not counted. An unreadable mtime keeps the entry.
+- Shared payload cache keyed by sha256 (the release `.wasm.sha256` sidecar is the identity): one copy per hash under the real home, never `install_dir()`. Each home's `plugins/<name>.wasm` is a hard link to it, with copy as fallback. A hit is served only after its bytes re-hash. Entries unused past their bound are removed; live links keep their data.
+- No writer mutates `plugins/<name>.wasm` in place: writes and rollbacks use temp plus rename (`write_download_atomically`, `record_plugin_load_failure_and_rollback`), so a shared inode is replaced, never written through.
+- Staged names are `<exe>.new` or `<exe>.new2`; any staged suffix is stripped first, so a copy is overwritten, not chained.
+- A junction or symlink to an installed skill means the source tree is the install; its SKILL.md is never overwritten.
+- `source-head` in the release body names the commit recorded in `plugins/<name>.build.json`. A failure there never fails an install.
+- A version file with a UTF-8 BOM is stripped before any semver compare.
+
+### Claim dispatch (src/daemon/claim_dispatch.rs)
+- A caller's `timeout_seconds` is a poll budget, not cancellation. A starved dispatch never ran, so `re_dispatch_safe` holds at any budget.
+- Lane wait: `_agentplug_lane_wait_ms` (`LANE_WAIT_MS_BODY_KEY`, written by gm-mcp) or `lane_wait_ms` (public spelling) is removed byte-exactly before the body is hashed or reaches a plugin. Floor `LANE_WAIT_FLOOR_MS`. The default is short; the ceiling is separate, so a named budget buys the ceiling. The git lane always waits its full maximum.
+- Lane holds are released only when: the holder is gone; stuck before `Running` past `LANE_HOLD_STUCK_MIN_MS`; running past `LANE_HOLD_RUNNING_MAX_MS_DEFAULT` with waiters queued; or it reached `Running` but has no registered worker past the stuck bound. A live running holder with no waiters keeps the lane. A displaced holder answers starved after `still_owns()` fails, so it never reaches the worktree. A worker-gone release is marked abandoned and its `Running` stage dropped, so the orphan sweep answers the claim.
+- Lanes are FIFO per (verb, body) identity: a re-dispatch under a new task id keeps its queue position.
+- Checkout-bound claims (commit) yield ahead of network-bound ones (push) until the push passes its yield budget. One writer per worktree always holds.
+- Claim heartbeat: `ClaimHeartbeat` renews the `claim-live` marker every `CLAIM_HEARTBEAT_MS` from thread start (lane wait included) until return. A marker older than `CLAIM_HEARTBEAT_STALE_MS` means the owner is gone. The marker is removed with its claim and joined, never detached.
+- A dispatch-wait ledger row keeps a claim alive only until `ORPHAN_CLAIM_MAX_AGE_MS`, unless the owner keeps beating its marker. `LEDGER_UNOWNED_STATES` name no owner and never protect a claim. A foreign daemon's live row does.
+- Host-built receipts get a dispatch id of shape `<ts>-<seq>-<hash>`, hashed with the plugin ledger's algorithm; ledger write is best-effort. Bodies above 1 MiB are not re-parsed.
+- Store lock `<db>.lock` is abandoned when it has no `.owner` record, a dead owner pid, or a heartbeat older than `STORE_LOCK_STALE_MS`. Only the owner removes a live lock. Unserialized codeinsight writers claim the owner record but never settle the lock.
+- The dispatch ledger holds `DISPATCH_LEDGER_MAX_ENTRIES` rows and is rewritten only on change.
+- Out-files are kept `SPOOL_OUT_WITNESS_HORIZON_MS` after write; above `SPOOL_OUT_HARD_MAX_FILES` the oldest are trimmed.
+- A `wait`/`sleep` whose duration has elapsed settles as completed, or timed_out if it asked for longer than served.
+- The admission band that refuses a dispatch is listed as `admission_hold_max_ms` in the status, not only the lane holds.
+
+### Selfcheck (src/main.rs)
+- Selfchecks are live witnesses against the real guard: lane FIFO and yield, budget, hold release, abandoned lanes, the `catch_unwind` panic path, pool size 4 (the git band is zero at fewer slots). Per-call env overrides (hold and ceiling bounds, yield budget) exist only so the selfcheck does not wait minutes; no shipped path sets them.

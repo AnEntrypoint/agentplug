@@ -17,66 +17,21 @@ pub(crate) fn in_flight_map() -> &'static Mutex<HashMap<InFlightKey, InFlightHan
 
 pub(super) const MAX_CLAIMED_DISPATCHES_PER_PROJECT: usize = 32;
 
-/// The lane-wait budget for every lane except codesearch and git, and the floor every other
-/// budget is read against.
-///
-/// A caller's `timeout_seconds` is a poll budget, not a cancellation: a dispatch that outlives it
-/// keeps waiting and the caller resumes it with `resume_task`. It tops out at 240s, so the lane may
-/// never answer inside one poll -- a caller that asked for the maximum budget used to be starved at
-/// 120s with `waited_ms: 120005` and no way to raise it. The lane budget now spans that whole
-/// documented budget, so a caller polling at the maximum and resuming once reaches the same wait it
-/// asked for instead of losing the race on a timer it could not see. Nothing runs while a dispatch
-/// waits, so a longer budget costs no correctness: `executed: false` and `re_dispatch_safe: true`
-/// hold at any budget.
 pub(super) const LANE_WAIT_MAX_MS_DEFAULT: u64 = 240_000;
 pub(super) const GIT_LANE_WAIT_MAX_MS_DEFAULT: u64 = 600_000;
 pub(super) const CODESEARCH_LANE_WAIT_MS_DEFAULT: u64 = 5_000;
 pub(super) const DISPATCH_WAIT_LEDGER_FILE: &str = ".dispatch-wait.json";
 pub(super) const LEDGER_REFRESH_MIN_INTERVAL_MS: u64 = 250;
 
-/// A lane hold past this long is a stalled holder, not a slow operation, and the watchdog reports
-/// it. The bound is a report threshold only: a live holder is never released, because one writer
-/// per lane is what keeps concurrent git writers on one worktree serialized.
 pub(super) const LANE_HOLD_REPORT_MIN_MS: u64 = 120_000;
-/// The watchdog names a long hold at most this often, so one stalled `git_finalize` produces a
-/// readable line per minute instead of one per ledger refresh.
 pub(super) const LANE_HOLD_REPORT_INTERVAL_MS: u64 = 60_000;
 
-/// A hold past this long is no longer a slow operation: the holder is either gone, has never
-/// reached `Running`, or reached `Running` and then stopped being a live worker, and the lane is
-/// released with a named reason. A hold by a dispatch that IS running and still registered is never
-/// released here -- the lane is what keeps two git writers out of one worktree, and a live holder is
-/// exactly the writer it protects; that hold has its own absolute ceiling in
-/// `LANE_HOLD_RUNNING_MAX_MS_DEFAULT`. The env override exists only so the selfcheck can witness the
-/// release without a three-minute wait. No shipped path sets it.
 pub(super) const LANE_HOLD_STUCK_MIN_MS_DEFAULT: u64 = 180_000;
 
-/// A hold by a dispatch that IS running is released past this long, when at least one claim is
-/// waiting on the lane.
-///
-/// The exemption above it is unbounded, so one dispatch that never finishes -- a `git push` blocked
-/// on a remote, measured at 724236ms on one project -- converts a serialization point into a
-/// project-wide stall: every state-changing git verb behind it answers starved, is told
-/// `re_dispatch_safe: true`, and re-queues behind the same hold, so the retry advice does not
-/// converge. Ten minutes is past any real git operation on any box this runs on, so a hold that
-/// long is a hung holder and not slow work; the lane is worth more than the tail of a dispatch that
-/// is already broken. Releasing it is chosen over leaving it because the alternative has no bound:
-/// the stall lasts as long as the holder does, and the holder has shown it can last arbitrarily
-/// long. The `waiters` gate keeps the release from ever firing when nobody is blocked, so the
-/// single-writer property is only spent to unblock somebody.
 pub(super) const LANE_HOLD_RUNNING_MAX_MS_DEFAULT: u64 = 600_000;
 
-/// The reserved body member the caller's own poll budget arrives in. gm-mcp writes it so the lane
-/// wait spans the budget the caller actually asked for -- a caller polling at the documented maximum
-/// used to be starved at 120s by a budget it had no way to raise -- and the runner strips it before
-/// the body is hashed for its FIFO identity and before it reaches any plugin, so the channel can
-/// never change what a request is or what a plugin sees.
 pub(super) const LANE_WAIT_MS_BODY_KEY: &str = "_agentplug_lane_wait_ms";
-/// The public spelling of the same channel, so a caller writing its own spool body buys the wait
-/// without owning the reserved name. The reserved member wins when both appear.
 pub(super) const LANE_WAIT_MS_PUBLIC_BODY_KEY: &str = "lane_wait_ms";
-/// A caller's budget is honoured down to this floor, so a sub-second poll cannot turn every lane
-/// wait into an instant starvation.
 pub(super) const LANE_WAIT_FLOOR_MS: u64 = 1_000;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -308,8 +263,6 @@ pub fn live_foreign_spool_sweeper(spool_dir: &Path) -> Option<u64> {
     let status = fs::read_to_string(spool_dir.join(".status.json")).ok()?;
     let value = serde_json::from_str::<serde_json::Value>(&status).ok()?;
     let pid = value.get("pid").and_then(|p| p.as_u64())?;
-    // A standalone watcher never sweeps (main.rs reads only `.txt` requests), so its heartbeat
-    // must not suppress this daemon's sweep.
     if !value
         .get("shared_process")
         .and_then(|s| s.as_bool())
@@ -464,19 +417,9 @@ pub(super) fn spill_large_exec_output_to_text_sibling(
     outer.to_string()
 }
 
-/// Entries kept in `.dispatch-ledger.json` -- the same cap the plugin-side ledger uses, so a
-/// host-minted id ages out of the window on the same schedule as a plugin-minted one.
 const DISPATCH_LEDGER_MAX_ENTRIES: usize = 500;
-/// Above this the receipt is not re-parsed to stamp an id: a megabyte-plus body is already spilling
-/// to a sibling file, and the id is a citation aid, never a reason to reserialize that much text.
 const DISPATCH_ID_STAMP_MAX_BODY_BYTES: usize = 1_048_576;
 
-/// Only the plugin mints a dispatch id (`dispatch_ledger::record`, reached from the guest reply), so
-/// every receipt the host builds because the plugin never answered -- an epoch deadline interrupt, a
-/// panic, an empty result, an admission or lane starvation answer, an orphaned claim -- carried no
-/// dispatch_id and left a failed dispatch uncitable, which breaks the (id, hash, ts) audit primitive.
-/// The stamping lives in the out-file writer rather than in each failing verb, so every written
-/// receipt gets one id of the same shape a successful receipt carries: `<ts>-<seq>-<hash>`.
 pub fn stamp_dispatch_id(out_dir: &Path, verb: &str, task: &str, out_body: &str) -> String {
     if out_body.len() > DISPATCH_ID_STAMP_MAX_BODY_BYTES {
         return out_body.to_string();
@@ -504,13 +447,6 @@ pub fn stamp_dispatch_id(out_dir: &Path, verb: &str, task: &str, out_body: &str)
     serde_json::to_string(&value).unwrap_or_else(|_| out_body.to_string())
 }
 
-/// Mints an id with the plugin ledger's own algorithm -- DefaultHasher (fixed keys, so the value is
-/// reproducible) over verb, fingerprint and ts -- and appends it to that same ledger file, so an
-/// ok:false dispatch resolves through `lookup()` like any other. The spool task stands in for the
-/// request fingerprint: at the writer the request body is gone, and the task is what identifies the
-/// request. The ledger write is best-effort for the same reason the out-file write is confirmed by a
-/// rename: the plugin writes this file too, and a lost ledger row costs a resolvable id, never the
-/// id itself, which the receipt carries either way.
 fn mint_host_dispatch_id(
     out_dir: &Path,
     verb: &str,
@@ -609,11 +545,6 @@ enum StoreLockState {
     },
 }
 
-/// How stale a store lock's owner heartbeat must be before the lock is treated as abandoned. It is
-/// far longer than any real write because it is not a timeout on the write: the owner record is
-/// re-stamped every STORE_OWNER_HEARTBEAT_MS while a dispatch holds the lock, so a live writer never
-/// ages past this. It exists only to escape a pid that was recycled by an unrelated process, which
-/// is the one case where "owner pid is alive" is true and the owner is still gone.
 const STORE_LOCK_STALE_MS: u64 = 900_000;
 
 const STORE_OWNER_HEARTBEAT_MS: u64 = 15_000;
@@ -650,13 +581,6 @@ fn reclaim_store_lock(lock_dir: &Path, owner_file: &Path, reason: &str) -> Store
     StoreLockState::Reclaimed
 }
 
-/// A `<db>.lock` directory is libsql's mutual-exclusion marker: the writer removes it when it
-/// finishes, so a process killed mid-write leaves it forever and every later write fails with no
-/// holder to wait on. The check is therefore not "is the directory there" but "is its owner still
-/// here": every dispatch that writes gm.db claims `<db>.lock.owner` (see StoreOwnerRecord), so a lock
-/// with no record was never claimed by a live writer, a record naming a dead pid is provably
-/// abandoned, and a live pid whose heartbeat stopped is abandoned too. A lock whose recorded owner is
-/// alive and heartbeating is never touched -- only its owner may remove it.
 fn settle_store_lock(root: &Path) -> StoreLockState {
     let gm_dir = root.join(".gm");
     let lock_dir = gm_dir.join("gm.db.lock");
@@ -719,15 +643,6 @@ fn store_owner_holds() -> &'static Mutex<HashMap<PathBuf, StoreOwnerHolds>> {
     HOLDS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Ownership of .gm/gm.db.lock for the lifetime of one dispatch. Refcounted because the
-/// unserialized codeinsight family runs several store writes at once: the first claim writes the
-/// record and the last release removes it, so a concurrent sibling never sees a lock with no owner.
-/// The heartbeat re-stamps the timestamp so a long index pass is never judged stale.
-///
-/// The hold is bounded by the claiming dispatch's admission budget: each claim extends
-/// `hold_until_ms` to its own deadline, and the heartbeat stops re-stamping once no holder is
-/// inside its deadline. The owner record then ages past STORE_LOCK_STALE_MS and settle_store_lock
-/// reclaims it, so a stuck dispatch cannot hold the store lock for good.
 struct StoreOwnerRecord {
     path: PathBuf,
 }
@@ -847,23 +762,12 @@ pub(super) fn inflight_claim_path(in_dir: &Path, verb: &str, task: &str) -> Path
         })
 }
 
-/// A claim's liveness marker, and the cadence the dispatch that owns it renews on.
-///
-/// A claim is the request file renamed, and its mtime is what orders the lane queue, so liveness
-/// cannot ride on the claim itself: re-stamping it would send a long wait to the back of its own
-/// lane. The marker sits beside the claim instead, so a sweep in ANY process can tell a 120s
-/// `wait` from the corpse of a daemon that died holding one -- both used to read as one claim
-/// nobody had touched for a minute, which is why a bounded wait was reaped inside its own budget.
 pub(super) const CLAIM_HEARTBEAT_DIR: &str = "claim-live";
 
 pub(super) const CLAIM_HEARTBEAT_EXT: &str = "live";
 
-/// How often the owner re-stamps its marker. Well inside MIN_ORPHAN_CLAIM_AGE_MS, so a claim whose
-/// owner is running can never drift into the orphan window between two beats.
 pub(super) const CLAIM_HEARTBEAT_MS: u64 = 15_000;
 
-/// A marker older than this has missed three beats, so its owner is gone or wedged and the claim is
-/// judged on its own age, exactly as it was before claims had markers at all.
 pub(super) const CLAIM_HEARTBEAT_STALE_MS: u64 = 45_000;
 
 fn claim_heartbeat_stale_ms() -> u64 {
@@ -886,8 +790,6 @@ pub(super) fn claim_heartbeat_path(spool_dir: &Path, verb: &str, task: &str) -> 
         .join(format!("{task}.{CLAIM_HEARTBEAT_EXT}"))
 }
 
-/// One beat: the owning pid and the stamp, the same two-line record the store-owner heartbeat
-/// writes.
 fn write_claim_heartbeat(marker: &Path) {
     if let Some(parent) = marker.parent() {
         let _ = fs::create_dir_all(parent);
@@ -897,8 +799,6 @@ fn write_claim_heartbeat(marker: &Path) {
     }
 }
 
-/// The pid that last renewed this claim and how long ago, or None when it carries no marker. No
-/// marker means no live dispatch ever renewed it, which is the orphan case this replaced.
 pub(super) fn claim_heartbeat(spool_dir: &Path, verb: &str, task: &str) -> Option<(u64, u64)> {
     let raw = fs::read_to_string(claim_heartbeat_path(spool_dir, verb, task)).ok()?;
     let mut lines = raw.lines();
@@ -907,19 +807,11 @@ pub(super) fn claim_heartbeat(spool_dir: &Path, verb: &str, task: &str) -> Optio
     Some((pid, now_ms().saturating_sub(stamp)))
 }
 
-/// Deletes a claim together with its marker: a marker left behind keeps naming a live owner for a
-/// task id the spool reuses, and only its going stale would ever stop that.
 fn remove_claim_file(spool_dir: &Path, verb: &str, task: &str, claim_path: &Path) {
     let _ = fs::remove_file(claim_heartbeat_path(spool_dir, verb, task));
     let _ = fs::remove_file(claim_path);
 }
 
-/// Renews a claim's marker for as long as one dispatch runs.
-///
-/// Held from the moment a dispatch thread starts -- which is while it waits for its lane, not only
-/// while it executes -- until that thread returns, so the whole life of the dispatch is covered.
-/// Dropping it stops the beats and takes the marker with it, so a finished dispatch leaves nothing
-/// behind that could protect an unrelated claim later.
 pub(crate) struct ClaimHeartbeat {
     stop: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
@@ -952,8 +844,6 @@ impl ClaimHeartbeat {
                         continue;
                     }
                     since = std::time::Duration::ZERO;
-                    // The claim IS the dispatch: once it is gone the dispatch has answered, so stop
-                    // beating instead of renewing a claim nobody holds any more.
                     if !beat_claim.exists() {
                         break;
                     }
@@ -974,8 +864,6 @@ impl Drop for ClaimHeartbeat {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
         if let Some(thread) = self.thread.take() {
-            // Joined, not detached: a detached beat could re-create the marker this drop removes,
-            // which would leave a finished dispatch still claiming a live owner.
             let _ = thread.join();
         }
         let _ = fs::remove_file(&self.marker);
@@ -1011,8 +899,6 @@ pub(super) fn requeue_claim(in_dir: &Path, verb: &str, task: &str) -> bool {
         .parent()
         .map(|parent| parent.to_path_buf())
         .unwrap_or_else(|| in_dir.to_path_buf());
-    // This claim is being handed to another daemon, so the beats stop here: the successor's own
-    // marker is the only liveness evidence for the work from now on.
     let _ = fs::remove_file(claim_heartbeat_path(&spool_dir, verb, task));
     if any_queued_request_exists(in_dir, verb, task) {
         let _ = fs::remove_file(&claim);
@@ -1114,13 +1000,6 @@ pub(super) fn read_handoff_inherited_claims() -> HashSet<AbandonedClaim> {
         .unwrap_or_default()
 }
 
-/// True when the dispatch holding a lane is still a live caller in some daemon.
-///
-/// This is the same question the orphan sweep asks of a claim file, asked of a lane holder: is the
-/// dispatch still in this daemon's in-flight map, and if not, does some daemon with a live pid
-/// still carry a fresh ledger row for it. A holder the daemon cannot name -- empty verb or empty
-/// task -- is treated as live, because an unidentified holder must never be reaped: reaping a
-/// running dispatch would let a second mutating git run in the same repo.
 fn lane_holder_is_live(root: &Path, _lane: &'static str, verb: &str, task: &str) -> bool {
     if verb.is_empty() || task.is_empty() {
         return true;
@@ -1136,12 +1015,6 @@ fn lane_holder_is_live(root: &Path, _lane: &'static str, verb: &str, task: &str)
     live_dispatch_wait_owner(&spool_dir, verb, task).is_some()
 }
 
-/// True while a worker is registered for this dispatch, which is the runner's own liveness ledger.
-///
-/// The in-flight entry is inserted before the dispatch thread spawns and removed only when that
-/// thread's scope ends, so it is present for exactly as long as a worker exists for the task. The
-/// stage map is not: a worker that dies after noting `Running` leaves the stage behind, and the
-/// stage alone then claims the lane is protecting a write that no longer exists.
 fn lane_holder_worker_registered(key: &InFlightKey) -> bool {
     in_flight_map()
         .lock()
@@ -1149,30 +1022,6 @@ fn lane_holder_worker_registered(key: &InFlightKey) -> bool {
         .contains_key(key)
 }
 
-/// Why this lane holder must give the lane up, or `None` while it must keep it.
-///
-/// Four holds are pathological, and all are named so the ledger says which one fired:
-///
-/// - `holder_dispatch_gone`: nothing live owns the dispatch any more. It cannot be running, so the
-///   hold is a tombstone and the lane is free.
-/// - `holder_stuck_before_running`: the dispatch is live but its stage is not `Running`, and has not
-///   been for `LANE_HOLD_STUCK_MIN_MS`. It holds the lane while it waits for its tool-queue turn, so
-///   it has not touched the worktree; the lane is taken from it and the displaced-holder check stops
-///   it from running on a lane it no longer owns.
-/// - `holder_worker_not_alive`: the holder reached `Running`, but no worker is registered for it any
-///   more and has not been for `LANE_HOLD_STUCK_MIN_MS`. The stage map is bookkeeping the worker
-///   itself never clears when it dies, so a stage alone cannot say whether the lane still protects a
-///   write: the in-flight registration is what the runner drops when the worker's thread ends, and
-///   without it there is no writer left to protect.
-/// - `holder_running_past_max`: the holder IS executing, and has been for
-///   `LANE_HOLD_RUNNING_MAX_MS`, with claims waiting behind it. Execution that long is a hung
-///   holder, not slow work, and an unbounded hold stalls the project's whole lane; see the constant.
-///
-/// - `holder_read_only_past_stuck_min`: a read-only state verb is executing past
-///   `LANE_HOLD_STUCK_MIN_MS` with claims queued behind it. It writes nothing, so nothing is protected.
-///
-/// A holder this daemon cannot see the stage of -- owned by another daemon -- is never released,
-/// because there is no way to know whether it is mid-write.
 pub(crate) fn lane_holder_stuck_reason(
     root: &Path,
     lane: &'static str,
@@ -1188,10 +1037,6 @@ pub(crate) fn lane_holder_stuck_reason(
         .unwrap_or_else(|e| e.into_inner())
         .get(&key)
         .map(|record| (record.stage, record.stage_since_ms));
-    // A staged holder is one this daemon is running, so the stage is authoritative: `Running` means
-    // it is executing, and only an execution past the absolute ceiling takes the lane from it; any
-    // other stage means it holds the lane without having touched the worktree, and past the bound
-    // that hold is over.
     match record {
         Some((DispatchStage::Running, since_ms))
             if now_ms().saturating_sub(since_ms) >= lane_hold_stuck_min_ms()
@@ -1217,8 +1062,6 @@ pub(crate) fn lane_holder_stuck_reason(
             return Some("holder_stuck_before_running")
         }
         Some(_) => return None,
-        // Unstaged here: it may be mid-claim, or owned by another daemon. The only safe reason to
-        // free the lane is that no daemon anywhere still owns this dispatch.
         None => {}
     }
     if in_flight_map()
@@ -1234,7 +1077,6 @@ pub(crate) fn lane_holder_stuck_reason(
     Some("holder_dispatch_gone")
 }
 
-/// A lane hold past the stuck bound, released with its reason.
 #[derive(Debug)]
 pub(crate) struct ReleasedLaneHold {
     pub(crate) lane: &'static str,
@@ -1244,17 +1086,6 @@ pub(crate) struct ReleasedLaneHold {
     pub(crate) reason: &'static str,
 }
 
-/// Frees every lane whose holder is gone, stuck before running, running past the ceiling with
-/// claims behind it, or running with no worker left to run it.
-///
-/// This is the hold watchdog's action. A holder released as gone or stuck before running was not
-/// executing, so the lane stays single-writer: the displaced holder asks `still_owns()` before
-/// dispatching and answers starved instead of running. A holder released as running past the ceiling
-/// IS executing -- that release is the lane draining instead of stalling, and it only fires past
-/// `LANE_HOLD_RUNNING_MAX_MS` with waiters queued, so the single-writer property is spent only to
-/// unblock somebody and only on a hold no real git operation reaches. A holder released as a worker
-/// that is gone protects no write at all: nothing is executing, so the lane is free and the dispatch
-/// is marked abandoned instead of being left to hold a lane and a claim forever.
 pub(crate) fn release_stuck_lane_holders(min_held_ms: u64) -> Vec<ReleasedLaneHold> {
     let owners = agentplug_host::release_dead_lane_owners(min_held_ms, &|root, lane, verb, task| {
         lane_holder_stuck_reason(root, lane, verb, task).is_none()
@@ -1264,10 +1095,6 @@ pub(crate) fn release_stuck_lane_holders(min_held_ms: u64) -> Vec<ReleasedLaneHo
         .map(|owner| {
             let reason = lane_holder_stuck_reason(&owner.root, owner.lane, &owner.verb, &owner.task)
                 .unwrap_or("holder_dispatch_gone");
-            // A worker that is gone never answers its own dispatch, so the stage record that has the
-            // ledger still naming it `claimed_running` is dropped here: the row becomes unowned, and
-            // the orphan sweep reaps the claim and answers `dispatch_orphaned` instead of leaving
-            // one dead dispatch in flight against the project cap forever.
             if reason == "holder_worker_not_alive" {
                 forget_dispatch_wait_record(&owner.root, &owner.verb, &owner.task);
             }
@@ -1321,23 +1148,8 @@ pub(super) const DISPATCH_WAIT_LEDGER_FRESH_MS: u64 = 120_000;
 pub(super) const DURATION_SETTLE_GRACE_MS: u64 = 5_000;
 pub(super) const WAIT_MAX_SERVED_MS: u64 = 600_000;
 
-/// Ledger states that name NO owner: the writing daemon lists the file but keeps no dispatch record
-/// for it, so the row restates the claim's existence instead of proving somebody runs it. A row in
-/// one of these states is how a claim that outlived its daemon came to be protected by the very
-/// ledger that lists it -- the sweep wrote the row, the row protected the claim, and the claim kept
-/// counting against the project's in-flight cap forever (measured 2026-10-11 in C:/dev/spoint:
-/// three `claimed_not_yet_tracked` rows at ~6.9e6 ms under a live daemon pid).
 pub(super) const LEDGER_UNOWNED_STATES: [&str; 2] = ["claimed_not_yet_tracked", "never_claimed"];
 
-/// A dispatch-wait ledger row is a live daemon's own statement that `(verb, task)` is in flight
-/// for it. A sweep that owns no in-process entry for that key can still read it, so an owned
-/// claim is never reaped as an orphan by a sweeper that cannot see the owner.
-///
-/// The statement counts only when the daemon that wrote it can name a dispatch: a row THIS daemon
-/// wrote in an unowned state is this daemon saying it holds no record for the task, which is the
-/// orphan case, not the owned one. A FOREIGN daemon's row still protects the claim whatever its
-/// state -- that daemon may track the dispatch in ways this process cannot read, and the sweep
-/// already refuses to run at all while a foreign sweeper holds a live heartbeat on this spool.
 pub(super) fn live_dispatch_wait_owner(spool_dir: &Path, verb: &str, task: &str) -> Option<u64> {
     let raw = fs::read_to_string(spool_dir.join(DISPATCH_WAIT_LEDGER_FILE)).ok()?;
     let value = serde_json::from_str::<serde_json::Value>(&raw).ok()?;
@@ -1391,9 +1203,6 @@ pub(super) fn requested_duration_ms(claim_path: &Path) -> Option<u64> {
         .and_then(|entry| entry.as_u64().or_else(|| entry.as_f64().map(|f| f as u64)))
 }
 
-/// A `wait`/`sleep` claim whose requested duration has already elapsed has performed the wait it
-/// asked for: settle it as completed, or as timed_out when it asked for longer than the verb
-/// serves, so the caller gets a real ticket instead of an unverified orphan.
 pub(super) fn settled_duration_outcome(
     claim_path: &Path,
     verb: &str,
@@ -1451,11 +1260,6 @@ pub fn sweep_orphaned_claims_across_roots(roots: &[PathBuf]) {
 
 pub(super) const MIN_ORPHAN_CLAIM_AGE_MS: u64 = 60_000;
 
-/// An absolute ceiling on how long a dispatch-wait ledger row may keep a claim alive. The row is
-/// written by whichever daemon refreshed the ledger last, so it can name a daemon that never owned
-/// the claim; past this age the row is no better evidence than the claim file itself, and the sweep
-/// must be allowed to answer the caller. A claim whose owner beats its own marker is not held to
-/// this: that marker is the owner's own statement, refreshed for as long as it runs.
 pub(super) const ORPHAN_CLAIM_MAX_AGE_MS: u64 = 120_000;
 
 pub(super) fn claim_age_ms(path: &Path) -> Option<u64> {
@@ -1708,12 +1512,7 @@ pub(super) const SPOOL_OUT_MIN_AGE_MS: u64 = 10 * 60 * 1000;
 pub(super) const SPOOL_OUT_DEFAULT_MAX_FILES: usize = 3000;
 pub(super) const SPOOL_OUT_DEFAULT_MAX_AGE_MS: u64 = 24 * 60 * 60 * 1000;
 pub(super) const SPOOL_OUT_MAX_REAP_PER_PASS: usize = 1500;
-/// An answered out-file is kept at least this long after it was written, whatever the file count: a
-/// witness is cited against its dispatch id within two hours, and once the 500-entry dispatch ledger
-/// has aged that id out, the out-file is the only copy of the answer.
 pub(super) const SPOOL_OUT_WITNESS_HORIZON_MS: u64 = 2 * 60 * 60 * 1000;
-/// Disk safety valve for a request flood: above this many out-files the oldest are trimmed even
-/// inside the witness horizon.
 pub(super) const SPOOL_OUT_HARD_MAX_FILES: usize = 20_000;
 
 pub(super) fn spool_out_env_usize(name: &str, default: usize) -> usize {
@@ -2079,8 +1878,6 @@ pub(crate) fn lane_wait_max(verb: &str, caller_budget_ms: Option<u64>) -> Durati
     Duration::from_millis(bounded)
 }
 
-/// The wait a caller that stated no budget gets: short for a verb whose whole point is a fast
-/// answer, the lane ceiling everywhere else.
 pub(crate) fn lane_wait_default_ms(verb: &str) -> u64 {
     if verb == "codesearch" {
         return env_ms_or(
@@ -2091,11 +1888,6 @@ pub(crate) fn lane_wait_default_ms(verb: &str) -> u64 {
     lane_wait_ceiling_ms(verb)
 }
 
-/// The longest wait a caller may buy on this lane, before the caller's own budget clamps it.
-///
-/// A default that doubled as the ceiling is what answered a `timeout_seconds: 240` caller at 5008ms:
-/// a caller that named a budget was clipped to the short default instead of buying the ceiling. The
-/// two are separate numbers now, so the prompt default is kept and the ceiling stays buyable.
 pub(crate) fn lane_wait_ceiling_ms(verb: &str) -> u64 {
     if dispatch_serial_lane(verb, "") == Some("git") {
         return git_lane_wait_max().as_millis() as u64;
@@ -2103,14 +1895,6 @@ pub(crate) fn lane_wait_ceiling_ms(verb: &str) -> u64 {
     env_ms_or("AGENTPLUG_LANE_WAIT_MAX_MS", LANE_WAIT_MAX_MS_DEFAULT)
 }
 
-/// Splits the caller's lane-wait budget out of a dispatch body.
-///
-/// Returns the body with the member removed -- that is the body the plugin sees and the one hashed
-/// for the claim's FIFO identity, so the channel is invisible to both -- plus the budget it carried.
-/// The reserved member gm-mcp writes from `timeout_seconds` wins; `lane_wait_ms` is the public
-/// spelling for a caller writing its own body. A body that is not a JSON object, or that carries the
-/// name without a plain integer value, is returned untouched with no budget: an unparseable channel
-/// is ignored rather than acted on.
 pub(crate) fn split_caller_lane_wait_ms(body: &str) -> (String, Option<u64>) {
     let (stripped, reserved) = strip_lane_wait_member(body, LANE_WAIT_MS_BODY_KEY);
     if reserved.is_some() {
@@ -2148,8 +1932,6 @@ fn strip_lane_wait_member(body: &str, member: &str) -> (String, Option<u64>) {
     }
     let budget = body[digits_at..at].parse::<u64>().ok();
     let value_end = at;
-    // Drop the member and one separating comma, whichever side it sits on, so every other byte of
-    // the body is preserved exactly.
     let mut after = value_end;
     while after < bytes.len() && is_space(bytes[after]) {
         after += 1;
@@ -2176,14 +1958,6 @@ fn strip_lane_wait_member(body: &str, member: &str) -> (String, Option<u64>) {
     )
 }
 
-/// The wait budget for a dispatch that lands on the git serial lane.
-///
-/// Every lane budget exists to turn an unreachable lane into an answer the caller can act on, not
-/// to cancel work: a starved dispatch never ran, so `re_dispatch_safe` holds no matter how long
-/// the budget is. Git is the slowest lane by a wide margin -- `git add`/`git commit` over a
-/// multi-thousand-path index takes minutes on this box -- and every starved caller re-dispatches
-/// immediately, so a short budget does not shorten anybody's wait, it only multiplies the number
-/// of waiters competing for the same lane. One long wait beats a dozen short ones.
 pub(super) fn git_lane_wait_max() -> Duration {
     Duration::from_millis(env_ms_or(
         "AGENTPLUG_GIT_LANE_WAIT_MAX_MS",
@@ -2191,9 +1965,6 @@ pub(super) fn git_lane_wait_max() -> Duration {
     ))
 }
 
-
-/// `granted_ms` is the budget this dispatch was actually given, so the answer names the wait it
-/// lost to and the ceiling it could have bought instead of leaving the caller to guess one.
 pub(super) fn lane_starved_answer(
     root: &Path,
     verb: &str,
@@ -2262,13 +2033,6 @@ pub(super) fn lane_starved_answer(
     .to_string()
 }
 
-/// The answer for a dispatch the hold watchdog displaced from a lane it had already won.
-///
-/// It holds the lane and has not run, so the reply is the same shape as a starvation: nothing
-/// executed, re-dispatching is safe, and the claim keeps its place at the head of the queue. The
-/// extra fields name the release, because this is the one starvation the caller did not cause by
-/// running out of budget -- the lane was taken from a holder that was stuck, and the caller's
-/// re-dispatch is the continuation of the same request, not a new one.
 pub(super) fn lane_displaced_answer(root: &Path, verb: &str, task: &str, lane: Option<&'static str>) -> String {
     let spool_dir = spool_dir_of_root(root);
     let (request_path, claim_path, out_path) = unanswered_spool_paths(&spool_dir, verb, task);
@@ -2366,21 +2130,11 @@ pub(crate) fn run_gm_dispatch_to_file(
     } else {
         inner_verb_owned.as_str()
     };
-    // The caller's own poll budget rides in the body as one reserved member (gm-mcp writes it from
-    // `timeout_seconds`). Take it out here, before anything hashes or runs the body: the plugin below
-    // must see exactly the body the caller wrote, and the lane's FIFO identity is hashed from that
-    // body, so a member that appeared in one dispatch and not in its re-dispatch would fork one
-    // waiting request into two queue places. The budget itself is what bounds the lane wait -- the
-    // caller could not raise it before, so a caller polling for 240s starved at a hard 120s.
     let (body_owned, caller_lane_wait_ms) = split_caller_lane_wait_ms(body);
     let body = body_owned.as_str();
     let lane = dispatch_serial_lane(tool_verb, body);
     let lane_wait_budget = lane_wait_max(tool_verb, caller_lane_wait_ms);
     let in_dir = root.join(".gm").join("exec-spool").join("in");
-    // Renew this dispatch's claim for as long as it runs: a wait {"ms":120000} was answered
-    // dispatch_orphaned at 64s because an untouched claim reads exactly like an abandoned one, so a
-    // bounded wait could be reaped inside its own budget by a sweep that could not see the owner.
-    // The guard covers the lane wait too, not only the execution.
     let _claim_heartbeat = ClaimHeartbeat::start(&in_dir, verb, task);
     note_dispatch_stage(root, verb, task, DispatchStage::WaitingForLane, lane);
     let _fairness_guard = match GmFairnessGuard::acquire_within(
@@ -2432,12 +2186,6 @@ pub(crate) fn run_gm_dispatch_to_file(
             return;
         }
     };
-    // A hold is bounded, so the watchdog may have taken this lane while we waited for the tool
-    // queue: it releases a holder that is stuck *before* running, and such a holder is not executing.
-    // Ask before dispatching rather than after -- a guard that no longer owns the lane must never
-    // reach the worktree, or two mutating git dispatches would share one repo. The claim is parked
-    // back at the head of its queue, so the caller's re-dispatch keeps the place it earned instead of
-    // rejoining behind every newer arrival.
     if !_fairness_guard.still_owns() {
         eprintln!(
             "[agentplug daemon] {verb}/{task} for {} won the {:?} lane but lost it to the hold watchdog before running -- answered dispatch_starved_waiting_for_serial_lane and parked the claim at the head of the queue; the verb did not run",
@@ -2450,9 +2198,6 @@ pub(crate) fn run_gm_dispatch_to_file(
         refresh_dispatch_wait_ledger(root);
         return;
     }
-    // The store owner is claimed only once the dispatch has won its queue place, so a dispatch
-    // still waiting never holds it. Its hold is bounded by its own admission budget (see
-    // StoreOwnerRecord::claim).
     let _store_owner = if lane == Some("store") {
         match settle_store_lock(root) {
             StoreLockState::Held { lock_dir, owner_pid, detail } => {
@@ -2478,10 +2223,6 @@ pub(crate) fn run_gm_dispatch_to_file(
             StoreLockState::Clear | StoreLockState::Reclaimed => Some(StoreOwnerRecord::claim(root, lane_wait_budget)),
         }
     } else if agentplug_host::dispatch_claims_store_owner(tool_verb) {
-        // Unserialized store writers (the codeinsight family) never reach settle_store_lock, so they
-        // must not settle -- a held lock there is answered by the guest from its persisted index, not
-        // refused -- but they do own the lock while they write, and claiming it is what lets the next
-        // settle tell a live writer from a directory an unclean exit left behind.
         Some(StoreOwnerRecord::claim(root, lane_wait_budget))
     } else {
         None
@@ -2531,10 +2272,6 @@ pub(crate) fn run_gm_dispatch_to_file(
     } else {
         eprintln!("[agentplug daemon] out-file write for {verb}/{task} did not confirm for {} -- leaving the claim for the orphan sweep instead of deleting an unanswered request", root.display());
     }
-    // The result is written, so this dispatch is finished: no admission slot may stay
-    // booked under this thread. Under unwinding the guards already released and this is
-    // a no-op; a slot whose guard never ran is reclaimed here instead of starving the
-    // next dispatch.
     let reclaimed = agentplug_host::release_admission_for_current_thread();
     if reclaimed > 0 {
         eprintln!(
@@ -2616,8 +2353,6 @@ pub(super) fn code_index_state(spool_dir: &Path) -> CodeIndexState {
     }
 }
 
-/// True at most once per `LANE_HOLD_REPORT_INTERVAL_MS`, so a stalled holder is named on a readable
-/// cadence instead of on every ledger refresh.
 fn lane_hold_watchdog_due(now: u64) -> bool {
     static LAST_REPORT_MS: OnceLock<Mutex<u64>> = OnceLock::new();
     let mut last = LAST_REPORT_MS
@@ -2631,7 +2366,6 @@ fn lane_hold_watchdog_due(now: u64) -> bool {
     true
 }
 
-/// Bounded well inside `DISPATCH_WAIT_LEDGER_STALE_MS` so a quiet ledger still answers with a fresh `ts`.
 const DISPATCH_WAIT_LEDGER_REFRESH: Duration = Duration::from_secs(15);
 
 fn without_wait_volatile_fields(value: &serde_json::Value) -> serde_json::Value {
@@ -2667,8 +2401,6 @@ fn without_wait_volatile_fields(value: &serde_json::Value) -> serde_json::Value 
     copy
 }
 
-/// A ledger whose rows have not changed is left on disk: only the daemon pid, a real change, or the
-/// liveness refresh forces another tmp-then-rename across every watched root.
 fn dispatch_wait_ledger_write_needed(ledger_path: &Path, payload: &str) -> bool {
     let Ok(existing) = fs::read_to_string(ledger_path) else {
         return true;
@@ -2809,13 +2541,6 @@ pub(super) fn refresh_dispatch_wait_ledger(root: &Path) {
         return;
     }
     let lane_holds = agentplug_host::registry::lane_holds(root);
-    // A hold past the bound is now bounded, not merely reported: the watchdog frees the lane when the
-    // holder is gone, or is live but has sat at a pre-Running stage past the stuck bound -- neither is
-    // executing, so the displaced holder asks `still_owns()` before dispatching and answers starved
-    // instead of running on a lane it no longer owns -- and, past the running ceiling with waiters
-    // queued, it frees the lane even from a holder that IS executing. That last case is the one an
-    // unbounded hold produces: a holder that never finishes stalls every later claim on the lane, and
-    // the waiters it releases are told to re-dispatch, which only queues them behind the same holder.
     let released_holds = if lane_hold_watchdog_due(now) {
         release_stuck_lane_holders(lane_hold_stuck_min_ms())
     } else {
@@ -2907,9 +2632,6 @@ pub(super) fn refresh_dispatch_wait_ledger(root: &Path) {
             })
             .collect::<Vec<serde_json::Value>>(),
         "lane_holds": lane_hold_rows,
-        // The band that actually refuses a dispatch is not a lane, and a caller reading only
-        // `lane_holds` sees an empty list while every verb in every project waits: the hold that
-        // blocks the daemon lives here, and it is listed here now, with the bound that ends it.
         "admission_hold_max_ms": agentplug_host::registry::admission_hold_max_ms(),
         "admission_holds": agentplug_host::registry::admission_holds()
             .iter()
@@ -3958,4 +3680,4 @@ pub fn try_dispatch_via_daemon(
         std::thread::sleep(Duration::from_millis(PLUGIN_DISPATCH_POLL_MS));
     }
 }
-
+
