@@ -1,7 +1,6 @@
 use std::collections::VecDeque;
 use std::sync::{Condvar, Mutex, MutexGuard};
 
-pub const EXEC_WORKERS: usize = 4;
 pub const BACKGROUND_AFTER_MS: u64 = 15_000;
 
 struct Gate {
@@ -28,7 +27,7 @@ pub fn acquire() -> WorkerLease {
     let ticket = state.next_ticket;
     state.next_ticket += 1;
     state.queue.push_back(ticket);
-    while !(state.running < EXEC_WORKERS && state.queue.front() == Some(&ticket)) {
+    while !(state.running < crate::registry::gm_pool_size() && state.queue.front() == Some(&ticket)) {
         state = RELEASED
             .wait(state)
             .unwrap_or_else(|error| error.into_inner());
