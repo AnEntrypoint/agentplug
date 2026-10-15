@@ -1234,7 +1234,7 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
          q_len: u32|
          -> u64 {
             let ns = read_guest_string(&mut caller, ns_ptr, ns_len);
-            let q = read_guest_string(&mut caller, q_ptr, q_len).to_lowercase();
+            let query = read_guest_string(&mut caller, q_ptr, q_len).to_lowercase();
             if ns.is_empty() {
                 return 0;
             }
@@ -1247,7 +1247,7 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
                         continue;
                     }
                     if let Ok(content) = fs::read_to_string(&path) {
-                        if q.is_empty() || content.to_lowercase().contains(&q) {
+                        if query.is_empty() || content.to_lowercase().contains(&query) {
                             let key = path
                                 .file_stem()
                                 .and_then(|s| s.to_str())
