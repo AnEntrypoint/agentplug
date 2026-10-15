@@ -4041,27 +4041,27 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .is_empty();
-        const SELF_UPDATE_HARD_CAP_MS: u64 = SELF_UPDATE_MAX_STARVED_MS + 60_000;
-        let self_update_hard_capped = pending_self_update_staged_at
-            .map(|staged_at| staged_at.elapsed() >= Duration::from_millis(SELF_UPDATE_HARD_CAP_MS))
-            .unwrap_or(false);
-        let force_handoff_despite_in_flight =
-            self_update_starved && detached_still_running && self_update_hard_capped;
-        let force_handoff_never_idle =
-            self_update_starved && self_update_hard_capped && !detached_still_running && any_work;
-        // The backoff defers the handoff, it does not forgive the starve: clearing the staged-at
-        // clock here disarmed SELF_UPDATE_HARD_CAP_MS for the life of the daemon, because the
-        // clock is re-armed only while pending_self_update is None. The gate below withholds the
-        // attempt, so the clock survives the backoff and the first tick past it forces the handoff.
+        // The backoff defers the handoff, it does not forgive the starve: the staged-at clock
+        // survives the backoff, so the first tick past it hands off without re-arming.
         let self_update_backed_off = pending_self_update
             .as_ref()
             .map(|(_, v)| handoff_backed_off(v))
             .unwrap_or(false);
+        // Bounded drain: once starved, in-flight dispatches run to completion and the swap waits
+        // for them. No claim is re-queued or abandoned; the handoff runs only when the daemon is
+        // idle (no admission claim, no detached dispatch).
+        if let Some((_, version)) = pending_self_update.as_ref() {
+            if self_update_starved
+                && (detached_still_running || any_work)
+                && !self_update_backed_off
+            {
+                log_handoff_deferred(version, &mut handoff_deferred_logged_at);
+            }
+        }
         let task_handoff = if pending_self_update.is_some()
             && !self_update_backed_off
-            && ((!any_work && !detached_still_running)
-                || force_handoff_despite_in_flight
-                || force_handoff_never_idle)
+            && !any_work
+            && !detached_still_running
         {
             match agentplug_host::prepare_task_handoff() {
                 Ok(guard) => {
@@ -4084,19 +4084,6 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
             if let Some((staged, version)) = pending_self_update.take() {
                 let claims_the_successor_inherits = snapshot_in_flight_claims();
                 write_handoff_inherited_claims(&version, &claims_the_successor_inherits);
-                if force_handoff_despite_in_flight {
-                    eprintln!(
-                        "[agentplug daemon] self-update to {version} starved for {}ms with in-flight dispatches still running after the extra grace window -- forcing handoff and re-queueing {} in-flight dispatch(es) for the incoming version; their callers wait longer and never see dispatch_orphaned",
-                        SELF_UPDATE_HARD_CAP_MS,
-                        claims_the_successor_inherits.len()
-                    );
-                }
-                if force_handoff_never_idle {
-                    eprintln!(
-                        "[agentplug daemon] self-update to {version} starved for {}ms with the daemon continuously busy (any_work true every tick, nothing detached) -- forcing handoff at the next tick boundary rather than waiting indefinitely for an idle tick that a busy shared daemon may never reach",
-                        SELF_UPDATE_HARD_CAP_MS
-                    );
-                }
                 if attempt_self_update_handoff(&staged, &version) {
                     task_handoff.commit();
                     let requeued =
