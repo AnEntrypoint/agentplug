@@ -357,7 +357,7 @@ struct CapabilityAllowlistConfig {
 
 fn compiled_default_capability_allowlist(caller_plugin: &str, callee_plugin: &str) -> bool {
     match caller_plugin {
-        "gm" => matches!(callee_plugin, "bert" | "libsql" | "treesitter" | "crux" | "lightpanda"),
+        "gm" => matches!(callee_plugin, "bert" | "libsql" | "treesitter" | "crux"),
         _ => false,
     }
 }
@@ -396,19 +396,12 @@ fn is_well_formed_verb(verb: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
 }
 
-fn plugin_call_takes_plain_text(plugin: &str, verb: &str) -> bool {
-    matches!((plugin, verb), ("lightpanda", "crawl"))
-}
-
-fn validate_plugin_call_body(plugin: &str, verb: &str, body: &str) -> Result<(), String> {
+fn validate_plugin_call_body(body: &str) -> Result<(), String> {
     if body.is_empty() {
         return Ok(());
     }
     if body.len() > 64 * 1024 * 1024 {
         return Err("body_exceeds_max_size".to_string());
-    }
-    if plugin_call_takes_plain_text(plugin, verb) {
-        return Ok(());
     }
     serde_json::from_str::<serde_json::Value>(body)
         .map(|_| ())
@@ -1349,7 +1342,7 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
                     serde_json::json!({"ok": false, "error": "invalid_verb", "verb": verb}),
                 );
             }
-            if let Err(reason) = validate_plugin_call_body(&plugin, &verb, &body) {
+            if let Err(reason) = validate_plugin_call_body(&body) {
                 return write_guest_json(
                     &mut caller,
                     serde_json::json!({"ok": false, "error": "invalid_body", "reason": reason}),
@@ -1703,17 +1696,6 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
             let body = read_guest_string(&mut caller, body_ptr, body_len);
             let cwd = caller.data().cwd();
             let reply = crate::crawl::crawl_cdp(&cwd, &body);
-            write_guest_json(&mut caller, reply)
-        },
-    )?;
-
-    linker.func_wrap(
-        "env",
-        "host_lightpanda_crawl",
-        |mut caller: Caller<'_, HostState>, body_ptr: u32, body_len: u32| -> u64 {
-            let body = read_guest_string(&mut caller, body_ptr, body_len);
-            let cwd = caller.data().cwd();
-            let reply = crate::crawl::lightpanda_crawl(&cwd, &body);
             write_guest_json(&mut caller, reply)
         },
     )?;
