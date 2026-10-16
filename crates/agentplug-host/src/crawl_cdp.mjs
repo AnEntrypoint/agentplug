@@ -23,18 +23,6 @@ async function closeHttpTarget(id) {
   await fetch(`${endpoint}/json/close/${id}`, { signal: AbortSignal.timeout(3000) }).then((r) => r.text()).catch(() => {});
 }
 
-async function attachBrowserTarget(browser) {
-  if (cfg.targetId) {
-    try {
-      const attached = await browser.send('Target.attachToTarget', { targetId: cfg.targetId, flatten: true });
-      return { targetId: cfg.targetId, sessionId: attached.sessionId, created: false };
-    } catch (_) {}
-  }
-  const created = await browser.send('Target.createTarget', { url: 'about:blank' });
-  const attached = await browser.send('Target.attachToTarget', { targetId: created.targetId, flatten: true });
-  return { targetId: created.targetId, sessionId: attached.sessionId, created: true };
-}
-
 function openSession(wsUrl, timeoutMs) {
   return new Promise((resolve, reject) => {
     const ws = new WebSocket(wsUrl);
@@ -153,27 +141,12 @@ async function main() {
       unlock = await lockSession(cfg.session.file, cfg.lockWaitMs || SESSION_LOCK_WAIT_MS);
       persisted = readSessionFile(cfg.session.file);
     }
-    if (cfg.browserSession) {
-      const info = await getJson('/json/version');
-      const browser = await openSession(info.webSocketDebuggerUrl, 5000);
-      close = () => browser.close();
-      const attached = await attachBrowserTarget(browser);
-      out.targetId = attached.targetId;
-      if (attached.created) release = () => browser.send('Target.closeTarget', { targetId: attached.targetId }).catch(() => {});
-      session = {
-        send: (method, params) => browser.send(method, params, attached.sessionId),
-        on: (method, handler) => browser.on(method, (params, sessionId) => {
-          if (sessionId === attached.sessionId) handler(params);
-        }),
-      };
-    } else {
-      const target = await acquireTarget((persisted && persisted.targetId) || cfg.targetId);
-      out.targetId = target.id;
-      const page = await openSession(target.webSocketDebuggerUrl, 5000);
-      close = () => page.close();
-      if (target.created) release = () => closeHttpTarget(target.id);
-      session = page;
-    }
+    const target = await acquireTarget((persisted && persisted.targetId) || cfg.targetId);
+    out.targetId = target.id;
+    const page = await openSession(target.webSocketDebuggerUrl, 5000);
+    close = () => page.close();
+    if (target.created) release = () => closeHttpTarget(target.id);
+    session = page;
     ctx = createToolContext({
       session,
       host: { evaluate, waitForComplete, sleep },
@@ -225,7 +198,7 @@ async function main() {
     await release();
     close();
     unlock();
-    if (!cfg.browserSession && !cfg.session && out.targetId) {
+    if (!cfg.session && out.targetId) {
       await fetch(`${endpoint}/json/close/${out.targetId}`, { signal: AbortSignal.timeout(3000) }).catch(() => {});
     }
   }

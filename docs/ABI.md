@@ -69,33 +69,18 @@ a host-level failure.
 
 ## Crawl contract (host side)
 
-Two engines serve one request shape. `crawl_cdp` is host-side Rust in
-`agentplug-host`, imported by the guest as `env.crawl_cdp`. The lightpanda engine
-is the wasm sibling `lightpanda.wasm` (`crates/agentplug-lightpanda-wasm`): its
-`crawl` verb calls the import `env.host_lightpanda_crawl`, which the runner
-answers with `agentplug_lightpanda::crawl`, the warm native server.
+`crawl_cdp` is the only crawl engine: host-side Rust in `agentplug-host`, imported by the guest as `env.crawl_cdp`.
 
-Entry points:
+Entry point:
 
-- `agentplug_host::crawl_cdp(cwd, body) -> Value` -- headful Chrome over CDP.
-  One Chrome per call, killed when the call returns. Chrome comes from
+- `agentplug_host::crawl_cdp(cwd, body) -> Value` -- headful Chrome over CDP, always; a `headless`
+  line is refused. One Chrome per call, killed when the call returns. Chrome comes from
   GM_BROWSER_CHROME_PATH, then CHROME_PATH, then the per-platform install paths
   (Windows install roots, macOS `.app` bundles, Linux packages) and PATH.
-- `agentplug_host::set_lightpanda_engine(agentplug_lightpanda::crawl)` -- the
-  runner registers the native engine at startup; the import is refused until then.
-- `agentplug_lightpanda::crawl(cwd, body)` -- headless lightpanda, one warm
-  `serve` per project root, reaped after GM_LIGHTPANDA_IDLE_SECONDS. The binary
-  is GM_LIGHTPANDA_PATH, then `<home>/.agentplug/bin/lightpanda-<arch>-<os>`
-  (the lightpanda-io/browser release asset names), then PATH. Windows has no
-  native lightpanda build; the server runs in WSL2 through `wsl.exe --exec`
-  (GM_LIGHTPANDA_WSL_DISTRO, GM_LIGHTPANDA_WSL_BINARY).
-  `agentplug_lightpanda::shutdown()` kills every warm process.
 
 Body (UTF-8 text, one step per line):
 
-- First non-blank line may be `engine=cdp` or `engine=lightpanda`. Absent means
-  cdp for `crawl_cdp` and lightpanda for the lightpanda plugin. The other name
-  is refused.
+- First non-blank line may be `engine=cdp`; any other engine name is refused.
 - `url=<url>` or a bare line starting `http://`, `https://`, `file://`,
   `data:` or `about:blank`: navigate and wait for `document.readyState`
   `complete`. The page record carries the final URL, title and body text
@@ -107,20 +92,11 @@ Body (UTF-8 text, one step per line):
 
 Reply (one JSON object):
 
-`ok` (bool), `engine` (`"cdp"` or `"lightpanda"`), `headless` (false for cdp,
-true for lightpanda), `stdout` and `stderr` (the Node helper's raw output),
+`ok` (bool), `engine` (always `"cdp"`), `headless` (always false), `stdout` and `stderr` (the Node helper's raw output),
 `exit_code` (int or null), `duration_ms`, `timed_out` (bool), `target_id`
 (CDP target id, or null), `pages` (array of `{op:"goto",url,title,text}`,
 `{op:"wait",ms}`, `{op:"eval",code,value}` in step order), `error` (null or a
 string naming the failing step or precondition).
-
-Lightpanda lifecycle: binary from GM_LIGHTPANDA_PATH, then PATH; nothing is
-downloaded. `lightpanda serve --host 127.0.0.1 --port <p>` starts once per
-project root, readiness is polled every 100 ms for up to 15 s, and the process
-is reaped after GM_LIGHTPANDA_IDLE_SECONDS (default 300) without a crawl. The
-remembered CDP target is reattached on the next crawl. A crawl that is already
-running for the project makes a second crawl answer `ok:false` immediately.
-Lightpanda has no native Windows build.
 
 ## Versioning
 

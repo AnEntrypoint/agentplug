@@ -10,7 +10,7 @@ const RUNNER_REPO = 'AnEntrypoint/agentplug-bin';
 const GUEST_REPO = 'AnEntrypoint/plugkit-bin';
 const GUEST_ASSET = 'plugkit-slim.wasm';
 const SEEDED_GM_VERSION = '0.1.1441';
-const LIVE_PLUGINS = ['libsql', 'bert', 'treesitter', 'crux', 'lightpanda'];
+const LIVE_PLUGINS = ['libsql', 'bert', 'treesitter', 'crux'];
 const PLUGIN_SUFFIXES = ['.wasm', '.version', '.wasm.sha256'];
 const STALE_GM_BUILD = {
   plugin: 'gm',
