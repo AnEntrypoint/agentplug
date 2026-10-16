@@ -1529,7 +1529,43 @@ pub fn record_runner_version(version: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+pub struct LatestPluginRelease {
+    pub version: String,
+    pub sha256: String,
+}
+
+// One redirect probe per plugin per poll. github.com answers `releases/latest/download/<asset>` with a
+// redirect whose target names the tag, and the followed sidecar is one line, so the check reads no
+// release listing and spends no REST API quota.
+fn probe_latest_plugin_release(plugin_name: &str) -> anyhow::Result<Option<LatestPluginRelease>> {
+    let Some(spec) = plugin_asset_spec(plugin_name) else {
+        anyhow::bail!("unknown plugin {plugin_name} -- not registered in agentplug-runner's plugin_asset_spec map");
+    };
+    let probe_url = format!(
+        "https://github.com/{}/releases/latest/download/{}.wasm.sha256",
+        spec.repo, spec.asset_basename
+    );
+    let response = agentplug_host::shared_agent().get(&probe_url).call()?;
+    let resolved = response.get_url().to_string();
+    let Some(version) = extract_version_from_release_url(&resolved) else {
+        return Ok(None);
+    };
+    let sha_line = response.into_string()?;
+    let sha256 = sha_line.split_whitespace().next().unwrap_or_default().to_string();
+    if sha256.is_empty() {
+        anyhow::bail!("empty sha256 sidecar for {} at {resolved}", spec.asset_basename);
+    }
+    Ok(Some(LatestPluginRelease { version, sha256 }))
+}
+
 pub fn fetch_latest_plugin_version(plugin_name: &str) -> anyhow::Result<Option<String>> {
+    if let Ok(Some(release)) = probe_latest_plugin_release(plugin_name) {
+        return Ok(Some(release.version));
+    }
+    fetch_latest_plugin_version_by_listing(plugin_name)
+}
+
+fn fetch_latest_plugin_version_by_listing(plugin_name: &str) -> anyhow::Result<Option<String>> {
     let Some(spec) = plugin_asset_spec(plugin_name) else {
         anyhow::bail!("unknown plugin {plugin_name} -- not registered in agentplug-runner's plugin_asset_spec map");
     };
@@ -1701,17 +1737,15 @@ pub fn refresh_plugin_if_stale(plugin_name: &str) -> anyhow::Result<Option<Strin
     if plugin_asset_spec(plugin_name).is_none() {
         return Ok(None);
     }
-    let Some(latest) = fetch_latest_plugin_version(plugin_name)? else {
+    let Some(release) = probe_latest_plugin_release(plugin_name)? else {
         return Ok(None);
     };
+    let latest = release.version.clone();
     match compare_release_semver(&latest, &installed) {
         Some(std::cmp::Ordering::Greater) => {}
-        Some(std::cmp::Ordering::Equal) => match (
-            fetch_remote_wasm_sha256(plugin_name, &latest),
-            installed_wasm_sha256(plugin_name),
-        ) {
-            (Ok(remote_sha), Some(local_sha)) if !remote_sha.eq_ignore_ascii_case(&local_sha) => {
-                eprintln!("[agentplug daemon] plugin {plugin_name} version {latest} matches but the released asset's sha256 has changed ({remote_sha} vs installed {local_sha}) -- re-fetching under the same tag");
+        Some(std::cmp::Ordering::Equal) => match installed_wasm_sha256(plugin_name) {
+            Some(local_sha) if !release.sha256.eq_ignore_ascii_case(&local_sha) => {
+                eprintln!("[agentplug daemon] plugin {plugin_name} version {latest} matches but the released asset's sha256 has changed ({} vs installed {local_sha}) -- re-fetching under the same tag", release.sha256);
             }
             _ => return Ok(None),
         },
@@ -1779,7 +1813,7 @@ const SKILL_LEDGER_FILE: &str = ".gm-skill-install-modes";
 const SKILL_PRELINK_DIR: &str = ".gm-skill-prelink";
 const SKILL_FILE_MAX_BYTES: u64 = 16 * 1024 * 1024;
 const SKILL_MANIFEST_MAX_BYTES: u64 = 1024 * 1024;
-pub const SKILL_REFRESH_INTERVAL: Duration = Duration::from_secs(300);
+pub const SKILL_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 
 fn skill_remote_url(rel: &str) -> String {
     format!("https://raw.githubusercontent.com/{SKILL_REMOTE_REPO}/{SKILL_REMOTE_BRANCH}/skills/{rel}")
@@ -2108,11 +2142,56 @@ fn installed_skill_roots(home: &Path) -> [PathBuf; 2] {
     ]
 }
 
+const SKILL_MANIFEST_CACHE_FILE: &str = "skill-manifest.cache.json";
+
+// One conditional request per cycle. An unchanged manifest answers 304 with no body, so the cached
+// copy is reused and only a changed manifest moves its bytes.
+fn fetch_skill_manifest_text() -> anyhow::Result<String> {
+    let cache_path = agentplug_host::install_dir().join(SKILL_MANIFEST_CACHE_FILE);
+    let cached: Option<serde_json::Value> = fs::read_to_string(&cache_path)
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok());
+    let cached_etag = cached
+        .as_ref()
+        .and_then(|value| value.get("etag"))
+        .and_then(|value| value.as_str())
+        .map(str::to_string);
+    let cached_text = cached
+        .as_ref()
+        .and_then(|value| value.get("text"))
+        .and_then(|value| value.as_str())
+        .map(str::to_string);
+    let mut request = agentplug_host::shared_agent().get(&skill_remote_url(SKILL_MANIFEST_REL));
+    if let (Some(etag), Some(_)) = (&cached_etag, &cached_text) {
+        request = request.set("If-None-Match", etag);
+    }
+    let response = request.call()?;
+    if response.status() == 304 {
+        return cached_text
+            .ok_or_else(|| anyhow::anyhow!("skill manifest answered 304 with no cached copy"));
+    }
+    let etag = response.header("ETag").map(str::to_string);
+    let mut bytes = Vec::new();
+    response
+        .into_reader()
+        .take(SKILL_MANIFEST_MAX_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > SKILL_MANIFEST_MAX_BYTES {
+        anyhow::bail!("skill manifest exceeds {SKILL_MANIFEST_MAX_BYTES} bytes");
+    }
+    let text = String::from_utf8(bytes)?;
+    if let Some(etag) = etag {
+        let record = serde_json::json!({ "etag": etag, "text": text });
+        let _ = fs::write(&cache_path, record.to_string());
+    }
+    Ok(text)
+}
+
 pub fn refresh_installed_skills() -> anyhow::Result<SkillRefreshReport> {
     let Some(home) = home_dir() else {
         anyhow::bail!("no HOME/USERPROFILE set -- cannot locate installed skills directories");
     };
-    let manifest = String::from_utf8(fetch_skill_bytes(SKILL_MANIFEST_REL, SKILL_MANIFEST_MAX_BYTES)?)?;
+    let manifest = fetch_skill_manifest_text()?;
     let entries = parse_skill_manifest(&manifest)?;
     if entries.is_empty() {
         anyhow::bail!("the published skill manifest lists no files; refusing to prune installs against it");
