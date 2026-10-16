@@ -3970,6 +3970,14 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
             .as_ref()
             .map(|(_, v)| handoff_backed_off(v))
             .unwrap_or(false);
+        let forced_swap_after_bound = pending_self_update.is_some()
+            && self_update_starved
+            && !self_update_backed_off;
+        if forced_swap_after_bound {
+            agentplug_host::begin_admission_drain();
+        } else {
+            agentplug_host::end_admission_drain();
+        }
         if let Some((_, version)) = pending_self_update.as_ref() {
             if self_update_starved
                 && (detached_still_running || any_work)
@@ -3980,8 +3988,7 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
         }
         let task_handoff = if pending_self_update.is_some()
             && !self_update_backed_off
-            && !any_work
-            && !detached_still_running
+            && (forced_swap_after_bound || (!any_work && !detached_still_running))
         {
             match agentplug_host::prepare_task_handoff() {
                 Ok(guard) => {

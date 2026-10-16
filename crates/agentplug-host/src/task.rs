@@ -144,12 +144,25 @@ fn execution_admission() -> &'static RwLock<()> {
 
 static EXECUTION_CLOSED: AtomicBool = AtomicBool::new(false);
 
+static ADMISSION_DRAINING: AtomicBool = AtomicBool::new(false);
+
+pub fn begin_admission_drain() {
+    ADMISSION_DRAINING.store(true, Ordering::Release);
+}
+
+pub fn end_admission_drain() {
+    ADMISSION_DRAINING.store(false, Ordering::Release);
+}
+
 pub(crate) fn admit_execution() -> Result<RwLockReadGuard<'static, ()>, String> {
     let guard = execution_admission()
         .read()
         .unwrap_or_else(|error| error.into_inner());
     if EXECUTION_CLOSED.load(Ordering::Acquire) {
         return Err("host ownership was handed off before execution began".to_string());
+    }
+    if ADMISSION_DRAINING.load(Ordering::Acquire) {
+        return Err("host is draining for a runner update; re-dispatch once the update lands".to_string());
     }
     Ok(guard)
 }
