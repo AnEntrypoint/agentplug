@@ -79,7 +79,18 @@ fn checked_directory(create: bool) -> Result<Option<PathBuf>, String> {
     Ok(Some(path))
 }
 
-fn read_record(path: &Path, id: &str) -> Result<Option<CompletedTask>, String> {
+#[cfg(unix)]
+fn private_to_effective_user(metadata: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    metadata.uid() == effective_uid() && metadata.permissions().mode() & 0o077 == 0
+}
+
+#[cfg(not(unix))]
+fn private_to_effective_user(_metadata: &std::fs::Metadata) -> bool {
+    true
+}
+
+fn read_bytes(path: &Path, require_private: bool) -> Result<Option<Vec<u8>>, String> {
     let metadata = match std::fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -88,14 +99,14 @@ fn read_record(path: &Path, id: &str) -> Result<Option<CompletedTask>, String> {
     if !metadata.is_file() || metadata.len() > MAX_RECORD_BYTES {
         return Err("task result is not a bounded regular file".to_string());
     }
+    if require_private && !private_to_effective_user(&metadata) {
+        return Err("task result file must be private to the effective user".to_string());
+    }
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
-        if metadata.uid() != effective_uid() || metadata.permissions().mode() & 0o077 != 0 {
-            return Err("task result file must be private to the effective user".to_string());
-        }
+        use std::os::unix::fs::OpenOptionsExt;
         options.custom_flags(libc::O_NOFOLLOW);
     }
     let file = options.open(path).map_err(|error| error.to_string())?;
@@ -113,10 +124,34 @@ fn read_record(path: &Path, id: &str) -> Result<Option<CompletedTask>, String> {
     if bytes.len() as u64 > MAX_RECORD_BYTES {
         return Err("task result exceeded its read bound".to_string());
     }
+    Ok(Some(bytes))
+}
+
+fn read_record(path: &Path, id: &str) -> Result<Option<CompletedTask>, String> {
+    let Some(bytes) = read_bytes(path, true)? else {
+        return Ok(None);
+    };
     let record: CompletedTask =
         serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
     validate_record(&record, id)?;
     Ok(Some(record))
+}
+
+fn prune_if_expired(path: &Path, now_ms: u64) -> Result<bool, String> {
+    #[derive(Deserialize)]
+    struct RetentionStamp {
+        finished_ms: u64,
+    }
+    let Some(bytes) = read_bytes(path, false)? else {
+        return Ok(false);
+    };
+    let stamp: RetentionStamp =
+        serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+    if now_ms.saturating_sub(stamp.finished_ms) < RETENTION_MS {
+        return Ok(false);
+    }
+    std::fs::remove_file(path).map_err(|error| error.to_string())?;
+    Ok(true)
 }
 
 fn validate_record(record: &CompletedTask, id: &str) -> Result<(), String> {
@@ -134,10 +169,6 @@ fn validate_record(record: &CompletedTask, id: &str) -> Result<(), String> {
         );
     }
     Ok(())
-}
-
-fn expired(record: &CompletedTask, now_ms: u64) -> bool {
-    now_ms.saturating_sub(record.finished_ms) >= RETENTION_MS
 }
 
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
@@ -188,12 +219,18 @@ pub(crate) fn save(records: Vec<CompletedTask>, now_ms: u64) -> Result<(), Strin
         let id = name.strip_suffix(".json").filter(|id| valid_id(id));
         let metadata =
             std::fs::symlink_metadata(entry.path()).map_err(|error| error.to_string())?;
-        if let Some(id) = id {
-            if let Some(record) = read_record(&entry.path(), id)? {
-                if expired(&record, now_ms) {
-                    std::fs::remove_file(entry.path()).map_err(|error| error.to_string())?;
-                    continue;
+        if id.is_some() {
+            match prune_if_expired(&entry.path(), now_ms) {
+                Ok(true) => continue,
+                Ok(false) => {}
+                Err(reason) => {
+                    eprintln!("[agentplug task-results] {name} kept from handoff: {reason}")
                 }
+            }
+            if !private_to_effective_user(&metadata) {
+                eprintln!(
+                    "[agentplug task-results] {name} kept from handoff: not private to the effective user"
+                );
             }
         }
         if sizes.len() >= MAX_RECORDS {
@@ -250,13 +287,12 @@ pub(crate) fn output(id: &str, max_bytes: usize, now_ms: u64) -> Result<Option<V
         return Ok(None);
     };
     let path = directory.join(format!("{id}.json"));
+    if prune_if_expired(&path, now_ms)? {
+        return Ok(None);
+    }
     let Some(record) = read_record(&path, id)? else {
         return Ok(None);
     };
-    if expired(&record, now_ms) {
-        std::fs::remove_file(&path).map_err(|error| error.to_string())?;
-        return Ok(None);
-    }
     let tail = |bytes: &[u8]| {
         String::from_utf8_lossy(&bytes[bytes.len().saturating_sub(max_bytes)..]).into_owned()
     };
