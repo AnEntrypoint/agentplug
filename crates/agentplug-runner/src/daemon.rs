@@ -1786,7 +1786,7 @@ fn reexec_from_canonical_and_exit(canonical: &std::path::Path) -> ! {
 pub fn run_takeover(version: &str, force: bool) -> anyhow::Result<()> {
     eprintln!("[agentplug daemon] takeover: building engine for version {version}");
     let mut plugin_modules = PluginModules::new()?;
-    for plugin_name in ["gm", "bert", "libsql", "treesitter", "crux", "lightpanda"] {
+    for plugin_name in ["gm", "bert", "libsql", "treesitter", "crux"] {
         if let Err(e) = plugin_modules.get_or_compile(plugin_name) {
             eprintln!("[agentplug daemon] takeover: pre-warm of {plugin_name} failed (non-fatal, will lazy-compile on first use): {e}");
         }
@@ -3744,7 +3744,7 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
             per_root_plugin_scan_walk.reset();
             roots_new_this_registry_poll.clear();
         }
-        for plugin_name in ["gm", "libsql", "bert", "treesitter", "crux", "lightpanda"] {
+        for plugin_name in ["gm", "libsql", "bert", "treesitter", "crux"] {
             if plugin_compile_in_backoff(plugin_name) {
                 continue;
             }

@@ -71,7 +71,6 @@ function runHelper(port, steps, session, extra = {}) {
   const config = {
     port,
     targetId: null,
-    browserSession: false,
     cwd: workDir,
     pageTimeoutMs: 30000,
     textLimit: 20000,
