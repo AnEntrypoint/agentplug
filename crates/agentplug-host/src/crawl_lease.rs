@@ -471,8 +471,10 @@ fn browser_running(browser: &mut SharedBrowser) -> bool {
     if endpoint_ready(browser.port, Instant::now(), CDP_POLL_INTERVAL, true) {
         return true;
     }
-    if matches!(browser.child.try_wait(), Ok(None)) {
-        return true;
+    match browser.child.try_wait() {
+        Ok(Some(_)) => return false,
+        Ok(None) => return true,
+        Err(_) => {}
     }
     process_exists(browser.pid)
 }

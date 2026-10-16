@@ -3378,6 +3378,18 @@ fn bounded_update_poll(configured_secs: u64, key: &str) -> Duration {
     Duration::from_secs(configured_secs.min(UPDATE_POLL_CEILING_SECS))
 }
 
+// A project that lists a plugin this runner cannot install would log the same failure on every
+// per-root pass. The first failure for each (plugin, root) pair is logged; repeats are not.
+fn plugin_failure_first_seen(plugin_name: &str, root: &std::path::Path) -> bool {
+    static SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    let key = format!("{plugin_name}@{}", root.display());
+    SEEN.get_or_init(Default::default)
+        .lock()
+        .map(|mut seen| seen.insert(key))
+        .unwrap_or(true)
+}
+
 fn spawn_update_poll_worker(
     daemon_cfg: DaemonConfig,
 ) -> std::sync::mpsc::Receiver<(PathBuf, String)> {
@@ -3707,7 +3719,9 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
                         match plugin_modules.get_or_compile(&plugin_name) {
                             Ok(()) => clear_plugin_compile_failure(&plugin_name),
                             Err(e) => {
-                                eprintln!("[agentplug daemon] failed to compile/install plugin {plugin_name} for {}: {e:#}", root.display());
+                                if plugin_failure_first_seen(&plugin_name, root) {
+                                    eprintln!("[agentplug daemon] failed to compile/install plugin {plugin_name} for {}: {e:#}", root.display());
+                                }
                                 record_plugin_compile_failure(&plugin_name, format!("{e:#}"));
                             }
                         }
