@@ -50,6 +50,17 @@ fn platform_kill(pid: u32) {
 #[cfg(not(unix))]
 fn platform_kill(_pid: u32) {}
 
+// Asks a process to exit cleanly. SIGTERM on unix; elsewhere there is no such request.
+#[cfg(unix)]
+pub(crate) fn request_exit(pid: u32) -> bool {
+    unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) == 0 }
+}
+
+#[cfg(not(unix))]
+pub(crate) fn request_exit(_pid: u32) -> bool {
+    false
+}
+
 pub(crate) fn kill_process_tree(pid: u32) {
     if cfg!(windows) {
         let mut cmd = Command::new("taskkill");

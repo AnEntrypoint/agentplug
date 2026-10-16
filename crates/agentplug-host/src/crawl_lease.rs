@@ -479,7 +479,18 @@ fn browser_running(browser: &mut SharedBrowser) -> bool {
     process_exists(browser.pid)
 }
 
+// Chromium commits cookies lazily, so a SIGKILL right after a sign-in loses the last of them. The browser is
+// asked to exit first and given a few seconds to flush; only then is it killed.
 fn close_browser(browser: &mut SharedBrowser) {
+    if crate::crawl::request_exit(browser.pid) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if matches!(browser.child.try_wait(), Ok(Some(_))) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
     kill_tree(browser.pid);
     kill_tree(browser.child.id());
     let _ = browser.child.kill();
