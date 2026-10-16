@@ -83,11 +83,15 @@ Body (UTF-8 text, one step per line):
 - First non-blank line may be `engine=cdp`; any other engine name is refused.
 - `url=<url>` or a bare line starting `http://`, `https://`, `file://`,
   `data:` or `about:blank`: navigate and wait for `document.readyState`
-  `complete`. The page record carries the final URL, title and body text
+  `complete` unless the tab is already on that URL, in which case nothing is
+  reloaded. The page record carries the final URL, title and body text
   (capped at 20000 characters).
 - `wait=<ms>`: sleep, at most 60000.
 - `eval=<js expression>`: evaluate on the current page; the value is returned
   by value.
+- `reload`: reload the current page (the only step that refreshes an unchanged page).
+- `close`: close the session's tab and forget its state. Without a session the call's own tab is closed when it returns.
+- `expect=tabs:N reuse:<session> open:N` (leading line, before the steps): checked against the shared Chrome's tab list before any step runs. A difference fails the call and names it under `expect`, and no step runs.
 - Blank lines and lines starting `#` are ignored. At least one step is required.
 
 Reply (one JSON object):
@@ -96,7 +100,7 @@ Reply (one JSON object):
 `exit_code` (int or null), `duration_ms`, `timed_out` (bool), `target_id`
 (CDP target id, or null), `pages` (array of `{op:"goto",url,title,text}`,
 `{op:"wait",ms}`, `{op:"eval",code,value}` in step order), `error` (null or a
-string naming the failing step or precondition).
+string naming the failing step or precondition), `tab` (`{targetId, state, url}`, where state is `opened` or `reused`), `steps` (one record per step: `index`, `action`, `tab`, `tab_state`, `url_before`, `url_after`, `navigated`, `skipped`, `closed`), `closed_tabs` (target ids this call closed on any exit, including timeout), and `expect` (null, or `{ok, report}` with `tabs_found`, `session_tab`, `session_tab_live`, `would_open`, `differences`).
 
 ## Versioning
 

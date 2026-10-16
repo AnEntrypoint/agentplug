@@ -192,10 +192,24 @@ fn goto_step(url: &str) -> Result<Value, String> {
     Ok(json!({"op": "goto", "url": url}))
 }
 
+#[derive(Default)]
+pub struct Expectation {
+    pub tabs: Option<u64>,
+    pub reuse: Option<String>,
+    pub open: Option<u64>,
+}
+
+impl Expectation {
+    fn is_empty(&self) -> bool {
+        self.tabs.is_none() && self.reuse.is_none() && self.open.is_none()
+    }
+}
+
 pub struct CdpCrawl {
     pub session: Option<String>,
     pub steps: Vec<Value>,
     pub headful: bool,
+    pub expect: Expectation,
 }
 
 const TOOL_STEP_GRAMMAR: &str ="snapshot, click=<uid>, dblclick=<uid>, hover=<uid>, click_at=<x>,<y>, fill=<uid> <value>, type=<text>, press=<key>, press_uid=<uid> <key>, upload=<uid> <path>[;<path>], wait_for=<text>, reload, back, forward, console, network[=<reqid>], dialog=accept|dismiss, screenshot=<path>, screenshot_full=<path>, screenshot_uid=<uid> <path>, trace_start, trace_stop[=<path>], cdp <Domain.method> (+ JSON params on the next line), events <Domain.event> [where <field>~<value>] [limit=N], wait <ms>";
@@ -203,6 +217,7 @@ const TOOL_STEP_GRAMMAR: &str ="snapshot, click=<uid>, dblclick=<uid>, hover=<ui
 pub fn parse_cdp_crawl_body(body: &str) -> Result<CdpCrawl, String> {
     let mut session = None;
     let headful = true;
+    let mut expect = Expectation::default();
     let mut steps = Vec::new();
     let mut lines = body.lines().enumerate().peekable();
     while let Some((index, raw)) = lines.next() {
@@ -234,6 +249,13 @@ pub fn parse_cdp_crawl_body(body: &str) -> Result<CdpCrawl, String> {
                     Some(session_name(value.trim()).map_err(|e| format!("line {number}: {e}"))?);
                 continue;
             }
+            if let Some(value) = line.strip_prefix("expect=") {
+                let more = parse_expect(value).map_err(|e| format!("line {number}: {e}"))?;
+                expect.tabs = more.tabs.or(expect.tabs);
+                expect.reuse = more.reuse.or(expect.reuse);
+                expect.open = more.open.or(expect.open);
+                continue;
+            }
             if is_headful_request(line) {
                 continue;
             }
@@ -259,12 +281,35 @@ pub fn parse_cdp_crawl_body(body: &str) -> Result<CdpCrawl, String> {
         session,
         steps,
         headful,
+        expect,
     })
 }
 
 fn is_headful_request(line: &str) -> bool {
     let lower = line.to_ascii_lowercase();
     lower == "headful" || lower.starts_with("headful=") || lower.starts_with("--headful")
+}
+
+// expect=tabs:N reuse:<session> open:N (or key=value). Each key is checked against the lease's
+// tab list before any step runs, so a difference fails the call before the browser is touched.
+fn parse_expect(value: &str) -> Result<Expectation, String> {
+    let mut expect = Expectation::default();
+    for token in value.split_whitespace() {
+        let (key, arg) = token
+            .split_once(|c: char| c == '=' || c == ':')
+            .ok_or_else(|| format!("expect: '{token}' needs key=value or key:value"))?;
+        match key {
+            "tabs" => expect.tabs = Some(require_number(arg, "expect tabs")?),
+            "open" => expect.open = Some(require_number(arg, "expect open")?),
+            "reuse" => expect.reuse = Some(session_name(arg)?),
+            other => {
+                return Err(format!(
+                    "expect: unknown key '{other}' (use tabs, reuse or open)"
+                ))
+            }
+        }
+    }
+    Ok(expect)
 }
 
 fn session_name(name: &str) -> Result<String, String> {
@@ -297,6 +342,9 @@ fn keyword_arg<'a>(line: &'a str, keyword: &str) -> Option<&'a str> {
 }
 
 fn parse_cdp_step(line: &str, lines: &mut StepLines<'_>) -> Result<Value, String> {
+    if line == "close" {
+        return Ok(json!({"op": "close"}));
+    }
     if let Some(arg) = keyword_arg(line, "cdp") {
         return parse_raw_cdp_step(arg, lines);
     }
@@ -854,6 +902,8 @@ pub fn crawl_reply_from_run(
     };
     let target_id = result.get("targetId").cloned().unwrap_or(Value::Null);
     let pages = result.get("pages").cloned().unwrap_or_else(|| json!([]));
+    let steps = result.get("steps").cloned().unwrap_or_else(|| json!([]));
+    let tab = result.get("tab").cloned().unwrap_or(Value::Null);
     json!({
         "ok": ok,
         "engine": engine,
@@ -865,6 +915,8 @@ pub fn crawl_reply_from_run(
         "timed_out": run.timed_out,
         "target_id": target_id,
         "pages": pages,
+        "steps": steps,
+        "tab": tab,
         "error": error,
     })
 }
@@ -881,32 +933,181 @@ pub fn crawl_cdp(cwd: &Path, body: &str) -> Value {
         Ok(attached) => attached,
         Err(e) => return crawl_error_reply("cdp", headless, started, e),
     };
+    let ledger = crawl_ledger_path(cwd, &agent);
+    if let Some(dir) = ledger.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(&ledger, "[]");
+    let expect = match check_expectations(port, cwd, parsed.session.as_deref(), &parsed.expect) {
+        Ok(report) => report,
+        Err(e) => {
+            let _ = std::fs::remove_file(&ledger);
+            crawl_lease::release(cwd, &agent);
+            let mut reply = crawl_error_reply("cdp", headless, started, e.clone());
+            if let Some(obj) = reply.as_object_mut() {
+                obj.insert("expect".to_string(), json!({ "ok": false, "error": e }));
+                obj.insert("steps".to_string(), json!([]));
+                obj.insert("closed_tabs".to_string(), json!([]));
+            }
+            return reply;
+        }
+    };
     let run = run_helper_with(
         port,
         None,
         &parsed.steps,
         CDP_HELPER_BUDGET,
-        cdp_run_config(cwd, parsed.session.as_deref()),
+        cdp_run_config(cwd, parsed.session.as_deref(), &ledger),
     );
-    let reply = match run {
+    let closed = close_created_tabs(port, &ledger);
+    let mut reply = match run {
         Ok(run) => crawl_reply_from_run("cdp", headless, started, run),
         Err(e) => crawl_error_reply("cdp", headless, started, e),
     };
+    if let Some(obj) = reply.as_object_mut() {
+        obj.entry("steps".to_string()).or_insert_with(|| json!([]));
+        obj.entry("tab".to_string()).or_insert(Value::Null);
+        obj.insert("closed_tabs".to_string(), json!(closed));
+        obj.insert(
+            "expect".to_string(),
+            if parsed.expect.is_empty() { Value::Null } else { json!({ "ok": true, "report": expect }) },
+        );
+    }
     crawl_lease::release(cwd, &agent);
     reply
 }
 
-fn cdp_run_config(cwd: &Path, session: Option<&str>) -> Value {
+fn crawl_ledger_path(cwd: &Path, agent: &str) -> PathBuf {
+    crawl_lease::session_dir(cwd)
+        .join("calls")
+        .join(format!("{agent}.json"))
+}
+
+fn session_file(cwd: &Path, name: &str) -> PathBuf {
+    cwd.join(".gm")
+        .join("crawl-cdp-sessions")
+        .join(format!("{name}.json"))
+}
+
+fn session_target_id(cwd: &Path, name: &str) -> Option<String> {
+    let text = std::fs::read_to_string(session_file(cwd, name)).ok()?;
+    serde_json::from_str::<Value>(&text)
+        .ok()?
+        .get("targetId")?
+        .as_str()
+        .map(str::to_string)
+}
+
+fn page_targets(port: u16) -> Result<Vec<Value>, String> {
+    let text = endpoint_get(port, "/json/list")?;
+    let list: Value = serde_json::from_str(&text)
+        .map_err(|e| format!("/json/list was not JSON: {e}"))?;
+    Ok(list
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter(|item| item.get("type").and_then(Value::as_str) == Some("page"))
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
+// Compares the lease's tab state with the expect= line. Returns the state it read, and the
+// differences by name when there are any.
+fn check_expectations(
+    port: u16,
+    cwd: &Path,
+    session: Option<&str>,
+    expect: &Expectation,
+) -> Result<Value, String> {
+    if expect.is_empty() {
+        return Ok(Value::Null);
+    }
+    let pages = page_targets(port)?;
+    let tabs_found = pages.len() as u64;
+    let session_tab = session.and_then(|name| session_target_id(cwd, name));
+    let session_live = session_tab.as_ref().is_some_and(|id| {
+        pages
+            .iter()
+            .any(|page| page.get("id").and_then(Value::as_str) == Some(id.as_str()))
+    });
+    let would_open: u64 = if session.is_some() && session_live { 0 } else { 1 };
+    let mut differences: Vec<String> = Vec::new();
+    if let Some(expected) = expect.tabs {
+        if expected != tabs_found {
+            differences.push(format!("tabs: expected {expected}, found {tabs_found}"));
+        }
+    }
+    if let Some(name) = expect.reuse.as_deref() {
+        if session != Some(name) {
+            differences.push(format!(
+                "reuse: expected session {name}, the body names {}",
+                session.unwrap_or("no session")
+            ));
+        } else if !session_live {
+            differences.push(format!("reuse: session {name} has no live tab to reuse"));
+        }
+    }
+    if let Some(expected) = expect.open {
+        if expected != would_open {
+            differences.push(format!(
+                "open: expected {expected}, this call would open {would_open}"
+            ));
+        }
+    }
+    let report = json!({
+        "tabs_found": tabs_found,
+        "session_tab": session_tab,
+        "session_tab_live": session_live,
+        "would_open": would_open,
+        "differences": differences,
+    });
+    if differences.is_empty() {
+        Ok(report)
+    } else {
+        Err(format!("expectation failed: {}", differences.join("; ")))
+    }
+}
+
+// Closes every tab the helper recorded as created by this call, except the session's own tab. Runs
+// after the helper returns on every outcome, so a watchdog or timeout kill cannot leave a tab open.
+fn close_created_tabs(port: u16, ledger: &Path) -> Vec<String> {
+    let entries: Vec<Value> = std::fs::read_to_string(ledger)
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default();
+    let mut closed = Vec::new();
+    for entry in entries {
+        if entry.get("keep").and_then(Value::as_bool) == Some(true) {
+            continue;
+        }
+        let Some(id) = entry.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        if id.is_empty() || !id.bytes().all(|b| b.is_ascii_alphanumeric()) {
+            continue;
+        }
+        if endpoint_get(port, &format!("/json/close/{id}")).is_ok() {
+            closed.push(id.to_string());
+        }
+    }
+    let _ = std::fs::remove_file(ledger);
+    closed
+}
+
+fn cdp_run_config(cwd: &Path, session: Option<&str>, ledger: &Path) -> Value {
     let mut config = json!({
         "cwd": cwd.display().to_string(),
         "watchdogMs": CDP_HELPER_BUDGET.as_millis() as u64 - 10_000,
+        "ledger": ledger.display().to_string(),
     });
     if let Some(name) = session {
-        let file = cwd
-            .join(".gm")
-            .join("crawl-cdp-sessions")
-            .join(format!("{name}.json"));
-        config["session"] = json!({ "name": name, "file": file.display().to_string() });
+        config["session"] = json!({
+            "name": name,
+            "file": session_file(cwd, name).display().to_string(),
+        });
     }
     config
 }
