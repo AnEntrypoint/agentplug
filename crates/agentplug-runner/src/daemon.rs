@@ -111,7 +111,6 @@ const GM_SPOOL_VERBS: &[&str] = &[
     "git_worktree_list",
     "git_worktree_remove",
     "git_worktree_prune",
-    "forget",
     "discipline",
     "browser_lease_acquire",
     "browser_lease_release",

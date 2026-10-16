@@ -2412,7 +2412,6 @@ const READ_LANE_VERBS: &[&str] = &["health"];
 
 const STORE_LANE_VERBS: &[&str] = &[
     "scan_deps",
-    "forget",
     "codeinsight_index",
     "code_index",
     "embed",
