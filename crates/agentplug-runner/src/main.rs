@@ -255,6 +255,7 @@ fn main() -> anyhow::Result<()> {
         "selfcheck-lane-network-yield" => selfcheck_lane_network_yield(),
         "selfcheck-spool-claim" => selfcheck_spool_claim(),
         "selfcheck-browser-lease" => selfcheck_browser_lease(),
+        "selfcheck-update-probes" => selfcheck_update_probes(),
         other => {
             eprintln!(
                 "agentplug-runner: unknown command '{other}'. Usage: agentplug-runner <plugin <name> [version]|spool|daemon|takeover <version>|dispatch [plugin] <verb> [body]|sweep-spool [root]|update-runner|release-bootstrap-status|build-info|pin-local-build|unpin-local-build|selfcheck-registry|selfcheck-inflight|selfcheck-idle-evict|version>"
@@ -2058,6 +2059,39 @@ fn selfcheck_spool_claim() -> anyhow::Result<()> {
     println!("[selfcheck-spool-claim] witnessed live against the real claim predicate: PASS");
     Ok(())
 }
+// Reads the release channel for the runner, every loaded plugin and the skill manifest, without staging,
+// installing or writing anything except the skill manifest cache the daemon already keeps.
+fn selfcheck_update_probes() -> anyhow::Result<()> {
+    const NAME: &str = "selfcheck-update-probes";
+    let mut problems: Vec<String> = Vec::new();
+    match download::fetch_latest_runner_version() {
+        Ok(Some(latest)) => println!("runner: running {}, latest release {latest}", env!("CARGO_PKG_VERSION")),
+        Ok(None) => problems.push("runner: no latest release resolved".to_string()),
+        Err(e) => problems.push(format!("runner: probe failed: {e:#}")),
+    }
+    for plugin in ["gm", "bert", "libsql", "treesitter", "crux"] {
+        let installed = download::installed_plugin_version(plugin).unwrap_or_else(|| "none".to_string());
+        match download::probe_latest_plugin_release(plugin) {
+            Ok(Some(release)) => {
+                let digest: String = release.sha256.chars().take(12).collect();
+                println!("plugin {plugin}: installed {installed}, latest release {} (sha {digest})", release.version);
+            }
+            Ok(None) => problems.push(format!("plugin {plugin}: no latest release resolved")),
+            Err(e) => problems.push(format!("plugin {plugin}: probe failed: {e:#}")),
+        }
+    }
+    match download::skill_manifest_status() {
+        Ok(status) => println!("skill manifest: {status}"),
+        Err(e) => problems.push(format!("skill manifest: {e:#}")),
+    }
+    if problems.is_empty() {
+        println!("RESULT: PASS");
+        Ok(())
+    } else {
+        selfcheck_fail(NAME, &problems.join("; "))
+    }
+}
+
 fn selfcheck_browser_lease() -> anyhow::Result<()> {
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};

@@ -683,20 +683,6 @@ fn is_safe_github_repo(repo: &str) -> bool {
     )
 }
 
-fn resolve_latest_tag_via_release_page(repo: &str) -> Option<String> {
-    let page_url = format!("https://github.com/{repo}/releases/latest");
-    let resp = agentplug_host::shared_agent().get(&page_url).call().ok()?;
-    let resolved_url = resp.get_url();
-    let idx = resolved_url.find("/releases/tag/")?;
-    let tag = resolved_url[idx + "/releases/tag/".len()..]
-        .split('/')
-        .next()?;
-    if tag.is_empty() {
-        return None;
-    }
-    release_version_from_tag(tag)
-}
-
 fn release_has_unambiguous_asset_pair(release: &serde_json::Value, asset_basename: &str) -> bool {
     let Some(assets) = release.get("assets").and_then(|assets| assets.as_array()) else {
         return false;
@@ -1394,6 +1380,20 @@ fn report_self_update_blocked(reason: &str) {
     eprintln!("[agentplug runner-update] self-update skipped: {reason}");
 }
 
+fn resolve_latest_tag_via_release_page(repo: &str) -> Option<String> {
+    let page_url = format!("https://github.com/{repo}/releases/latest");
+    let resp = agentplug_host::shared_agent().get(&page_url).call().ok()?;
+    let resolved_url = resp.get_url();
+    let idx = resolved_url.find("/releases/tag/")?;
+    let tag = resolved_url[idx + "/releases/tag/".len()..]
+        .split('/')
+        .next()?;
+    if tag.is_empty() {
+        return None;
+    }
+    release_version_from_tag(tag)
+}
+
 pub fn fetch_latest_runner_version() -> anyhow::Result<Option<String>> {
     if runner_asset_name().is_none() {
         eprintln!(
@@ -1407,15 +1407,8 @@ pub fn fetch_latest_runner_version() -> anyhow::Result<Option<String>> {
     let Some(asset) = runner_asset_name() else {
         return Ok(None);
     };
-    let probe_url =
-        format!("https://github.com/{RUNNER_BIN_REPO}/releases/latest/download/{asset}.sha256");
-    if let Ok(resp) = agentplug_host::shared_agent().get(&probe_url).call() {
-        let resolved_url = resp.get_url().to_string();
-        if let Some(version) = extract_version_from_release_url(&resolved_url)
-            .or_else(|| resolve_latest_tag_via_release_page(RUNNER_BIN_REPO))
-        {
-            return Ok(Some(version));
-        }
+    if let Ok(Some((version, _))) = probe_latest_asset(RUNNER_BIN_REPO, &format!("{asset}.sha256")) {
+        return Ok(Some(version));
     }
     match github_api_call(&url) {
         Ok(resp) => {
@@ -1534,26 +1527,38 @@ pub struct LatestPluginRelease {
     pub sha256: String,
 }
 
-// One redirect probe per plugin per poll. github.com answers `releases/latest/download/<asset>` with a
-// redirect whose target names the tag, and the followed sidecar is one line, so the check reads no
-// release listing and spends no REST API quota.
-fn probe_latest_plugin_release(plugin_name: &str) -> anyhow::Result<Option<LatestPluginRelease>> {
+// The release channel answers `releases/latest/download/<asset>` with a redirect whose Location names
+// the tag. That first hop is read without being followed: following it lands on an asset store URL
+// that carries no tag, and a probe that reads the tag from there finds nothing. The sidecar is then
+// read from the Location, so one probe is two small requests and spends no REST API quota.
+fn probe_latest_asset(repo: &str, asset: &str) -> anyhow::Result<Option<(String, String)>> {
+    static NO_REDIRECT: std::sync::OnceLock<ureq::Agent> = std::sync::OnceLock::new();
+    let agent = NO_REDIRECT.get_or_init(|| {
+        agentplug_host::build_agent_without_redirects(std::time::Duration::from_secs(10))
+    });
+    let first_hop = format!("https://github.com/{repo}/releases/latest/download/{asset}");
+    let response = agent.get(&first_hop).call()?;
+    let Some(location) = response.header("location").map(str::to_string) else {
+        return Ok(None);
+    };
+    let Some(version) = extract_version_from_release_url(&location) else {
+        return Ok(None);
+    };
+    let body = agentplug_host::shared_agent().get(&location).call()?.into_string()?;
+    Ok(Some((version, body)))
+}
+
+pub fn probe_latest_plugin_release(plugin_name: &str) -> anyhow::Result<Option<LatestPluginRelease>> {
     let Some(spec) = plugin_asset_spec(plugin_name) else {
         anyhow::bail!("unknown plugin {plugin_name} -- not registered in agentplug-runner's plugin_asset_spec map");
     };
-    let probe_url = format!(
-        "https://github.com/{}/releases/latest/download/{}.wasm.sha256",
-        spec.repo, spec.asset_basename
-    );
-    let response = agentplug_host::shared_agent().get(&probe_url).call()?;
-    let resolved = response.get_url().to_string();
-    let Some(version) = extract_version_from_release_url(&resolved) else {
+    let asset = format!("{}.wasm.sha256", spec.asset_basename);
+    let Some((version, body)) = probe_latest_asset(&spec.repo, &asset)? else {
         return Ok(None);
     };
-    let sha_line = response.into_string()?;
-    let sha256 = sha_line.split_whitespace().next().unwrap_or_default().to_string();
+    let sha256 = body.split_whitespace().next().unwrap_or_default().to_string();
     if sha256.is_empty() {
-        anyhow::bail!("empty sha256 sidecar for {} at {resolved}", spec.asset_basename);
+        anyhow::bail!("empty sha256 sidecar for {} in {}", spec.asset_basename, spec.repo);
     }
     Ok(Some(LatestPluginRelease { version, sha256 }))
 }
@@ -1737,18 +1742,27 @@ pub fn refresh_plugin_if_stale(plugin_name: &str) -> anyhow::Result<Option<Strin
     if plugin_asset_spec(plugin_name).is_none() {
         return Ok(None);
     }
-    let Some(release) = probe_latest_plugin_release(plugin_name)? else {
-        return Ok(None);
+    let (latest, probed_sha) = match probe_latest_plugin_release(plugin_name) {
+        Ok(Some(release)) => (release.version, Some(release.sha256)),
+        _ => match fetch_latest_plugin_version_by_listing(plugin_name)? {
+            Some(version) => (version, None),
+            None => return Ok(None),
+        },
     };
-    let latest = release.version.clone();
     match compare_release_semver(&latest, &installed) {
         Some(std::cmp::Ordering::Greater) => {}
-        Some(std::cmp::Ordering::Equal) => match installed_wasm_sha256(plugin_name) {
-            Some(local_sha) if !release.sha256.eq_ignore_ascii_case(&local_sha) => {
-                eprintln!("[agentplug daemon] plugin {plugin_name} version {latest} matches but the released asset's sha256 has changed ({} vs installed {local_sha}) -- re-fetching under the same tag", release.sha256);
+        Some(std::cmp::Ordering::Equal) => {
+            let remote_sha = match probed_sha {
+                Some(sha) => Ok(sha),
+                None => fetch_remote_wasm_sha256(plugin_name, &latest),
+            };
+            match (remote_sha, installed_wasm_sha256(plugin_name)) {
+                (Ok(remote_sha), Some(local_sha)) if !remote_sha.eq_ignore_ascii_case(&local_sha) => {
+                    eprintln!("[agentplug daemon] plugin {plugin_name} version {latest} matches but the released asset's sha256 has changed ({remote_sha} vs installed {local_sha}) -- re-fetching under the same tag");
+                }
+                _ => return Ok(None),
             }
-            _ => return Ok(None),
-        },
+        }
         Some(std::cmp::Ordering::Less) => {
             eprintln!(
                 "[agentplug daemon] plugin {plugin_name} latest release {latest} is older than installed {installed} -- refusing downgrade"
@@ -2146,7 +2160,19 @@ const SKILL_MANIFEST_CACHE_FILE: &str = "skill-manifest.cache.json";
 
 // One conditional request per cycle. An unchanged manifest answers 304 with no body, so the cached
 // copy is reused and only a changed manifest moves its bytes.
-fn fetch_skill_manifest_text() -> anyhow::Result<String> {
+const SKILL_MANIFEST_FULL_FETCH_MS: u64 = 10 * 60 * 1000;
+
+fn unix_ms_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+// One conditional request per cycle: an unchanged manifest answers 304 with no body, so the cached copy
+// is reused. Every SKILL_MANIFEST_FULL_FETCH_MS the request is unconditional, because a 304 can come from
+// an edge that still holds the copy the stored ETag names; a stale edge is therefore bounded in time.
+fn fetch_skill_manifest_with_status() -> anyhow::Result<(String, &'static str)> {
     let cache_path = agentplug_host::install_dir().join(SKILL_MANIFEST_CACHE_FILE);
     let cached: Option<serde_json::Value> = fs::read_to_string(&cache_path)
         .ok()
@@ -2161,14 +2187,24 @@ fn fetch_skill_manifest_text() -> anyhow::Result<String> {
         .and_then(|value| value.get("text"))
         .and_then(|value| value.as_str())
         .map(str::to_string);
+    let cached_at = cached
+        .as_ref()
+        .and_then(|value| value.get("at_ms"))
+        .and_then(|value| value.as_u64())
+        .unwrap_or(0);
+    let now = unix_ms_now();
+    let full_fetch_due = now.saturating_sub(cached_at) >= SKILL_MANIFEST_FULL_FETCH_MS;
     let mut request = agentplug_host::shared_agent().get(&skill_remote_url(SKILL_MANIFEST_REL));
-    if let (Some(etag), Some(_)) = (&cached_etag, &cached_text) {
-        request = request.set("If-None-Match", etag);
+    if !full_fetch_due {
+        if let (Some(etag), Some(_)) = (&cached_etag, &cached_text) {
+            request = request.set("If-None-Match", etag);
+        }
     }
     let response = request.call()?;
     if response.status() == 304 {
-        return cached_text
-            .ok_or_else(|| anyhow::anyhow!("skill manifest answered 304 with no cached copy"));
+        let text = cached_text
+            .ok_or_else(|| anyhow::anyhow!("skill manifest answered 304 with no cached copy"))?;
+        return Ok((text, "304 not modified"));
     }
     let etag = response.header("ETag").map(str::to_string);
     let mut bytes = Vec::new();
@@ -2181,10 +2217,20 @@ fn fetch_skill_manifest_text() -> anyhow::Result<String> {
     }
     let text = String::from_utf8(bytes)?;
     if let Some(etag) = etag {
-        let record = serde_json::json!({ "etag": etag, "text": text });
+        let record = serde_json::json!({ "etag": etag, "text": text, "at_ms": now });
         let _ = fs::write(&cache_path, record.to_string());
     }
-    Ok(text)
+    Ok((text, "200 fetched"))
+}
+
+fn fetch_skill_manifest_text() -> anyhow::Result<String> {
+    Ok(fetch_skill_manifest_with_status()?.0)
+}
+
+pub fn skill_manifest_status() -> anyhow::Result<String> {
+    let (text, status) = fetch_skill_manifest_with_status()?;
+    let entries = parse_skill_manifest(&text)?.len();
+    Ok(format!("{status}, {} bytes, {entries} entries", text.len()))
 }
 
 pub fn refresh_installed_skills() -> anyhow::Result<SkillRefreshReport> {

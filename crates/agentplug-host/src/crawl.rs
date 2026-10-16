@@ -131,9 +131,21 @@ pub(crate) fn crawl_browser_pid(profile: &Path) -> Option<u32> {
         .ok()
 }
 
+#[cfg(unix)]
+fn unix_process_exists(pid: u32) -> bool {
+    // Signal 0 only probes. EPERM still means the process exists, owned by someone else.
+    let probed = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    probed == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(not(unix))]
+fn unix_process_exists(_pid: u32) -> bool {
+    true
+}
+
 pub(crate) fn process_exists(pid: u32) -> bool {
     if !cfg!(windows) {
-        return true;
+        return unix_process_exists(pid);
     }
     let script = format!("if (Get-Process -Id {pid} -ErrorAction SilentlyContinue) {{ 'yes' }}");
     let mut cmd = Command::new("powershell");
