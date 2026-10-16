@@ -312,12 +312,12 @@ fn selfcheck_registry() -> anyhow::Result<()> {
     );
 
     project.load_plugin(&engine, "gm", &module, "hash-b")?;
-    let out2 = project.dispatch("gm", "probe", "{}")?;
+    let reinstantiated_reply = project.dispatch("gm", "probe", "{}")?;
     assert_eq!(
-        out2, "ok",
+        reinstantiated_reply, "ok",
         "reinstantiated slot on the new hash must still serve real dispatches"
     );
-    println!("[selfcheck-registry] slot reinstantiated on hash-b and served a second real dispatch: {out2:?}");
+    println!("[selfcheck-registry] slot reinstantiated on hash-b and served a second real dispatch: {reinstantiated_reply:?}");
 
     note_shared_plugin_bytes_current("gm", "hash-b");
     assert!(

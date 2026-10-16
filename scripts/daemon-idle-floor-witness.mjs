@@ -1,24 +1,4 @@
 #!/usr/bin/env node
-// Idle-floor witness for the agentplug shared daemon.
-//
-// Boots --runner as `daemon` inside an isolated AGENTPLUG_HOME (never the live home), attaches
-// synthetic git roots that carry the spool verb directories a live project has, samples the
-// daemon's CPU through Get-Process TotalProcessorTime over --samples windows of --window-ms, and
-// prints RESULT: PASS only when the mean core-equivalent is at or below --threshold, the daemon
-// stayed alive with no self-update handoff, every root was attached, and freshly written
-// requests are still answered within --liveness-max-ms.
-//
-//   node scripts/daemon-idle-floor-witness.mjs --runner <agentplug-runner.exe> [options]
-//     --roots 121  --warmup-ms 60000  --samples 60  --window-ms 2000  --threshold 0.05
-//     --liveness 3  --liveness-max-ms 3000  --home <dir>  --live-home <dir>  --keep
-//
-// --live-home is read only: its default plugins and precompiled cache are copied into the
-// isolated home so the daemon never downloads and never writes outside --home. The runner is
-// copied into <home>/bin and run from there with AGENTPLUG_NO_SELF_UPDATE=1 and a frozen marker,
-// so a staged or released runner in the shared install directory is never adopted or swapped in.
-// The shared installed runner must be unchanged by the run, or the run is invalid.
-// Exit 0 on PASS, 1 on FAIL, 2 on a usage or setup error.
-
 import { spawn, spawnSync } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';

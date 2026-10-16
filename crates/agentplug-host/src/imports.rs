@@ -19,12 +19,12 @@ fn base64_encode(bytes: &[u8]) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {
-        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
-        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
-        out.push(ALPHABET[(n >> 18) as usize & 63] as char);
-        out.push(ALPHABET[(n >> 12) as usize & 63] as char);
-        out.push(if chunk.len() > 1 { ALPHABET[(n >> 6) as usize & 63] as char } else { '=' });
-        out.push(if chunk.len() > 2 { ALPHABET[n as usize & 63] as char } else { '=' });
+        let chunk_bytes = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let packed_triple = (u32::from(chunk_bytes[0]) << 16) | (u32::from(chunk_bytes[1]) << 8) | u32::from(chunk_bytes[2]);
+        out.push(ALPHABET[(packed_triple >> 18) as usize & 63] as char);
+        out.push(ALPHABET[(packed_triple >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 { ALPHABET[(packed_triple >> 6) as usize & 63] as char } else { '=' });
+        out.push(if chunk.len() > 2 { ALPHABET[packed_triple as usize & 63] as char } else { '=' });
     }
     out
 }
@@ -997,8 +997,8 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
                     let canonical_path = fs::canonicalize(&full)
                         .ok()
                         .map(|path| path.to_string_lossy().into_owned());
-                    let v = serde_json::json!({"isDirectory": md.is_dir(), "isFile": md.is_file(), "size": md.len(), "mtimeMs": mtime_ms, "mtime_ms": mtime_ms, "canonicalPath": canonical_path});
-                    write_guest_json(&mut caller, v)
+                    let metadata_json = serde_json::json!({"isDirectory": md.is_dir(), "isFile": md.is_file(), "size": md.len(), "mtimeMs": mtime_ms, "mtime_ms": mtime_ms, "canonicalPath": canonical_path});
+                    write_guest_json(&mut caller, metadata_json)
                 }
                 Err(_) => 0,
             }
@@ -1234,7 +1234,7 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
          q_len: u32|
          -> u64 {
             let ns = read_guest_string(&mut caller, ns_ptr, ns_len);
-            let q = read_guest_string(&mut caller, q_ptr, q_len).to_lowercase();
+            let query = read_guest_string(&mut caller, q_ptr, q_len).to_lowercase();
             if ns.is_empty() {
                 return 0;
             }
@@ -1247,7 +1247,7 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
                         continue;
                     }
                     if let Ok(content) = fs::read_to_string(&path) {
-                        if q.is_empty() || content.to_lowercase().contains(&q) {
+                        if query.is_empty() || content.to_lowercase().contains(&query) {
                             let key = path
                                 .file_stem()
                                 .and_then(|s| s.to_str())
@@ -1452,9 +1452,9 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
                 result = match guard.as_mut() {
                     None => Err(anyhow::anyhow!("bert not loaded yet")),
                     Some(handle) => crate::registry::dispatch_on(&mut handle.store, handle.instance, "embed", &body, &caller_root, caller_siblings.clone()).and_then(|resp| {
-                        let v: serde_json::Value = serde_json::from_str(&resp)?;
-                        let arr = v.get("embedding").and_then(|e| e.as_array()).ok_or_else(|| anyhow::anyhow!("no embedding field"))?;
-                        Ok::<Vec<f32>, anyhow::Error>(arr.iter().filter_map(|x| x.as_f64()).map(|x| x as f32).collect())
+                        let response_json: serde_json::Value = serde_json::from_str(&resp)?;
+                        let embedding_array = response_json.get("embedding").and_then(|e| e.as_array()).ok_or_else(|| anyhow::anyhow!("no embedding field"))?;
+                        Ok::<Vec<f32>, anyhow::Error>(embedding_array.iter().filter_map(|x| x.as_f64()).map(|x| x as f32).collect())
                     }),
                 };
                 if result.is_err() {
@@ -1507,11 +1507,11 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
             let cwd = if cwd_arg.is_empty() {
                 caller.data().cwd()
             } else {
-                let p = PathBuf::from(&cwd_arg);
-                if p.is_absolute() { p } else { caller.data().cwd().join(p) }
+                let cwd_path = PathBuf::from(&cwd_arg);
+                if cwd_path.is_absolute() { cwd_path } else { caller.data().cwd().join(cwd_path) }
             };
             if !cwd.is_dir() {
-                let v = serde_json::json!({
+                let error_json = serde_json::json!({
                     "stdout": "",
                     "stderr": format!(
                         "git cwd does not exist: {} (resolved from cwd arg {:?}) -- pass an absolute path, or a path relative to the dispatch's own working directory, not a bare project/repo name",
@@ -1519,7 +1519,7 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
                     ),
                     "exit_code": -1,
                 });
-                return write_guest_json(&mut caller, v);
+                return write_guest_json(&mut caller, error_json);
                 }
                     git_call_stats_note(&argv, false, 0);
                     let layout_question = git_layout_question(&cwd, &argv);
@@ -1573,7 +1573,7 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
                 {
                     crate::windowless::apply_windowless(&mut git_cmd);
                 }
-                let v = match git_cmd.spawn() {
+                let spawn_result = match git_cmd.spawn() {
                     Ok(mut child) => {
                         let containment = match crate::process_tree::establish_containment(&child) {
                             Ok(containment) => containment,
@@ -1692,7 +1692,7 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
                     git_started.elapsed().as_secs_f64() * 1000.0
                 );
             }
-            write_guest_json(&mut caller, v)
+            write_guest_json(&mut caller, spawn_result)
         },
     )?;
 
