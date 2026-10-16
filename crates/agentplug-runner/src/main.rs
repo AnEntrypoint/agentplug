@@ -344,11 +344,6 @@ fn selfcheck_pool_fairness() -> anyhow::Result<()> {
         "code_index must classify as heavy"
     );
     assert_eq!(
-        cost_class_for_verb("recall"),
-        DispatchCostClass::Heavy,
-        "recall must classify as heavy"
-    );
-    assert_eq!(
         cost_class_for_verb("codesearch"),
         DispatchCostClass::Cheap,
         "the verb-only compatibility classifier must stay cheap"
@@ -405,7 +400,7 @@ fn selfcheck_pool_fairness() -> anyhow::Result<()> {
         DispatchCostClass::Cheap,
         "instruction must classify as cheap"
     );
-    println!("[selfcheck-pool-fairness] verb classification: code_index/recall heavy, codesearch/instruction cheap");
+    println!("[selfcheck-pool-fairness] verb classification: code_index heavy, codesearch/instruction cheap");
 
     const POOL_SIZE: usize = 4;
     let pool = Arc::new(SharedPluginPool::new("gm", POOL_SIZE));

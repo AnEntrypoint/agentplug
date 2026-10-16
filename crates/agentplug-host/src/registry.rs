@@ -262,10 +262,6 @@ const HEAVY_DISPATCH_VERBS: &[&str] = &[
     "embed",
     "health",
     "index",
-    "memorize",
-    "memorize-fire",
-    "memorize-prune",
-    "recall",
     "scan_deps",
     "background-convert",
     "bert",
@@ -2412,15 +2408,10 @@ const GIT_NETWORK_LANE_VERBS: &[&str] = &["git_push", "git_pull", "git_fetch"];
 
 const LANE_NETWORK_YIELD_MS: u64 = 120_000;
 
-const READ_LANE_VERBS: &[&str] = &["health", "recall"];
+const READ_LANE_VERBS: &[&str] = &["health"];
 
 const STORE_LANE_VERBS: &[&str] = &[
     "scan_deps",
-    "memorize",
-    "memorize-fire",
-    "memorize-prune",
-    "memorize-vacuum",
-    "memorize-retention",
     "forget",
     "codeinsight_index",
     "code_index",
@@ -2428,8 +2419,6 @@ const STORE_LANE_VERBS: &[&str] = &[
     "index",
     "libsql",
     "bert",
-    "tencentdb-compat-probe",
-    "tencentdb-memory-import",
     "config-sync-now",
     "dataflow_resolve",
     "sql_open",
