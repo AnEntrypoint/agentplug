@@ -424,22 +424,22 @@ impl DaemonConfig {
         Duration::from_secs(self.heartbeat_interval_secs.unwrap_or(10))
     }
     fn plugin_update_poll_interval(&self) -> Duration {
-        Duration::from_secs(self.plugin_update_poll_interval_secs.unwrap_or(60))
+        bounded_update_poll(self.plugin_update_poll_interval_secs.unwrap_or(60), "plugin_update_poll_interval_secs")
     }
     fn plugin_update_poll_interval_for(&self, plugin_name: &str) -> Duration {
         match self
             .plugin_update_poll_interval_secs_by_name
             .get(plugin_name)
         {
-            Some(secs) => Duration::from_secs(*secs),
+            Some(secs) => bounded_update_poll(*secs, "plugin_update_poll_interval_secs_by_name"),
             None => self.plugin_update_poll_interval(),
         }
     }
     fn runner_update_poll_interval(&self) -> Duration {
-        Duration::from_secs(self.runner_update_poll_interval_secs.unwrap_or(60))
+        bounded_update_poll(self.runner_update_poll_interval_secs.unwrap_or(60), "runner_update_poll_interval_secs")
     }
     fn instruction_source_poll_interval(&self) -> Duration {
-        Duration::from_secs(self.instruction_source_poll_interval_secs.unwrap_or(15))
+        bounded_update_poll(self.instruction_source_poll_interval_secs.unwrap_or(15), "instruction_source_poll_interval_secs")
     }
     fn max_concurrent_projects(&self) -> usize {
         4
@@ -3373,6 +3373,19 @@ pub fn run_daemon() -> anyhow::Result<()> {
     run_daemon_body(plugin_modules)
 }
 
+/// No update check waits longer than this. A longer configured interval is clamped, so an
+/// install cannot sit an hour behind a release because of one setting.
+const UPDATE_POLL_CEILING_SECS: u64 = 600;
+
+fn bounded_update_poll(configured_secs: u64, key: &str) -> Duration {
+    if configured_secs > UPDATE_POLL_CEILING_SECS {
+        eprintln!(
+            "[agentplug daemon] {key}={configured_secs}s is above the {UPDATE_POLL_CEILING_SECS}s update ceiling; polling every {UPDATE_POLL_CEILING_SECS}s instead"
+        );
+    }
+    Duration::from_secs(configured_secs.min(UPDATE_POLL_CEILING_SECS))
+}
+
 fn spawn_update_poll_worker(
     daemon_cfg: DaemonConfig,
 ) -> std::sync::mpsc::Receiver<(PathBuf, String)> {
@@ -3396,6 +3409,7 @@ fn spawn_update_poll_worker(
         let runner_update_poll_interval = daemon_cfg.runner_update_poll_interval();
         let mut last_runner_update_poll = seed_poll_timer_from_persisted_ts(&persisted_runner_poll_ts_path());
         let mut first_runner_poll_pending = true;
+        let mut last_skill_refresh: Option<Instant> = None;
         let persisted_runner_poll_ts_at_boot = read_persisted_poll_ts(&persisted_runner_poll_ts_path());
         if persisted_runner_poll_ts_at_boot > 0 {
             HEARTBEAT_LAST_RUNNER_POLL_TS.store(persisted_runner_poll_ts_at_boot, std::sync::atomic::Ordering::Relaxed);
@@ -3439,6 +3453,13 @@ fn spawn_update_poll_worker(
                     }
                 }
                 record_plugin_poll_error(if cycle_errors.is_empty() { None } else { Some(cycle_errors.join("; ")) });
+            }
+
+            if last_skill_refresh.is_none_or(|at| at.elapsed() >= crate::download::SKILL_REFRESH_INTERVAL) {
+                last_skill_refresh = Some(Instant::now());
+                if let Err(e) = crate::download::refresh_installed_skills() {
+                    eprintln!("[agentplug daemon] skill refresh failed: {e:#}");
+                }
             }
 
             if first_runner_poll_pending || last_runner_update_poll.elapsed() >= runner_update_poll_interval || take_forced_runner_refresh_request() {
