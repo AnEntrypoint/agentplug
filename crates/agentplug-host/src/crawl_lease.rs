@@ -371,7 +371,6 @@ pub fn release_session(root: &Path) {
     kill_tree(holder.browser_pid);
     reap_stale_crawl_browsers(&profile_dir(root));
     let _ = std::fs::remove_file(owner_file(root));
-    let _ = std::fs::remove_dir_all(profile_dir(root));
 }
 
 fn publish_holder(root: &Path, port: u16, chrome_pid: u32) -> Result<(), String> {
@@ -385,6 +384,14 @@ fn publish_holder(root: &Path, port: u16, chrome_pid: u32) -> Result<(), String>
     holder.browser_pid = chrome_pid;
     holder.heartbeat_at_ms = now_ms();
     write_holder(root, &holder)
+}
+
+// A profile is kept across launches so the signed-in state survives. Chrome leaves singleton
+// lock files behind when it is killed, and a stale one blocks the next start, so only those go.
+fn clear_profile_locks(profile: &Path) {
+    for name in ["SingletonLock", "SingletonCookie", "SingletonSocket"] {
+        let _ = std::fs::remove_file(profile.join(name));
+    }
 }
 
 fn launch(root: &Path) -> Result<SharedBrowser, String> {
@@ -403,7 +410,7 @@ fn launch(root: &Path) -> Result<SharedBrowser, String> {
         let port = free_local_port()?;
         let profile = profile_dir(root);
         reap_stale_crawl_browsers(&profile);
-        let _ = std::fs::remove_dir_all(&profile);
+        clear_profile_locks(&profile);
         std::fs::create_dir_all(&profile)
             .map_err(|e| format!("could not create Chrome profile {}: {e}", profile.display()))?;
         let mut cmd = Command::new(&chrome);
@@ -422,7 +429,6 @@ fn launch(root: &Path) -> Result<SharedBrowser, String> {
         let child = match cmd.spawn() {
             Ok(child) => child,
             Err(e) => {
-                let _ = std::fs::remove_dir_all(&profile);
                 return Err(format!("Chrome launch failed ({}): {e}", chrome.display()));
             }
         };
@@ -476,7 +482,6 @@ fn close_browser(browser: &mut SharedBrowser) {
     kill_tree(browser.child.id());
     let _ = browser.child.kill();
     let _ = browser.child.wait();
-    let _ = std::fs::remove_dir_all(&browser.profile);
 }
 
 pub fn acquire(root: &Path, agent: &str, headful: bool) -> Result<(u16, u32), String> {
