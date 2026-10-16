@@ -3248,7 +3248,9 @@ pub(super) fn dispatch_project(
                     Some(compile_err) => format!("plugin {plugin_name} failed to compile/install: {compile_err}"),
                     None => format!("plugin {plugin_name} not yet compiled for {}: dispatch this thread's own get_or_compile could not run against the shared PluginModules from a worker thread -- see plugin_modules.get_or_compile() call in run_daemon's pre-chunk warm pass", root.display()),
                 };
-                eprintln!("[agentplug daemon] {reason}");
+                if plugin_failure_first_seen(plugin_name, root) {
+                    eprintln!("[agentplug daemon] {reason}");
+                }
                 if plugin_name == "gm" {
                     gm_load_failure_reason = Some(reason);
                 }
