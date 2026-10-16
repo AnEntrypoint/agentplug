@@ -24,11 +24,6 @@ const MAX_CDP_PARAMS_LINES: usize = 64;
 type StepLines<'a> = std::iter::Peekable<std::iter::Enumerate<std::str::Lines<'a>>>;
 const URL_SCHEMES: [&str; 5] = ["http://", "https://", "about:blank", "file://", "data:"];
 
-pub struct ParsedCrawl {
-    pub engine: Option<String>,
-    pub steps: Vec<Value>,
-}
-
 pub struct HelperRun {
     pub stdout: String,
     pub stderr: String,
@@ -150,53 +145,9 @@ pub(crate) fn process_exists(pid: u32) -> bool {
     }
 }
 
-pub fn parse_crawl_body(body: &str) -> Result<ParsedCrawl, String> {
-    let mut engine = None;
-    let mut steps = Vec::new();
-    let mut seen_content = false;
-    for (index, raw) in body.lines().enumerate() {
-        let line = raw.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let number = index + 1;
-        if !seen_content {
-            seen_content = true;
-            if let Some(value) = line.strip_prefix("engine=") {
-                engine = Some(match value.trim() {
-                    name @ ("cdp" | "lightpanda") => name.to_string(),
-                    other => {
-                        return Err(format!(
-                            "line {number}: engine must be cdp or lightpanda, got '{other}'"
-                        ))
-                    }
-                });
-                continue;
-            }
-        }
-        if is_headless_request(line) {
-            return Err(format!(
-                "line {number}: headless is not a lightpanda step: engine=lightpanda is headless already, so remove the headless line"
-            ));
-        }
-        steps.push(parse_step(line).map_err(|e| format!("line {number}: {e}"))?);
-    }
-    finish(engine, steps)
-}
-
 fn is_headless_request(line: &str) -> bool {
     let lower = line.to_ascii_lowercase();
     lower == "headless" || lower.starts_with("headless=") || lower.starts_with("--headless")
-}
-
-fn finish(engine: Option<String>, steps: Vec<Value>) -> Result<ParsedCrawl, String> {
-    if steps.is_empty() {
-        return Err(
-            "crawl body has no steps: give at least one URL, url=<url>, wait=<ms> or eval=<js>"
-                .to_string(),
-        );
-    }
-    Ok(ParsedCrawl { engine, steps })
 }
 
 fn parse_step(line: &str) -> Result<Value, String> {
@@ -251,7 +202,7 @@ const TOOL_STEP_GRAMMAR: &str ="snapshot, click=<uid>, dblclick=<uid>, hover=<ui
 
 pub fn parse_cdp_crawl_body(body: &str) -> Result<CdpCrawl, String> {
     let mut session = None;
-    let mut headful = env_flag("GM_CRAWL_CDP_HEADFUL");
+    let headful = true;
     let mut steps = Vec::new();
     let mut lines = body.lines().enumerate().peekable();
     while let Some((index, raw)) = lines.next() {
@@ -284,12 +235,12 @@ pub fn parse_cdp_crawl_body(body: &str) -> Result<CdpCrawl, String> {
                 continue;
             }
             if is_headful_request(line) {
-                headful = true;
                 continue;
             }
             if is_headless_request(line) {
-                headful = false;
-                continue;
+                return Err(format!(
+                    "line {number}: headless is refused: engine=cdp runs a headful browser"
+                ));
             }
         } else if is_headful_request(line) || is_headless_request(line) {
             return Err(format!(
@@ -314,15 +265,6 @@ pub fn parse_cdp_crawl_body(body: &str) -> Result<CdpCrawl, String> {
 fn is_headful_request(line: &str) -> bool {
     let lower = line.to_ascii_lowercase();
     lower == "headful" || lower.starts_with("headful=") || lower.starts_with("--headful")
-}
-
-fn env_flag(name: &str) -> bool {
-    std::env::var_os(name)
-        .map(|value| {
-            let value = value.to_string_lossy().to_ascii_lowercase();
-            !matches!(value.as_str(), "" | "0" | "false" | "no" | "off")
-        })
-        .unwrap_or(false)
 }
 
 fn session_name(name: &str) -> Result<String, String> {
@@ -795,26 +737,6 @@ pub(crate) fn find_chrome() -> Option<PathBuf> {
         })
 }
 
-pub type LightpandaEngine = fn(&Path, &str) -> Value;
-
-static LIGHTPANDA_ENGINE: std::sync::OnceLock<LightpandaEngine> = std::sync::OnceLock::new();
-
-pub fn set_lightpanda_engine(engine: LightpandaEngine) {
-    let _ = LIGHTPANDA_ENGINE.set(engine);
-}
-
-pub fn lightpanda_crawl(cwd: &Path, body: &str) -> Value {
-    match LIGHTPANDA_ENGINE.get() {
-        Some(engine) => engine(cwd, body),
-        None => crawl_error_reply(
-            "lightpanda",
-            true,
-            Instant::now(),
-            "the lightpanda engine is not registered in this runner".to_string(),
-        ),
-    }
-}
-
 fn read_pipe<R: Read>(pipe: Option<R>) -> Vec<u8> {
     let mut buf = Vec::new();
     if let Some(mut pipe) = pipe {
@@ -828,9 +750,8 @@ pub fn run_helper(
     target_id: Option<&str>,
     steps: &[Value],
     budget: Duration,
-    browser_session: bool,
 ) -> Result<HelperRun, String> {
-    run_helper_with(port, target_id, steps, budget, browser_session, json!({}))
+    run_helper_with(port, target_id, steps, budget, json!({}))
 }
 
 fn run_helper_with(
@@ -838,14 +759,12 @@ fn run_helper_with(
     target_id: Option<&str>,
     steps: &[Value],
     budget: Duration,
-    browser_session: bool,
     extra: Value,
 ) -> Result<HelperRun, String> {
     let node = find_on_path("node").ok_or("node is required on PATH to run the crawl helper")?;
     let mut config = json!({
         "port": port,
         "targetId": target_id,
-        "browserSession": browser_session,
         "steps": steps,
         "pageTimeoutMs": 30000,
         "textLimit": 20000,
@@ -967,7 +886,6 @@ pub fn crawl_cdp(cwd: &Path, body: &str) -> Value {
         None,
         &parsed.steps,
         CDP_HELPER_BUDGET,
-        false,
         cdp_run_config(cwd, parsed.session.as_deref()),
     );
     let reply = match run {

@@ -387,7 +387,7 @@ fn publish_holder(root: &Path, port: u16, chrome_pid: u32) -> Result<(), String>
     write_holder(root, &holder)
 }
 
-fn launch(root: &Path, headful: bool) -> Result<SharedBrowser, String> {
+fn launch(root: &Path) -> Result<SharedBrowser, String> {
     let chrome = find_chrome().ok_or_else(|| {
         "no Chrome found: set GM_BROWSER_CHROME_PATH or CHROME_PATH, or install Google Chrome or Chromium"
             .to_string()
@@ -409,9 +409,6 @@ fn launch(root: &Path, headful: bool) -> Result<SharedBrowser, String> {
         let mut cmd = Command::new(&chrome);
         cmd.arg(format!("--remote-debugging-port={port}"))
             .arg(format!("--user-data-dir={}", profile.display()));
-        if !headful {
-            cmd.arg("--headless=new");
-        }
         cmd.args([
             "--no-first-run",
             "--no-default-browser-check",
@@ -435,7 +432,7 @@ fn launch(root: &Path, headful: bool) -> Result<SharedBrowser, String> {
             pid: spawn_pid,
             port,
             profile,
-            headful,
+            headful: true,
             active: HashSet::new(),
             idle_since_ms: None,
         };
@@ -445,7 +442,7 @@ fn launch(root: &Path, headful: bool) -> Result<SharedBrowser, String> {
         }
         last_failure = format!(
             "attempt {attempt}/{CDP_LAUNCH_ATTEMPTS}: {} ({}) on port {port} did not answer within {}ms: {}",
-            if headful { "headful Chrome" } else { "headless Chrome" },
+            "headful Chrome",
             chrome.display(),
             CDP_READY_DEADLINE.as_millis(),
             endpoint_failure(port)
@@ -453,7 +450,7 @@ fn launch(root: &Path, headful: bool) -> Result<SharedBrowser, String> {
         close_browser(&mut browser);
     }
     Err(format!(
-        "{last_failure}. Chrome needs a desktop session to open a window: pass `headful` only where one exists, and set GM_BROWSER_CHROME_PATH to a full Chrome otherwise"
+        "{last_failure}. Chrome needs a desktop session to open a window; set GM_BROWSER_CHROME_PATH to a full Chrome otherwise"
     ))
 }
 
@@ -514,7 +511,7 @@ pub fn acquire_session(
         close_browser(&mut stale);
     }
     claim_session(root, agent, ttl_ms, wait_ms)?;
-    let browser = match launch(root, headful) {
+    let browser = match launch(root) {
         Ok(browser) => browser,
         Err(e) => {
             release_session(root);

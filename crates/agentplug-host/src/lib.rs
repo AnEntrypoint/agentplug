@@ -28,8 +28,7 @@ pub use broker::{
 };
 pub use crawl::{
     crawl_cdp, crawl_error_reply, crawl_reply_from_run, endpoint_ready, find_on_path,
-    free_local_port, lightpanda_crawl, parse_cdp_crawl_body, parse_crawl_body, run_helper,
-    set_lightpanda_engine, CdpCrawl, HelperRun, LightpandaEngine, ParsedCrawl,
+    free_local_port, parse_cdp_crawl_body, run_helper, CdpCrawl, HelperRun,
 };
 pub use crawl_lease::{
     claim_session, lease_reply, owner_file, release_session, session_dir, shutdown_shared_browsers,
