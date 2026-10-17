@@ -453,7 +453,7 @@ fn drain_reader_capped<R: std::io::Read + Send + 'static>(
     })
 }
 
-fn normalize_lexically(path: &std::path::Path) -> Option<PathBuf> {
+pub(crate) fn normalize_lexically(path: &std::path::Path) -> Option<PathBuf> {
     use std::path::Component;
     let mut out = PathBuf::new();
     for component in path.components() {
@@ -592,7 +592,7 @@ fn fs_write_lock_for(path: &Path) -> std::sync::Arc<Mutex<()>> {
         .clone()
 }
 
-fn atomic_write_locked(full: &Path, data: &str) -> std::io::Result<()> {
+pub(crate) fn atomic_write_locked(full: &Path, data: &str) -> std::io::Result<()> {
     let lock = fs_write_lock_for(full);
     let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
     atomic_write_under_held_lock(full, data)
@@ -627,7 +627,7 @@ fn atomic_write_under_held_lock(full: &Path, data: &str) -> std::io::Result<()> 
     }
 }
 
-fn atomic_cas_write_locked(full: &Path, expected: &str, data: &str) -> std::io::Result<bool> {
+pub(crate) fn atomic_cas_write_locked(full: &Path, expected: &str, data: &str) -> std::io::Result<bool> {
     let lock = fs_write_lock_for(full);
     let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
     let current = fs::read_to_string(full).unwrap_or_default();
@@ -638,7 +638,7 @@ fn atomic_cas_write_locked(full: &Path, expected: &str, data: &str) -> std::io::
     Ok(true)
 }
 
-fn has_project_marker(dir: &std::path::Path) -> bool {
+pub(crate) fn has_project_marker(dir: &std::path::Path) -> bool {
     const MARKERS: &[&str] = &[
         ".git",
         ".gm",
@@ -650,7 +650,7 @@ fn has_project_marker(dir: &std::path::Path) -> bool {
     MARKERS.iter().any(|m| dir.join(m).exists())
 }
 
-fn sandboxed_guest_path_with_extra_roots(
+pub(crate) fn sandboxed_guest_path_with_extra_roots(
     cwd: &std::path::Path,
     path: &str,
     extra_roots: &[PathBuf],
@@ -1078,73 +1078,12 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
          opts_ptr: u32,
          opts_len: u32|
          -> u64 {
+
             let url = read_guest_string(&mut caller, url_ptr, url_len);
             let opts_str = read_guest_string(&mut caller, opts_ptr, opts_len);
-            let opts: serde_json::Value = if opts_str.is_empty() {
-                serde_json::json!({})
-            } else {
-                serde_json::from_str(&opts_str).unwrap_or(serde_json::json!({}))
-            };
-            let method = opts
-                .get("method")
-                .and_then(|v| v.as_str())
-                .unwrap_or("GET")
-                .to_uppercase();
-            let body = opts.get("body").and_then(|v| v.as_str());
-            let timeout = opts
-                .get("timeoutMs")
-                .and_then(|v| v.as_u64())
-                .map(Duration::from_millis)
-                .unwrap_or(Duration::from_secs(10));
-            let binary_response = opts.get("responseEncoding").and_then(|v| v.as_str()) == Some("base64");
-            let fetch_agent = if binary_response {
-                crate::http_agent::build_agent_without_redirects(timeout)
-            } else {
-                fetch_agent(timeout)
-            };
-            let mut req = fetch_agent.request(&method, &url);
-            if let Some(headers) = opts.get("headers").and_then(|v| v.as_object()) {
-                for (k, v) in headers {
-                    if let Some(vs) = v.as_str() {
-                        req = req.set(k, vs);
-                    }
-                }
-            }
-            req = req.timeout(timeout);
-            let resp = match body {
-                Some(b) => req.send_string(b),
-                None => req.call(),
-            };
-            let result = match resp {
-                Ok(r) if binary_response => {
-                    use std::io::Read;
-                    let status = r.status();
-                    let content_type = r.header("content-type").unwrap_or("").to_string();
-                    let location = r.header("location").map(String::from);
-                    let mut bytes = Vec::new();
-                    match r
-                        .into_reader()
-                        .take(HOST_BINARY_READ_MAX_BYTES + 1)
-                        .read_to_end(&mut bytes)
-                    {
-                        Ok(_) if bytes.len() as u64 > HOST_BINARY_READ_MAX_BYTES => serde_json::json!({"ok": false, "status": status, "error": "response_exceeds_binary_limit", "limit_bytes": HOST_BINARY_READ_MAX_BYTES}),
-                        Ok(_) => serde_json::json!({"ok": true, "status": status, "content_type": content_type, "location": location, "body": base64_encode(&bytes), "encoding": "base64"}),
-                        Err(e) => serde_json::json!({"ok": false, "status": status, "error": e.to_string()}),
-                    }
-                }
-                Ok(r) => {
-                    let status = r.status();
-                    let text = r.into_string().unwrap_or_default();
-                    serde_json::json!({"ok": true, "status": status, "body": text})
-                }
-                Err(ureq::Error::Status(code, r)) => {
-                    let location = r.header("location").map(String::from);
-                    let text = r.into_string().unwrap_or_default();
-                    serde_json::json!({"ok": false, "status": code, "body": text, "location": location})
-                }
-                Err(e) => serde_json::json!({"ok": false, "status": 0, "error": e.to_string()}),
-            };
-            write_guest_json(&mut caller, result)
+
+            let value = fetch_value(&url, &opts_str);
+            write_guest_json(&mut caller, value)
         },
     )?;
 
@@ -1264,16 +1203,12 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
          opts_ptr: u32,
          opts_len: u32|
          -> u64 {
+
             let code = read_guest_string(&mut caller, code_ptr, code_len);
             let opts_str = read_guest_string(&mut caller, opts_ptr, opts_len);
-            let opts: serde_json::Value = if opts_str.is_empty() {
-                serde_json::json!({})
-            } else {
-                serde_json::from_str(&opts_str).unwrap_or(serde_json::json!({}))
-            };
-            let cwd = caller.data().cwd();
-            let result = crate::exec_js::run(&code, &opts, &cwd);
-            write_guest_json(&mut caller, result)
+
+            let value = exec_js_value(caller.data(), &code, &opts_str);
+            write_guest_json(&mut caller, value)
         },
     )?;
 
@@ -1294,23 +1229,12 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
          p_ptr: u32,
          p_len: u32|
          -> u64 {
+
             let action = read_guest_string(&mut caller, a_ptr, a_len);
             let params_str = read_guest_string(&mut caller, p_ptr, p_len);
-            let params: serde_json::Value = if params_str.is_empty() {
-                serde_json::json!({})
-            } else {
-                serde_json::from_str(&params_str).unwrap_or(serde_json::json!({}))
-            };
-            let cwd = caller.data().cwd();
-            let result = if action == crate::fs_prewarm::ACTION {
-                let extra_roots = caller.data().extra_readable_roots();
-                crate::fs_prewarm::run(&params, |p| {
-                    sandboxed_guest_path_with_extra_roots(&cwd, p, &extra_roots)
-                })
-            } else {
-                crate::task::handle(&action, &params, &cwd)
-            };
-            write_guest_json(&mut caller, result)
+
+            let value = task_proc_value(caller.data(), &action, &params_str);
+            write_guest_json(&mut caller, value)
         },
     )?;
 
@@ -1328,77 +1252,8 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
             let plugin = read_guest_string(&mut caller, plugin_ptr, plugin_len);
             let verb = read_guest_string(&mut caller, verb_ptr, verb_len);
             let body = read_guest_string(&mut caller, body_ptr, body_len);
-
-            let caller_plugin = caller.data().plugin_name.clone();
-            if !is_well_formed_plugin_name(&plugin) {
-                return write_guest_json(
-                    &mut caller,
-                    serde_json::json!({"ok": false, "error": "invalid_plugin_name", "plugin": plugin}),
-                );
-            }
-            if !is_well_formed_verb(&verb) {
-                return write_guest_json(
-                    &mut caller,
-                    serde_json::json!({"ok": false, "error": "invalid_verb", "verb": verb}),
-                );
-            }
-            if let Err(reason) = validate_plugin_call_body(&body) {
-                return write_guest_json(
-                    &mut caller,
-                    serde_json::json!({"ok": false, "error": "invalid_body", "reason": reason}),
-                );
-            }
-            if !plugin_call_capability_allowed(&caller.data().cwd(), &caller_plugin, &plugin) {
-                return write_guest_json(
-                    &mut caller,
-                    serde_json::json!({"ok": false, "error": "capability_denied", "caller": caller_plugin, "plugin": plugin}),
-                );
-            }
-
-            let caller_siblings = caller.data().siblings();
-            let caller_root = caller.data().cwd();
-            let sibling_pool = { caller_siblings.lock().unwrap().get(&plugin).cloned() };
-            let sibling_pool = match sibling_pool {
-                Some(pool) => Some(pool),
-                None if crate::registry::ensure_sibling_registered(&caller_root, &plugin, &caller_siblings) => {
-                    caller_siblings.lock().unwrap().get(&plugin).cloned()
-                }
-                None => None,
-            };
-            let Some(sibling_pool) = sibling_pool else {
-                return write_guest_json(
-                    &mut caller,
-                    serde_json::json!({"ok": false, "error": "unknown_plugin", "plugin": plugin}),
-                );
-            };
-
-            let acquire_start = std::time::Instant::now();
-            let acquire_timeout_ms = crate::registry::SharedPluginPool::ACQUIRE_TIMEOUT_MS;
-            let mut guard = sibling_pool.acquire().expect("acquire() always returns Some -- FIFO wait never denies");
-            if guard.is_none() {
-                drop(guard);
-                crate::registry::ensure_sibling_registered(&caller_root, &plugin, &caller_siblings);
-                let remaining_ms = acquire_timeout_ms.saturating_sub(acquire_start.elapsed().as_millis() as u64);
-                sibling_pool.any_instantiated_within(remaining_ms);
-                let remaining_ms = acquire_timeout_ms.saturating_sub(acquire_start.elapsed().as_millis() as u64);
-                guard = sibling_pool.acquire_within(remaining_ms).0;
-            }
-            let result = match guard.as_mut() {
-                None => Err(anyhow::anyhow!("plugin_not_loaded_yet")),
-                Some(handle) => crate::registry::dispatch_on(&mut handle.store, handle.instance, &verb, &body, &caller_root, caller_siblings.clone()),
-            };
-            sibling_pool.evict_if_swap_pending(&mut guard);
-            drop(guard);
-
-            match result {
-                Ok(s) if !s.is_empty() => write_guest_bytes(&mut caller, s.as_bytes()),
-                Ok(_) => write_guest_json(&mut caller, serde_json::json!({"ok": true})),
-                Err(e) if e.to_string() == "plugin_not_loaded_yet" => write_guest_json(
-                    &mut caller,
-                    serde_json::json!({"ok": false, "error": "plugin_not_loaded_yet", "plugin": plugin}),
-                ),
-                Err(e) => write_guest_json(&mut caller, serde_json::json!({"ok": false, "error": e.to_string(), "plugin": plugin})),
-            }
+            let bytes = plugin_call_bytes(caller.data(), &plugin, &verb, &body);
+            write_guest_bytes(&mut caller, &bytes)
         },
     )?;
 
@@ -1407,80 +1262,19 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
         "host_vec_embed",
         |mut caller: Caller<'_, HostState>, text_ptr: u32, text_len: u32, out_ptr: u32, out_len: u32| -> i32 {
             let text = read_guest_string(&mut caller, text_ptr, text_len);
-            if text.is_empty() || text.len() > 1024 * 1024 {
-                return -1;
-            }
-            let caller_plugin = caller.data().plugin_name.clone();
-            if !plugin_call_capability_allowed(&caller.data().cwd(), &caller_plugin, "bert") {
-                eprintln!("[agentplug:host_vec_embed] capability_denied: caller {caller_plugin} not permitted to reach bert");
-                return -1;
-            }
-            let body = serde_json::json!({"text": text}).to_string();
-
-            let caller_siblings = caller.data().siblings();
-            let caller_root = caller.data().cwd();
-            let sibling_pool = { caller_siblings.lock().unwrap_or_else(|e| e.into_inner()).get("bert").cloned() };
-            let sibling_pool = match sibling_pool {
-                Some(pool) => Some(pool),
-                None if crate::registry::ensure_sibling_registered(&caller_root, "bert", &caller_siblings) => {
-                    caller_siblings.lock().unwrap_or_else(|e| e.into_inner()).get("bert").cloned()
-                }
-                None => {
-                    let registered: Vec<String> = caller_siblings.lock().unwrap_or_else(|e| e.into_inner()).keys().cloned().collect();
-                    eprintln!(
-                        "[agentplug:host_vec_embed] no `bert` sibling registered for {} (caller plugin {caller_plugin}); this process has {registered:?} loaded -- the embedder is unreachable, so every embedding-dependent verb will fail until bert is loaded into the SAME siblings map as the caller",
-                        caller_root.display()
-                    );
-                    None
-                }
-            };
-            let Some(sibling_pool) = sibling_pool else {
-                return -1;
-            };
-            const EMBED_RETRY_ATTEMPTS: u32 = 3;
-            const EMBED_RETRY_BACKOFF_MS: u64 = 500;
-            let mut result: anyhow::Result<Vec<f32>> = Err(anyhow::anyhow!("embed not attempted"));
-            for attempt in 0..EMBED_RETRY_ATTEMPTS {
-                let mut guard = sibling_pool.acquire().expect("acquire() always returns Some -- FIFO wait never denies");
-                result = match guard.as_mut() {
-                    None => Err(anyhow::anyhow!("bert not loaded yet")),
-                    Some(handle) => crate::registry::dispatch_on(&mut handle.store, handle.instance, "embed", &body, &caller_root, caller_siblings.clone()).and_then(|resp| {
-                        let response_json: serde_json::Value = serde_json::from_str(&resp)?;
-                        let embedding_array = response_json.get("embedding").and_then(|e| e.as_array()).ok_or_else(|| anyhow::anyhow!("no embedding field"))?;
-                        Ok::<Vec<f32>, anyhow::Error>(embedding_array.iter().filter_map(|x| x.as_f64()).map(|x| x as f32).collect())
-                    }),
-                };
-                if result.is_err() {
-                    *guard = None;
-                } else {
-                    sibling_pool.evict_if_swap_pending(&mut guard);
-                }
-                drop(guard);
-                if result.is_ok() {
-                    break;
-                }
-                if attempt + 1 < EMBED_RETRY_ATTEMPTS {
-                    sibling_pool.any_instantiated_within(EMBED_RETRY_BACKOFF_MS);
-                }
-            }
-
-            match result {
+            match vec_embed_values(caller.data(), &text, out_len) {
                 Ok(values) => {
-                    let dim = values.len().min(out_len as usize);
-                    let mut bytes = Vec::with_capacity(dim * 4);
-                    for v in &values[..dim] {
+                    let mut bytes = Vec::with_capacity(values.len() * 4);
+                    for v in &values {
                         bytes.extend_from_slice(&v.to_le_bytes());
                     }
                     let memory = guest_memory(&mut caller);
                     if memory.write(&mut caller, out_ptr as usize, &bytes).is_err() {
                         return -1;
                     }
-                    dim as i32
+                    values.len() as i32
                 }
-                Err(e) => {
-                    eprintln!("[agentplug:host_vec_embed] failed after {EMBED_RETRY_ATTEMPTS} attempts: {e}");
-                    -1
-                }
+                Err(rc) => rc,
             }
         },
     )?;
@@ -1489,203 +1283,12 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
         "env",
         "host_git",
         |mut caller: Caller<'_, HostState>, args_ptr: u32, args_len: u32, cwd_ptr: u32, cwd_len: u32| -> u64 {
+
             let args = read_guest_string(&mut caller, args_ptr, args_len);
             let cwd_arg = read_guest_string(&mut caller, cwd_ptr, cwd_len);
-            let trimmed = args.trim();
-            let argv: Vec<String> = if trimmed.starts_with('[') {
-                serde_json::from_str::<Vec<String>>(trimmed).unwrap_or_else(|_| trimmed.split_whitespace().map(String::from).collect())
-            } else {
-                trimmed.split_whitespace().map(String::from).collect()
-            };
-            let cwd = if cwd_arg.is_empty() {
-                caller.data().cwd()
-            } else {
-                let cwd_path = PathBuf::from(&cwd_arg);
-                if cwd_path.is_absolute() { cwd_path } else { caller.data().cwd().join(cwd_path) }
-            };
-            if !cwd.is_dir() {
-                let error_json = serde_json::json!({
-                    "stdout": "",
-                    "stderr": format!(
-                        "git cwd does not exist: {} (resolved from cwd arg {:?}) -- pass an absolute path, or a path relative to the dispatch's own working directory, not a bare project/repo name",
-                        cwd.display(), cwd_arg
-                    ),
-                    "exit_code": -1,
-                });
-                return write_guest_json(&mut caller, error_json);
-                }
-                    git_call_stats_note(&argv, false, 0);
-                    let layout_question = git_layout_question(&cwd, &argv);
-                    let index_question = git_index_question(&cwd, &argv);
-                    let index_identity =
-                        index_question.as_ref().and_then(|(dir, _)| git_index_identity(dir));
-                    if let Some((dir, question)) = layout_question.as_ref() {
-                        if let Some(answer) = git_layout_recall(dir, question, None) {
-                            return write_guest_json(&mut caller, serde_json::json!({
-                                "stdout": answer.stdout,
-                                "stderr": answer.stderr,
-                                "exit_code": answer.exit_code,
-                                "stdout_truncated": false,
-                                "stderr_truncated": false,
-                            }));
-                        }
-                    }
-                    if let Some((dir, question)) = index_question.as_ref() {
-                        if let Some(answer) = git_layout_recall(dir, question, index_identity.clone()) {
-                            return write_guest_json(&mut caller, serde_json::json!({
-                                "stdout": answer.stdout,
-                                "stderr": answer.stderr,
-                                "exit_code": answer.exit_code,
-                                "stdout_truncated": false,
-                                "stderr_truncated": false,
-                            }));
-                        }
-                    }
-                    if let Some(dir) = git_head_question(&cwd, &argv) {
-                        if let Some(sha) = git_head_sha_from_disk(&dir) {
-                            return write_guest_json(&mut caller, serde_json::json!({
-                                "stdout": format!("{sha}\n"),
-                                "stderr": "",
-                                "exit_code": 0,
-                                "stdout_truncated": false,
-                                "stderr_truncated": false,
-                            }));
-                        }
-                    }
-                    git_call_stats_note(&argv, true, 0);
-                    let git_started = Instant::now();
-                    let mut git_cmd = std::process::Command::new("git");
-                    git_cmd.args(&argv).current_dir(&cwd).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
-                    configure_github_git_credentials(&mut git_cmd, &argv);
-                #[cfg(unix)]
-                {
-                    use std::os::unix::process::CommandExt;
-                    git_cmd.process_group(0);
-                }
-                #[cfg(windows)]
-                {
-                    crate::windowless::apply_windowless(&mut git_cmd);
-                }
-                let spawn_result = match git_cmd.spawn() {
-                    Ok(mut child) => {
-                        let containment = match crate::process_tree::establish_containment(&child) {
-                            Ok(containment) => containment,
-                            Err(error) => {
-                                crate::process_tree::kill_tree(child.id());
-                                let _ = child.kill();
-                                let _ = child.wait();
-                                return write_guest_json(&mut caller, serde_json::json!({
-                                    "stdout": "",
-                                    "stderr": format!("git process containment failed: {error}"),
-                                    "exit_code": -1,
-                                }));
-                            }
-                        };
-                        let cap_hit = Arc::new(AtomicBool::new(false));
-                    let out_handle = child.stdout.take().map(|o| drain_reader_capped(o, HOST_GIT_STDOUT_CAP_BYTES, cap_hit.clone()));
-                    let err_handle = child.stderr.take().map(|e| drain_reader_capped(e, HOST_GIT_STDERR_CAP_BYTES, cap_hit.clone()));
-                    let timeout_ms = git_subprocess_timeout_ms();
-                    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
-                    let mut exit_code: i32 = -1;
-                    let mut timed_out = false;
-                    let mut cap_stopped = false;
-                    loop {
-                            if cap_hit.load(Ordering::SeqCst) {
-                                crate::process_tree::terminate_containment(&containment, child.id());
-                                let _ = child.wait();
-                            cap_stopped = true;
-                            break;
-                        }
-                        match child.wait_timeout(Duration::from_millis(20)) {
-                            Ok(Some(status)) => { exit_code = status.code().unwrap_or(-1); break; }
-                            Ok(None) => {}
-                            Err(_) => break,
-                        }
-                            if Instant::now() >= deadline {
-                                crate::process_tree::terminate_containment(&containment, child.id());
-                                let _ = child.wait();
-                            timed_out = true;
-                            break;
-                        }
-                        }
-                        let (stdout, out_trunc_read) =
-                            out_handle.and_then(|h| h.join().ok()).unwrap_or_default();
-                        let (stderr, err_trunc_read) =
-                            err_handle.and_then(|h| h.join().ok()).unwrap_or_default();
-                        let output_truncated = out_trunc_read || err_trunc_read || cap_stopped;
-                        let stderr = String::from_utf8_lossy(&stderr);
-                        let output_limit_error =
-                            format!("git {argv:?} output exceeded the host capture limit");
-                        if let Some((dir, question)) = layout_question.as_ref() {
-                            if timed_out || output_truncated || exit_code != 0 {
-                                git_layout_forget_dir(dir);
-                            } else {
-                                git_layout_remember(
-                                    dir.clone(),
-                                    question,
-                                    GitLayoutAnswer {
-                                        stdout: String::from_utf8_lossy(&stdout).into_owned(),
-                                        stderr: stderr.to_string(),
-                                        exit_code,
-                                        fingerprint: None,
-                                    },
-                                );
-                            }
-                        } else if let Some((dir, question)) = index_question.as_ref() {
-                            if timed_out || output_truncated || exit_code != 0 {
-                                git_layout_forget_dir(dir);
-                            } else if let Some(identity) = index_identity.as_ref() {
-                                if stdout.len() <= GIT_INDEX_ANSWER_MAX_BYTES {
-                                    git_layout_remember(
-                                        dir.clone(),
-                                        question,
-                                        GitLayoutAnswer {
-                                            stdout: String::from_utf8_lossy(&stdout).into_owned(),
-                                            stderr: stderr.to_string(),
-                                            exit_code,
-                                            fingerprint: Some(identity.clone()),
-                                        },
-                                    );
-                                }
-                            }
-                        } else {
-                            git_layout_forget_dir(&cwd);
-                        }
-                        if timed_out {
-                            serde_json::json!({
-                                "stdout": String::from_utf8_lossy(&stdout),
-                                "stderr": format!("git {argv:?} timed out after {timeout_ms}ms, killed"),
-                                "exit_code": -1,
-                            })
-                        } else {
-                            serde_json::json!({
-                                "stdout": String::from_utf8_lossy(&stdout),
-                                "stderr": if output_truncated {
-                                    if stderr.is_empty() {
-                                        output_limit_error
-                                    } else {
-                                        format!("{stderr}\n{output_limit_error}")
-                                    }
-                                } else {
-                                    stderr.into_owned()
-                                },
-                                "exit_code": if output_truncated { -1 } else { exit_code },
-                                "stdout_truncated": out_trunc_read,
-                                "stderr_truncated": err_trunc_read,
-                            })
-                        }
-                }
-                Err(e) => serde_json::json!({"stdout": "", "stderr": e.to_string(), "exit_code": 1}),
-            };
-            git_call_stats_add_ms(&argv, git_started.elapsed().as_millis() as u64);
-            if std::env::var_os("GM_GIT_TRACE").is_some() {
-                eprintln!(
-                    "[agentplug:git_trace] argv={argv:?} cwd={} elapsed_ms={:.1}",
-                    cwd.display(),
-                    git_started.elapsed().as_secs_f64() * 1000.0
-                );
-            }
-            write_guest_json(&mut caller, spawn_result)
+
+            let value = git_value(caller.data(), &args, &cwd_arg);
+            write_guest_json(&mut caller, value)
         },
     )?;
 
@@ -1693,21 +1296,22 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
         "env",
         "crawl_cdp",
         |mut caller: Caller<'_, HostState>, body_ptr: u32, body_len: u32| -> u64 {
+
             let body = read_guest_string(&mut caller, body_ptr, body_len);
-            let cwd = caller.data().cwd();
-            let reply = crate::crawl::crawl_cdp(&cwd, &body);
-            write_guest_json(&mut caller, reply)
+
+            let value = crawl_cdp_value(caller.data(), &body);
+            write_guest_json(&mut caller, value)
         },
     )?;
 
     Ok(())
 }
 
-fn kv_namespace_dir(cwd: &std::path::Path, ns: &str) -> PathBuf {
+pub(crate) fn kv_namespace_dir(cwd: &std::path::Path, ns: &str) -> PathBuf {
     cwd.join(".agentplug-kv").join(safe_name(ns))
 }
 
-fn kv_file_path(cwd: &std::path::Path, ns: &str, key: &str) -> PathBuf {
+pub(crate) fn kv_file_path(cwd: &std::path::Path, ns: &str, key: &str) -> PathBuf {
     kv_namespace_dir(cwd, ns).join(format!("{}.json", safe_name(key)))
 }
 
@@ -1750,5 +1354,450 @@ mod tests {
         });
         assert!(helper_present);
         set_github_cli_config_dir(None);
+    }
+}
+
+pub(crate) fn git_value(state: &HostState, args: &str, cwd_arg: &str) -> serde_json::Value {
+    fn wrap_reply(v: serde_json::Value) -> serde_json::Value {
+        v
+    }
+    let trimmed = args.trim();
+    let argv: Vec<String> = if trimmed.starts_with('[') {
+        serde_json::from_str::<Vec<String>>(trimmed).unwrap_or_else(|_| trimmed.split_whitespace().map(String::from).collect())
+    } else {
+        trimmed.split_whitespace().map(String::from).collect()
+    };
+    let cwd = if cwd_arg.is_empty() {
+        state.cwd()
+    } else {
+        let cwd_path = PathBuf::from(&cwd_arg);
+        if cwd_path.is_absolute() { cwd_path } else { state.cwd().join(cwd_path) }
+    };
+    if !cwd.is_dir() {
+        let error_json = serde_json::json!({
+            "stdout": "",
+            "stderr": format!(
+                "git cwd does not exist: {} (resolved from cwd arg {:?}) -- pass an absolute path, or a path relative to the dispatch's own working directory, not a bare project/repo name",
+                cwd.display(), cwd_arg
+            ),
+            "exit_code": -1,
+        });
+        return wrap_reply( error_json);
+        }
+            git_call_stats_note(&argv, false, 0);
+            let layout_question = git_layout_question(&cwd, &argv);
+            let index_question = git_index_question(&cwd, &argv);
+            let index_identity =
+                index_question.as_ref().and_then(|(dir, _)| git_index_identity(dir));
+            if let Some((dir, question)) = layout_question.as_ref() {
+                if let Some(answer) = git_layout_recall(dir, question, None) {
+                    return wrap_reply( serde_json::json!({
+                        "stdout": answer.stdout,
+                        "stderr": answer.stderr,
+                        "exit_code": answer.exit_code,
+                        "stdout_truncated": false,
+                        "stderr_truncated": false,
+                    }));
+                }
+            }
+            if let Some((dir, question)) = index_question.as_ref() {
+                if let Some(answer) = git_layout_recall(dir, question, index_identity.clone()) {
+                    return wrap_reply( serde_json::json!({
+                        "stdout": answer.stdout,
+                        "stderr": answer.stderr,
+                        "exit_code": answer.exit_code,
+                        "stdout_truncated": false,
+                        "stderr_truncated": false,
+                    }));
+                }
+            }
+            if let Some(dir) = git_head_question(&cwd, &argv) {
+                if let Some(sha) = git_head_sha_from_disk(&dir) {
+                    return wrap_reply( serde_json::json!({
+                        "stdout": format!("{sha}\n"),
+                        "stderr": "",
+                        "exit_code": 0,
+                        "stdout_truncated": false,
+                        "stderr_truncated": false,
+                    }));
+                }
+            }
+            git_call_stats_note(&argv, true, 0);
+            let git_started = Instant::now();
+            let mut git_cmd = std::process::Command::new("git");
+            git_cmd.args(&argv).current_dir(&cwd).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+            configure_github_git_credentials(&mut git_cmd, &argv);
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            git_cmd.process_group(0);
+        }
+        #[cfg(windows)]
+        {
+            crate::windowless::apply_windowless(&mut git_cmd);
+        }
+        let spawn_result = match git_cmd.spawn() {
+            Ok(mut child) => {
+                let containment = match crate::process_tree::establish_containment(&child) {
+                    Ok(containment) => containment,
+                    Err(error) => {
+                        crate::process_tree::kill_tree(child.id());
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return wrap_reply( serde_json::json!({
+                            "stdout": "",
+                            "stderr": format!("git process containment failed: {error}"),
+                            "exit_code": -1,
+                        }));
+                    }
+                };
+                let cap_hit = Arc::new(AtomicBool::new(false));
+            let out_handle = child.stdout.take().map(|o| drain_reader_capped(o, HOST_GIT_STDOUT_CAP_BYTES, cap_hit.clone()));
+            let err_handle = child.stderr.take().map(|e| drain_reader_capped(e, HOST_GIT_STDERR_CAP_BYTES, cap_hit.clone()));
+            let timeout_ms = git_subprocess_timeout_ms();
+            let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+            let mut exit_code: i32 = -1;
+            let mut timed_out = false;
+            let mut cap_stopped = false;
+            loop {
+                    if cap_hit.load(Ordering::SeqCst) {
+                        crate::process_tree::terminate_containment(&containment, child.id());
+                        let _ = child.wait();
+                    cap_stopped = true;
+                    break;
+                }
+                match child.wait_timeout(Duration::from_millis(20)) {
+                    Ok(Some(status)) => { exit_code = status.code().unwrap_or(-1); break; }
+                    Ok(None) => {}
+                    Err(_) => break,
+                }
+                    if Instant::now() >= deadline {
+                        crate::process_tree::terminate_containment(&containment, child.id());
+                        let _ = child.wait();
+                    timed_out = true;
+                    break;
+                }
+                }
+                let (stdout, out_trunc_read) =
+                    out_handle.and_then(|h| h.join().ok()).unwrap_or_default();
+                let (stderr, err_trunc_read) =
+                    err_handle.and_then(|h| h.join().ok()).unwrap_or_default();
+                let output_truncated = out_trunc_read || err_trunc_read || cap_stopped;
+                let stderr = String::from_utf8_lossy(&stderr);
+                let output_limit_error =
+                    format!("git {argv:?} output exceeded the host capture limit");
+                if let Some((dir, question)) = layout_question.as_ref() {
+                    if timed_out || output_truncated || exit_code != 0 {
+                        git_layout_forget_dir(dir);
+                    } else {
+                        git_layout_remember(
+                            dir.clone(),
+                            question,
+                            GitLayoutAnswer {
+                                stdout: String::from_utf8_lossy(&stdout).into_owned(),
+                                stderr: stderr.to_string(),
+                                exit_code,
+                                fingerprint: None,
+                            },
+                        );
+                    }
+                } else if let Some((dir, question)) = index_question.as_ref() {
+                    if timed_out || output_truncated || exit_code != 0 {
+                        git_layout_forget_dir(dir);
+                    } else if let Some(identity) = index_identity.as_ref() {
+                        if stdout.len() <= GIT_INDEX_ANSWER_MAX_BYTES {
+                            git_layout_remember(
+                                dir.clone(),
+                                question,
+                                GitLayoutAnswer {
+                                    stdout: String::from_utf8_lossy(&stdout).into_owned(),
+                                    stderr: stderr.to_string(),
+                                    exit_code,
+                                    fingerprint: Some(identity.clone()),
+                                },
+                            );
+                        }
+                    }
+                } else {
+                    git_layout_forget_dir(&cwd);
+                }
+                if timed_out {
+                    serde_json::json!({
+                        "stdout": String::from_utf8_lossy(&stdout),
+                        "stderr": format!("git {argv:?} timed out after {timeout_ms}ms, killed"),
+                        "exit_code": -1,
+                    })
+                } else {
+                    serde_json::json!({
+                        "stdout": String::from_utf8_lossy(&stdout),
+                        "stderr": if output_truncated {
+                            if stderr.is_empty() {
+                                output_limit_error
+                            } else {
+                                format!("{stderr}\n{output_limit_error}")
+                            }
+                        } else {
+                            stderr.into_owned()
+                        },
+                        "exit_code": if output_truncated { -1 } else { exit_code },
+                        "stdout_truncated": out_trunc_read,
+                        "stderr_truncated": err_trunc_read,
+                    })
+                }
+        }
+        Err(e) => serde_json::json!({"stdout": "", "stderr": e.to_string(), "exit_code": 1}),
+    };
+    git_call_stats_add_ms(&argv, git_started.elapsed().as_millis() as u64);
+    if std::env::var_os("GM_GIT_TRACE").is_some() {
+        eprintln!(
+            "[agentplug:git_trace] argv={argv:?} cwd={} elapsed_ms={:.1}",
+            cwd.display(),
+            git_started.elapsed().as_secs_f64() * 1000.0
+        );
+    }
+    wrap_reply( spawn_result)
+}
+
+pub(crate) fn exec_js_value(state: &HostState, code: &str, opts_str: &str) -> serde_json::Value {
+    fn wrap_reply(v: serde_json::Value) -> serde_json::Value {
+        v
+    }
+    let opts: serde_json::Value = if opts_str.is_empty() {
+        serde_json::json!({})
+    } else {
+        serde_json::from_str(&opts_str).unwrap_or(serde_json::json!({}))
+    };
+    let cwd = state.cwd();
+    let result = crate::exec_js::run(&code, &opts, &cwd);
+    wrap_reply( result)
+}
+
+pub(crate) fn task_proc_value(state: &HostState, action: &str, params_str: &str) -> serde_json::Value {
+    fn wrap_reply(v: serde_json::Value) -> serde_json::Value {
+        v
+    }
+    let params: serde_json::Value = if params_str.is_empty() {
+        serde_json::json!({})
+    } else {
+        serde_json::from_str(&params_str).unwrap_or(serde_json::json!({}))
+    };
+    let cwd = state.cwd();
+    let result = if action == crate::fs_prewarm::ACTION {
+        let extra_roots = state.extra_readable_roots();
+        crate::fs_prewarm::run(&params, |p| {
+            sandboxed_guest_path_with_extra_roots(&cwd, p, &extra_roots)
+        })
+    } else {
+        crate::task::handle(&action, &params, &cwd)
+    };
+    wrap_reply( result)
+}
+
+pub(crate) fn fetch_value(url: &str, opts_str: &str) -> serde_json::Value {
+    fn wrap_reply(v: serde_json::Value) -> serde_json::Value {
+        v
+    }
+    let opts: serde_json::Value = if opts_str.is_empty() {
+        serde_json::json!({})
+    } else {
+        serde_json::from_str(&opts_str).unwrap_or(serde_json::json!({}))
+    };
+    let method = opts
+        .get("method")
+        .and_then(|v| v.as_str())
+        .unwrap_or("GET")
+        .to_uppercase();
+    let body = opts.get("body").and_then(|v| v.as_str());
+    let timeout = opts
+        .get("timeoutMs")
+        .and_then(|v| v.as_u64())
+        .map(Duration::from_millis)
+        .unwrap_or(Duration::from_secs(10));
+    let binary_response = opts.get("responseEncoding").and_then(|v| v.as_str()) == Some("base64");
+    let fetch_agent = if binary_response {
+        crate::http_agent::build_agent_without_redirects(timeout)
+    } else {
+        fetch_agent(timeout)
+    };
+    let mut req = fetch_agent.request(&method, &url);
+    if let Some(headers) = opts.get("headers").and_then(|v| v.as_object()) {
+        for (k, v) in headers {
+            if let Some(vs) = v.as_str() {
+                req = req.set(k, vs);
+            }
+        }
+    }
+    req = req.timeout(timeout);
+    let resp = match body {
+        Some(b) => req.send_string(b),
+        None => req.call(),
+    };
+    let result = match resp {
+        Ok(r) if binary_response => {
+            use std::io::Read;
+            let status = r.status();
+            let content_type = r.header("content-type").unwrap_or("").to_string();
+            let location = r.header("location").map(String::from);
+            let mut bytes = Vec::new();
+            match r
+                .into_reader()
+                .take(HOST_BINARY_READ_MAX_BYTES + 1)
+                .read_to_end(&mut bytes)
+            {
+                Ok(_) if bytes.len() as u64 > HOST_BINARY_READ_MAX_BYTES => serde_json::json!({"ok": false, "status": status, "error": "response_exceeds_binary_limit", "limit_bytes": HOST_BINARY_READ_MAX_BYTES}),
+                Ok(_) => serde_json::json!({"ok": true, "status": status, "content_type": content_type, "location": location, "body": base64_encode(&bytes), "encoding": "base64"}),
+                Err(e) => serde_json::json!({"ok": false, "status": status, "error": e.to_string()}),
+            }
+        }
+        Ok(r) => {
+            let status = r.status();
+            let text = r.into_string().unwrap_or_default();
+            serde_json::json!({"ok": true, "status": status, "body": text})
+        }
+        Err(ureq::Error::Status(code, r)) => {
+            let location = r.header("location").map(String::from);
+            let text = r.into_string().unwrap_or_default();
+            serde_json::json!({"ok": false, "status": code, "body": text, "location": location})
+        }
+        Err(e) => serde_json::json!({"ok": false, "status": 0, "error": e.to_string()}),
+    };
+    wrap_reply( result)
+}
+
+pub(crate) fn crawl_cdp_value(state: &HostState, body: &str) -> serde_json::Value {
+    fn wrap_reply(v: serde_json::Value) -> serde_json::Value {
+        v
+    }
+    let cwd = state.cwd();
+    let reply = crate::crawl::crawl_cdp(&cwd, &body);
+    wrap_reply( reply)
+}
+
+
+pub(crate) fn plugin_call_bytes(state: &HostState, plugin: &str, verb: &str, body: &str) -> Vec<u8> {
+    let json = |v: serde_json::Value| v.to_string().into_bytes();
+    let caller_plugin = state.plugin_name.clone();
+    if !is_well_formed_plugin_name(plugin) {
+        return json(serde_json::json!({"ok": false, "error": "invalid_plugin_name", "plugin": plugin}));
+    }
+    if !is_well_formed_verb(verb) {
+        return json(serde_json::json!({"ok": false, "error": "invalid_verb", "verb": verb}));
+    }
+    if let Err(reason) = validate_plugin_call_body(body) {
+        return json(serde_json::json!({"ok": false, "error": "invalid_body", "reason": reason}));
+    }
+    if !plugin_call_capability_allowed(&state.cwd(), &caller_plugin, plugin) {
+        return json(serde_json::json!({"ok": false, "error": "capability_denied", "caller": caller_plugin, "plugin": plugin}));
+    }
+
+    let caller_siblings = state.siblings();
+    let caller_root = state.cwd();
+    let sibling_pool = { caller_siblings.lock().unwrap().get(plugin).cloned() };
+    let sibling_pool = match sibling_pool {
+        Some(pool) => Some(pool),
+        None if crate::registry::ensure_sibling_registered(&caller_root, plugin, &caller_siblings) => {
+            caller_siblings.lock().unwrap().get(plugin).cloned()
+        }
+        None => None,
+    };
+    let Some(sibling_pool) = sibling_pool else {
+        return json(serde_json::json!({"ok": false, "error": "unknown_plugin", "plugin": plugin}));
+    };
+
+    let acquire_start = std::time::Instant::now();
+    let acquire_timeout_ms = crate::registry::SharedPluginPool::ACQUIRE_TIMEOUT_MS;
+    let mut guard = sibling_pool.acquire().expect("acquire() always returns Some -- FIFO wait never denies");
+    if guard.is_none() {
+        drop(guard);
+        crate::registry::ensure_sibling_registered(&caller_root, plugin, &caller_siblings);
+        let remaining_ms = acquire_timeout_ms.saturating_sub(acquire_start.elapsed().as_millis() as u64);
+        sibling_pool.any_instantiated_within(remaining_ms);
+        let remaining_ms = acquire_timeout_ms.saturating_sub(acquire_start.elapsed().as_millis() as u64);
+        guard = sibling_pool.acquire_within(remaining_ms).0;
+    }
+    let result = match guard.as_mut() {
+        None => Err(anyhow::anyhow!("plugin_not_loaded_yet")),
+        Some(handle) => crate::registry::dispatch_on(&mut handle.store, handle.instance, verb, body, &caller_root, caller_siblings.clone()),
+    };
+    sibling_pool.evict_if_swap_pending(&mut guard);
+    drop(guard);
+
+    match result {
+        Ok(s) if !s.is_empty() => s.into_bytes(),
+        Ok(_) => json(serde_json::json!({"ok": true})),
+        Err(e) if e.to_string() == "plugin_not_loaded_yet" => {
+            json(serde_json::json!({"ok": false, "error": "plugin_not_loaded_yet", "plugin": plugin}))
+        }
+        Err(e) => json(serde_json::json!({"ok": false, "error": e.to_string(), "plugin": plugin})),
+    }
+}
+
+pub(crate) fn vec_embed_values(state: &HostState, text: &str, out_len: u32) -> Result<Vec<f32>, i32> {
+    if text.is_empty() || text.len() > 1024 * 1024 {
+        return Err(-1);
+    }
+    let caller_plugin = state.plugin_name.clone();
+    if !plugin_call_capability_allowed(&state.cwd(), &caller_plugin, "bert") {
+        eprintln!("[agentplug:host_vec_embed] capability_denied: caller {caller_plugin} not permitted to reach bert");
+        return Err(-1);
+    }
+    let body = serde_json::json!({"text": text}).to_string();
+
+    let caller_siblings = state.siblings();
+    let caller_root = state.cwd();
+    let sibling_pool = { caller_siblings.lock().unwrap_or_else(|e| e.into_inner()).get("bert").cloned() };
+    let sibling_pool = match sibling_pool {
+        Some(pool) => Some(pool),
+        None if crate::registry::ensure_sibling_registered(&caller_root, "bert", &caller_siblings) => {
+            caller_siblings.lock().unwrap_or_else(|e| e.into_inner()).get("bert").cloned()
+        }
+        None => {
+            let registered: Vec<String> = caller_siblings.lock().unwrap_or_else(|e| e.into_inner()).keys().cloned().collect();
+            eprintln!(
+                "[agentplug:host_vec_embed] no `bert` sibling registered for {} (caller plugin {caller_plugin}); this process has {registered:?} loaded -- the embedder is unreachable, so every embedding-dependent verb will fail until bert is loaded into the SAME siblings map as the caller",
+                caller_root.display()
+            );
+            None
+        }
+    };
+    let Some(sibling_pool) = sibling_pool else {
+        return Err(-1);
+    };
+    const EMBED_RETRY_ATTEMPTS: u32 = 3;
+    const EMBED_RETRY_BACKOFF_MS: u64 = 500;
+    let mut result: anyhow::Result<Vec<f32>> = Err(anyhow::anyhow!("embed not attempted"));
+    for attempt in 0..EMBED_RETRY_ATTEMPTS {
+        let mut guard = sibling_pool.acquire().expect("acquire() always returns Some -- FIFO wait never denies");
+        result = match guard.as_mut() {
+            None => Err(anyhow::anyhow!("bert not loaded yet")),
+            Some(handle) => crate::registry::dispatch_on(&mut handle.store, handle.instance, "embed", &body, &caller_root, caller_siblings.clone()).and_then(|resp| {
+                let response_json: serde_json::Value = serde_json::from_str(&resp)?;
+                let embedding_array = response_json.get("embedding").and_then(|e| e.as_array()).ok_or_else(|| anyhow::anyhow!("no embedding field"))?;
+                Ok::<Vec<f32>, anyhow::Error>(embedding_array.iter().filter_map(|x| x.as_f64()).map(|x| x as f32).collect())
+            }),
+        };
+        if result.is_err() {
+            *guard = None;
+        } else {
+            sibling_pool.evict_if_swap_pending(&mut guard);
+        }
+        drop(guard);
+        if result.is_ok() {
+            break;
+        }
+        if attempt + 1 < EMBED_RETRY_ATTEMPTS {
+            sibling_pool.any_instantiated_within(EMBED_RETRY_BACKOFF_MS);
+        }
+    }
+
+    match result {
+        Ok(mut values) => {
+            values.truncate(out_len as usize);
+            Ok(values)
+        }
+        Err(e) => {
+            eprintln!("[agentplug:host_vec_embed] failed after {EMBED_RETRY_ATTEMPTS} attempts: {e}");
+            Err(-1)
+        }
     }
 }

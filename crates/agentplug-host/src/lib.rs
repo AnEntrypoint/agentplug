@@ -9,6 +9,7 @@ mod fs_prewarm;
 mod github_auth;
 mod host_state;
 mod http_agent;
+mod component_env;
 mod imports;
 mod install;
 mod memory_pressure;
@@ -34,6 +35,7 @@ pub use crawl_lease::{
     claim_session, lease_reply, owner_file, release_session, session_dir, shutdown_shared_browsers,
     spawn_housekeeping_timer, status as lease_status, LeaseHolder, HEARTBEAT_MS, TTL_MS, WAIT_MS,
 };
+pub use component_env::{call_component_dispatch, call_component_version};
 pub use dispatch_origin::{enter_dispatch_origin_scope, DispatchOriginScope};
 pub use github_auth::{github_cli_token, invalidate_github_cli_token};
 pub use host_state::HostState;
@@ -92,6 +94,8 @@ pub fn build_engine() -> anyhow::Result<Engine> {
     let mut config = Config::new();
     config.wasm_backtrace_details(wasmtime::WasmBacktraceDetails::Enable);
     config.epoch_interruption(true);
+    config.wasm_component_model(true);
+    config.wasm_component_model_async(true);
     let engine = Engine::new(&config).map_err(|e| anyhow::anyhow!(e))?;
     start_epoch_ticker(engine.clone());
     Ok(engine)
