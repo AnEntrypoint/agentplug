@@ -256,6 +256,8 @@ fn main() -> anyhow::Result<()> {
         "selfcheck-spool-claim" => selfcheck_spool_claim(),
         "selfcheck-browser-lease" => selfcheck_browser_lease(),
         "selfcheck-update-probes" => selfcheck_update_probes(),
+        "component-dispatch" => component_dispatch(),
+        "component-version" => component_version(),
         other => {
             eprintln!(
                 "agentplug-runner: unknown command '{other}'. Usage: agentplug-runner <plugin <name> [version]|spool|daemon|takeover <version>|dispatch [plugin] <verb> [body]|sweep-spool [root]|update-runner|release-bootstrap-status|build-info|pin-local-build|unpin-local-build|selfcheck-registry|selfcheck-inflight|selfcheck-idle-evict|version>"
@@ -265,6 +267,33 @@ fn main() -> anyhow::Result<()> {
     };
     agentplug_host::shutdown_shared_browsers();
     outcome
+}
+
+fn component_dispatch() -> anyhow::Result<()> {
+    let args: Vec<String> = std::env::args().collect();
+    let [_, _, wasm, verb, body, rest @ ..] = args.as_slice() else {
+        anyhow::bail!("usage: agentplug-runner component-dispatch <wasm> <verb> <body> [cwd]");
+    };
+    let cwd = match rest.first() {
+        Some(cwd) => std::path::PathBuf::from(cwd),
+        None => std::env::current_dir()?,
+    };
+    let engine = agentplug_host::build_engine()?;
+    let bytes = std::fs::read(wasm)?;
+    let reply = agentplug_host::call_component_dispatch(&engine, &bytes, &cwd, "plugkit", verb, body)?;
+    println!("{reply}");
+    Ok(())
+}
+
+fn component_version() -> anyhow::Result<()> {
+    let args: Vec<String> = std::env::args().collect();
+    let [_, _, wasm] = args.as_slice() else {
+        anyhow::bail!("usage: agentplug-runner component-version <wasm>");
+    };
+    let engine = agentplug_host::build_engine()?;
+    let bytes = std::fs::read(wasm)?;
+    println!("{}", agentplug_host::call_component_version(&engine, &bytes, &std::env::current_dir()?)?);
+    Ok(())
 }
 
 const SELFCHECK_SUCCESS_WAT: &str = r#"(module
