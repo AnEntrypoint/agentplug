@@ -9,6 +9,7 @@ mod fs_prewarm;
 mod github_auth;
 mod host_state;
 mod http_agent;
+mod artifact;
 mod component_env;
 mod imports;
 mod install;
@@ -35,6 +36,7 @@ pub use crawl_lease::{
     claim_session, lease_reply, owner_file, release_session, session_dir, shutdown_shared_browsers,
     spawn_housekeeping_timer, status as lease_status, LeaseHolder, HEARTBEAT_MS, TTL_MS, WAIT_MS,
 };
+pub use artifact::{artifact_kind, artifact_kind_of_file, ArtifactKind, COMPONENT_ON_CORE_PATH, CORE_MODULE_ON_COMPONENT_PATH};
 pub use component_env::{call_component_dispatch, call_component_version};
 pub use dispatch_origin::{enter_dispatch_origin_scope, DispatchOriginScope};
 pub use github_auth::{github_cli_token, invalidate_github_cli_token};

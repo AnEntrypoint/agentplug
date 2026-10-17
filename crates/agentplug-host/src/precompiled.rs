@@ -157,6 +157,13 @@ pub fn load_module_file_backed(
     plugin_name: &str,
     content_hash: &str,
 ) -> anyhow::Result<Module> {
+    if crate::artifact::artifact_kind_of_file(wasm_path)? == crate::artifact::ArtifactKind::Component {
+        anyhow::bail!(
+            "{}: {} is a component; load it through the component path (call_component_dispatch), not the core module loader",
+            crate::artifact::COMPONENT_ON_CORE_PATH,
+            wasm_path.display()
+        );
+    }
     remove_legacy_wasmtime_cache_once();
     let artifact_path = precompiled_module_path(engine, plugin_name, content_hash);
     if artifact_path.exists() {

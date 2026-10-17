@@ -208,6 +208,9 @@ pub(crate) fn host_env_get(key: &str) -> Option<Vec<u8>> {
 }
 
 pub(crate) fn host_random_fill(len: u32) -> Option<Vec<u8>> {
+    if std::env::var_os("AGENTPLUG_COMPONENT_TRACE").is_some() {
+        eprintln!("[agentplug component] host-random-fill len={len}");
+    }
     let mut buf = vec![0u8; len as usize];
     getrandom::fill(&mut buf).ok()?;
     Some(buf)
@@ -336,6 +339,16 @@ pub(crate) fn register_component_env(linker: &mut Linker<HostState>) -> anyhow::
     Ok(())
 }
 
+fn expect_component(bytes: &[u8]) -> anyhow::Result<()> {
+    match crate::artifact::artifact_kind(bytes)? {
+        crate::artifact::ArtifactKind::Component => Ok(()),
+        crate::artifact::ArtifactKind::CoreModule => anyhow::bail!(
+            "{}: the artifact is a core module; load it through the core module loader",
+            crate::artifact::CORE_MODULE_ON_COMPONENT_PATH
+        ),
+    }
+}
+
 pub fn call_component_dispatch(
     engine: &Engine,
     component_bytes: &[u8],
@@ -344,9 +357,11 @@ pub fn call_component_dispatch(
     verb: &str,
     body: &str,
 ) -> anyhow::Result<String> {
+    expect_component(component_bytes)?;
     let component = Component::new(engine, component_bytes)?;
     let mut linker: Linker<HostState> = Linker::new(engine);
     register_component_env(&mut linker)?;
+    wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
     wasmtime_wasi::p3::add_to_linker(&mut linker)?;
     let mut store = Store::new(
         engine,
@@ -371,9 +386,11 @@ pub fn call_component_dispatch(
 }
 
 pub fn call_component_version(engine: &Engine, component_bytes: &[u8], cwd: &Path) -> anyhow::Result<String> {
+    expect_component(component_bytes)?;
     let component = Component::new(engine, component_bytes)?;
     let mut linker: Linker<HostState> = Linker::new(engine);
     register_component_env(&mut linker)?;
+    wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
     wasmtime_wasi::p3::add_to_linker(&mut linker)?;
     let mut store = Store::new(
         engine,

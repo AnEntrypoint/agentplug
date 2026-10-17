@@ -258,6 +258,7 @@ fn main() -> anyhow::Result<()> {
         "selfcheck-update-probes" => selfcheck_update_probes(),
         "component-dispatch" => component_dispatch(),
         "component-version" => component_version(),
+        "core-load" => core_load(),
         other => {
             eprintln!(
                 "agentplug-runner: unknown command '{other}'. Usage: agentplug-runner <plugin <name> [version]|spool|daemon|takeover <version>|dispatch [plugin] <verb> [body]|sweep-spool [root]|update-runner|release-bootstrap-status|build-info|pin-local-build|unpin-local-build|selfcheck-registry|selfcheck-inflight|selfcheck-idle-evict|version>"
@@ -282,6 +283,17 @@ fn component_dispatch() -> anyhow::Result<()> {
     let bytes = std::fs::read(wasm)?;
     let reply = agentplug_host::call_component_dispatch(&engine, &bytes, &cwd, "plugkit", verb, body)?;
     println!("{reply}");
+    Ok(())
+}
+
+fn core_load() -> anyhow::Result<()> {
+    let args: Vec<String> = std::env::args().collect();
+    let [_, _, wasm] = args.as_slice() else {
+        anyhow::bail!("usage: agentplug-runner core-load <wasm>");
+    };
+    let engine = agentplug_host::build_engine()?;
+    agentplug_host::load_module_file_backed(&engine, std::path::Path::new(wasm), "plugkit", "probe")?;
+    println!("core module loaded");
     Ok(())
 }
 
