@@ -1,0 +1,64 @@
+name: wasip3-link
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'crates/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/wasip3-link.yml'
+  pull_request:
+    paths:
+      - 'crates/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/wasip3-link.yml'
+  workflow_dispatch:
+  repository_dispatch:
+    types: [rs-plugkit-push]
+
+permissions:
+  contents: read
+
+jobs:
+  link-wasip3-component:
+    name: link the rs-plugkit wasip3 component through agentplug-host
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: AnEntrypoint/rs-plugkit
+          ref: ${{ github.event.client_payload.sha || 'main' }}
+          path: rs-plugkit
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d
+        with:
+          toolchain: nightly
+          targets: wasm32-wasip3
+
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d
+        with:
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@63fed3e2fecf6f7b51dc6f043341b79ef82a9ae7
+        with:
+          key: wasip3-link
+          workspaces: |
+            . -> target
+            rs-plugkit -> target
+
+      - name: Build the rs-plugkit guest as a wasip3 component (slim, wit-env)
+        working-directory: rs-plugkit
+        run: cargo +nightly build -p rs-plugkit --release --target wasm32-wasip3 --features slim,wit-env
+
+      - name: Link the component through agentplug-host (ignored link test)
+        env:
+          GM_WASIP3_COMPONENT: ${{ github.workspace }}/rs-plugkit/target/wasm32-wasip3/release/rs_plugkit.wasm
+        run: cargo test -p agentplug-host component_links_wasi_p3_and_every_env_import -- --ignored

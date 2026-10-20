@@ -1,0 +1,36 @@
+name: rust-ci
+
+on:
+  push:
+    branches: ['**']
+    paths:
+      - 'crates/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'scripts/**'
+      - '.github/workflows/rust-ci.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rust-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          persist-credentials: false
+
+      - uses: Swatinem/rust-cache@63fed3e2fecf6f7b51dc6f043341b79ef82a9ae7
+        with:
+          key: rust-ci-linux-x64-test
+          add-job-id-key: false
+
+      - name: cargo test (runner, compiles all targets once)
+        run: cargo test -p agentplug-runner
