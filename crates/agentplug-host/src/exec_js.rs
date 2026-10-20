@@ -1,0 +1,1481 @@
+use std::ffi::OsString;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::sync::{Once, OnceLock};
+use std::time::{Duration, Instant};
+
+use serde_json::{json, Value};
+
+fn wait_sync_window(
+    child: &mut std::process::Child,
+    window: Duration,
+) -> std::io::Result<Option<std::process::ExitStatus>> {
+    let deadline = Instant::now() + window;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(Some(status));
+        }
+        if Instant::now() >= deadline || crate::task::admission_draining() {
+            return Ok(None);
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+const RESULT_SENTINEL: &str = "__GM_RESULT__";
+const META_SENTINEL: &str = "__GM_META__";
+const PROFILE_SENTINEL: &str = "__GM_PROFILE__";
+const DEFAULT_LIMIT_MS: u64 = 300_000;
+const HARD_CEILING_MS: u64 = 900_000;
+const MIN_LIMIT_MS: i64 = 100;
+const DRAIN_GRACE_MS: u64 = 50;
+
+struct BuiltCommand {
+    cmd: String,
+    args: Vec<String>,
+    stdin_payload: Option<String>,
+}
+
+fn resolve_limit(opts: &Value) -> Result<(u64, Option<u64>), Value> {
+    match opts.get("timeoutMs").and_then(|v| v.as_i64()) {
+        Some(ms) if ms < MIN_LIMIT_MS => Err(json!({
+            "ok": false, "error": "timeoutMs below floor", "min": MIN_LIMIT_MS, "received": ms,
+        })),
+        Some(ms) if ms as u64 > HARD_CEILING_MS => Ok((HARD_CEILING_MS, Some(ms as u64))),
+        Some(ms) => Ok((ms as u64, None)),
+        None => Ok((DEFAULT_LIMIT_MS, None)),
+    }
+}
+
+fn exec_path_dirs() -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = std::env::var_os("PATH")
+        .map(|value| std::env::split_paths(&value).collect())
+        .unwrap_or_default();
+    if let Some(extra) = std::env::var_os("GM_EXEC_PATH_EXTRA") {
+        dirs.extend(std::env::split_paths(&extra).filter(|dir| !dir.as_os_str().is_empty()));
+    }
+    if let Some(login) = login_shell_path() {
+        dirs.extend(std::env::split_paths(&login).filter(|dir| !dir.as_os_str().is_empty()));
+    }
+    let cargo_bin = std::env::var_os("CARGO_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cargo")))
+        .map(|home| home.join("bin"));
+    if let Some(cargo_bin) = cargo_bin.filter(|dir| dir.is_dir()) {
+        dirs.push(cargo_bin);
+    }
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        dirs.extend(
+            [
+                home.join("tools"),
+                home.join("workspace").join("google-cloud-sdk").join("bin"),
+                home.join("go-install"),
+                home.join(".gm-tools"),
+            ]
+            .into_iter()
+            .filter(|dir| dir.is_dir()),
+        );
+    }
+    let mut seen = std::collections::HashSet::new();
+    dirs.retain(|dir| seen.insert(dir.clone()));
+    dirs
+}
+
+#[derive(Default)]
+struct LoginEnvironment {
+    path: Option<OsString>,
+    runtime_directory: Option<OsString>,
+}
+
+static LOGIN_ENVIRONMENT: OnceLock<LoginEnvironment> = OnceLock::new();
+static EMPTY_LOGIN_ENVIRONMENT: LoginEnvironment = LoginEnvironment {
+    path: None,
+    runtime_directory: None,
+};
+static LOGIN_PROBE: Once = Once::new();
+
+fn login_environment() -> &'static LoginEnvironment {
+    LOGIN_PROBE.call_once(|| {
+        #[cfg(unix)]
+        {
+            let _ = std::thread::Builder::new()
+                .name("gm-login-probe".into())
+                .spawn(|| {
+                    if let Some(environment) = probe_login_environment() {
+                        let _ = LOGIN_ENVIRONMENT.set(environment);
+                    }
+                });
+        }
+    });
+    LOGIN_ENVIRONMENT
+        .get()
+        .unwrap_or(&EMPTY_LOGIN_ENVIRONMENT)
+}
+
+fn login_shell_path() -> Option<OsString> {
+    login_environment().path.clone()
+}
+
+#[cfg(unix)]
+fn current_user_login_shell() -> Option<OsString> {
+    use std::ffi::CStr;
+    use std::os::unix::ffi::OsStringExt;
+    use std::os::unix::fs::MetadataExt;
+
+    let mut buffer = vec![0u8; 4096];
+    loop {
+        let (uid, status, shell) = unsafe {
+            let uid = libc::geteuid();
+            let mut account: libc::passwd = std::mem::zeroed();
+            let mut result = std::ptr::null_mut();
+            let status = libc::getpwuid_r(
+                uid,
+                &mut account,
+                buffer.as_mut_ptr().cast(),
+                buffer.len(),
+                &mut result,
+            );
+            let shell = if status == 0
+                && !result.is_null()
+                && account.pw_uid == uid
+                && !account.pw_shell.is_null()
+            {
+                Some(OsString::from_vec(
+                    CStr::from_ptr(account.pw_shell).to_bytes().to_vec(),
+                ))
+            } else {
+                None
+            };
+            (uid, status, shell)
+        };
+        if status == libc::ERANGE && buffer.len() < 65_536 {
+            buffer.resize(buffer.len() * 2, 0);
+            continue;
+        }
+        let shell = shell?;
+        let path = Path::new(&shell);
+        let metadata = std::fs::metadata(path).ok()?;
+        return (path.is_absolute()
+            && metadata.is_file()
+            && (metadata.uid() == 0 || metadata.uid() == uid)
+            && metadata.mode() & 0o022 == 0
+            && metadata.mode() & 0o111 != 0)
+            .then_some(shell);
+    }
+}
+
+#[cfg(unix)]
+const LOGIN_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[cfg(unix)]
+fn probe_login_environment() -> Option<LoginEnvironment> {
+    let shell = std::env::var_os("SHELL")
+        .or_else(current_user_login_shell)
+        .unwrap_or_else(|| OsString::from("/bin/sh"));
+    probe_login_shell(shell, LOGIN_PROBE_TIMEOUT)
+}
+
+#[cfg(unix)]
+fn probe_login_shell(shell: OsString, timeout: Duration) -> Option<LoginEnvironment> {
+    use std::io::Read;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::ffi::OsStringExt;
+    use std::os::unix::process::CommandExt;
+
+    let mut child = Command::new(shell)
+        .args([
+            "-lc",
+            "printf '\\0GM_PATH=%s\\0GM_XDG_RUNTIME_DIR=%s\\0' \"$PATH\" \"$XDG_RUNTIME_DIR\"",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .process_group(0)
+        .spawn()
+        .ok()?;
+    let containment = match crate::process_tree::establish_containment(&child) {
+        Ok(containment) => containment,
+        Err(_) => {
+            crate::process_tree::kill_tree(child.id());
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+    };
+    let result = (|| {
+        let mut pipe = child.stdout.take().expect("login probe stdout is piped");
+        let fd = pipe.as_raw_fd();
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+            return None;
+        }
+        let deadline = Instant::now() + timeout;
+        let mut output = Vec::new();
+        let mut chunk = [0u8; 4096];
+        let mut status = None;
+        loop {
+            loop {
+                if Instant::now() >= deadline {
+                    return None;
+                }
+                match pipe.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(count) => {
+                        if output.len() + count > 65_536 {
+                            return None;
+                        }
+                        output.extend_from_slice(&chunk[..count]);
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(_) => return None,
+                }
+            }
+            if status.is_some() {
+                break;
+            }
+            status = child.try_wait().ok()?;
+            if Instant::now() >= deadline {
+                return None;
+            }
+            if status.is_none() {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        if !status?.success() {
+            return None;
+        }
+        let value = |prefix: &[u8]| {
+            output
+                .split(|byte| *byte == 0)
+                .rev()
+                .find_map(|field| field.strip_prefix(prefix))
+                .filter(|value| !value.is_empty())
+                .map(|value| OsString::from_vec(value.to_vec()))
+        };
+        Some(LoginEnvironment {
+            path: value(b"GM_PATH="),
+            runtime_directory: value(b"GM_XDG_RUNTIME_DIR="),
+        })
+    })();
+    crate::process_tree::terminate_containment(&containment, child.id());
+    let _ = child.kill();
+    let _ = child.wait();
+    result
+}
+
+fn exec_path() -> OsString {
+    std::env::join_paths(exec_path_dirs())
+        .unwrap_or_else(|_| std::env::var_os("PATH").unwrap_or_default())
+}
+
+pub fn run(code: &str, opts: &Value, cwd: &Path) -> Value {
+    let lang = opts
+        .get("lang")
+        .and_then(|v| v.as_str())
+        .unwrap_or("nodejs");
+    let (limit_ms, _clamped_from) = match resolve_limit(opts) {
+        Ok(v) => v,
+        Err(rejection) => return rejection,
+    };
+
+    let is_js_lang = lang == "nodejs" || lang == "js";
+    let want_profile = opts
+        .get("profile")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+        && is_js_lang;
+    let profile_skipped = if opts
+        .get("profile")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+        && !is_js_lang
+    {
+        Some(json!({
+            "reason": format!("profile requested but lang={lang} is not js/nodejs; CPU profiling only supported on the node surface"),
+            "lang": lang,
+        }))
+    } else {
+        None
+    };
+    let want_mem =
+        opts.get("mem").and_then(|v| v.as_bool()).unwrap_or(false) && is_js_lang && !want_profile;
+    let mode = if want_profile {
+        ExecMode::Profile
+    } else if want_mem {
+        ExecMode::Mem
+    } else {
+        ExecMode::Default
+    };
+
+    let built = match build_command_mode(lang, code, mode, opts) {
+        Some(v) => v,
+        None => return json!({"ok": false, "error": format!("unsupported lang: {lang}")}),
+    };
+
+    let _admission = match crate::task::admit_execution() {
+        Ok(guard) => guard,
+        Err(error) => {
+            return json!({"ok": false, "error": error, "error_code": "task_handoff_pending", "execution_started": false})
+        }
+    };
+    let worker = crate::exec_pool::acquire();
+    let t0 = Instant::now();
+    let mut command = Command::new(&built.cmd);
+    command
+        .args(&built.args)
+        .env("PATH", exec_path())
+        .current_dir(cwd)
+        .stdin(if built.stdin_payload.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    configure_execution_environment(&mut command);
+    if std::env::var_os("GH_CONFIG_DIR").is_none() {
+        if let Some(directory) = crate::github_cli_config_dir() {
+            command.env("GH_CONFIG_DIR", directory);
+        }
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    #[cfg(windows)]
+    {
+        crate::windowless::apply_windowless(&mut command);
+    }
+    let spawn = command.spawn();
+
+    let mut child = match spawn {
+        Ok(c) => c,
+        Err(e) => {
+            return json!({
+                "ok": false, "stdout": "", "stderr": e.to_string(), "exit_code": -1,
+                "spawn_error": {"message": e.to_string()},
+            });
+        }
+    };
+    let dispatch_task = crate::dispatch_origin::current_spool_task();
+    let session = opts
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .or_else(crate::dispatch_origin::current_session_id);
+    crate::child_pids::record(
+        cwd,
+        "exec",
+        lang,
+        session.as_deref(),
+        dispatch_task.as_deref(),
+        child.id(),
+    );
+    let containment = match crate::process_tree::establish_containment(&child) {
+        Ok(containment) => containment,
+        Err(error) => {
+            crate::process_tree::kill_tree(child.id());
+            let _ = child.kill();
+            let _ = child.wait();
+            return json!({
+                "ok": false,
+                "stdout": "",
+                "stderr": error,
+                "exit_code": -1,
+                "containment_error": true,
+            });
+        }
+    };
+
+    if let (Some(payload), Some(mut stdin)) = (built.stdin_payload, child.stdin.take()) {
+        std::thread::spawn(move || {
+            let _ = stdin.write_all(payload.as_bytes());
+        });
+    }
+    let stdout_pipe = child.stdout.take().map(crate::task::drain_in_background);
+    let stderr_pipe = child.stderr.take().map(crate::task::drain_in_background);
+
+    let handover_ms = limit_ms.min(crate::exec_pool::BACKGROUND_AFTER_MS);
+    let waited = wait_sync_window(&mut child, Duration::from_millis(handover_ms));
+    if matches!(waited, Ok(None)) && handover_ms < limit_ms && !crate::task::admission_draining() {
+        drop(worker);
+        let partial_stdout = stdout_pipe
+            .as_ref()
+            .map(crate::task::DrainedPipe::snapshot)
+            .unwrap_or_default();
+        let partial_stderr = stderr_pipe
+            .as_ref()
+            .map(crate::task::DrainedPipe::snapshot)
+            .unwrap_or_default();
+        return match crate::task::adopt_running(child, containment, lang, t0, stdout_pipe, stderr_pipe) {
+            Ok(task_id) => json!({
+                "ok": true,
+                "background": true,
+                "in_progress": true,
+                "task_id": task_id,
+                "handover_after_ms": crate::exec_pool::BACKGROUND_AFTER_MS,
+                "limit_ms": limit_ms,
+                "elapsed_ms": t0.elapsed().as_millis() as u64,
+                "stdout": String::from_utf8_lossy(&partial_stdout),
+                "stderr": String::from_utf8_lossy(&partial_stderr),
+                "decision_required": "the call ran past the foreground window and moved to background management; its worker was released. task-output with {\"id\":\"<task_id>\"} returns the output so far and the final result once it exits; task-stop with that id terminates it."
+            }),
+            Err(error) => json!({
+                "ok": false,
+                "error": error,
+                "error_code": "task_registration_failed",
+            }),
+        };
+    }
+    if matches!(waited, Ok(None)) {
+        crate::process_tree::terminate_containment(&containment, child.id());
+        let _ = child.kill();
+        let exit_code = child
+            .wait()
+            .ok()
+            .and_then(|status| status.code())
+            .unwrap_or(-1);
+        let drain_deadline = Instant::now() + Duration::from_millis(1500);
+        let stdout = stdout_pipe
+            .map(|pipe| pipe.collect_with_grace(drain_deadline))
+            .unwrap_or_default();
+        let stderr = stderr_pipe
+            .map(|pipe| pipe.collect_with_grace(drain_deadline))
+            .unwrap_or_default();
+        return json!({
+            "ok": false,
+            "timed_out": true,
+            "killed": true,
+            "error_code": if crate::task::admission_draining() { "host_draining" } else { "exec_timeout" },
+            "limit_ms": limit_ms,
+            "elapsed_ms": t0.elapsed().as_millis() as u64,
+            "stdout": String::from_utf8_lossy(&stdout),
+            "stderr": String::from_utf8_lossy(&stderr),
+            "exit_code": exit_code,
+        });
+    }
+    let exit_code = child.wait().ok().and_then(|s| s.code()).unwrap_or(-1);
+    let drain_deadline = (Instant::now() + Duration::from_millis(DRAIN_GRACE_MS))
+        .min(t0 + Duration::from_millis(limit_ms));
+    let drains_finished = || {
+        stdout_pipe
+            .as_ref()
+            .map_or(true, crate::task::DrainedPipe::is_finished)
+            && stderr_pipe
+                .as_ref()
+                .map_or(true, crate::task::DrainedPipe::is_finished)
+    };
+    while !drains_finished() {
+        let remaining = drain_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        std::thread::sleep(remaining.min(Duration::from_millis(1)));
+    }
+    let duration_ms = t0.elapsed().as_millis() as u64;
+    if !drains_finished() {
+        let partial_stdout = stdout_pipe
+            .as_ref()
+            .map(crate::task::DrainedPipe::snapshot)
+            .unwrap_or_default();
+        let partial_stderr = stderr_pipe
+            .as_ref()
+            .map(crate::task::DrainedPipe::snapshot)
+            .unwrap_or_default();
+        let task_id = match crate::task::adopt_running(
+            child,
+            containment,
+            lang,
+            t0,
+            stdout_pipe,
+            stderr_pipe,
+        ) {
+            Ok(id) => id,
+            Err(error) => {
+                return json!({
+                    "ok": false,
+                    "error": error,
+                    "error_code": "task_registration_failed",
+                    "exit_code": exit_code,
+                    "duration_ms": duration_ms,
+                })
+            }
+        };
+        return json!({
+            "ok": true,
+            "timed_out": false,
+            "in_progress": true,
+            "task_id": task_id,
+            "exit_code": exit_code,
+            "duration_ms": duration_ms,
+            "task_timeout_ms": 30 * 60 * 1000,
+            "stdout": String::from_utf8_lossy(&partial_stdout),
+            "stderr": String::from_utf8_lossy(&partial_stderr),
+            "pipes_held_by_descendant": true,
+            "decision_required": "the direct process exited but its output drains remain unfinished after the bounded grace; a descendant still holds the pipes. stdout and stderr above are everything the direct process wrote before it exited and are not lost. task-output with {\"id\":\"<task_id>\"} keeps collecting until every pipe closes; task-stop with that id terminates the process group. To return synchronously next time, detach so no descendant inherits the pipes: ( nohup cmd >log 2>&1 & )"
+        });
+    }
+    let stdout_buf = stdout_pipe.map(|p| p.collect()).unwrap_or_default();
+    let stderr_buf = stderr_pipe.map(|p| p.collect()).unwrap_or_default();
+
+    let stdout_raw = String::from_utf8_lossy(&stdout_buf).into_owned();
+    let stderr = String::from_utf8_lossy(&stderr_buf).into_owned();
+
+    match mode {
+        ExecMode::Profile => {
+            let (clean_stdout, parsed) = extract_sentinel(&stdout_raw, PROFILE_SENTINEL);
+            let ok = exit_code == 0
+                && parsed
+                    .as_ref()
+                    .map(|p| p.get("user_error").map(|e| e.is_null()).unwrap_or(true))
+                    .unwrap_or(false);
+            let mut v = json!({
+                "ok": ok,
+                "stdout": clean_stdout,
+                "stderr": stderr,
+                "exit_code": exit_code,
+                "timed_out": false,
+                "duration_ms": duration_ms,
+                "result": parsed.as_ref().and_then(|p| p.get("result")).cloned().unwrap_or(Value::Null),
+                "profile": parsed.as_ref().and_then(|p| p.get("profile")).cloned().unwrap_or(json!({"timeframe": null, "culprits": []})),
+                "profile_error": parsed.as_ref().and_then(|p| p.get("profile_error")).cloned().unwrap_or_else(|| json!("profile sentinel not found in stdout")),
+                "mem": parsed.as_ref().and_then(|p| p.get("mem")).cloned().unwrap_or(Value::Null),
+                "wall_vs_cpu": parsed.as_ref().and_then(|p| p.get("wall_vs_cpu")).cloned().unwrap_or(Value::Null),
+            });
+            if let Some(u) = parsed.as_ref().and_then(|p| p.get("user_error")) {
+                if !u.is_null() {
+                    v["user_error"] = u.clone();
+                }
+            }
+            v
+        }
+        ExecMode::Mem => {
+            let (clean_stdout, parsed) = extract_sentinel(&stdout_raw, META_SENTINEL);
+            let has_error = parsed
+                .as_ref()
+                .and_then(|p| p.get("error"))
+                .map(|e| !e.is_null())
+                .unwrap_or(false);
+            let ok = exit_code == 0 && parsed.is_some() && !has_error;
+            let mut v = json!({
+                "ok": ok,
+                "stdout": clean_stdout,
+                "stderr": stderr,
+                "exit_code": exit_code,
+                "timed_out": false,
+                "duration_ms": duration_ms,
+                "result": parsed.as_ref().and_then(|p| p.get("result")).cloned().unwrap_or(Value::Null),
+                "mem": parsed.as_ref().and_then(|p| p.get("mem")).cloned().unwrap_or(Value::Null),
+                "wall_ms": parsed.as_ref().and_then(|p| p.get("wall_ms")).cloned().unwrap_or(Value::Null),
+            });
+            if has_error {
+                v["error"] = parsed
+                    .as_ref()
+                    .and_then(|p| p.get("error"))
+                    .cloned()
+                    .unwrap_or(Value::Null);
+            }
+            v
+        }
+        ExecMode::Default => {
+            let mut stdout = stdout_raw;
+            let mut result_field: Option<Value> = None;
+            if is_js_lang {
+                if let Some((idx, line_end, parsed)) =
+                    stdout.rmatch_indices(RESULT_SENTINEL).find_map(|(idx, _)| {
+                        let tail = &stdout[idx + RESULT_SENTINEL.len()..];
+                        let line_end = tail.find('\n').unwrap_or(tail.len());
+                        serde_json::from_str::<Value>(&tail[..line_end])
+                            .ok()
+                            .map(|parsed| (idx, line_end, parsed))
+                    })
+                {
+                    result_field = Some(parsed);
+                    let tail = &stdout[idx + RESULT_SENTINEL.len()..];
+                    let mut cleaned = String::new();
+                    cleaned.push_str(&stdout[..idx]);
+                    if let Some(rest_start) = tail.get(line_end + 1..) {
+                        cleaned.push_str(rest_start);
+                    }
+                    if cleaned.ends_with('\n') {
+                        cleaned.pop();
+                    }
+                    stdout = cleaned;
+                }
+            }
+
+            let mut v = json!({
+                "ok": exit_code == 0,
+                "stdout": stdout,
+                "stderr": stderr,
+                "exit_code": exit_code,
+                "timed_out": false,
+                "duration_ms": duration_ms,
+            });
+            if let Some(r) = result_field {
+                v["result"] = r;
+            }
+            if let Some(skipped) = profile_skipped {
+                v["profile_skipped"] = skipped;
+            }
+            v
+        }
+    }
+}
+
+pub(crate) fn configure_execution_environment(command: &mut Command) {
+    if std::env::var_os("XDG_RUNTIME_DIR").is_none() {
+        if let Some(directory) = &login_environment().runtime_directory {
+            command.env("XDG_RUNTIME_DIR", directory);
+        }
+    }
+    let Some(cargo_bin) = cargo_bin_dir() else {
+        return;
+    };
+    if !cargo_bin.is_dir() {
+        return;
+    }
+    let Some(path) = prepend_path(&cargo_bin, std::env::var_os("PATH")) else {
+        return;
+    };
+    command.env("PATH", path);
+}
+
+fn cargo_bin_dir() -> Option<PathBuf> {
+    #[cfg(windows)]
+    let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"));
+    #[cfg(not(windows))]
+    let home = std::env::var_os("HOME");
+    cargo_bin_dir_from_homes(std::env::var_os("CARGO_HOME"), home)
+}
+
+fn cargo_bin_dir_from_homes(
+    cargo_home: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+) -> Option<PathBuf> {
+    if let Some(cargo_home) = cargo_home.filter(|value| !value.is_empty()) {
+        return Some(PathBuf::from(cargo_home).join("bin"));
+    }
+    Some(PathBuf::from(home?).join(".cargo").join("bin"))
+}
+
+fn prepend_path(bin: &Path, existing: Option<std::ffi::OsString>) -> Option<std::ffi::OsString> {
+    let existing = existing
+        .as_ref()
+        .map(|path| std::env::split_paths(path).collect::<Vec<_>>())
+        .unwrap_or_default();
+    if existing.iter().any(|entry| entry == bin) {
+        return None;
+    }
+    std::env::join_paths(std::iter::once(bin.to_path_buf()).chain(existing)).ok()
+}
+
+fn extract_sentinel(stdout: &str, sentinel: &str) -> (String, Option<Value>) {
+    match stdout.find(sentinel) {
+        Some(idx) => {
+            let tail = &stdout[idx + sentinel.len()..];
+            let parsed = serde_json::from_str::<Value>(tail).ok();
+            (stdout[..idx].to_string(), parsed)
+        }
+        None => (stdout.to_string(), None),
+    }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum ExecMode {
+    Default,
+    Mem,
+    Profile,
+}
+
+pub(crate) fn build_command(
+    lang: &str,
+    code: &str,
+    opts: &Value,
+) -> Option<(String, Vec<String>, Option<String>)> {
+    build_command_mode(lang, code, ExecMode::Default, opts)
+        .map(|b| (b.cmd, b.args, b.stdin_payload))
+}
+
+const ESM_REQUIRE_PRELUDE: &str = "import { createRequire as __gmCreateRequire } from 'node:module';\nconst require = __gmCreateRequire(process.cwd() + '/');\n";
+
+fn is_ident_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_' || b == b'$'
+}
+
+fn split_top_level_module_declarations(code: &str) -> (String, String) {
+    let bytes = code.as_bytes();
+    let mut head = String::new();
+    let mut rest = String::new();
+    let mut copy_from = 0usize;
+    let mut i = 0usize;
+    let mut at_stmt_start = true;
+    while i < bytes.len() {
+        let b = bytes[i];
+        match b {
+            b'/' if bytes.get(i + 1) == Some(&b'/') => {
+                i += 2;
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+                at_stmt_start = true;
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                i += 2;
+                while i < bytes.len() && !(bytes[i] == b'*' && bytes.get(i + 1) == Some(&b'/')) {
+                    i += 1;
+                }
+                i += 2;
+            }
+            b'"' | b'\'' | b'`' => {
+                let quote = b;
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == b'\\' {
+                        i += 2;
+                        continue;
+                    }
+                    let closed = bytes[i] == quote;
+                    i += 1;
+                    if closed {
+                        break;
+                    }
+                }
+                at_stmt_start = false;
+            }
+            b'\n' => {
+                at_stmt_start = true;
+                i += 1;
+            }
+            b'\t' | b'\r' | b' ' => i += 1,
+            b';' | b')' => {
+                at_stmt_start = true;
+                i += 1;
+            }
+            _ => {
+                let mut declared = false;
+                if at_stmt_start {
+                    for keyword in [b"import".as_slice(), b"export".as_slice()] {
+                        if !bytes[i..].starts_with(keyword) {
+                            continue;
+                        }
+                        let tail = bytes.get(i + keyword.len()).copied();
+                        let dynamic_import = keyword == b"import" && tail == Some(b'(');
+                        if !tail.is_some_and(is_ident_byte) && !dynamic_import {
+                            let end = module_declaration_end(code, i + keyword.len());
+                            rest.push_str(&code[copy_from..i]);
+                            copy_from = end;
+                            head.push_str(code[i..end].trim());
+                            head.push('\n');
+                            i = end;
+                            declared = true;
+                        }
+                    }
+                }
+                if !declared {
+                    at_stmt_start = false;
+                    i += 1;
+                }
+            }
+        }
+    }
+    if copy_from == 0 {
+        (String::new(), code.to_string())
+    } else {
+        rest.push_str(&code[copy_from..]);
+        (head, rest)
+    }
+}
+
+fn module_declaration_end(code: &str, from: usize) -> usize {
+    let bytes = code.as_bytes();
+    let mut i = from;
+    let mut depth = 0i32;
+    while i < bytes.len() {
+        let b = bytes[i];
+        match b {
+            b'/' if bytes.get(i + 1) == Some(&b'/') => {
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                i += 2;
+                while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                    i += 1;
+                }
+                i += 2;
+            }
+            b'"' | b'\'' | b'`' => {
+                let quote = b;
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == b'\\' {
+                        i += 2;
+                        continue;
+                    }
+                    let closed = bytes[i] == quote;
+                    i += 1;
+                    if closed {
+                        break;
+                    }
+                }
+            }
+            b'{' | b'(' | b'[' => {
+                depth += 1;
+                i += 1;
+            }
+            b'}' | b')' | b']' => {
+                depth -= 1;
+                i += 1;
+            }
+            b';' if depth <= 0 => return i + 1,
+            b'\n' if depth <= 0 => return i + 1,
+            _ => i += 1,
+        }
+    }
+    bytes.len()
+}
+
+fn build_command_mode(
+    lang: &str,
+    code: &str,
+    mode: ExecMode,
+    opts: &Value,
+) -> Option<BuiltCommand> {
+    match lang {
+        "nodejs" | "js" => {
+            let (module_head_src, body) = split_top_level_module_declarations(code);
+            let as_module = !module_head_src.is_empty();
+            let wrapped = match mode {
+                ExecMode::Default => {
+                    let trimmed = body.trim();
+                    let is_bare_expression = !trimmed.is_empty()
+                        && !trimmed.contains(';')
+                        && !trimmed.contains('\n')
+                        && !trimmed.starts_with("return")
+                        && !trimmed.starts_with("const ")
+                        && !trimmed.starts_with("let ")
+                        && !trimmed.starts_with("var ")
+                        && !trimmed.starts_with("throw ")
+                        && !trimmed.starts_with("if")
+                        && !trimmed.starts_with("for")
+                        && !trimmed.starts_with("while")
+                        && !trimmed.starts_with("switch")
+                        && !trimmed.starts_with("try")
+                        && !trimmed.starts_with("function")
+                        && !trimmed.starts_with("class ")
+                        && !trimmed.starts_with("//")
+                        && !trimmed.starts_with("/*");
+                    let body = if is_bare_expression {
+                        format!("    return (\n{body}\n);\n")
+                    } else {
+                        format!("{body}\n")
+                    };
+                    format!(
+                        "(async () => {{\n  try {{\n    const __r = await (async () => {{\n{body}}})();\n    try {{ console.log('{RESULT_SENTINEL}' + JSON.stringify(__r === undefined ? null : __r)); }}\n    catch (__se) {{ console.log('{RESULT_SENTINEL}' + JSON.stringify({{ __unserializable: String(__se && __se.message || __se) }})); }}\n  }} catch (__e) {{\n    console.error(String(__e && __e.stack || __e));\n    process.exitCode = 1;\n  }}\n}})();\n"
+                    )
+                },
+                ExecMode::Mem => format!(
+                    "const {{ performance: __perf }} = require('perf_hooks');\n\
+                     (async () => {{\n\
+                     \x20 const __mb = process.memoryUsage(); const __w0 = __perf.now();\n\
+                     \x20 let __r = null, __err = null;\n\
+                     \x20 try {{ __r = await (async () => {{\n{body}\n}})(); }} catch (e) {{ __err = {{ name: e && e.name || 'Error', message: String(e && e.message || e), stack: String(e && e.stack || '') }}; }}\n\
+                     \x20 const __wallMs = Math.round((__perf.now() - __w0) * 1000) / 1000; const __ma = process.memoryUsage();\n\
+                     \x20 const __mem = {{ rss_mb: Math.round(__ma.rss/10485.76)/100, heapUsed_mb: Math.round(__ma.heapUsed/10485.76)/100, heapUsed_delta_mb: Math.round((__ma.heapUsed-__mb.heapUsed)/10485.76)/100, external_mb: Math.round(__ma.external/10485.76)/100 }};\n\
+                     \x20 process.stdout.write('{META_SENTINEL}' + JSON.stringify({{ result: __r === undefined ? null : __r, error: __err, mem: __mem, wall_ms: __wallMs }}));\n\
+                     \x20 if (__err) process.exitCode = 1;\n\
+                     }})();\n"
+                ),
+                ExecMode::Profile => {
+                    let sample_interval = opts.get("sampleIntervalUs").and_then(|v| v.as_i64()).filter(|v| *v > 0).unwrap_or(100);
+                    let top_n = opts.get("profileTopN").and_then(|v| v.as_i64()).filter(|v| *v > 0).unwrap_or(20);
+                    format!(
+                        "{AGGREGATE_CPU_PROFILE_SRC}\n\
+                         const __inspector = require('inspector');\n\
+                         const {{ performance: __perf }} = require('perf_hooks');\n\
+                         const __session = new __inspector.Session();\n\
+                         __session.connect();\n\
+                         const __post = (m, p) => new Promise((res, rej) => __session.post(m, p || {{}}, (e, r) => e ? rej(e) : res(r)));\n\
+                         (async () => {{\n\
+                         \x20 let __profile = null, __profileError = null, __userResult = null, __userError = null, __wallMs = 0;\n\
+                         \x20 const __memBefore = process.memoryUsage();\n\
+                         \x20 try {{\n\
+                         \x20\x20  await __post('Profiler.enable');\n\
+                         \x20\x20  await __post('Profiler.setSamplingInterval', {{ interval: {sample_interval} }});\n\
+                         \x20\x20  await __post('Profiler.start');\n\
+                         \x20\x20  const __w0 = __perf.now();\n\
+                         \x20\x20  try {{ __userResult = await (async () => {{\n{body}\n}})(); }} catch (ue) {{ __userError = String(ue && ue.stack || ue); }}\n\
+                         \x20\x20  __wallMs = Math.round((__perf.now() - __w0) * 1000) / 1000;\n\
+                         \x20\x20  const __r = await __post('Profiler.stop');\n\
+                         \x20\x20  __profile = __r && __r.profile || null;\n\
+                         \x20 }} catch (pe) {{ __profileError = String(pe && pe.message || pe); }}\n\
+                         \x20 const __memAfter = process.memoryUsage();\n\
+                         \x20 const __agg = __profile ? aggregateCpuProfile(__profile, {top_n}, false) : {{ timeframe: null, culprits: [] }};\n\
+                         \x20 const __cpuTotalUs = __agg.timeframe ? __agg.timeframe.total_us : 0;\n\
+                         \x20 const __wallUs = Math.round(__wallMs * 1000);\n\
+                         \x20 const __mem = {{ rss_mb: Math.round(__memAfter.rss/10485.76)/100, heapUsed_mb: Math.round(__memAfter.heapUsed/10485.76)/100, heapUsed_delta_mb: Math.round((__memAfter.heapUsed-__memBefore.heapUsed)/10485.76)/100, external_mb: Math.round(__memAfter.external/10485.76)/100 }};\n\
+                         \x20 const __wallVsCpu = {{ wall_us: __wallUs, cpu_total_sampled_us: __cpuTotalUs, offcpu_us: Math.max(0, __wallUs - __cpuTotalUs), note: 'offcpu_us = inner wall minus on-CPU sampled JS self time = IO/async/GPU/idle the CPU sampler is blind to' }};\n\
+                         \x20 process.stdout.write('{PROFILE_SENTINEL}' + JSON.stringify({{ result: __userResult, user_error: __userError, profile: __agg, profile_error: __profileError, mem: __mem, wall_vs_cpu: __wallVsCpu }}));\n\
+                         \x20 __session.disconnect();\n\
+                         }})();\n"
+                    )
+                }
+            };
+            let wrapped = if as_module && mode != ExecMode::Default {
+                format!("{ESM_REQUIRE_PRELUDE}{module_head_src}{wrapped}")
+            } else if as_module {
+                format!("{module_head_src}{wrapped}")
+            } else {
+                wrapped
+            };
+            let cmd = resolve_node_cmd();
+            let is_node = command_is_node(&cmd);
+            let mut args = Vec::new();
+            if !is_node {
+                args.push("run".to_string());
+            }
+            if as_module && is_node {
+                args.push("--input-type=module".to_string());
+            }
+            args.push("-".to_string());
+            Some(BuiltCommand {
+                cmd,
+                args,
+                stdin_payload: Some(wrapped),
+            })
+        }
+        "python" | "py" => Some(BuiltCommand {
+            cmd: "python".to_string(),
+            args: vec!["-c".to_string(), PYTHON_STDIN_EVAL.to_string()],
+            stdin_payload: Some(code.to_string()),
+        }),
+        "bash" | "sh" | "shell" => Some(BuiltCommand {
+            cmd: resolve_bash_cmd(),
+            args: vec!["-c".to_string(), BASH_STDIN_EVAL.to_string()],
+            stdin_payload: Some(code.to_string()),
+        }),
+        "powershell" | "ps1" => Some(BuiltCommand {
+            cmd: "powershell".to_string(),
+            args: vec![
+                "-NoProfile".to_string(),
+                "-NonInteractive".to_string(),
+                "-Command".to_string(),
+                "-".to_string(),
+            ],
+            stdin_payload: Some(code.to_string()),
+        }),
+        "deno" => Some(BuiltCommand {
+            cmd: "deno".to_string(),
+            args: vec![
+                "run".to_string(),
+                "--allow-all".to_string(),
+                "-".to_string(),
+            ],
+            stdin_payload: Some(code.to_string()),
+        }),
+        "agent" | "claude" => {
+            let permission_mode = opts
+                .get("permissionMode")
+                .and_then(|v| v.as_str())
+                .filter(|mode| {
+                    matches!(*mode, "default" | "acceptEdits" | "plan" | "bypassPermissions")
+                })
+                .unwrap_or(DEFAULT_AGENT_PERMISSION_MODE);
+            Some(BuiltCommand {
+                cmd: resolve_claude_cmd(),
+                args: vec![
+                    "-p".to_string(),
+                    code.to_string(),
+                    "--output-format".to_string(),
+                    "text".to_string(),
+                    "--permission-mode".to_string(),
+                    permission_mode.to_string(),
+                ],
+                stdin_payload: None,
+            })
+        }
+        _ => None,
+    }
+}
+
+const AGGREGATE_CPU_PROFILE_SRC: &str = r#"function aggregateCpuProfile(profile, topN, isBrowserCtx) {
+  if (!profile || !Array.isArray(profile.nodes) || !Array.isArray(profile.samples)) {
+    return { timeframe: null, culprits: [] };
+  }
+  const byId = new Map();
+  for (const node of profile.nodes) byId.set(node.id, node);
+  const deltas = Array.isArray(profile.timeDeltas) ? profile.timeDeltas : [];
+  const selfUs = new Map();
+  const sampleCount = profile.samples.length;
+  for (let i = 0; i < profile.samples.length; i++) {
+    const node = byId.get(profile.samples[i]);
+    if (!node) continue;
+    const delta = deltas[i + 1] || deltas[i] || 0;
+    selfUs.set(node.id, (selfUs.get(node.id) || 0) + Math.abs(delta));
+  }
+  const totalUs = Array.from(selfUs.values()).reduce((a, b) => a + b, 0);
+  const acc = new Map();
+  for (const [id, us] of selfUs.entries()) {
+    const node = byId.get(id);
+    if (!node || !node.callFrame) continue;
+    const cf = node.callFrame;
+    const fn = cf.functionName || '(anonymous)';
+    const loc = `${cf.url || ''}:${cf.lineNumber != null ? cf.lineNumber + 1 : 0}:${cf.columnNumber != null ? cf.columnNumber + 1 : 0}`;
+    const key = `${fn}@${loc}`;
+    const prior = acc.get(key) || { location: loc, function: fn, self_us: 0, hits: 0 };
+    prior.self_us += us;
+    prior.hits += 1;
+    acc.set(key, prior);
+  }
+  const culprits = Array.from(acc.values())
+    .map(c => ({ ...c, self_pct: totalUs > 0 ? Math.round((c.self_us / totalUs) * 10000) / 100 : 0 }))
+    .sort((a, b) => b.self_us - a.self_us)
+    .slice(0, topN);
+  return {
+    timeframe: {
+      start_us: typeof profile.startTime === 'number' ? profile.startTime : 0,
+      end_us: typeof profile.endTime === 'number' ? profile.endTime : 0,
+      total_us: totalUs,
+      sample_count: sampleCount,
+    },
+    culprits,
+  };
+}"#;
+
+fn command_is_node(cmd: &str) -> bool {
+    Path::new(cmd)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .is_some_and(|stem| stem.eq_ignore_ascii_case("node"))
+}
+
+fn resolve_node_cmd() -> String {
+    for candidate in ["node", "bun"] {
+        if let Some(p) = which(candidate) {
+            return p.to_string_lossy().into_owned();
+        }
+    }
+    "node".to_string()
+}
+
+fn resolve_claude_cmd() -> String {
+    if let Some(found) = which("claude") {
+        return found.to_string_lossy().into_owned();
+    }
+    let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"));
+    if let Some(home) = home {
+        for name in ["claude", "claude.exe"] {
+            let installed = Path::new(&home).join(".local").join("bin").join(name);
+            if installed.exists() {
+                return installed.to_string_lossy().into_owned();
+            }
+        }
+    }
+    "claude".to_string()
+}
+
+const DEFAULT_AGENT_PERMISSION_MODE: &str = "bypassPermissions";
+const BASH_STDIN_EVAL: &str = "eval \"$(cat)\"";
+const PYTHON_STDIN_EVAL: &str = "import sys;exec(compile(sys.stdin.read(),\"<stdin>\",\"exec\"))";
+
+
+fn resolve_bash_cmd() -> String {
+    if cfg!(windows) {
+        return git_for_windows_bash()
+            .or_else(windows_bash_off_system32)
+            .unwrap_or_else(|| "bash".to_string());
+    }
+    which("bash")
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "bash".to_string())
+}
+
+fn git_for_windows_bash() -> Option<String> {
+    let mut roots: Vec<std::path::PathBuf> = Vec::new();
+    if let Some(git) = which("git") {
+        roots.extend(git.ancestors().skip(1).take(3).map(Path::to_path_buf));
+    }
+    for var in ["ProgramW6432", "ProgramFiles", "ProgramFiles(x86)"] {
+        if let Some(dir) = std::env::var_os(var) {
+            roots.push(Path::new(&dir).join("Git"));
+        }
+    }
+    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+        roots.push(Path::new(&local).join("Programs").join("Git"));
+    }
+    roots
+        .into_iter()
+        .flat_map(|root| [root.join("bin").join("bash.exe"), root.join("usr").join("bin").join("bash.exe")])
+        .find(|p| p.is_file())
+        .map(|p| p.to_string_lossy().into_owned())
+}
+
+fn windows_bash_off_system32() -> Option<String> {
+    let system32 = std::env::var_os("SystemRoot")
+        .map(|root| Path::new(&root).join("System32").to_string_lossy().to_ascii_lowercase())?;
+    let path_var = std::env::var_os("PATH")?;
+    std::env::split_paths(&path_var)
+        .map(|dir| dir.join("bash.exe"))
+        .filter(|p| p.is_file())
+        .map(|p| p.to_string_lossy().into_owned())
+        .find(|p| !p.to_ascii_lowercase().starts_with(&system32))
+}
+
+fn which(cmd: &str) -> Option<std::path::PathBuf> {
+    let path_var = std::env::var_os("PATH")?;
+    let exe_name = if cfg!(windows) {
+        format!("{cmd}.exe")
+    } else {
+        cmd.to_string()
+    };
+    std::env::split_paths(&path_var)
+        .map(|p| p.join(&exe_name))
+        .find(|p| p.exists())
+}
+
+#[allow(dead_code)]
+fn write_script(prefix: &str, content: &str) -> std::io::Result<std::path::PathBuf> {
+    let path = std::env::temp_dir().join(format!("{prefix}-{}.js", std::process::id()));
+    let mut f = std::fs::File::create(&path)?;
+    f.write_all(content.as_bytes())?;
+    Ok(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+    use std::time::{Duration, Instant};
+
+    use serde_json::json;
+
+    fn bash_path(path: &std::path::Path) -> String {
+        path.to_string_lossy().replace('\\', "/")
+    }
+
+    #[test]
+    fn exec_path_returns_without_waiting_for_the_login_probe() {
+        let started = Instant::now();
+        let path = super::exec_path();
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "exec_path waited on the login probe: {:?}",
+            started.elapsed()
+        );
+        assert!(!path.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn login_probe_gives_up_on_a_slow_shell_at_its_deadline() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let script = std::env::temp_dir().join(format!(
+            "gm-login-probe-{}-slow-shell.sh",
+            std::process::id()
+        ));
+        std::fs::write(&script, "#!/bin/sh\nsleep 5\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let started = Instant::now();
+        let environment = super::probe_login_shell(
+            script.clone().into_os_string(),
+            Duration::from_millis(500),
+        );
+        let elapsed = started.elapsed();
+        let _ = std::fs::remove_file(&script);
+        assert!(environment.is_none(), "a timed-out probe must store nothing");
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "login probe ignored its deadline: {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn backgrounded_sleeper_returns_foreground_output_instead_of_blocking() {
+        let _guard = crate::task::test_registry_guard();
+        let marker = std::env::temp_dir()
+            .join(format!("gm-exec-detach-{}-held.marker", std::process::id()));
+        let _ = std::fs::remove_file(&marker);
+        let code = format!(
+            "printf '%s' foreground-; {{ sleep 3; touch \"{}\"; }} &",
+            bash_path(&marker)
+        );
+        let _ = super::exec_path();
+        let started = Instant::now();
+        let result = super::run(
+            &code,
+            &json!({"lang": "bash", "timeoutMs": 10_000}),
+            Path::new("."),
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "dispatch waited on the backgrounded sleeper: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(result.get("exit_code").and_then(|v| v.as_i64()), Some(0));
+        assert_eq!(result.get("in_progress").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(
+            result.get("stdout").and_then(|v| v.as_str()),
+            Some("foreground-"),
+            "foreground stdout must survive a descendant holding the pipes"
+        );
+        assert!(
+            !marker.exists(),
+            "the sleeper finished before the dispatch returned"
+        );
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !marker.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "the backgrounded sleeper did not keep running after the dispatch returned"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let _ = std::fs::remove_file(&marker);
+    }
+
+    #[test]
+    fn detached_subshell_returns_synchronously_and_leaves_the_sleeper_running() {
+        let _guard = crate::task::test_registry_guard();
+        let marker = std::env::temp_dir()
+            .join(format!("gm-exec-detach-{}-detached.marker", std::process::id()));
+        let log = std::env::temp_dir()
+            .join(format!("gm-exec-detach-{}-detached.log", std::process::id()));
+        let _ = std::fs::remove_file(&marker);
+        let code = format!(
+            "printf '%s' foreground-; ( sleep 3; touch \"{}\" ) >\"{}\" 2>&1 &",
+            bash_path(&marker),
+            bash_path(&log)
+        );
+        let _ = super::exec_path();
+        let started = Instant::now();
+        let result = super::run(
+            &code,
+            &json!({"lang": "bash", "timeoutMs": 10_000}),
+            Path::new("."),
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "detached subshell made the dispatch wait: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(result.get("ok").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(result.get("exit_code").and_then(|v| v.as_i64()), Some(0));
+        assert_eq!(result.get("in_progress").and_then(|v| v.as_bool()), None);
+        assert_eq!(
+            result.get("stdout").and_then(|v| v.as_str()),
+            Some("foreground-")
+        );
+        assert!(
+            !marker.exists(),
+            "the sleeper finished before the dispatch returned"
+        );
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !marker.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "the detached sleeper did not keep running after the dispatch returned"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let _ = std::fs::remove_file(&marker);
+        let _ = std::fs::remove_file(&log);
+    }
+
+    #[test]
+    fn detached_writer_is_still_appending_a_minute_after_the_dispatch_returned() {
+        let _guard = crate::task::test_registry_guard();
+        let log = std::env::temp_dir()
+            .join(format!("gm-exec-durable-{}-writer.log", std::process::id()));
+        let _ = std::fs::remove_file(&log);
+        let code = format!(
+            "( i=0; while [ $i -lt 90 ]; do echo $i >> '{}'; i=$((i+1)); sleep 1; done ) >/dev/null 2>&1 &",
+            bash_path(&log)
+        );
+        let result = super::run(
+            &code,
+            &json!({"lang": "bash", "timeoutMs": 10_000}),
+            Path::new("."),
+        );
+        assert_eq!(result.get("ok").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(result.get("exit_code").and_then(|v| v.as_i64()), Some(0));
+        assert_eq!(
+            result.get("in_progress").and_then(|v| v.as_bool()),
+            None,
+            "a detached writer that owns no pipe must not hand the dispatch off to a task"
+        );
+        let lines = || {
+            std::fs::read_to_string(&log)
+                .map(|body| body.lines().count())
+                .unwrap_or(0)
+        };
+        let deadline = Instant::now() + Duration::from_secs(80);
+        while lines() < 60 {
+            assert!(
+                Instant::now() < deadline,
+                "the detached writer stopped after {} lines, so the dispatch killed it",
+                lines()
+            );
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        let at_minute = lines();
+        std::thread::sleep(Duration::from_secs(3));
+        assert!(
+            lines() > at_minute,
+            "the detached writer wrote {} lines at the minute mark and {} three seconds later",
+            at_minute,
+            lines()
+        );
+        let _ = std::fs::remove_file(&log);
+    }
+
+    #[test]
+    fn exited_foreground_child_hands_late_descendant_output_to_task() {
+        let _guard = crate::task::test_registry_guard();
+        let result = super::run(
+            "printf '%s' before-; printf '%s' err-before- >&2; (sleep 0.5; printf '%s' tail; printf '%s' err-tail >&2) &",
+            &json!({"lang": "bash", "timeoutMs": 1_000}),
+            Path::new("."),
+        );
+        assert_eq!(result.get("ok").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(
+            result.get("timed_out").and_then(|v| v.as_bool()),
+            Some(false)
+        );
+        assert_eq!(
+            result.get("in_progress").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        assert_eq!(result.get("exit_code").and_then(|v| v.as_i64()), Some(0));
+        let id = result
+            .get("task_id")
+            .and_then(|v| v.as_str())
+            .expect("handoff task id")
+            .to_string();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut saw_finished_before_drains = false;
+        let final_output = loop {
+            let output = crate::task::handle("output", &json!({"id": id}), Path::new("."));
+            let finished = output.get("running").and_then(|v| v.as_bool()) == Some(false);
+            let stdout = output
+                .get("stdout")
+                .and_then(|v| v.as_str())
+                .expect("stdout");
+            let stderr = output
+                .get("stderr")
+                .and_then(|v| v.as_str())
+                .expect("stderr");
+            if finished && !stdout.contains("tail") && !stderr.contains("err-tail") {
+                saw_finished_before_drains = true;
+            }
+            if finished && stdout.contains("tail") && stderr.contains("err-tail") {
+                break output;
+            }
+            assert!(Instant::now() < deadline, "late descendant output was lost");
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert!(saw_finished_before_drains);
+        assert_eq!(
+            final_output.get("stdout").and_then(|v| v.as_str()),
+            Some("before-tail")
+        );
+        assert_eq!(
+            final_output.get("stderr").and_then(|v| v.as_str()),
+            Some("err-before-err-tail")
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn stopping_exited_shell_kills_its_delayed_pipe_owner_without_waiting_for_it() {
+        let _guard = crate::task::test_registry_guard();
+        let result = super::run(
+            "printf '%s' before-; (sleep 5; printf '%s' tail) &",
+            &json!({"lang": "bash", "timeoutMs": 1_000}),
+            Path::new("."),
+        );
+        let id = result
+            .get("task_id")
+            .and_then(|v| v.as_str())
+            .expect("handoff task id")
+            .to_string();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let output = crate::task::handle("output", &json!({"id": id}), Path::new("."));
+            if output.get("running").and_then(|v| v.as_bool()) == Some(false) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "shell did not exit");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let started = Instant::now();
+        let stopped = crate::task::handle("stop", &json!({"id": id}), Path::new("."));
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "stop waited for the descendant pipe owner"
+        );
+        assert_eq!(stopped.get("ok").and_then(|v| v.as_bool()), Some(true));
+    }
+
+    #[test]
+    fn prepends_cargo_bin_without_losing_caller_path_entries() {
+        let cargo_bin = std::path::PathBuf::from("configured-cargo").join("bin");
+        let caller = vec![
+            std::path::PathBuf::from("caller-one"),
+            std::path::PathBuf::from("caller-two"),
+        ];
+        let path =
+            super::prepend_path(&cargo_bin, Some(std::env::join_paths(&caller).unwrap())).unwrap();
+        assert_eq!(
+            std::env::split_paths(&path).collect::<Vec<_>>(),
+            [cargo_bin, caller[0].clone(), caller[1].clone()]
+        );
+    }
+
+    #[test]
+    fn does_not_duplicate_cargo_bin_in_caller_path() {
+        let cargo_bin = std::path::PathBuf::from("configured-cargo").join("bin");
+        let caller =
+            std::env::join_paths([cargo_bin.clone(), std::path::PathBuf::from("caller")]).unwrap();
+        assert!(super::prepend_path(&cargo_bin, Some(caller)).is_none());
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn foreground_bash_uses_the_configured_cargo_bin() {
+        let Some(home) = std::env::var_os("HOME") else {
+            return;
+        };
+        if !std::path::PathBuf::from(home)
+            .join(".cargo")
+            .join("bin")
+            .join("cargo")
+            .is_file()
+        {
+            return;
+        }
+        let result = super::run(
+            "cargo --version >/dev/null",
+            &json!({"lang": "bash", "timeoutMs": 5_000}),
+            Path::new("."),
+        );
+        assert_eq!(
+            result.get("ok").and_then(|value| value.as_bool()),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn explicit_cargo_home_takes_precedence_over_home() {
+        let cargo_home = std::ffi::OsString::from("configured-cargo-home");
+        let home = std::ffi::OsString::from("fallback-home");
+        assert_eq!(
+            super::cargo_bin_dir_from_homes(Some(cargo_home), Some(home)),
+            Some(std::path::PathBuf::from("configured-cargo-home").join("bin"))
+        );
+    }
+}
