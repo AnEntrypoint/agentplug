@@ -506,7 +506,9 @@ impl DaemonConfig {
         self.side_plugin_concurrency.unwrap_or(1).max(1)
     }
     fn shared_store_recycle_private_bytes(&self) -> u64 {
-        const DEFAULT_MB: u64 = 600;
+        // The embed Store's steady private commit is about 1.6 GB (wasm linear memory only grows).
+        // A limit below that recreated the Store on every pressure check: 700 recycles observed.
+        const DEFAULT_MB: u64 = 2560;
         self.shared_store_recycle_private_mb
             .unwrap_or(DEFAULT_MB)
             .max(256)
