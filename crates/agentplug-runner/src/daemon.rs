@@ -920,7 +920,9 @@ fn wasted_daemon_start_backoff_remaining_ms() -> u64 {
         return 0;
     }
     let (ts, wasted_starts) = read_wasted_daemon_start_backoff();
-    if ts == 0 || wasted_starts == 0 {
+    // A ts ahead of the wall clock makes the elapsed term saturate to zero, so the full window would be
+    // reported on every read. Such a record is discarded (not clamped, which would pin it the same way).
+    if ts == 0 || wasted_starts == 0 || ts > now_ms() {
         return 0;
     }
     let window = WASTED_DAEMON_START_BACKOFF_BASE_MS
