@@ -9,6 +9,17 @@ fn ledger_path(cwd: &Path) -> std::path::PathBuf {
     cwd.join(".gm").join("exec-spool").join(".child-pids.jsonl")
 }
 
+// Owner-only mode, asserted on every record: a directory or file created with the umask
+// default (0755 / 0644) is tightened here too, since OpenOptions::mode applies only on create.
+#[cfg(unix)]
+fn set_owner_mode(path: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode));
+}
+
+#[cfg(not(unix))]
+fn set_owner_mode(_path: &Path, _mode: u32) {}
+
 fn json_string(value: &str) -> String {
     let escaped = value
         .replace('\\', "/")
@@ -67,9 +78,18 @@ pub fn record(
         }
     }
     if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
+        let _ = crate::imports::create_private_dir_all(dir);
+        set_owner_mode(dir, 0o700);
     }
-    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&path) {
+    let mut options = OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    if let Ok(mut file) = options.open(&path) {
+        set_owner_mode(&path, 0o600);
         let _ = file.write_all(line.as_bytes());
     }
 }
