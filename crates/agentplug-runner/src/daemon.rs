@@ -859,8 +859,14 @@ fn take_lock_marker_aside(lock: &std::path::Path, judged: &str, tag: &str) {
     }
     let taken = fs::read_to_string(&tomb).unwrap_or_default();
     if taken != judged {
+        // A fresh marker was moved aside. When a newer marker already holds the path the link
+        // fails, and the tomb is kept so the moved marker's bytes are not destroyed.
         if let Err(err) = fs::hard_link(&tomb, lock) {
-            eprintln!("wasted-daemon-start lock restore failed: {err}");
+            eprintln!(
+                "wasted-daemon-start lock restore failed, kept {}: {err}",
+                tomb.display()
+            );
+            return;
         }
     }
     let _ = fs::remove_file(&tomb);
