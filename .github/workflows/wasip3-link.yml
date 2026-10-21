@@ -56,9 +56,9 @@ jobs:
 
       - name: Build the rs-plugkit guest as a wasip3 component (slim, wit-env)
         working-directory: rs-plugkit
-        run: cargo +nightly build -p rs-plugkit --release --target wasm32-wasip3 --features slim,wit-env
+        run: cargo +nightly build -p rs-plugkit --target wasm32-wasip3 --features slim,wit-env
 
       - name: Link the component through agentplug-host (ignored link test)
         env:
-          GM_WASIP3_COMPONENT: ${{ github.workspace }}/rs-plugkit/target/wasm32-wasip3/release/rs_plugkit.wasm
+          GM_WASIP3_COMPONENT: ${{ github.workspace }}/rs-plugkit/target/wasm32-wasip3/debug/rs_plugkit.wasm
         run: cargo test -p agentplug-host component_links_wasi_p3_and_every_env_import -- --ignored
