@@ -822,14 +822,19 @@ fn github_token() -> Option<GithubToken> {
 }
 
 fn github_api_call(url: &str) -> Result<ureq::Response, ureq::Error> {
+    github_api_call_with(url, &[])
+}
+
+fn github_api_call_with(url: &str, headers: &[(&str, &str)]) -> Result<ureq::Response, ureq::Error> {
+    let with_headers = |request: ureq::Request| headers.iter().fold(request, |r, (k, v)| r.set(k, v));
     let Some(token) = github_token() else {
-        return github_api_request(url).call();
+        return with_headers(github_api_request(url)).call();
     };
     let from_cli = matches!(&token, GithubToken::Cli(_));
     let token = match token {
         GithubToken::Environment(token) | GithubToken::Cli(token) => token,
     };
-    match github_api_request(url)
+    match with_headers(github_api_request(url))
         .set("Authorization", &format!("Bearer {token}"))
         .call()
     {
@@ -838,7 +843,7 @@ fn github_api_call(url: &str) -> Result<ureq::Response, ureq::Error> {
                 agentplug_host::invalidate_github_cli_token();
             }
             eprintln!("[agentplug] GitHub credentials rejected (401 Bad credentials) fetching {url} -- retrying unauthenticated");
-            github_api_request(url).call()
+            with_headers(github_api_request(url)).call()
         }
         other => other,
     }
@@ -1592,18 +1597,51 @@ fn probe_latest_asset(repo: &str, asset: &str) -> anyhow::Result<Option<(String,
     let cached: Option<serde_json::Value> = fs::read_to_string(&cache_path)
         .ok()
         .and_then(|text| serde_json::from_str(&text).ok());
-    let mut request = agentplug_host::shared_agent().get(&api).set("Accept", "application/vnd.github+json");
-    if let Some(etag) = cached.as_ref().and_then(|c| c.get("etag")).and_then(|v| v.as_str()) {
-        request = request.set("If-None-Match", etag);
+    let cached_release = cached.as_ref().and_then(|c| {
+        let version = c.get("version")?.as_str()?.to_string();
+        let body = c.get("body")?.as_str()?.to_string();
+        (!version.is_empty() && !body.is_empty()).then_some((version, body))
+    });
+    let now_secs = unix_ms_now() / 1000;
+    let backoff_until = cached
+        .as_ref()
+        .and_then(|c| c.get("backoff_until_secs"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    if now_secs < backoff_until {
+        if let Some(hit) = cached_release.clone() {
+            return Ok(Some(hit));
+        }
     }
-    let response = request.call()?;
-    if response.status() == 304 {
-        if let Some(cached) = cached.as_ref() {
-            let version = cached.get("version").and_then(|v| v.as_str()).unwrap_or_default().to_string();
-            let body = cached.get("body").and_then(|v| v.as_str()).unwrap_or_default().to_string();
-            if !version.is_empty() && !body.is_empty() {
-                return Ok(Some((version, body)));
+    let etag_cached = cached.as_ref().and_then(|c| c.get("etag")).and_then(|v| v.as_str()).map(str::to_string);
+    let mut headers: Vec<(&str, &str)> = vec![("Accept", "application/vnd.github+json")];
+    if let Some(etag) = etag_cached.as_deref() {
+        headers.push(("If-None-Match", etag));
+    }
+    let response = match github_api_call_with(&api, &headers) {
+        Ok(response) => response,
+        Err(ureq::Error::Status(code, resp)) if code == 403 || code == 429 => {
+            // Anonymous or rate-limited: hold off until the reset header and serve the cached release meanwhile.
+            let reset = resp.header("x-ratelimit-reset").and_then(|v| v.parse::<u64>().ok());
+            let until = reset.unwrap_or(now_secs + 600).max(now_secs + 60);
+            let mut record = cached.clone().unwrap_or_else(|| serde_json::json!({}));
+            if let Some(object) = record.as_object_mut() {
+                object.insert("backoff_until_secs".to_string(), serde_json::json!(until));
             }
+            if let Some(parent) = cache_path.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            let _ = fs::write(&cache_path, record.to_string());
+            if let Some(hit) = cached_release.clone() {
+                return Ok(Some(hit));
+            }
+            return Err(describe_github_api_error(&api, ureq::Error::Status(code, resp)));
+        }
+        Err(err) => return Err(describe_github_api_error(&api, err)),
+    };
+    if response.status() == 304 {
+        if let Some(hit) = cached_release.clone() {
+            return Ok(Some(hit));
         }
     }
     let etag = response.header("etag").map(str::to_string);
