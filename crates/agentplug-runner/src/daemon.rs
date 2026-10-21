@@ -3988,7 +3988,9 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
 
     const IDLE_WAIT_MIN_MS: u64 = 25;
     const IDLE_WAIT_MAX_MS: u64 = 1_000;
-    const PENDING_UNCLAIMED_IDLE_WAIT_MAX_MS: u64 = 250;
+    // Equal to the spool-in settle age (claim_dispatch.rs SPOOL_IN_FILE_SETTLE): the stamp check needs two
+    // sweeps one settle age apart, so a longer cap adds that gap to every trivial dispatch's claim wait.
+    const PENDING_UNCLAIMED_IDLE_WAIT_MAX_MS: u64 = 100;
     let mut idle_wait_ms = IDLE_WAIT_MIN_MS;
 
     let shared_plugin_release_idle_ms = daemon_cfg.shared_plugin_release_idle_ms();
