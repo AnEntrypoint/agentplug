@@ -314,7 +314,7 @@ pub fn run(code: &str, opts: &Value, cwd: &Path) -> Value {
         None => return json!({"ok": false, "error": format!("unsupported lang: {lang}")}),
     };
 
-    let _admission = match crate::task::admit_execution() {
+    let admission = match crate::task::admit_execution() {
         Ok(guard) => guard,
         Err(error) => {
             return json!({"ok": false, "error": error, "error_code": "task_handoff_pending", "execution_started": false})
@@ -398,6 +398,10 @@ pub fn run(code: &str, opts: &Value, cwd: &Path) -> Value {
     let stdout_pipe = child.stdout.take().map(crate::task::drain_in_background);
     let stderr_pipe = child.stderr.take().map(crate::task::drain_in_background);
 
+    // The admission read guard only has to stop a run from starting after a
+    // handoff is prepared. The child has started by now, so release it before
+    // the synchronous wait; otherwise a forced swap's try_write never succeeds.
+    drop(admission);
     let handover_ms = limit_ms.min(crate::exec_pool::BACKGROUND_AFTER_MS);
     let waited = wait_sync_window(&mut child, Duration::from_millis(handover_ms));
     if matches!(waited, Ok(None)) && handover_ms < limit_ms && !crate::task::admission_draining() {

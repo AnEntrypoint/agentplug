@@ -151,7 +151,10 @@ fn main() -> anyhow::Result<()> {
             run_spool_watcher_single_process(&mut project, &spool_dir)
         }
         "daemon-guard" => daemon::run_daemon_guard(),
-        "daemon" => daemon::run_daemon(),
+        "daemon" => {
+            daemon::install_shutdown_signal_handlers();
+            daemon::run_daemon()
+        }
         "sweep-spool" => {
             let root = args
                 .get(2)
