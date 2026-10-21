@@ -1230,6 +1230,45 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
     )?;
     linker.func_wrap(
         "env",
+        "host_kv_cas",
+        |mut caller: Caller<'_, HostState>,
+         ns_ptr: u32,
+         ns_len: u32,
+         key_ptr: u32,
+         key_len: u32,
+         expected_ptr: u32,
+         expected_len: u32,
+         val_ptr: u32,
+         val_len: u32|
+         -> u32 {
+            let ns = read_guest_string(&mut caller, ns_ptr, ns_len);
+            let key = read_guest_string(&mut caller, key_ptr, key_len);
+            let expected = read_guest_string(&mut caller, expected_ptr, expected_len);
+            let val = read_guest_string(&mut caller, val_ptr, val_len);
+            if ns.is_empty() || key.is_empty() {
+                return 0;
+            }
+            let path = kv_file_path(&caller.data().cwd(), &ns, &key);
+            if let Some(parent) = path.parent() {
+                let _ = create_private_dir_all(parent);
+            }
+            // A missing key compares equal to an empty expected value. The per-path lock makes the
+            // read-compare-write one step against other host_kv_cas calls on this key; host_kv_put
+            // does not take it.
+            let lock = fs_write_lock_for(&path);
+            let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+            let current = fs::read_to_string(&path).unwrap_or_default();
+            if current != expected {
+                return 0;
+            }
+            match create_private_file(&path, &val) {
+                Ok(()) => 1,
+                Err(_) => 0,
+            }
+        },
+    )?;
+    linker.func_wrap(
+        "env",
         "host_kv_delete",
         |mut caller: Caller<'_, HostState>,
          ns_ptr: u32,
