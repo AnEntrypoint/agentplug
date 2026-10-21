@@ -389,6 +389,7 @@ pub(crate) fn adopt_running(
     containment: crate::process_tree::ProcessContainment,
     lang: &str,
     started: Instant,
+    timeout_ms: u64,
     stdout_pipe: Option<DrainedPipe>,
     stderr_pipe: Option<DrainedPipe>,
 ) -> Result<String, String> {
@@ -398,8 +399,10 @@ pub(crate) fn adopt_running(
         containment,
         lang: lang.to_string(),
         started_ms,
-        deadline: deadline_after(started, ADOPTED_TASK_TIMEOUT_MS)
-            .expect("fixed adopted task timeout fits Instant"),
+        // The caller's child budget (limit_ms) counts from the start of the call, so a child that moves
+        // to background is still killed at that deadline; the 30 min ceiling only caps larger budgets.
+        deadline: deadline_after(started, timeout_ms.min(ADOPTED_TASK_TIMEOUT_MS))
+            .expect("adopted task timeout fits Instant"),
         stdout_pipe,
         stderr_pipe,
         stdout: Vec::new(),

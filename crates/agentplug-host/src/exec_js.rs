@@ -414,7 +414,7 @@ pub fn run(code: &str, opts: &Value, cwd: &Path) -> Value {
             .as_ref()
             .map(crate::task::DrainedPipe::snapshot)
             .unwrap_or_default();
-        return match crate::task::adopt_running(child, containment, lang, t0, stdout_pipe, stderr_pipe) {
+        return match crate::task::adopt_running(child, containment, lang, t0, limit_ms, stdout_pipe, stderr_pipe) {
             Ok(task_id) => json!({
                 "ok": true,
                 "background": true,
@@ -494,6 +494,7 @@ pub fn run(code: &str, opts: &Value, cwd: &Path) -> Value {
             containment,
             lang,
             t0,
+            limit_ms,
             stdout_pipe,
             stderr_pipe,
         ) {
@@ -515,7 +516,7 @@ pub fn run(code: &str, opts: &Value, cwd: &Path) -> Value {
             "task_id": task_id,
             "exit_code": exit_code,
             "duration_ms": duration_ms,
-            "task_timeout_ms": 30 * 60 * 1000,
+            "task_timeout_ms": limit_ms.min(30 * 60 * 1000),
             "stdout": String::from_utf8_lossy(&partial_stdout),
             "stderr": String::from_utf8_lossy(&partial_stderr),
             "pipes_held_by_descendant": true,
