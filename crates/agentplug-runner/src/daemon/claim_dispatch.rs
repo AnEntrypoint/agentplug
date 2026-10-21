@@ -1596,7 +1596,7 @@ pub(super) const ORPHAN_CLAIM_MAX_AGE_MS: u64 = 120_000;
 
 pub(super) fn claim_age_ms(path: &Path) -> Option<u64> {
     let modified = fs::metadata(path).ok()?.modified().ok()?;
-    Some(modified.elapsed().ok()?.as_millis() as u64)
+    Some(modified.elapsed().map(|age| age.as_millis() as u64).unwrap_or(0))
 }
 
 pub(super) fn sweep_orphaned_claims_distinguishing_handoff_from_crash(
