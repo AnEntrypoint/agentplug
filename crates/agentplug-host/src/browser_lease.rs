@@ -918,7 +918,12 @@ fn forget_browser_record(root: &Path) {
     let _ = std::fs::remove_file(browser_record_file(root));
 }
 
-fn adopt_idle_browser(root: &Path, headful: bool, wanted: &Path) -> Option<SharedBrowser> {
+fn adopt_idle_browser(
+    root: &Path,
+    headful: bool,
+    wanted: &Path,
+    expired_reason: &str,
+) -> Option<SharedBrowser> {
     let text = std::fs::read_to_string(browser_record_file(root)).ok()?;
     let value: Value = serde_json::from_str(&text).ok()?;
     let port = int_field(&value, "port") as u16;
@@ -975,7 +980,7 @@ fn adopt_idle_browser(root: &Path, headful: bool, wanted: &Path) -> Option<Share
     if now_ms().saturating_sub(idle_since) >= idle_window_ms() {
         close_browser(&mut browser);
         forget_browser_record(root);
-        log_browser(root, "browser-idle-close", pid, "reason=expired-before-adoption");
+        log_browser(root, "browser-idle-close", pid, expired_reason);
         return None;
     }
     log_browser(
@@ -985,6 +990,32 @@ fn adopt_idle_browser(root: &Path, headful: bool, wanted: &Path) -> Option<Share
         &format!("port={port} idle_since_ms={idle_since}"),
     );
     Some(browser)
+}
+
+// A runner handoff keeps an idle browser by writing its record; the new process must sweep it, since housekeeping
+// walks only the in-memory map and that map is filled by an acquire alone.
+pub fn adopt_kept_browsers(roots: &[PathBuf]) {
+    for root in roots {
+        if browsers().contains_key(root) || claimed().contains(root) || has_waiter(root) {
+            continue;
+        }
+        let Some(value) = std::fs::read_to_string(browser_record_file(root))
+            .ok()
+            .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        else {
+            continue;
+        };
+        let headful = value.get("headful").and_then(Value::as_bool).unwrap_or(false);
+        let profile = value
+            .get("profile")
+            .and_then(Value::as_str)
+            .map(PathBuf::from)
+            .unwrap_or_else(|| profile_dir(root));
+        let expired = "reason=expired-at-sweep-adoption";
+        if let Some(browser) = adopt_idle_browser(root, headful, &profile, expired) {
+            browsers().insert(root.clone(), browser);
+        }
+    }
 }
 
 pub fn acquire(root: &Path, agent: &str, headful: bool) -> Result<(u16, u32), String> {
@@ -1058,7 +1089,7 @@ fn attach_after_claim(
 ) -> Result<(u16, u32), String> {
     let profile = profile_for(root, opts);
     if !browsers().contains_key(root) {
-        if let Some(adopted) = adopt_idle_browser(root, headful, &profile) {
+        if let Some(adopted) = adopt_idle_browser(root, headful, &profile, "reason=expired-before-adoption") {
             browsers().insert(root.to_path_buf(), adopted);
         }
     }
