@@ -1515,6 +1515,11 @@ fn daemon_log_sink() -> Option<fs::File> {
 }
 
 fn spawn_detached(exe: &Path, args: &[&str]) -> anyhow::Result<()> {
+    spawn_detached_child(exe, args).map(|_| ())
+}
+
+/// Spawns a detached child and returns its handle, so a caller can stop it later.
+fn spawn_detached_child(exe: &Path, args: &[&str]) -> anyhow::Result<std::process::Child> {
     let mut cmd = std::process::Command::new(exe);
     cmd.args(args);
     cmd.stdin(std::process::Stdio::null());
@@ -1540,8 +1545,7 @@ fn spawn_detached(exe: &Path, args: &[&str]) -> anyhow::Result<()> {
             });
         }
     }
-    cmd.spawn()?;
-    Ok(())
+    Ok(cmd.spawn()?)
 }
 
 fn spawn_detached_daemon() -> anyhow::Result<()> {
@@ -1851,6 +1855,23 @@ fn clear_handoff_awaiting() {
     *HANDOFF_AWAITING.lock().unwrap_or_else(|e| e.into_inner()) = None;
 }
 
+/// The detached takeover successor spawned for the awaited handoff; stopped if it misses the window.
+static HANDOFF_SUCCESSOR: Mutex<Option<std::process::Child>> = Mutex::new(None);
+
+/// Stops the takeover successor that missed the readiness window and withdraws its readiness
+/// marker, so it cannot claim ownership after the old daemon has stayed on its version.
+fn stop_handoff_successor() {
+    let successor = HANDOFF_SUCCESSOR
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take();
+    if let Some(mut child) = successor {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    let _ = fs::remove_file(takeover_ready_path());
+}
+
 fn takeover_ready_pid(version: &str) -> Option<u64> {
     let raw = fs::read_to_string(takeover_ready_path()).ok()?;
     let v = serde_json::from_str::<serde_json::Value>(&raw).ok()?;
@@ -1889,6 +1910,7 @@ fn attempt_self_update_handoff(staged_exe: &Path, version: &str) -> bool {
             return false;
         }
         clear_handoff_awaiting();
+        stop_handoff_successor();
         eprintln!("[agentplug daemon] self-update to {version} did not confirm ready in time -- staying on current version, will retry next poll");
         record_handoff_failure(
             version,
@@ -1906,13 +1928,17 @@ fn attempt_self_update_handoff(staged_exe: &Path, version: &str) -> bool {
     }
     let ready_path = takeover_ready_path();
     let _ = fs::remove_file(&ready_path);
-    if let Err(e) = spawn_detached(staged_exe, &["takeover", version]) {
-        record_handoff_failure(
-            version,
-            format!("spawn_detached of staged {version} failed: {e}"),
-        );
-        return false;
-    }
+    let successor = match spawn_detached_child(staged_exe, &["takeover", version]) {
+        Ok(child) => child,
+        Err(e) => {
+            record_handoff_failure(
+                version,
+                format!("spawn_detached of staged {version} failed: {e}"),
+            );
+            return false;
+        }
+    };
+    *HANDOFF_SUCCESSOR.lock().unwrap_or_else(|e| e.into_inner()) = Some(successor);
     *HANDOFF_AWAITING.lock().unwrap_or_else(|e| e.into_inner()) =
         Some((version.to_string(), Instant::now() + HANDOFF_READY_WINDOW));
     false
