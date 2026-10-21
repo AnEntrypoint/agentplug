@@ -35,8 +35,9 @@ pub use browser::{
     free_local_port, parse_cdp_browser_body, run_helper, CdpBrowser, HelperRun,
 };
 pub use browser_lease::{
-    claim_session, lease_reply, owner_file, release_session, session_dir, shutdown_shared_browsers,
-    spawn_housekeeping_timer, status as lease_status, LeaseHolder, HEARTBEAT_MS, TTL_MS, WAIT_MS,
+    adopt_kept_browsers, claim_session, lease_reply, owner_file, release_session, session_dir,
+    shutdown_shared_browsers, spawn_housekeeping_timer, status as lease_status, LeaseHolder, HEARTBEAT_MS,
+    TTL_MS, WAIT_MS,
 };
 pub use dispatch_origin::{enter_dispatch_origin_scope, DispatchOriginScope};
 pub use github_auth::{github_cli_token, invalidate_github_cli_token};

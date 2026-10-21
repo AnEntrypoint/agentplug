@@ -4115,6 +4115,7 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
                 cold_sweep_walk.reset();
             }
             set_known_project_roots(&known_roots);
+            agentplug_host::adopt_kept_browsers(&known_roots);
             if sweep_orphans_left_by_whatever_daemon_died_before_answering {
                 sweep_orphaned_claims_across_roots(&known_roots);
                 for root in &known_roots {
