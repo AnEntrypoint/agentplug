@@ -4,6 +4,7 @@ use std::io::Write;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -20,6 +21,41 @@ use crate::download::{
     ensure_plugin_installed, installed_plugin_version, installed_runner_version,
     is_recognized_release_semver, record_runner_version,
 };
+
+/// Set by the signal or console-control handler. The handler only stores here;
+/// the daemon loop turns the flag into a stop request, so the file write and the
+/// graceful stop run on the loop thread, never inside the handler.
+static SHUTDOWN_SIGNAL: AtomicBool = AtomicBool::new(false);
+
+fn shutdown_signal_received() -> bool {
+    SHUTDOWN_SIGNAL.load(Ordering::SeqCst)
+}
+
+#[cfg(unix)]
+extern "C" fn on_shutdown_signal(_signal: libc::c_int) {
+    SHUTDOWN_SIGNAL.store(true, Ordering::SeqCst);
+}
+
+#[cfg(windows)]
+unsafe extern "system" fn on_console_ctrl(_ctrl_type: u32) -> windows_sys::Win32::Foundation::BOOL {
+    SHUTDOWN_SIGNAL.store(true, Ordering::SeqCst);
+    1
+}
+
+/// Installs SIGTERM and SIGINT handlers (Unix) or a console control handler
+/// (Windows). Called only by the `daemon` entry, so other commands keep the
+/// default signal disposition.
+pub fn install_shutdown_signal_handlers() {
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGTERM, on_shutdown_signal as libc::sighandler_t);
+        libc::signal(libc::SIGINT, on_shutdown_signal as libc::sighandler_t);
+    }
+    #[cfg(windows)]
+    unsafe {
+        windows_sys::Win32::System::Console::SetConsoleCtrlHandler(Some(on_console_ctrl), 1);
+    }
+}
 
 fn registry_path() -> PathBuf {
     install_dir().join("daemon-registry.txt")
@@ -4334,11 +4370,16 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
             last_shared_release = Instant::now();
         }
 
+        if shutdown_signal_received() && stop_request_age_ms().is_none() {
+            write_stop_request("signal");
+        }
+
         if last_any_dispatch.elapsed() >= Duration::from_millis(STOP_REQUEST_MIN_IDLE_MS)
             && !detached_still_running
             && stop_request_age_ms().is_some()
         {
             let _ = fs::remove_file(stop_request_path());
+            release_ownership_for_handoff();
             eprintln!(
                 "[agentplug daemon] honoring a stop request after {}ms idle -- the watcher for this install dir is standing down with it; the next dispatch starts a fresh daemon",
                 STOP_REQUEST_MIN_IDLE_MS

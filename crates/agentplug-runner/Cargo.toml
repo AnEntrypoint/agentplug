@@ -26,4 +26,4 @@ mlua = { version = "0.10", features = ["lua54", "vendored", "serialize"] }
 libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_Diagnostics_Debug", "Win32_System_Threading"] }
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_Diagnostics_Debug", "Win32_System_Console", "Win32_System_Threading"] }
