@@ -880,7 +880,7 @@ fn with_wasted_daemon_start_lock(critical: impl FnOnce()) {
     take_lock_marker_aside(&lock, &token, "unlock");
 }
 
-fn record_wasted_daemon_start() {
+pub(crate) fn record_wasted_daemon_start() {
     let path = daemon_spawn_backoff_path();
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
