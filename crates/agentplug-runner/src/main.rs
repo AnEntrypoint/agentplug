@@ -257,6 +257,7 @@ fn main() -> anyhow::Result<()> {
         "selfcheck-spool-claim" => selfcheck_spool_claim(),
         "selfcheck-browser-lease" => selfcheck_browser_lease(),
         "selfcheck-update-probes" => selfcheck_update_probes(),
+        "selfcheck-spawn-backoff" => selfcheck_spawn_backoff(),
         other => {
             eprintln!(
                 "agentplug-runner: unknown command '{other}'. Usage: agentplug-runner <plugin <name> [version]|spool|daemon|takeover <version>|dispatch [plugin] <verb> [body]|sweep-spool [root]|update-runner|release-bootstrap-status|build-info|pin-local-build|unpin-local-build|selfcheck-registry|selfcheck-inflight|selfcheck-idle-evict|version>"
@@ -2057,6 +2058,43 @@ fn selfcheck_spool_claim() -> anyhow::Result<()> {
 
     let _ = fs::remove_dir_all(in_dir.parent().unwrap_or(&in_dir));
     println!("[selfcheck-spool-claim] witnessed live against the real claim predicate: PASS");
+    Ok(())
+}
+
+// Calls the real wasted-daemon-start recorder from concurrent threads against a throwaway AGENTPLUG_HOME,
+// so the live daemon-spawn-backoff.json is never touched.
+fn selfcheck_spawn_backoff() -> anyhow::Result<()> {
+    use std::fs;
+
+    const NAME: &str = "selfcheck-spawn-backoff";
+    const CALLERS: u32 = 8;
+    let home = std::env::temp_dir().join(format!(
+        "agentplug-selfcheck-spawn-backoff-{}-{}",
+        std::process::id(),
+        agentplug_host::now_ms()
+    ));
+    fs::create_dir_all(&home)?;
+    let previous = std::env::var_os("AGENTPLUG_HOME");
+    std::env::set_var("AGENTPLUG_HOME", &home);
+    let workers: Vec<_> = (0..CALLERS)
+        .map(|_| std::thread::spawn(daemon::record_wasted_daemon_start))
+        .collect();
+    let joined = workers.into_iter().all(|w| w.join().is_ok());
+    match previous {
+        Some(value) => std::env::set_var("AGENTPLUG_HOME", value),
+        None => std::env::remove_var("AGENTPLUG_HOME"),
+    }
+    let record = fs::read_to_string(home.join("daemon-spawn-backoff.json"))?;
+    let _ = fs::remove_dir_all(&home);
+    let record: serde_json::Value = serde_json::from_str(&record)?;
+    let wasted = record["wasted_starts"].as_u64().unwrap_or(0);
+    println!("[{NAME}] {CALLERS} concurrent record_wasted_daemon_start calls: wasted_starts={wasted}");
+    anyhow::ensure!(joined, "{NAME}: a recorder thread panicked");
+    anyhow::ensure!(
+        wasted == u64::from(CALLERS),
+        "{NAME}: the lock lost increments: wasted_starts={wasted} != {CALLERS}"
+    );
+    println!("[{NAME}] the lock-serialised counter keeps every increment: PASS");
     Ok(())
 }
 // Reads the release channel for the runner, every loaded plugin and the skill manifest, without staging,
