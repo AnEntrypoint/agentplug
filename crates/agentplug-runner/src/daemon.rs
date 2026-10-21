@@ -3387,7 +3387,7 @@ fn spawn_claim_sweep_stall_watchdog(bound: Duration) -> std::thread::JoinHandle<
 
 fn refresh_project_heartbeats_off_loop() {
     for root in read_known_project_roots() {
-        if fs::create_dir_all(&spool_dir_of(&root)).is_err() {
+        if ensure_owner_dir(&spool_dir_of(&root)).is_err() {
             continue;
         }
         write_project_heartbeat_with_queue_info(
@@ -4195,7 +4195,7 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
         }
         for (position, (_, root)) in active_roots.iter().enumerate() {
             let spool_dir = root.join(".gm").join("exec-spool");
-            if fs::create_dir_all(&spool_dir).is_ok() {
+            if ensure_owner_dir(&spool_dir).is_ok() {
                 write_project_heartbeat_rate_limited(
                     root,
                     read_status_busy_until_if_future(root),
@@ -4256,7 +4256,7 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
         for (root, project, did_work) in done.into_inner().unwrap_or_else(|e| e.into_inner()) {
             any_work = any_work || did_work;
             let spool_dir = root.join(".gm").join("exec-spool");
-            if fs::create_dir_all(&spool_dir).is_ok() {
+            if ensure_owner_dir(&spool_dir).is_ok() {
                 write_project_heartbeat_rate_limited(
                     root.as_path(),
                     read_status_busy_until_if_future(root.as_path()),

@@ -94,7 +94,7 @@ fn main() -> anyhow::Result<()> {
             let cwd = std::env::current_dir().expect("cwd unavailable");
             let cwd = agentplug_host::project_root(&cwd);
             let spool_dir = cwd.join(".gm").join("exec-spool");
-            std::fs::create_dir_all(&spool_dir)?;
+            daemon::ensure_owner_dir(&spool_dir)?;
 
             if !daemon::claim_spool_launcher_slot(&spool_dir) {
                 eprintln!(
@@ -1945,7 +1945,7 @@ fn selfcheck_idle_evict() -> anyhow::Result<()> {
         agentplug_host::now_ms()
     ));
     let spool_dir = root.join(".gm").join("exec-spool");
-    fs::create_dir_all(&spool_dir)?;
+    daemon::ensure_owner_dir(&spool_dir)?;
 
     let mut project = ProjectPlugins::new(root.clone());
     project.last_active = Instant::now() - Duration::from_secs(3600);

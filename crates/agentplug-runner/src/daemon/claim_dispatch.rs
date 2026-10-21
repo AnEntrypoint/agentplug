@@ -709,7 +709,7 @@ fn create_owner_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     fs::write(path, contents)
 }
 
-fn ensure_owner_dir(path: &Path) -> std::io::Result<()> {
+pub(crate) fn ensure_owner_dir(path: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::DirBuilderExt;
@@ -717,6 +717,9 @@ fn ensure_owner_dir(path: &Path) -> std::io::Result<()> {
     }
     #[cfg(not(unix))]
     fs::create_dir_all(path)?;
+    if let Some(gm_dir) = path.parent().filter(|p| p.file_name().is_some_and(|n| n == ".gm")) {
+        owner_only(gm_dir, 0o700)?;
+    }
     owner_only(path, 0o700)
 }
 
@@ -3064,7 +3067,7 @@ pub(super) fn refresh_dispatch_wait_ledger(root: &Path) {
         "{DISPATCH_WAIT_LEDGER_FILE}.tmp.{}",
         std::process::id()
     ));
-    if fs::write(&tmp, payload).is_ok() {
+    if write_owner_file(&tmp, payload) {
         let _ = fs::rename(&tmp, &ledger_path);
     }
 }
