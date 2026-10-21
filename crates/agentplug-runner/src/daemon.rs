@@ -795,12 +795,16 @@ fn lock_is_stale(lock: &std::path::Path, stale: std::time::Duration) -> bool {
         .unwrap_or(false)
 }
 
-fn steal_stale_wasted_daemon_start_lock(lock: &std::path::Path, stale: std::time::Duration) {
-    if !lock_is_stale(lock, stale) {
-        return;
-    }
+/// The marker body is `<pid>-<nanos>`, written after its create-new.
+fn lock_owner_pid(observed: &str) -> Option<u64> {
+    observed.split('-').next()?.trim().parse::<u64>().ok()
+}
+
+/// Moves the marker aside and removes it only when the bytes taken are the bytes
+/// judged. A different marker that was renamed in between is linked back.
+fn take_lock_marker_aside(lock: &std::path::Path, judged: &str, tag: &str) {
     let tomb = std::path::PathBuf::from(format!(
-        "{}.steal-{}-{}",
+        "{}.{tag}-{}-{}",
         lock.display(),
         std::process::id(),
         std::time::SystemTime::now()
@@ -811,12 +815,28 @@ fn steal_stale_wasted_daemon_start_lock(lock: &std::path::Path, stale: std::time
     if fs::rename(lock, &tomb).is_err() {
         return;
     }
-    if !lock_is_stale(&tomb, stale) {
+    let taken = fs::read_to_string(&tomb).unwrap_or_default();
+    if taken != judged {
         if let Err(err) = fs::hard_link(&tomb, lock) {
             eprintln!("wasted-daemon-start lock restore failed: {err}");
         }
     }
     let _ = fs::remove_file(&tomb);
+}
+
+/// Steals only a marker whose owner pid is dead. An empty or unparsable marker has
+/// no owner to probe, so only an age past the stale window abandons it.
+fn steal_stale_wasted_daemon_start_lock(lock: &std::path::Path, stale: std::time::Duration) {
+    let Ok(observed) = fs::read_to_string(lock) else {
+        return;
+    };
+    let owner_dead = match lock_owner_pid(&observed) {
+        Some(pid) => !pid_is_alive(pid),
+        None => lock_is_stale(lock, stale),
+    };
+    if owner_dead {
+        take_lock_marker_aside(lock, &observed, "steal");
+    }
 }
 
 fn with_wasted_daemon_start_lock(critical: impl FnOnce()) {
@@ -850,9 +870,7 @@ fn with_wasted_daemon_start_lock(critical: impl FnOnce()) {
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
     critical();
-    if fs::read_to_string(&lock).ok().as_deref() == Some(token.as_str()) {
-        let _ = fs::remove_file(&lock);
-    }
+    take_lock_marker_aside(&lock, &token, "unlock");
 }
 
 fn record_wasted_daemon_start() {
@@ -1766,7 +1784,68 @@ fn staged_binary_self_check(staged_exe: &Path, expected_version: &str) -> bool {
     }
 }
 
+/// The staged takeover awaiting its readiness marker: (version, deadline).
+static HANDOFF_AWAITING: Mutex<Option<(String, Instant)>> = Mutex::new(None);
+
+const HANDOFF_READY_WINDOW: Duration = Duration::from_secs(10);
+
+fn handoff_awaiting_for(version: &str) -> bool {
+    HANDOFF_AWAITING
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .is_some_and(|(awaited, _)| awaited == version)
+}
+
+fn clear_handoff_awaiting() {
+    *HANDOFF_AWAITING.lock().unwrap_or_else(|e| e.into_inner()) = None;
+}
+
+fn takeover_ready_pid(version: &str) -> Option<u64> {
+    let raw = fs::read_to_string(takeover_ready_path()).ok()?;
+    let v = serde_json::from_str::<serde_json::Value>(&raw).ok()?;
+    if v.get("version").and_then(|x| x.as_str()) != Some(version) {
+        return None;
+    }
+    v.get("pid").and_then(|x| x.as_u64())
+}
+
+/// One non-blocking step of a self-update handoff, called once per daemon tick. The
+/// first call for a version spawns the staged takeover and records its readiness
+/// deadline; later calls read the readiness marker once and return. Returns true only
+/// when the successor is ready and this daemon may release ownership.
 fn attempt_self_update_handoff(staged_exe: &Path, version: &str) -> bool {
+    let awaited = HANDOFF_AWAITING
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    if let Some((_, deadline)) = awaited.filter(|(v, _)| v == version) {
+        if let Some(successor_pid) = takeover_ready_pid(version) {
+            match reserve_ownership_for_handoff(successor_pid, version) {
+                Ok(()) => {
+                    clear_handoff_awaiting();
+                    eprintln!("[agentplug daemon] new version {version} confirmed ready -- releasing ownership for handoff");
+                    record_handoff_attempt(None);
+                    clear_handoff_escalation(version);
+                    release_ownership_for_handoff();
+                    return true;
+                }
+                Err(error) => eprintln!(
+                    "[agentplug daemon] self-update successor for {version} cannot reserve the ownership handoff: {error}"
+                ),
+            }
+        }
+        if Instant::now() < deadline {
+            return false;
+        }
+        clear_handoff_awaiting();
+        eprintln!("[agentplug daemon] self-update to {version} did not confirm ready in time -- staying on current version, will retry next poll");
+        record_handoff_failure(
+            version,
+            format!("staged {version} did not write a matching readiness marker within 10s"),
+        );
+        return false;
+    }
     if !staged_binary_self_check(staged_exe, version) {
         let _ = fs::remove_file(staged_exe);
         record_handoff_failure(
@@ -1784,34 +1863,8 @@ fn attempt_self_update_handoff(staged_exe: &Path, version: &str) -> bool {
         );
         return false;
     }
-    for _ in 0..40 {
-        std::thread::sleep(Duration::from_millis(250));
-        if let Ok(raw) = fs::read_to_string(&ready_path) {
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
-                if v.get("version").and_then(|x| x.as_str()) == Some(version) {
-                    let Some(successor_pid) = v.get("pid").and_then(|x| x.as_u64()) else {
-                        continue;
-                    };
-                    if let Err(error) = reserve_ownership_for_handoff(successor_pid, version) {
-                        eprintln!(
-                            "[agentplug daemon] self-update successor for {version} cannot reserve the ownership handoff: {error}"
-                        );
-                        continue;
-                    }
-                    eprintln!("[agentplug daemon] new version {version} confirmed ready -- releasing ownership for handoff");
-                    record_handoff_attempt(None);
-                    clear_handoff_escalation(version);
-                    release_ownership_for_handoff();
-                    return true;
-                }
-            }
-        }
-    }
-    eprintln!("[agentplug daemon] self-update to {version} did not confirm ready in time -- staying on current version, will retry next poll");
-    record_handoff_failure(
-        version,
-        format!("staged {version} did not write a matching readiness marker within 10s"),
-    );
+    *HANDOFF_AWAITING.lock().unwrap_or_else(|e| e.into_inner()) =
+        Some((version.to_string(), Instant::now() + HANDOFF_READY_WINDOW));
     false
 }
 
@@ -4305,7 +4358,9 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
         if let Some(task_handoff) = task_handoff {
             if let Some((staged, version)) = pending_self_update.take() {
                 let claims_the_successor_inherits = snapshot_in_flight_claims();
-                write_handoff_inherited_claims(&version, &claims_the_successor_inherits);
+                if !handoff_awaiting_for(&version) {
+                    write_handoff_inherited_claims(&version, &claims_the_successor_inherits);
+                }
                 if attempt_self_update_handoff(&staged, &version) {
                     task_handoff.commit();
                     let requeued =
@@ -4317,8 +4372,14 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
                     mark_intentional_exit("runner-handoff");
                     return Ok(());
                 }
-                clear_handoff_inherited_claims();
-                if staged.exists() {
+                let awaiting = handoff_awaiting_for(&version);
+                if !awaiting {
+                    // A completed failed swap ends its admission drain here; a takeover
+                    // still awaiting its readiness marker keeps both until it resolves.
+                    clear_handoff_inherited_claims();
+                    agentplug_host::end_admission_drain();
+                }
+                if staged.exists() || awaiting {
                     pending_self_update = Some((staged, version));
                 } else {
                     pending_self_update_staged_at = None;
