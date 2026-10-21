@@ -3916,6 +3916,10 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
     let mut pending_self_update_staged_at: Option<Instant> = None;
     let mut handoff_deferred_logged_at: Option<Instant> = None;
     const SELF_UPDATE_MAX_STARVED_MS: u64 = 60 * 1000;
+    // Upper bound on how long a forced swap holds the admission drain. Past it the drain
+    // is released and admissions resume; the swap is retried on a later tick.
+    const FORCED_SWAP_DRAIN_MAX_MS: u64 = 60 * 1000;
+    let mut forced_swap_drain_started: Option<Instant> = None;
 
     if let Some((staged_at_ms, _len)) = staged_runner_awaiting_handoff() {
         if let Some(staged_path) = canonical_runner_exe_path().map(|c| {
@@ -4317,10 +4321,18 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
             .as_ref()
             .map(|(_, v)| handoff_backed_off(v))
             .unwrap_or(false);
+        if pending_self_update.is_none() {
+            forced_swap_drain_started = None;
+        }
+        let forced_swap_drain_expired = forced_swap_drain_started
+            .map(|started| started.elapsed() >= Duration::from_millis(FORCED_SWAP_DRAIN_MAX_MS))
+            .unwrap_or(false);
         let forced_swap_after_bound = pending_self_update.is_some()
             && self_update_starved
-            && !self_update_backed_off;
+            && !self_update_backed_off
+            && !forced_swap_drain_expired;
         if forced_swap_after_bound {
+            forced_swap_drain_started.get_or_insert_with(Instant::now);
             agentplug_host::begin_admission_drain();
         } else {
             agentplug_host::end_admission_drain();
@@ -4349,6 +4361,9 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
                 }
                 Err(error) => {
                     eprintln!("[agentplug daemon] task result preservation refuses staged runner handoff: {error}");
+                    // Error exit of the handoff: release the admission drain now. A still-forced
+                    // swap re-arms it on the next tick, bounded by FORCED_SWAP_DRAIN_MAX_MS.
+                    agentplug_host::end_admission_drain();
                     None
                 }
             }
