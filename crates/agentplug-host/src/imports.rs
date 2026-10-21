@@ -416,6 +416,21 @@ pub fn git_subprocess_timeout_ms() -> u64 {
         .unwrap_or(GIT_SUBPROCESS_TIMEOUT_MS_DEFAULT_AMPLE_FOR_SLOW_PUSH_FETCH_OR_FIRST_CLONE)
 }
 
+const GIT_PUSH_SUBPROCESS_TIMEOUT_MS_DEFAULT: u64 = 120_000;
+
+/// Budget for one git child. A push is capped at 120 s (AGENTPLUG_GIT_PUSH_TIMEOUT_MS overrides it), so a hung push
+/// releases the git lane sooner; clone and fetch keep the full git budget.
+pub fn git_subprocess_timeout_ms_for(argv: &[String]) -> u64 {
+    if git_argv_subcommand(argv) != Some("push") {
+        return git_subprocess_timeout_ms();
+    }
+    std::env::var("AGENTPLUG_GIT_PUSH_TIMEOUT_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|ms| *ms > 0)
+        .unwrap_or_else(|| git_subprocess_timeout_ms().min(GIT_PUSH_SUBPROCESS_TIMEOUT_MS_DEFAULT))
+}
+
 const HOST_GIT_STDOUT_CAP_BYTES: usize = 1_048_576;
 const HOST_GIT_STDERR_CAP_BYTES: usize = 262_144;
 
@@ -1655,7 +1670,7 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
                         let cap_hit = Arc::new(AtomicBool::new(false));
                     let out_handle = child.stdout.take().map(|o| drain_reader_capped(o, HOST_GIT_STDOUT_CAP_BYTES, cap_hit.clone()));
                     let err_handle = child.stderr.take().map(|e| drain_reader_capped(e, HOST_GIT_STDERR_CAP_BYTES, cap_hit.clone()));
-                    let timeout_ms = git_subprocess_timeout_ms();
+                    let timeout_ms = git_subprocess_timeout_ms_for(&argv);
                     let deadline = Instant::now() + Duration::from_millis(timeout_ms);
                     let mut exit_code: i32 = -1;
                     let mut timed_out = false;

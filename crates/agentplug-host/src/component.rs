@@ -9,7 +9,7 @@ use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 
 use crate::imports::{
     atomic_cas_write_locked, atomic_write_locked, base64_encode, configure_github_git_credentials,
-    create_private_dir_all, fetch_agent, git_subprocess_timeout_ms, has_project_marker, kv_file_path, normalize_lexically,
+    create_private_dir_all, fetch_agent, git_subprocess_timeout_ms_for, has_project_marker, kv_file_path, normalize_lexically,
     plugin_call_capability_allowed, sandboxed_guest_path_with_extra_roots,
     validate_plugin_call_body,
 };
@@ -203,7 +203,7 @@ fn run_git(root: &Path, args: &str, cwd_arg: &str) -> serde_json::Value {
     let cap_hit = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let out_handle = child.stdout.take().map(|o| crate::imports::drain_reader_capped(o, GIT_STDOUT_CAP_BYTES, cap_hit.clone()));
     let err_handle = child.stderr.take().map(|e| crate::imports::drain_reader_capped(e, GIT_STDERR_CAP_BYTES, cap_hit.clone()));
-    let timeout_ms = git_subprocess_timeout_ms();
+    let timeout_ms = git_subprocess_timeout_ms_for(&argv);
     let deadline = Instant::now() + Duration::from_millis(timeout_ms);
     let mut exit_code: i32 = -1;
     let mut timed_out = false;
