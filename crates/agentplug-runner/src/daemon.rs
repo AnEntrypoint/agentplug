@@ -2171,7 +2171,7 @@ fn write_daemon_heartbeat(project_count: usize, plugin_module_count: usize) {
             "pending_store_swaps": pending_store_swaps_by_plugin(),
             "staged_runner_awaiting_handoff": staged_runner.is_some(),
             "staged_runner_since_ts": staged_runner.map(|(since_ts, _)| serde_json::json!(since_ts)).unwrap_or(serde_json::Value::Null),
-            "staged_runner_waiting_ms": staged_runner.map(|(since_ts, _)| serde_json::json!(now_ms().saturating_sub(since_ts))).unwrap_or(serde_json::Value::Null),
+            "staged_runner_age_ms": staged_runner.map(|(since_ts, _)| serde_json::json!(now_ms().saturating_sub(since_ts))).unwrap_or(serde_json::Value::Null),
             "last_handoff_attempt_ts": handoff_attempt.as_ref().map(|(ts, _)| serde_json::json!(ts)).unwrap_or(serde_json::Value::Null),
             "last_handoff_error": handoff_attempt.as_ref().and_then(|(_, err)| err.clone()),
             "last_completed_runner_swap": read_last_completed_runner_swap().unwrap_or(serde_json::Value::Null),
