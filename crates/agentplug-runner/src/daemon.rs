@@ -679,19 +679,26 @@ pub fn claim_ownership() -> bool {
     let recheck_still_stale = match recheck_pid {
         None => true,
         Some(p) if !pid_is_alive(p) => true,
-        Some(_) => fs::read_to_string(daemon_status_path())
-            .ok()
-            .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
-            .and_then(|v| v.get("ts").and_then(|t| t.as_u64()))
-            .map(|ts| now_ms().saturating_sub(ts) >= DAEMON_STALE_MS)
-            .unwrap_or_else(|| {
-                fs::metadata(&owner_path)
+        Some(owner) => {
+            // A status record judges this owner only when its pid is the owner's. A new owner that has
+            // installed itself but not yet written its status still leaves the previous owner's ts in
+            // place, so that ts must not make it stale; the owner file's age stands in instead.
+            let status = fs::read_to_string(daemon_status_path())
+                .ok()
+                .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok());
+            let status_ts = status
+                .filter(|v| v.get("pid").and_then(|p| p.as_u64()) == Some(owner))
+                .and_then(|v| v.get("ts").and_then(|t| t.as_u64()));
+            match status_ts {
+                Some(ts) => now_ms().saturating_sub(ts) >= DAEMON_STALE_MS,
+                None => fs::metadata(&owner_path)
                     .and_then(|m| m.modified())
                     .ok()
                     .and_then(|t| t.elapsed().ok())
                     .map(|age| age >= Duration::from_millis(DAEMON_STALE_MS))
-                    .unwrap_or(false)
-            }),
+                    .unwrap_or(false),
+            }
+        }
     };
     if !recheck_still_stale {
         return recheck_pid == Some(my_pid);
