@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -89,6 +89,40 @@ fn read_bounded(path: &Path, max_bytes: u64) -> io::Result<Vec<u8>> {
     file.take(max_bytes + 1).read_to_end(&mut bytes)?;
     if bytes.len() as u64 > max_bytes {
         return Err(io::Error::other("cycle file exceeds read bound"));
+    }
+    Ok(bytes)
+}
+
+/// Reads the live observations file. The writer rotates it by record count (256 JSONL lines),
+/// so it can outgrow MAX_FILE_BYTES; an oversized file keeps its newest MAX_FILE_BYTES bytes and
+/// drops the record cut at the window start, so the cycle runs instead of erroring every tick.
+fn read_observations(path: &Path) -> io::Result<Vec<u8>> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let mut file = options.open(path)?;
+    let meta = file.metadata()?;
+    if !meta.is_file() {
+        return Err(io::Error::other("cycle input is not a regular file"));
+    }
+    let len = meta.len();
+    let windowed = len > MAX_FILE_BYTES;
+    if windowed {
+        file.seek(SeekFrom::Start(len - MAX_FILE_BYTES))?;
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_FILE_BYTES).read_to_end(&mut bytes)?;
+    if windowed {
+        match bytes.iter().position(|&byte| byte == b'\n') {
+            Some(end) => {
+                bytes.drain(..=end);
+            }
+            None => bytes.clear(),
+        }
     }
     Ok(bytes)
 }
@@ -501,7 +535,7 @@ pub fn process_owner(root: &Path, owner: &str) -> io::Result<()> {
             }
         }
         let observations_bytes =
-            match read_bounded(&owner_dir.join("observations.json"), MAX_FILE_BYTES) {
+            match read_observations(&owner_dir.join("observations.json")) {
                 Ok(bytes) => bytes,
                 Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
                 Err(error) => return Err(error),
