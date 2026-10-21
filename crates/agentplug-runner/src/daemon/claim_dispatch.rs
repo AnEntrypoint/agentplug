@@ -1070,6 +1070,8 @@ pub(super) const CLAIM_HEARTBEAT_MS: u64 = 15_000;
 
 pub(super) const CLAIM_HEARTBEAT_STALE_MS: u64 = 45_000;
 
+pub(super) const CLAIM_HEARTBEAT_SPAWN_ATTEMPTS: u32 = 3;
+
 fn claim_heartbeat_stale_ms() -> u64 {
     static CLAMP_LOGGED: AtomicBool = AtomicBool::new(false);
     let configured = env_ms_or("AGENTPLUG_CLAIM_HEARTBEAT_STALE_MS", CLAIM_HEARTBEAT_STALE_MS);
@@ -1124,7 +1126,7 @@ pub(super) fn stamp_age_ms(stamp: u64, observed_file: &Path) -> u64 {
         .ok()
         .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|d| now.saturating_sub(d.as_millis() as u64))
-        .unwrap_or(u64::MAX)
+        .unwrap_or(0)
 }
 
 pub(super) fn claim_heartbeat(spool_dir: &Path, verb: &str, task: &str) -> Option<(u64, u64)> {
@@ -1157,33 +1159,49 @@ impl ClaimHeartbeat {
         let marker = claim_heartbeat_path(&spool_dir, verb, task);
         let stop = Arc::new(AtomicBool::new(false));
         write_claim_heartbeat(&marker);
-        let beat_stop = Arc::clone(&stop);
-        let beat_marker = marker.clone();
-        let beat_claim = claim;
-        let thread = std::thread::Builder::new()
-            .name(format!("claim-heartbeat-{task}"))
-            .spawn(move || {
-                let beat = std::time::Duration::from_millis(CLAIM_HEARTBEAT_MS);
-                let poll = std::time::Duration::from_millis(250);
-                let mut since = std::time::Duration::ZERO;
-                while !beat_stop.load(Ordering::Relaxed) {
-                    std::thread::sleep(poll);
-                    since += poll;
-                    if since < beat {
-                        continue;
+        let spawn_beat = || {
+            let beat_stop = Arc::clone(&stop);
+            let beat_marker = marker.clone();
+            let beat_claim = claim.clone();
+            std::thread::Builder::new()
+                .name(format!("claim-heartbeat-{task}"))
+                .spawn(move || {
+                    let beat = std::time::Duration::from_millis(CLAIM_HEARTBEAT_MS);
+                    let poll = std::time::Duration::from_millis(250);
+                    let mut since = std::time::Duration::ZERO;
+                    while !beat_stop.load(Ordering::Relaxed) {
+                        std::thread::sleep(poll);
+                        since += poll;
+                        if since < beat {
+                            continue;
+                        }
+                        since = std::time::Duration::ZERO;
+                        if !beat_claim.exists() {
+                            break;
+                        }
+                        write_claim_heartbeat(&beat_marker);
                     }
-                    since = std::time::Duration::ZERO;
-                    if !beat_claim.exists() {
-                        break;
-                    }
-                    write_claim_heartbeat(&beat_marker);
+                    let _ = fs::remove_file(&beat_marker);
+                })
+        };
+        let mut thread = None;
+        for attempt in 0..CLAIM_HEARTBEAT_SPAWN_ATTEMPTS {
+            match spawn_beat() {
+                Ok(handle) => {
+                    thread = Some(handle);
+                    break;
                 }
-                let _ = fs::remove_file(&beat_marker);
-            })
-            .map_err(|e| {
-                eprintln!("[agentplug daemon] claim heartbeat thread could not start for {task}: {e} -- the claim is kept, but the orphan sweep will judge it on its age alone")
-            })
-            .ok();
+                Err(e) => {
+                    eprintln!("[agentplug daemon] claim heartbeat thread could not start for {task} (attempt {}): {e}", attempt + 1);
+                    if attempt + 1 < CLAIM_HEARTBEAT_SPAWN_ATTEMPTS {
+                        std::thread::sleep(std::time::Duration::from_millis(200 * (attempt as u64 + 1)));
+                    }
+                }
+            }
+        }
+        if thread.is_none() {
+            eprintln!("[agentplug daemon] claim heartbeat for {task} is not renewed after {CLAIM_HEARTBEAT_SPAWN_ATTEMPTS} spawn attempts -- the claim is kept, but the orphan sweep will judge it on its age alone");
+        }
         ClaimHeartbeat {
             stop,
             thread,
@@ -4092,4 +4110,4 @@ pub fn try_dispatch_via_daemon(
         std::thread::sleep(Duration::from_millis(PLUGIN_DISPATCH_POLL_MS));
     }
 }
-
+
