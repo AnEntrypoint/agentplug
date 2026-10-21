@@ -304,7 +304,9 @@ pub(super) fn spool_in_file_has_no_writer(request_path: &Path) -> bool {
         .is_ok()
 }
 
-const SPOOL_IN_FILE_SETTLE: std::time::Duration = std::time::Duration::from_millis(500);
+// Age floor before a spool-in file's (len, mtime) stamp is recorded. The stamp must match on two
+// sweeps before the file is claimed, so that check, not this floor, refuses a file still being written.
+const SPOOL_IN_FILE_SETTLE: std::time::Duration = std::time::Duration::from_millis(100);
 
 #[cfg(not(windows))]
 pub(super) fn spool_in_file_has_no_writer(request_path: &Path) -> bool {
