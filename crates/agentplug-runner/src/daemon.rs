@@ -457,7 +457,12 @@ impl DaemonConfig {
         Duration::from_secs(self.registry_poll_interval_secs.unwrap_or(5))
     }
     fn heartbeat_interval(&self) -> Duration {
-        Duration::from_secs(self.heartbeat_interval_secs.unwrap_or(10))
+        let configured = self.heartbeat_interval_secs.unwrap_or(10);
+        let ceiling = DAEMON_STALE_MS / 2000;
+        if configured > ceiling {
+            eprintln!("[agentplug daemon] heartbeat_interval_secs={configured}s is above the {ceiling}s ceiling (half of the {DAEMON_STALE_MS} ms stale bound); heartbeating every {ceiling}s instead");
+        }
+        Duration::from_secs(configured.min(ceiling))
     }
     fn plugin_update_poll_interval(&self) -> Duration {
         bounded_update_poll(self.plugin_update_poll_interval_secs.unwrap_or(60), "plugin_update_poll_interval_secs")
