@@ -4580,7 +4580,13 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
         #[cfg(not(any(windows, target_os = "linux")))]
         std::thread::sleep(Duration::from_millis(idle_wait_ms));
         if !any_work {
-            let cap_ms = if pending_work_exists_before_idle_wait {
+            // A request that arrived during the wait is seen only after the wait, so the pending cap
+            // must apply to the wait that follows it too; otherwise the backoff from idle (up to 1 s)
+            // delays the settle and confirm sweeps that claim it.
+            let pending_work_after_wait = known_roots
+                .iter()
+                .any(|root| project_has_pending_dispatch_work(root));
+            let cap_ms = if pending_work_exists_before_idle_wait || pending_work_after_wait {
                 PENDING_UNCLAIMED_IDLE_WAIT_MAX_MS
             } else {
                 IDLE_WAIT_MAX_MS
