@@ -2587,7 +2587,10 @@ fn write_project_heartbeat_with_queue_info(
     if !status_write_needed(&status_path, &previous, &payload) {
         return;
     }
-    let _ = fs::write(&status_path, payload.to_string());
+    let temp_path = status_path.with_extension(format!("json.tmp.{}", std::process::id()));
+    if fs::write(&temp_path, payload.to_string()).is_err() || fs::rename(&temp_path, &status_path).is_err() {
+        let _ = fs::remove_file(&temp_path);
+    }
 }
 
 const STATUS_LIVENESS_REFRESH: Duration = Duration::from_secs(5);
