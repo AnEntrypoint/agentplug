@@ -697,31 +697,66 @@ pub fn claim_ownership() -> bool {
         return recheck_pid == Some(my_pid);
     }
     let takeover_lock = owner_path.with_extension("takeover.lock");
-    let create_takeover_lock = || {
+    let Some(_takeover) = acquire_takeover(&takeover_lock) else {
+        return false;
+    };
+    let installed = install_stale_owner(&owner_path, recheck_pid, my_pid);
+    installed
+}
+
+/// Takes the stale-owner takeover lock for one claim; the lock is held while the returned value lives.
+/// On unix it is an exclusive flock on takeover.lock, which is never removed: the kernel drops the lock
+/// when the holder exits, so a crashed taker cannot leave a lock that a second taker steals.
+#[cfg(unix)]
+fn acquire_takeover(takeover_lock: &Path) -> Option<fs::File> {
+    use std::os::unix::io::AsRawFd;
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(takeover_lock)
+        .ok()?;
+    // SAFETY: `file` owns the descriptor and stays open until the caller drops the returned File.
+    let locked = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0;
+    locked.then_some(file)
+}
+
+/// Off unix there is no flock here: the lock is a create-new file, removed when the guard drops.
+#[cfg(not(unix))]
+struct TakeoverFile(PathBuf);
+
+#[cfg(not(unix))]
+impl Drop for TakeoverFile {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}
+
+#[cfg(not(unix))]
+fn acquire_takeover(takeover_lock: &Path) -> Option<TakeoverFile> {
+    let create = || {
         fs::OpenOptions::new()
             .write(true)
             .create_new(true)
-            .open(&takeover_lock)
+            .open(takeover_lock)
             .is_ok()
     };
-    if !create_takeover_lock() {
-        let lock_stale = fs::metadata(&takeover_lock)
+    if !create() {
+        let lock_stale = fs::metadata(takeover_lock)
             .and_then(|m| m.modified())
             .ok()
             .and_then(|t| t.elapsed().ok())
             .map(|age| age >= Duration::from_millis(DAEMON_STALE_MS))
             .unwrap_or(false);
         if !lock_stale {
-            return false;
+            return None;
         }
-        let _ = fs::remove_file(&takeover_lock);
-        if !create_takeover_lock() {
-            return false;
+        let _ = fs::remove_file(takeover_lock);
+        if !create() {
+            return None;
         }
     }
-    let installed = install_stale_owner(&owner_path, recheck_pid, my_pid);
-    let _ = fs::remove_file(&takeover_lock);
-    installed
+    Some(TakeoverFile(takeover_lock.to_path_buf()))
 }
 
 fn install_stale_owner(owner_path: &Path, observed_pid: Option<u64>, my_pid: u64) -> bool {
