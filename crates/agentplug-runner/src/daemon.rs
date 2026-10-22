@@ -2832,10 +2832,6 @@ impl RegistryWalk {
     }
 }
 
-fn spawn_dream_rsi_cycle_ticker(interval: Duration) -> std::thread::JoinHandle<()> {
-    crate::dream_cycle::spawn(interval, read_known_project_roots, heartbeat_authority_lost)
-}
-
 fn spool_dir_of(root: &Path) -> PathBuf {
     root.join(".gm").join("exec-spool")
 }
@@ -4097,9 +4093,6 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
     let _heartbeat_stall_watchdog = spawn_heartbeat_stall_watchdog(heartbeat_interval);
     write_daemon_heartbeat(0, 0);
 
-    const DREAM_RSI_CYCLE_TICK_INTERVAL_MS: u64 = 60_000;
-    let _dream_rsi_cycle_ticker =
-        spawn_dream_rsi_cycle_ticker(Duration::from_millis(DREAM_RSI_CYCLE_TICK_INTERVAL_MS));
     mark_main_loop_phase("loop-start");
     let _claim_sweep_stall_watchdog =
         spawn_claim_sweep_stall_watchdog(daemon_cfg.claim_sweep_stall_bound());
