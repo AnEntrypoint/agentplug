@@ -2480,6 +2480,69 @@ pub(crate) fn annotate_admission_on_reply(
     reply.to_string()
 }
 
+// A dispatch that waits for its serial lane and then succeeds still spent that time waiting, and a reply that
+// does not name it leaves the caller's dispatch_wait_split with an unattributed residual the size of the lane
+// queue. Stamping the measured lane wait on the successful reply is what attributes it.
+pub(super) const LANE_WAIT_ANNOTATION_FLOOR_MS: u64 = 250;
+
+pub(super) struct LaneWaitAnnotation {
+    pub(super) lane_waited_ms: u64,
+    pub(super) tool_queue_waited_ms: u64,
+    pub(super) lane: Option<&'static str>,
+    pub(super) holder_verb: Option<String>,
+    pub(super) holder_task: Option<String>,
+    pub(super) lane_position: Option<u64>,
+    pub(super) lane_waiters: usize,
+}
+
+pub(super) fn annotate_lane_wait_on_reply(out_body: String, waited: &LaneWaitAnnotation) -> String {
+    if waited.lane_waited_ms < LANE_WAIT_ANNOTATION_FLOOR_MS
+        && waited.tool_queue_waited_ms < LANE_WAIT_ANNOTATION_FLOOR_MS
+    {
+        return out_body;
+    }
+    if out_body.len() > ADMISSION_ANNOTATION_MAX_BYTES {
+        return out_body;
+    }
+    let Ok(mut reply) = serde_json::from_str::<serde_json::Value>(&out_body) else {
+        return out_body;
+    };
+    let Some(fields) = reply.as_object_mut() else {
+        return out_body;
+    };
+    fields.insert(
+        "lane_waited_ms".to_string(),
+        serde_json::json!(waited.lane_waited_ms),
+    );
+    fields.insert(
+        "tool_queue_waited_ms".to_string(),
+        serde_json::json!(waited.tool_queue_waited_ms),
+    );
+    fields.insert(
+        "lane_waited_for".to_string(),
+        serde_json::json!(waited.lane.unwrap_or("unassigned")),
+    );
+    if waited.lane_waited_ms >= LANE_WAIT_ANNOTATION_FLOOR_MS {
+        fields.insert(
+            "lane_wait_holder_verb".to_string(),
+            serde_json::json!(waited.holder_verb),
+        );
+        fields.insert(
+            "lane_wait_holder_task".to_string(),
+            serde_json::json!(waited.holder_task),
+        );
+        fields.insert(
+            "lane_wait_position".to_string(),
+            serde_json::json!(waited.lane_position),
+        );
+        fields.insert(
+            "lane_wait_waiters".to_string(),
+            serde_json::json!(waited.lane_waiters),
+        );
+    }
+    reply.to_string()
+}
+
 // Dispatches the ledger shows waiting behind a gate, counted from the same ledger the wait reply names:
 // (waiting for admission, waiting for the serial lane). Both 0 when the ledger is absent or unreadable.
 pub(super) fn admission_queue_depth(spool_dir: &Path) -> (usize, usize) {
@@ -2681,6 +2744,67 @@ pub(super) fn lane_starved_answer(
     );
     let spool_dir = spool_dir_of_root(root);
     let (request_path, claim_path, out_path) = unanswered_spool_paths(&spool_dir, verb, task);
+    let named_lane = lane.unwrap_or("");
+    let holders_detail: Vec<serde_json::Value> = agentplug_host::registry::lane_holds(root)
+        .into_iter()
+        .filter(|hold| named_lane.is_empty() || hold.lane == named_lane)
+        .map(|hold| {
+            let stuck = lane_holder_stuck_reason(root, hold.lane, &hold.verb, &hold.task);
+            serde_json::json!({
+                "lane": hold.lane,
+                "verb": hold.verb,
+                "task": hold.task,
+                "held_ms": hold.held_ms,
+                "waiters": hold.waiters,
+                "waiters_active": hold.waiters_active,
+                "waiters_stale": hold.waiters_stale,
+                "stuck": stuck.is_some(),
+                "stuck_reason": stuck,
+            })
+        })
+        .collect();
+    let waiters_detail: Vec<serde_json::Value> =
+        agentplug_host::registry::lane_waiter_detail(root, named_lane)
+            .into_iter()
+            .map(|entry| {
+                serde_json::json!({
+                    "lane": entry.lane,
+                    "verb": entry.verb,
+                    "task": entry.task,
+                    "position": entry.position,
+                    "waiting_ms": entry.waiting_ms,
+                    "active": entry.active,
+                    "stale": entry.stale,
+                })
+            })
+            .collect();
+    let holder_verb = report.lane_holder_verb.clone().unwrap_or_default();
+    let holder_task = report.lane_holder_task.clone().unwrap_or_default();
+    let holder_stuck_reason = if named_lane.is_empty() {
+        None
+    } else {
+        lane_holder_stuck_reason(root, named_lane, &holder_verb, &holder_task)
+    };
+    let stuck_min_ms = lane_hold_stuck_min_ms();
+    let stuck_sentence = match holder_stuck_reason {
+        Some(reason) => format!(
+            "The holder is already past the {}ms stuck bound and is classified {}: the next watchdog tick frees the lane rather than making every waiter serve out the full {}ms running ceiling. {}",
+            stuck_min_ms,
+            reason,
+            running_max_ms,
+            escape_timing
+        ),
+        None => format!(
+            "The holder is not yet past the {}ms stuck bound, so it is a slow holder rather than a stuck one: it keeps the lane until it finishes or reaches the {}ms running ceiling. {}",
+            stuck_min_ms,
+            running_max_ms,
+            escape_timing
+        ),
+    };
+    let (lane_queue, admission_queue) = {
+        let (admission, lane_depth) = admission_queue_depth(&spool_dir);
+        (lane_depth, admission)
+    };
     serde_json::json!({
         "ok": false,
         "error_code": "dispatch_starved_waiting_for_serial_lane",
@@ -2689,16 +2813,25 @@ pub(super) fn lane_starved_answer(
         "lane": lane,
         "waited_ms": report.waited_ms,
         "lane_waiters": report.waiters,
+        "lane_waiters_active": report.waiters_active,
+        "lane_waiters_stale": report.waiters_stale,
         "lane_position": report.lane_position,
         "lane_holder_task": report.lane_holder_task,
         "lane_holder_verb": report.lane_holder_verb,
         "lane_holder_held_ms": report.lane_holder_held_ms,
         "lane_holder_age_ms": report.lane_holder_age_ms,
+        "lane_holder_stuck": holder_stuck_reason.is_some(),
+        "lane_holder_stuck_reason": holder_stuck_reason,
+        "lane_holders_detail": holders_detail,
+        "lane_waiters_detail": waiters_detail,
+        "lane_queue_depth": lane_queue,
+        "admission_queue_depth": admission_queue,
         "lane_wait_budget_ms": granted_ms,
         "lane_wait_default_ms": lane_wait_default_ms(verb),
         "lane_wait_ceiling_ms": ceiling_ms,
         "suggested_lane_wait_ms": ceiling_ms,
         "lane_hold_running_max_ms": running_max_ms,
+        "lane_hold_stuck_min_ms": stuck_min_ms,
         "lane_hold_releases_in_ms": releases_in_ms,
         "escape_hatch": "this lane is a serialization point, not the only way to publish: to route around a holder instead of re-queueing behind it, publish through the GitHub Git API -- POST /repos/<owner>/<repo>/git/blobs (base64, CRLF normalized to LF), POST /repos/<owner>/<repo>/git/trees with base_tree set to the remote tip, POST /repos/<owner>/<repo>/git/commits with parents:[tip], then PATCH /repos/<owner>/<repo>/git/refs/heads/<branch> with {\"sha\":<commit>,\"force\":false} -- and verify with GET /repos/<owner>/<repo>/contents/<path>?ref=<branch> whose blob sha equals git hash-object of the file.",
         "retry_hint": format!(
@@ -2722,7 +2855,7 @@ pub(super) fn lane_starved_answer(
               report.lane_position.map(|position| position.to_string()).unwrap_or_else(|| "unknown".to_string()),
               report.waiters,
             spool_dir.join(DISPATCH_WAIT_LEDGER_FILE).display(),
-            escape_timing
+            stuck_sentence
         ),
     })
     .to_string()
@@ -2832,6 +2965,8 @@ pub(crate) fn run_gm_dispatch_to_file(
     let in_dir = root.join(".gm").join("exec-spool").join("in");
     let _claim_heartbeat = ClaimHeartbeat::start(&in_dir, verb, task);
     note_dispatch_stage(root, verb, task, DispatchStage::WaitingForLane, lane);
+    let lane_queue_before = agentplug_host::registry::lane_queue_state(root, lane, task);
+    let lane_wait_started = std::time::Instant::now();
     let _fairness_guard = match GmFairnessGuard::acquire_within(
         root,
         tool_verb,
@@ -2859,7 +2994,9 @@ pub(crate) fn run_gm_dispatch_to_file(
             return;
         }
     };
+    let lane_waited_ms = lane_wait_started.elapsed().as_millis() as u64;
     note_dispatch_stage(root, verb, task, DispatchStage::WaitingForToolQueue, lane);
+    let tool_queue_started = std::time::Instant::now();
     let _tool_guard = match ToolDispatchGuard::acquire_within(
         root,
         plugin_name,
@@ -2880,6 +3017,16 @@ pub(crate) fn run_gm_dispatch_to_file(
             refresh_dispatch_wait_ledger(root);
             return;
         }
+    };
+    let tool_queue_waited_ms = tool_queue_started.elapsed().as_millis() as u64;
+    let lane_wait_annotation = LaneWaitAnnotation {
+        lane_waited_ms,
+        tool_queue_waited_ms,
+        lane,
+        holder_verb: lane_queue_before.lane_holder_verb,
+        holder_task: lane_queue_before.lane_holder_task,
+        lane_position: lane_queue_before.lane_position,
+        lane_waiters: lane_queue_before.lane_waiters,
     };
     if !_fairness_guard.still_owns() {
         eprintln!(
@@ -2963,6 +3110,7 @@ pub(crate) fn run_gm_dispatch_to_file(
         }
     };
     let out_body = annotate_admission_on_reply(out_body, admission);
+    let out_body = annotate_lane_wait_on_reply(out_body, &lane_wait_annotation);
     let out_body = patch_update_available_from_escalation(plugin_name, verb, out_body);
     let out_body = redact_secret_named_reply(verb, body, out_body);
     let out_body = spill_large_exec_output_to_text_sibling(out_dir, verb, task, out_body);
@@ -3257,6 +3405,7 @@ pub(super) fn refresh_dispatch_wait_ledger(root: &Path) {
                         && released.task == hold.task
                 })
                 .map(|released| released.reason);
+            let stuck = lane_holder_stuck_reason(root, hold.lane, &hold.verb, &hold.task);
             serde_json::json!({
                 "lane": hold.lane,
                 "verb": hold.verb,
@@ -3265,6 +3414,8 @@ pub(super) fn refresh_dispatch_wait_ledger(root: &Path) {
                 "waiters": hold.waiters,
                 "holds_waiters": hold.waiters > 0,
                 "over_bound": hold.held_ms >= LANE_HOLD_REPORT_MIN_MS,
+                "stuck": stuck.is_some(),
+                "stuck_reason": stuck,
                 "released": released.is_some(),
                 "released_reason": released,
             })
