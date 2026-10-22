@@ -1847,6 +1847,8 @@ fn staged_binary_self_check(staged_exe: &Path, expected_version: &str) -> bool {
 
 /// The staged takeover awaiting its readiness marker: (version, deadline).
 static HANDOFF_AWAITING: Mutex<Option<(String, Instant)>> = Mutex::new(None);
+// The last reserve_ownership_for_handoff error of the readiness window, named in the failure at its deadline.
+static HANDOFF_RESERVE_ERROR: Mutex<Option<String>> = Mutex::new(None);
 
 const HANDOFF_READY_WINDOW: Duration = Duration::from_secs(10);
 
@@ -1898,9 +1900,15 @@ fn attempt_self_update_handoff(staged_exe: &Path, version: &str) -> bool {
         .unwrap_or_else(|e| e.into_inner())
         .clone();
     if let Some((_, deadline)) = awaited.filter(|(v, _)| v == version) {
+        // A reserve error is retried on each poll until the readiness window closes; the failure
+        // recorded at the deadline carries the last reserve error, so the reason is not a missing marker.
         if let Some(successor_pid) = takeover_ready_pid(version) {
             match reserve_ownership_for_handoff(successor_pid, version) {
                 Ok(()) => {
+                    HANDOFF_RESERVE_ERROR
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .take();
                     clear_handoff_awaiting();
                     eprintln!("[agentplug daemon] new version {version} confirmed ready -- releasing ownership for handoff");
                     record_handoff_attempt(None);
@@ -1908,9 +1916,14 @@ fn attempt_self_update_handoff(staged_exe: &Path, version: &str) -> bool {
                     release_ownership_for_handoff();
                     return true;
                 }
-                Err(error) => eprintln!(
-                    "[agentplug daemon] self-update successor for {version} cannot reserve the ownership handoff: {error}"
-                ),
+                Err(error) => {
+                    eprintln!(
+                        "[agentplug daemon] self-update successor for {version} cannot reserve the ownership handoff: {error}"
+                    );
+                    *HANDOFF_RESERVE_ERROR
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner()) = Some(error.to_string());
+                }
             }
         }
         if Instant::now() < deadline {
@@ -1918,11 +1931,16 @@ fn attempt_self_update_handoff(staged_exe: &Path, version: &str) -> bool {
         }
         clear_handoff_awaiting();
         stop_handoff_successor();
+        let last_reserve_error = HANDOFF_RESERVE_ERROR
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        let reason = match last_reserve_error {
+            Some(error) => format!("staged {version} readiness marker was written but the ownership reservation failed within 10s: {error}"),
+            None => format!("staged {version} did not write a matching readiness marker within 10s"),
+        };
         eprintln!("[agentplug daemon] self-update to {version} did not confirm ready in time -- staying on current version, will retry next poll");
-        record_handoff_failure(
-            version,
-            format!("staged {version} did not write a matching readiness marker within 10s"),
-        );
+        record_handoff_failure(version, reason);
         return false;
     }
     if !staged_binary_self_check(staged_exe, version) {
