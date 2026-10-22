@@ -75,8 +75,14 @@ fn checked_directory(create: bool) -> Result<Option<PathBuf>, String> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
-        if metadata.uid() != effective_uid() || metadata.permissions().mode() & 0o077 != 0 {
+        if metadata.uid() != effective_uid() {
             return Err("task result directory must be private to its owner".to_string());
+        }
+        if metadata.permissions().mode() & 0o077 != 0 {
+            // An older build left this owned directory group/other-readable (mode 750). Refusing it
+            // wedged every staged runner handoff, so tighten it to 0700 instead.
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
+                .map_err(|error| error.to_string())?;
         }
     }
     Ok(Some(path))
