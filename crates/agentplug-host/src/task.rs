@@ -21,6 +21,9 @@ struct TaskEntry {
     stderr: Vec<u8>,
     exit_code: Option<i32>,
     finished_ms: Option<u64>,
+    // Set when the deadline killed the task, so its reply carries the same exec_timeout label as a
+    // foreground timeout (exec_js.rs) instead of a bare exit_code -1.
+    timed_out: bool,
 }
 
 pub(crate) struct DrainedPipe {
@@ -224,6 +227,7 @@ pub fn prepare_task_handoff() -> Result<Option<TaskHandoff>, String> {
                 started_ms: entry.started_ms,
                 finished_ms: entry.finished_ms.expect("completed task checked"),
                 exit_code: entry.exit_code,
+                timed_out: entry.timed_out,
                 stdout: entry.stdout[stdout_start..].to_vec(),
                 stderr: entry.stderr[stderr_start..].to_vec(),
                 stdout_omitted_bytes: stdout_start as u64,
@@ -376,6 +380,7 @@ fn poll_entry(entry: &mut TaskEntry) {
                     }
                 }
                 entry.exit_code = Some(-1);
+                entry.timed_out = true;
                 entry.finished_ms = Some(now_ms());
                 harvest_finished_drains(entry);
             }
@@ -409,6 +414,7 @@ pub(crate) fn adopt_running(
         stderr: Vec::new(),
         exit_code: None,
         finished_ms: None,
+        timed_out: false,
     };
     register_task(entry)
 }
@@ -530,6 +536,7 @@ fn spawn(params: &Value, cwd: &Path) -> Value {
         stderr: Vec::new(),
         exit_code: None,
         finished_ms: None,
+        timed_out: false,
     };
     let id = match register_task(entry) {
         Ok(id) => id,
@@ -599,7 +606,7 @@ fn output(params: &Value) -> Value {
         .as_ref()
         .map(DrainedPipe::snapshot)
         .unwrap_or_else(|| entry.stderr.clone());
-    json!({
+    let mut reply = json!({
         "ok": true,
         "id": id,
         "stdout": tail(&stdout),
@@ -608,7 +615,18 @@ fn output(params: &Value) -> Value {
         "stderr_omitted_bytes": stderr.len().saturating_sub(max_bytes),
         "running": entry.finished_ms.is_none(),
         "exit_code": entry.exit_code,
-    })
+    });
+    if entry.timed_out {
+        timeout_label(&mut reply);
+    }
+    reply
+}
+
+// The label a foreground exec timeout carries (exec_js.rs), applied to a background task the deadline killed.
+pub(crate) fn timeout_label(reply: &mut Value) {
+    reply["timed_out"] = json!(true);
+    reply["killed"] = json!(true);
+    reply["error_code"] = json!("exec_timeout");
 }
 
 fn stop(params: &Value) -> Value {

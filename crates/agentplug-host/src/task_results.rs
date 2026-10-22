@@ -25,6 +25,9 @@ pub(crate) struct CompletedTask {
     pub started_ms: u64,
     pub finished_ms: u64,
     pub exit_code: Option<i32>,
+    // Records written before this field existed read as not timed out.
+    #[serde(default)]
+    pub timed_out: bool,
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
     pub stdout_omitted_bytes: u64,
@@ -296,14 +299,18 @@ pub(crate) fn output(id: &str, max_bytes: usize, now_ms: u64) -> Result<Option<V
     let tail = |bytes: &[u8]| {
         String::from_utf8_lossy(&bytes[bytes.len().saturating_sub(max_bytes)..]).into_owned()
     };
-    Ok(Some(json!({
+    let mut reply = json!({
         "ok": true, "id": id, "running": false, "exit_code": record.exit_code,
         "stdout": tail(&record.stdout), "stderr": tail(&record.stderr),
         "stdout_omitted_bytes": record.stdout_omitted_bytes + record.stdout.len().saturating_sub(max_bytes) as u64,
         "stderr_omitted_bytes": record.stderr_omitted_bytes + record.stderr.len().saturating_sub(max_bytes) as u64,
         "retained_after_handoff": true,
         "retention_expires_ms": record.finished_ms.saturating_add(RETENTION_MS),
-    })))
+    });
+    if record.timed_out {
+        crate::task::timeout_label(&mut reply);
+    }
+    Ok(Some(reply))
 }
 
 pub(crate) fn remove(id: &str) -> Result<bool, String> {
