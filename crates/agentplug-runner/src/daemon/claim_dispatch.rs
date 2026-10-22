@@ -2223,6 +2223,26 @@ pub(crate) fn annotate_admission_on_reply(
     reply.to_string()
 }
 
+// Dispatches the ledger shows waiting behind a gate, counted from the same ledger the wait reply names:
+// (waiting for admission, waiting for the serial lane). Both 0 when the ledger is absent or unreadable.
+pub(super) fn admission_queue_depth(spool_dir: &Path) -> (usize, usize) {
+    let Some(value) = fs::read_to_string(spool_dir.join(DISPATCH_WAIT_LEDGER_FILE))
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+    else {
+        return (0, 0);
+    };
+    let Some(rows) = value.get("requests").and_then(|rows| rows.as_array()) else {
+        return (0, 0);
+    };
+    let count = |wanted: &str| {
+        rows.iter()
+            .filter(|row| row.get("state").and_then(|s| s.as_str()) == Some(wanted))
+            .count()
+    };
+    (count("claimed_waiting_for_admission"), count("claimed_waiting_for_serial_lane"))
+}
+
 pub(super) fn admission_starved_answer(
     root: &Path,
     verb: &str,
@@ -2234,9 +2254,15 @@ pub(super) fn admission_starved_answer(
     in_flight: usize,
     slots: usize,
     holders: &str,
+    holder_detail: &[(String, u64)],
 ) -> String {
     let spool_dir = spool_dir_of_root(root);
     let (request_path, claim_path, out_path) = unanswered_spool_paths(&spool_dir, verb, task);
+    let (admission_queue, lane_queue) = admission_queue_depth(&spool_dir);
+    let holders_detail: Vec<serde_json::Value> = holder_detail
+        .iter()
+        .map(|(holder_verb, held_ms)| serde_json::json!({"verb": holder_verb, "held_ms": held_ms}))
+        .collect();
     serde_json::json!({
         "ok": false,
         "error_code": "dispatch_starved_waiting_for_admission",
@@ -2248,6 +2274,9 @@ pub(super) fn admission_starved_answer(
         "admission_limit": limit,
         "plugin_slots": slots,
         "admission_holders": holders,
+        "admission_holders_detail": holders_detail,
+        "admission_queue_depth": admission_queue,
+        "lane_queue_depth": lane_queue,
         "admission_hold_max_ms": agentplug_host::registry::admission_hold_max_ms(),
         "waited_ms": waited_ms,
         "daemon_pid": std::process::id(),
@@ -2657,12 +2686,12 @@ pub(crate) fn run_gm_dispatch_to_file(
         Ok(Ok(s)) if !s.is_empty() => s,
         Ok(Ok(_)) => serde_json::json!({"ok": false, "error": "empty dispatch result", "verb": verb}).to_string(),
         Ok(Err(e)) => match e.downcast_ref::<agentplug_host::PluginDispatchError>() {
-            Some(agentplug_host::PluginDispatchError::AdmissionStarved { kind, waited_ms, limit, in_flight, slots, holders }) => {
+            Some(agentplug_host::PluginDispatchError::AdmissionStarved { kind, waited_ms, limit, in_flight, slots, holders, holder_detail }) => {
                 eprintln!(
                     "[agentplug daemon] {verb}/{task} for {} was claimed but never entered the {kind} admission gate within {waited_ms}ms (holders: {holders}) -- answered dispatch_starved_waiting_for_admission; the verb did not run",
                     root.display()
                 );
-                admission_starved_answer(root, verb, task, lane, *kind, *waited_ms, *limit, *in_flight, *slots, holders)
+                admission_starved_answer(root, verb, task, lane, *kind, *waited_ms, *limit, *in_flight, *slots, holders, holder_detail)
             }
             _ => serde_json::json!({"ok": false, "error": describe_dispatch_error_naming_wasm_trap_kind_distinctly_from_a_guest_logic_error(&e), "verb": verb}).to_string(),
         },

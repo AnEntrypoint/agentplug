@@ -130,6 +130,7 @@ pub enum PluginDispatchError {
         in_flight: usize,
         slots: usize,
         holders: String,
+        holder_detail: Vec<(String, u64)>,
     },
 }
 
@@ -153,6 +154,7 @@ impl std::fmt::Display for PluginDispatchError {
                 in_flight,
                 slots,
                 holders,
+                ..
             } => {
                 write!(f, "the {kind} admission gate was not entered within {waited_ms}ms -- {in_flight} dispatches already hold the {limit} admitted slots of {slots} (holders: {holders}); this dispatch was NOT executed and re-dispatching is safe")
             }
@@ -170,6 +172,7 @@ fn admission_starved_error(report: AdmissionWaitReport) -> PluginDispatchError {
         in_flight: report.in_flight,
         slots: report.slots,
         holders: report.holders,
+        holder_detail: report.holder_detail,
     }
 }
 
@@ -449,6 +452,12 @@ impl TicketQueue {
         true
     }
 
+    fn holder_detail(&self) -> Vec<(String, u64)> {
+        let mut ordered: Vec<&AdmissionHolder> = self.holders.iter().collect();
+        ordered.sort_by_key(|holder| holder.since);
+        ordered.iter().map(|holder| (holder.verb.clone(), holder.since.elapsed().as_millis() as u64)).collect()
+    }
+
     fn holders_summary(&self) -> String {
         if self.holders.is_empty() {
             return "none".to_string();
@@ -684,6 +693,7 @@ pub struct AdmissionWaitReport {
     pub in_flight: usize,
     pub slots: usize,
     pub holders: String,
+    pub holder_detail: Vec<(String, u64)>,
 }
 
 #[derive(Clone, Copy)]
@@ -872,7 +882,7 @@ impl SharedPluginPool {
         remember_pool(pool);
         let start = Instant::now();
         loop {
-            let (in_flight, holders) = {
+            let (in_flight, holders, holder_detail) = {
                 let mut q = pool.ticket_queue.lock().unwrap_or_else(|e| e.into_inner());
                 if q.blocking_inflight < limit {
                     q.blocking_inflight += 1;
@@ -883,7 +893,7 @@ impl SharedPluginPool {
                         holder,
                     });
                 }
-                (q.blocking_inflight, q.holders_summary())
+                (q.blocking_inflight, q.holders_summary(), q.holder_detail())
             };
             let waited_ms = start.elapsed().as_millis() as u64;
             if start.elapsed() >= max_wait {
@@ -895,6 +905,7 @@ impl SharedPluginPool {
                     in_flight,
                     slots: pool.slots.len(),
                     holders,
+                    holder_detail,
                 });
             }
             mark_admission_wait("blocking", limit, in_flight);
@@ -966,7 +977,7 @@ impl SharedPluginPool {
         let start = Instant::now();
         let mut logged_at_ms = 0u64;
         loop {
-            let (in_flight, holders) = {
+            let (in_flight, holders, holder_detail) = {
                 let mut q = pool.ticket_queue.lock().unwrap_or_else(|e| e.into_inner());
                 let heavy_ok = !is_heavy || q.heavy_inflight < heavy_limit;
                 if heavy_ok && q.non_short_inflight < limit {
@@ -1002,7 +1013,7 @@ impl SharedPluginPool {
                         holder,
                     });
                 }
-                (q.non_short_inflight, q.holders_summary())
+                (q.non_short_inflight, q.holders_summary(), q.holder_detail())
             };
             let waited_ms = start.elapsed().as_millis() as u64;
             if start.elapsed() >= max_wait {
@@ -1014,6 +1025,7 @@ impl SharedPluginPool {
                     in_flight,
                     slots: pool.slots.len(),
                     holders,
+                    holder_detail,
                 });
             }
             mark_admission_wait(kind, limit, in_flight);
@@ -1723,11 +1735,10 @@ impl ProjectPlugins {
             ) {
                 Ok(acquired) => acquired,
                 Err(waited_ms) => {
-                    let holders = pool
-                        .ticket_queue
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .holders_summary();
+                    let (holders, holder_detail) = {
+                        let q = pool.ticket_queue.lock().unwrap_or_else(|e| e.into_inner());
+                        (q.holders_summary(), q.holder_detail())
+                    };
                     return Err(admission_starved_error(AdmissionWaitReport {
                         kind: "slot",
                         waited_ms,
@@ -1735,6 +1746,7 @@ impl ProjectPlugins {
                         in_flight: pool.slots.len(),
                         slots: pool.slots.len(),
                         holders,
+                        holder_detail,
                     })
                     .into());
                 }
@@ -1921,11 +1933,10 @@ impl DispatchHandle {
             ) {
                 Ok(acquired) => acquired,
                 Err(waited_ms) => {
-                    let holders = pool
-                        .ticket_queue
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .holders_summary();
+                    let (holders, holder_detail) = {
+                        let q = pool.ticket_queue.lock().unwrap_or_else(|e| e.into_inner());
+                        (q.holders_summary(), q.holder_detail())
+                    };
                     return Err(admission_starved_error(AdmissionWaitReport {
                         kind: "slot",
                         waited_ms,
@@ -1933,6 +1944,7 @@ impl DispatchHandle {
                         in_flight: pool.slots.len(),
                         slots: pool.slots.len(),
                         holders,
+                        holder_detail,
                     })
                     .into());
                 }
