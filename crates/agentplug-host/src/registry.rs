@@ -2690,6 +2690,43 @@ pub fn lane_holds(root: &Path) -> Vec<LaneHold> {
     holds
 }
 
+pub struct LaneWaiterDetail {
+    pub lane: &'static str,
+    pub verb: String,
+    pub task: String,
+    pub position: u64,
+    pub waiting_ms: u64,
+    pub active: bool,
+    pub stale: bool,
+}
+
+// One lane's waiter queue in the order the lane admits them, so a starved reply can name who is ahead of
+// this dispatch instead of only counting them. A stale ticket is one whose owner stopped refreshing it; it
+// still holds its place until it ages out, so it is reported, never skipped.
+pub fn lane_waiter_detail(root: &Path, lane: &str) -> Vec<LaneWaiterDetail> {
+    let Some(lane) = lane_name(lane) else {
+        return Vec::new();
+    };
+    let now = crate::now_ms();
+    let waiters = gm_lane_waiters().lock().unwrap_or_else(|e| e.into_inner());
+    let Some(queue) = waiters.get(&(root.to_path_buf(), lane)) else {
+        return Vec::new();
+    };
+    queue
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| LaneWaiterDetail {
+            lane,
+            verb: entry.verb.clone(),
+            task: entry.task.clone(),
+            position: index as u64 + 1,
+            waiting_ms: now.saturating_sub(entry.claimed_ms),
+            active: entry.active,
+            stale: !entry.active && now.saturating_sub(entry.last_seen_ms) >= LANE_TICKET_STALE_MS,
+        })
+        .collect()
+}
+
 fn tool_queue_holders() -> &'static Mutex<HashMap<String, String>> {
     static HOLDERS: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
     HOLDERS.get_or_init(|| Mutex::new(HashMap::new()))
