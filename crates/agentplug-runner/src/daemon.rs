@@ -2617,6 +2617,10 @@ fn write_project_heartbeat_with_queue_info(
     payload["ts"] = serde_json::json!(now_ms());
     payload["daemon"] = serde_json::json!(true);
     payload["shared_process"] = serde_json::json!(true);
+    // Host and pid-namespace identity of this daemon. Two runners that share one project .gm from
+    // different containers or hosts see each other's pids in different process tables, so a foreign
+    // record is judged by this field and by heartbeat age, never by pid_is_alive.
+    payload["host_id"] = serde_json::json!(crate::daemon::claim_dispatch::host_identity());
     payload["runtime"] = serde_json::json!("agentplug");
     if let Some(busy_until) = busy_until {
         payload["busy_until"] = serde_json::json!(busy_until);
@@ -2654,6 +2658,18 @@ fn write_project_heartbeat_with_queue_info(
         map.remove("runner_update_in_progress");
         map.remove("runner_update_staged_age_ms");
         map.remove("runner_update_handoff_backed_off");
+    }
+    match crate::daemon::claim_dispatch::foreign_host_spool_sweeper(&spool_dir) {
+        Some(pid) => {
+            payload["foreign_host_sweeper_pid"] = serde_json::json!(pid);
+            payload["foreign_host_sweeper_note"] = serde_json::json!("this project's .gm is owned by a runner on another host or pid namespace; its liveness is judged by heartbeat age, not by its pid");
+        }
+        None => {
+            if let Some(map) = payload.as_object_mut() {
+                map.remove("foreign_host_sweeper_pid");
+                map.remove("foreign_host_sweeper_note");
+            }
+        }
     }
     match sweep_holder_report() {
         Some((phase, root, held_ms)) => {
@@ -3075,19 +3091,52 @@ fn handoff_retry_backoff_slot() -> &'static Mutex<Option<(String, Instant)>> {
 
 const HANDOFF_DEFERRAL_LOG_INTERVAL: Duration = Duration::from_secs(60);
 
+/// Dispatch ids of the dispatches this daemon currently has in flight, so a daemon diagnostic can be
+/// joined to the reply that caused it. Each in-flight claim is resolved through its project's dispatch
+/// wait ledger; a claim with no readable ledger falls back to its verb/task, which is still joinable.
+fn in_flight_dispatch_ids() -> Vec<String> {
+    let keys: Vec<(std::path::PathBuf, String, String)> = in_flight_map()
+        .lock()
+        .map(|map| map.keys().cloned().collect())
+        .unwrap_or_default();
+    keys.iter()
+        .map(|(root, verb, task)| {
+            let ledger = spool_dir_of(root).join(claim_dispatch::DISPATCH_WAIT_LEDGER_FILE);
+            fs::read_to_string(&ledger)
+                .ok()
+                .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+                .and_then(|value| {
+                    value
+                        .get("dispatch_id")
+                        .and_then(|id| id.as_str())
+                        .map(str::to_string)
+                })
+                .unwrap_or_else(|| format!("{verb}/{task}"))
+        })
+        .collect()
+}
+
 fn log_handoff_deferred(version: &str, last_logged: &mut Option<Instant>) {
     if last_logged.is_some_and(|at| at.elapsed() < HANDOFF_DEFERRAL_LOG_INTERVAL) {
         return;
     }
     *last_logged = Some(Instant::now());
     let pending = agentplug_host::pending_task_ids();
+    // Carry the dispatch ids of the work being waited on: without them this line can only be joined to
+    // a dispatch by hand, which is what made the deferral undiagnosable from a failure reply.
+    let dispatches = in_flight_dispatch_ids();
+    let dispatch_note = if dispatches.is_empty() {
+        "no dispatch in flight".to_string()
+    } else {
+        format!("dispatch_id(s) {}", dispatches.join(", "))
+    };
     if pending.is_empty() {
         eprintln!(
-            "[agentplug daemon] staged self-update to {version} deferred: admission lock busy; the swap waits for it to clear (durable task results)"
+            "[agentplug daemon] staged self-update to {version} deferred: admission lock busy; the swap waits for it to clear (durable task results) [{dispatch_note}]"
         );
     } else {
         eprintln!(
-            "[agentplug daemon] staged self-update to {version} deferred: {} unfinished task(s) {}; the swap waits for them to finish (durable task results)",
+            "[agentplug daemon] staged self-update to {version} deferred: {} unfinished task(s) {}; the swap waits for them to finish (durable task results) [{dispatch_note}]",
             pending.len(),
             pending.join(", ")
         );
@@ -4443,11 +4492,16 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
         let forced_swap_drain_expired = forced_swap_drain_started
             .map(|started| started.elapsed() >= Duration::from_millis(FORCED_SWAP_DRAIN_MAX_MS))
             .unwrap_or(false);
-        let forced_swap_after_bound = pending_self_update.is_some()
+        // The drain holds while a staged swap is starved, independent of the handoff retry backoff.
+        // Gating it on !self_update_backed_off ended it for the whole backoff window and re-armed it
+        // afterwards, so each window admitted fresh work while the swap was still starved: the drain
+        // flipped off and on per backoff window instead of once per staged swap. The backoff gates the
+        // handoff attempt below, not admission; FORCED_SWAP_DRAIN_MAX_MS still bounds the drain.
+        let forced_swap_drain_active = pending_self_update.is_some()
             && self_update_starved
-            && !self_update_backed_off
             && !forced_swap_drain_expired;
-        if forced_swap_after_bound {
+        let forced_swap_after_bound = forced_swap_drain_active && !self_update_backed_off;
+        if forced_swap_drain_active {
             forced_swap_drain_started.get_or_insert_with(Instant::now);
             agentplug_host::begin_admission_drain();
         } else {

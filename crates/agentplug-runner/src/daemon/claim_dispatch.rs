@@ -263,6 +263,73 @@ pub(super) fn take_forced_runner_refresh_request() -> bool {
 
 pub(super) const FOREIGN_SWEEPER_STALE_MS: u64 = 120_000;
 
+/// Identity of the machine and pid namespace this daemon runs in, so an ownership record written by a
+/// runner in another container or on another host over a shared project .gm is recognised as foreign.
+/// A bare pid is only meaningful inside one process table: the same number is a different process (or
+/// none) in another namespace, so a record whose host id differs is judged by its heartbeat age alone.
+pub(crate) fn host_identity() -> String {
+    static HOST: OnceLock<String> = OnceLock::new();
+    HOST.get_or_init(|| {
+        let hostname = fs::read_to_string("/proc/sys/kernel/hostname")
+            .or_else(|_| fs::read_to_string("/etc/hostname"))
+            .map(|raw| raw.trim().to_string())
+            .ok()
+            .or_else(|| std::env::var("HOSTNAME").ok())
+            .or_else(|| std::env::var("COMPUTERNAME").ok())
+            .unwrap_or_else(|| "unknown-host".to_string());
+        // The pid namespace inode separates a container from its host when the hostname is shared; the
+        // boot id separates two boots of one host. Neither alone is enough across machines, so all three
+        // ride together.
+        let pid_ns = fs::read_link("/proc/self/ns/pid")
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|_| "pidns:none".to_string());
+        let boot_id = fs::read_to_string("/proc/sys/kernel/random/boot_id")
+            .map(|raw| raw.trim().chars().take(8).collect::<String>())
+            .unwrap_or_else(|_| "boot:none".to_string());
+        format!("{hostname}|{pid_ns}|{boot_id}")
+    })
+    .clone()
+}
+
+/// The host id recorded in a project's `.status.json`, when it carries one. A record written before this
+/// field existed has no host id, and an absent id means "same host as whoever wrote it", never "foreign".
+pub(super) fn status_host_id(spool_dir: &Path) -> Option<String> {
+    let status = fs::read_to_string(spool_dir.join(".status.json")).ok()?;
+    let value = serde_json::from_str::<serde_json::Value>(&status).ok()?;
+    value
+        .get("host_id")
+        .and_then(|h| h.as_str())
+        .map(str::to_string)
+}
+
+/// A live sweeper on another host or pid namespace: judged by heartbeat age alone, never `pid_is_alive`.
+pub fn foreign_host_spool_sweeper(spool_dir: &Path) -> Option<u64> {
+    let status = fs::read_to_string(spool_dir.join(".status.json")).ok()?;
+    let value = serde_json::from_str::<serde_json::Value>(&status).ok()?;
+    let pid = value.get("pid").and_then(|p| p.as_u64())?;
+    if !value
+        .get("shared_process")
+        .and_then(|s| s.as_bool())
+        .unwrap_or(false)
+    {
+        return None;
+    }
+    if pid == std::process::id() as u64 {
+        return None;
+    }
+    if status_host_id(spool_dir)
+        .map(|host| host == host_identity())
+        .unwrap_or(true)
+    {
+        return None;
+    }
+    let ts = value.get("ts").and_then(|t| t.as_u64()).unwrap_or(0);
+    if stamp_age_ms(ts, &spool_dir.join(".status.json")) >= FOREIGN_SWEEPER_STALE_MS {
+        return None;
+    }
+    Some(pid)
+}
+
 pub fn live_foreign_spool_sweeper(spool_dir: &Path) -> Option<u64> {
     let status = fs::read_to_string(spool_dir.join(".status.json")).ok()?;
     let value = serde_json::from_str::<serde_json::Value>(&status).ok()?;
@@ -280,6 +347,17 @@ pub fn live_foreign_spool_sweeper(spool_dir: &Path) -> Option<u64> {
     let ts = value.get("ts").and_then(|t| t.as_u64()).unwrap_or(0);
     if stamp_age_ms(ts, &spool_dir.join(".status.json")) >= FOREIGN_SWEEPER_STALE_MS {
         return None;
+    }
+    // A record from another host or pid namespace names a pid in a process table this runner cannot
+    // read: pid_is_alive would report a live foreign owner dead (its claims swept and executed twice)
+    // or an unrelated local reuse of the same number alive (a stale claim held). Its freshness is the
+    // only liveness signal that travels across the boundary, so that is what decides here.
+    let foreign_host = value
+        .get("host_id")
+        .and_then(|h| h.as_str())
+        .map_or(false, |host| host != host_identity());
+    if foreign_host {
+        return Some(pid);
     }
     if !pid_is_alive(pid) {
         return None;
@@ -1226,8 +1304,14 @@ fn write_claim_heartbeat(marker: &Path) {
         "{}.tmp.{pid}",
         marker.file_name().unwrap_or_default().to_string_lossy()
     ));
-    let written = fs::write(&tmp, format!("{pid}\n{}\n", now_ms()))
-        .and_then(|()| fs::rename(&tmp, marker));
+    // Third line: the host and pid namespace that owns the claim, so a heartbeat written by a runner in
+    // another container or on another host can be recognised as foreign instead of being tested against
+    // this process table. A marker written before this line existed parses as host-less (same host).
+    let written = fs::write(
+        &tmp,
+        format!("{pid}\n{}\n{}\n", now_ms(), host_identity()),
+    )
+    .and_then(|()| fs::rename(&tmp, marker));
     if let Err(e) = written {
         let _ = fs::remove_file(&tmp);
         eprintln!("[agentplug daemon] could not write claim heartbeat {}: {e} -- the claim is kept, but the orphan sweep will judge it on its age alone", marker.display());
@@ -1261,6 +1345,14 @@ pub(super) fn claim_heartbeat(spool_dir: &Path, verb: &str, task: &str) -> Optio
     let pid = lines.next()?.trim().parse::<u64>().ok()?;
     let stamp = lines.next()?.trim().parse::<u64>().ok()?;
     Some((pid, stamp_age_ms(stamp, &path)))
+}
+
+/// The host id recorded in a claim heartbeat marker, when the marker carries one.
+pub(super) fn claim_heartbeat_host(spool_dir: &Path, verb: &str, task: &str) -> Option<String> {
+    let path = claim_heartbeat_path(spool_dir, verb, task);
+    let raw = fs::read_to_string(&path).ok()?;
+    let host = raw.lines().nth(2)?.trim();
+    (!host.is_empty()).then(|| host.to_string())
 }
 
 fn remove_claim_file(spool_dir: &Path, verb: &str, task: &str, claim_path: &Path) {
@@ -1805,9 +1897,19 @@ pub(super) fn sweep_orphaned_claims_distinguishing_handoff_from_crash(
                 if heartbeat_age_ms
                     < claim_heartbeat_stale_ms()
                 {
+                    // The pid in the marker is only meaningful inside the process table that wrote it.
+                    // When the marker records a different host or pid namespace, the fresh heartbeat is
+                    // the liveness signal, and the pid is reported as untestable rather than as alive.
+                    let foreign = claim_heartbeat_host(&spool_dir, &verb, &task)
+                        .map_or(false, |host| host != host_identity());
                     eprintln!(
-                        "[agentplug daemon] leaving claim {verb}/{task} for {} alone -- its owner renewed it {heartbeat_age_ms}ms ago under pid {heartbeat_pid}, so the dispatch that claimed it is still running however long it takes",
-                        root.display()
+                        "[agentplug daemon] leaving claim {verb}/{task} for {} alone -- its owner renewed it {heartbeat_age_ms}ms ago under pid {heartbeat_pid}{}, so the dispatch that claimed it is still running however long it takes",
+                        root.display(),
+                        if foreign {
+                            " on another host or pid namespace -- that pid is not testable here, the heartbeat age is"
+                        } else {
+                            ""
+                        }
                     );
                     continue;
                 }
