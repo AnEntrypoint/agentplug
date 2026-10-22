@@ -493,6 +493,28 @@ fn count_ledger_entries(raw: &str) -> u64 {
 // whichever one the file already uses: a JSON array (the historical format) gets the entry spliced in
 // before its closing bracket, and a JSONL ledger gets one more line. That keeps this writer working
 // across the append-only migration instead of forcing the array rewrite back onto a migrated ledger.
+// A JSONL ledger is the append-only format, so the entry is written with O_APPEND: the bytes the host
+// puts on disk are the entry alone, not the whole file. An array ledger has no append point, so it is
+// still rewritten; moving that file to JSONL is what makes every writer's cost O(new bytes).
+fn is_jsonl_ledger(existing: &str) -> bool {
+    existing.trim_start().starts_with('{')
+}
+
+fn append_jsonl_entry(path: &Path, entry: &str) -> bool {
+    use std::io::Write;
+    let Ok(metadata) = fs::metadata(path) else {
+        return fs::write(path, format!("{entry}\n")).is_ok();
+    };
+    if metadata.len() == 0 {
+        return fs::write(path, format!("{entry}\n")).is_ok();
+    }
+    fs::OpenOptions::new()
+        .append(true)
+        .open(path)
+        .and_then(|mut file| file.write_all(format!("{entry}\n").as_bytes()))
+        .is_ok()
+}
+
 fn append_ledger_entry(existing: &str, entry: &str) -> Option<String> {
     let trimmed = existing.trim_end();
     if trimmed.is_empty() {
@@ -554,6 +576,12 @@ fn mint_host_dispatch_id(
         "host_minted": true,
     })
     .to_string();
+    if is_jsonl_ledger(&existing) && seq as usize <= DISPATCH_LEDGER_MAX_ENTRIES {
+        if append_jsonl_entry(&path, &entry) {
+            return Some(dispatch_id);
+        }
+        return None;
+    }
     // Over the cap the ledger has to be trimmed, and that needs the parsed entries, so this is the one
     // path that still reads and rewrites the whole file.
     let serialized = if seq as usize >= DISPATCH_LEDGER_MAX_ENTRIES + DISPATCH_LEDGER_TRIM_SLACK {
