@@ -613,12 +613,60 @@ pub(crate) fn atomic_write_locked(full: &Path, data: &str) -> std::io::Result<()
     atomic_write_under_held_lock(full, data)
 }
 
+// Every path this writer touches gets a {name}.tmp-{pid}-{seq} sibling, removed only on this function's own
+// failure paths. A process killed between create_private_file and rename leaves that sibling forever, so this
+// writer sweeps them itself: nothing else reaches paths outside .gm/exec-spool, where the guest's
+// dispatch_ledger::sweep_stale_spool_tmp cannot look. The candidate rule and the staleness window are the ones
+// rs-plugkit's dispatch_ledger::sweep_stale_tmp_beside uses, so one bound covers temps from either side.
+const TMP_SWEEP_MARKER: &str = ".tmp-";
+const TMP_SWEEP_STALE_MS: u64 = 30 * 1000;
+
+fn sweep_stale_tmp_beside(full: &Path, name: &str) {
+    let dir = match full.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir,
+        _ => return,
+    };
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    for entry in entries.flatten() {
+        let Some(candidate) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if !(candidate.starts_with(name) && candidate.contains(TMP_SWEEP_MARKER)) {
+            continue;
+        }
+        // DirEntry::metadata does not follow a symlink, so this also refuses to remove one.
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        if !meta.is_file() {
+            continue;
+        }
+        let mtime_ms = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as u64);
+        if mtime_ms.is_some_and(|ms| ms.saturating_add(TMP_SWEEP_STALE_MS) < now_ms) {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+}
+
 fn atomic_write_under_held_lock(full: &Path, data: &str) -> std::io::Result<()> {
+    let name = full.file_name().and_then(|n| n.to_str()).unwrap_or("state");
+    // Before the identical-content shortcut: a path rewritten with the bytes it already holds is the common
+    // no-op case, and it still owns any temp left beside it by a process that died.
+    sweep_stale_tmp_beside(full, name);
     if fs::read(full).is_ok_and(|existing| existing == data.as_bytes()) {
         return Ok(());
     }
     static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let name = full.file_name().and_then(|n| n.to_str()).unwrap_or("state");
     let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let tmp = full.with_file_name(format!("{name}.tmp-{}-{seq}", std::process::id()));
     if let Err(e) = create_private_file(&tmp, data) {
