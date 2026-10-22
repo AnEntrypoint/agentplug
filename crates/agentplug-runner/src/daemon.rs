@@ -4434,9 +4434,12 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
                 log_handoff_deferred(version, &mut handoff_deferred_logged_at);
             }
         }
+        // A forced swap ignores any_work: while admission drains, claims the drain rejects still set
+        // did_work, so any_work would hold the handoff for as long as spool traffic lasts. The write
+        // lock in prepare_task_handoff and its registry check still exclude executing tasks.
         let task_handoff = if pending_self_update.is_some()
             && !self_update_backed_off
-            && !any_work
+            && (forced_swap_after_bound || !any_work)
             && !detached_still_running
         {
             match agentplug_host::prepare_task_handoff() {
