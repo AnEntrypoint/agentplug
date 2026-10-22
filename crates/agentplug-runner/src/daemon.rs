@@ -3984,6 +3984,10 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
 
     const SELF_RECYCLE_IDLE_MS: u64 = 60 * 60 * 1000;
     const STOP_REQUEST_MIN_IDLE_MS: u64 = 60_000;
+    // A stop request still pending after this grace ends the detached tasks (exec children adopted
+    // into the background) through their containment, so a background task cannot hold SIGTERM for its
+    // whole budget. The stop is then honoured on the idle rule above.
+    const STOP_REQUEST_DETACHED_GRACE_MS: u64 = 30_000;
     let mut last_any_dispatch = Instant::now();
 
     const IDLE_WAIT_MIN_MS: u64 = 25;
@@ -4007,6 +4011,10 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
     // Upper bound on how long a forced swap holds the admission drain. Past it the drain
     // is released and admissions resume; the swap is retried on a later tick.
     const FORCED_SWAP_DRAIN_MAX_MS: u64 = 60 * 1000;
+    // A staged swap waits for every registry task to finish. Past this age the detached tasks are
+    // ended through their containment, so one background task cannot hold the staged runner for its
+    // whole 30 min budget. Matches the running-task budget used by the lane hold reports (10 min).
+    const SELF_UPDATE_DETACHED_GRACE_MS: u64 = 10 * 60 * 1000;
     let mut forced_swap_drain_started: Option<Instant> = None;
 
     if let Some((staged_at_ms, _len)) = staged_runner_awaiting_handoff() {
@@ -4434,6 +4442,23 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
                 log_handoff_deferred(version, &mut handoff_deferred_logged_at);
             }
         }
+        // A staged swap that has waited past SELF_UPDATE_DETACHED_GRACE_MS ends the registry tasks that
+        // block prepare_task_handoff, so the swap can land; younger tasks are left to finish.
+        if pending_self_update.is_some()
+            && !self_update_backed_off
+            && pending_self_update_staged_at.is_some_and(|staged_at| {
+                staged_at.elapsed() >= Duration::from_millis(SELF_UPDATE_DETACHED_GRACE_MS)
+            })
+        {
+            let ended = agentplug_host::stop_pending_tasks();
+            if !ended.is_empty() {
+                eprintln!(
+                    "[agentplug daemon] staged self-update waited past {SELF_UPDATE_DETACHED_GRACE_MS}ms -- ended {} detached task(s) that blocked the handoff: {}",
+                    ended.len(),
+                    ended.join(", ")
+                );
+            }
+        }
         // A forced swap ignores any_work: while admission drains, claims the drain rejects still set
         // did_work, so any_work would hold the handoff for as long as spool traffic lasts. The write
         // lock in prepare_task_handoff and its registry check still exclude executing tasks.
@@ -4540,6 +4565,16 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
 
         if shutdown_signal_received() && stop_request_age_ms().is_none() {
             write_stop_request("signal");
+        }
+        if stop_request_age_ms().is_some_and(|age| age >= STOP_REQUEST_DETACHED_GRACE_MS) {
+            let ended = agentplug_host::stop_pending_tasks();
+            if !ended.is_empty() {
+                eprintln!(
+                    "[agentplug daemon] stop request pending past {STOP_REQUEST_DETACHED_GRACE_MS}ms -- ended {} detached task(s) through their containment: {}",
+                    ended.len(),
+                    ended.join(", ")
+                );
+            }
         }
 
         if last_any_dispatch.elapsed() >= Duration::from_millis(STOP_REQUEST_MIN_IDLE_MS)
