@@ -674,6 +674,33 @@ pub(crate) fn create_private_dir_all(path: &Path) -> std::io::Result<()> {
 }
 
 
+// host_fs_write and host_fs_cas_write return 1 on success, 2 for a CAS mismatch and 0 for every other
+// failure. A full volume is the one failure a caller can act on (retry later, free space, stop appending),
+// so it gets its own code, 3, instead of collapsing into 0 with a sandbox refusal. The guest still folds
+// unknown codes to IoError until it maps 3, which is why the path is named on stderr too.
+pub(crate) const HOST_WRITE_NO_SPACE: u32 = 3;
+
+pub(crate) fn io_error_is_out_of_space(err: &std::io::Error) -> bool {
+    if err.kind() == std::io::ErrorKind::StorageFull {
+        return true;
+    }
+    // ENOSPC, ERROR_DISK_FULL (112) and ERROR_HANDLE_DISK_FULL (39); Rust reports StorageFull only when
+    // it maps the errno itself, which it does not do for every platform or every write path.
+    matches!(err.raw_os_error(), Some(28) | Some(112) | Some(39))
+}
+
+fn classify_write_error(err: &std::io::Error, full: &std::path::Path, what: &str) -> u32 {
+    if io_error_is_out_of_space(err) {
+        eprintln!(
+            "[agentplug host] {what} for {} failed with no space left on the target filesystem (os error {:?}) -- the temporary file was removed, so no partial content is visible at that path",
+            full.display(),
+            err.raw_os_error()
+        );
+        return HOST_WRITE_NO_SPACE;
+    }
+    0
+}
+
 pub(crate) fn atomic_cas_write_locked(full: &Path, expected: &str, data: &str) -> std::io::Result<bool> {
     let lock = fs_write_lock_for(full);
     let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -940,7 +967,7 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
             }
             match atomic_write_locked(&full, &data) {
                 Ok(()) => 1,
-                Err(_) => 0,
+                Err(err) => classify_write_error(&err, &full, "host_fs_write"),
             }
         },
     )?;
@@ -971,7 +998,7 @@ pub fn register_env_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()
             match atomic_cas_write_locked(&full, &expected, &data) {
                 Ok(true) => 1,
                 Ok(false) => 2,
-                Err(_) => 0,
+                Err(err) => classify_write_error(&err, &full, "host_fs_cas_write"),
             }
         },
     )?;

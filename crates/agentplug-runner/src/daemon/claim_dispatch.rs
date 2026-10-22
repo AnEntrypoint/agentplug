@@ -479,6 +479,41 @@ pub fn stamp_dispatch_id(out_dir: &Path, verb: &str, task: &str, out_body: &str)
     serde_json::to_string(&value).unwrap_or_else(|_| out_body.to_string())
 }
 
+// How far past DISPATCH_LEDGER_MAX_ENTRIES the file may drift before the host pays for a full
+// parse-and-trim pass. Appending is O(new bytes); trimming is O(file), so it runs rarely.
+const DISPATCH_LEDGER_TRIM_SLACK: usize = 500;
+
+// Both writers emit compact JSON, so one entry is one occurrence. A request_body that quotes the key
+// escapes it (`\"dispatch_id\":`), which does not match the needle.
+fn count_ledger_entries(raw: &str) -> u64 {
+    raw.matches("\"dispatch_id\":").count() as u64
+}
+
+// Appends one entry without parsing or re-serializing the rest of the ledger. The on-disk format is
+// whichever one the file already uses: a JSON array (the historical format) gets the entry spliced in
+// before its closing bracket, and a JSONL ledger gets one more line. That keeps this writer working
+// across the append-only migration instead of forcing the array rewrite back onto a migrated ledger.
+fn append_ledger_entry(existing: &str, entry: &str) -> Option<String> {
+    let trimmed = existing.trim_end();
+    if trimmed.is_empty() {
+        return Some(format!("[{entry}]"));
+    }
+    if trimmed.starts_with('[') {
+        let Some(inner) = trimmed.strip_suffix(']') else {
+            return None;
+        };
+        return if inner.trim().is_empty() {
+            Some(format!("[{entry}]"))
+        } else {
+            Some(format!("{inner},{entry}]"))
+        };
+    }
+    if trimmed.starts_with('{') {
+        return Some(format!("{trimmed}\n{entry}"));
+    }
+    None
+}
+
 fn mint_host_dispatch_id(
     out_dir: &Path,
     verb: &str,
@@ -495,19 +530,11 @@ fn mint_host_dispatch_id(
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(_) => return None,
     };
-    let mut list: Vec<serde_json::Value> = if existing.trim().is_empty() {
-        Vec::new()
-    } else {
-        match serde_json::from_str::<serde_json::Value>(&existing) {
-            Ok(serde_json::Value::Array(a)) => a,
-            _ => return None,
-        }
-    };
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
-    let seq = list.len() as u64;
+    let seq = count_ledger_entries(&existing);
     let dispatch_id = format!("{}-{}-{:x}", ts, seq, {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -516,7 +543,7 @@ fn mint_host_dispatch_id(
         ts.hash(&mut h);
         h.finish()
     });
-    list.push(serde_json::json!({
+    let entry = serde_json::json!({
         "dispatch_id": dispatch_id,
         "verb": verb,
         "fingerprint": task,
@@ -525,17 +552,29 @@ fn mint_host_dispatch_id(
         "output_bytes": output_bytes,
         "session_id": null,
         "host_minted": true,
-    }));
-    list.retain(|e| {
-        e.get("ts")
-            .and_then(|v| v.as_u64())
-            .is_some_and(|t| t.saturating_add(DISPATCH_LEDGER_RETAIN_MS) >= ts)
-    });
-    if list.len() > DISPATCH_LEDGER_MAX_ENTRIES {
-        let drop = list.len() - DISPATCH_LEDGER_MAX_ENTRIES;
-        list.drain(0..drop);
-    }
-    let serialized = serde_json::Value::Array(list).to_string();
+    })
+    .to_string();
+    // Over the cap the ledger has to be trimmed, and that needs the parsed entries, so this is the one
+    // path that still reads and rewrites the whole file.
+    let serialized = if seq as usize >= DISPATCH_LEDGER_MAX_ENTRIES + DISPATCH_LEDGER_TRIM_SLACK {
+        let mut list: Vec<serde_json::Value> = match serde_json::from_str::<serde_json::Value>(&existing) {
+            Ok(serde_json::Value::Array(a)) => a,
+            _ => return None,
+        };
+        list.push(serde_json::from_str(&entry).unwrap_or(serde_json::Value::Null));
+        list.retain(|e| {
+            e.get("ts")
+                .and_then(|v| v.as_u64())
+                .is_some_and(|t| t.saturating_add(DISPATCH_LEDGER_RETAIN_MS) >= ts)
+        });
+        if list.len() > DISPATCH_LEDGER_MAX_ENTRIES {
+            let drop = list.len() - DISPATCH_LEDGER_MAX_ENTRIES;
+            list.drain(0..drop);
+        }
+        serde_json::Value::Array(list).to_string()
+    } else {
+        append_ledger_entry(&existing, &entry)?
+    };
     let tmp = path.with_file_name(format!(
         ".dispatch-ledger.json.tmp.{}",
         std::process::id()
