@@ -387,7 +387,7 @@ pub(super) fn spool_in_file_has_no_writer(request_path: &Path) -> bool {
 // Both shipped writers (gm-mcp and scripts/triage/dispatch-verb.mjs) land the request with a rename,
 // so the bytes are complete the moment the name appears; the floor only bounds how early the first of
 // the two agreeing samples may be taken, and every millisecond here is paid by every dispatch.
-const SPOOL_IN_FILE_SETTLE: std::time::Duration = std::time::Duration::from_millis(25);
+const SPOOL_IN_FILE_SETTLE: std::time::Duration = std::time::Duration::from_millis(10);
 
 #[cfg(not(windows))]
 pub(super) fn spool_in_file_has_no_writer(request_path: &Path) -> bool {
@@ -614,6 +614,41 @@ fn append_ledger_entry(existing: &str, entry: &str) -> Option<String> {
     None
 }
 
+fn serialize_ledger_entries(existing: &str, list: &[serde_json::Value]) -> String {
+    if is_jsonl_ledger(existing) {
+        let mut out = String::new();
+        for entry in list {
+            out.push_str(&entry.to_string());
+            out.push('\n');
+        }
+        return out;
+    }
+    serde_json::Value::Array(list.to_vec()).to_string()
+}
+
+// Parses a ledger in either on-disk format: a JSON array (the historical format) or JSONL, one object
+// per line, which is the append-only format the ledger now uses. A line that does not parse is skipped
+// rather than failing the trim, so one bad line cannot stop dispatch ids from being minted.
+fn parse_ledger_entries(raw: &str) -> Option<Vec<serde_json::Value>> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Some(Vec::new());
+    }
+    if trimmed.starts_with('[') {
+        return match serde_json::from_str::<serde_json::Value>(trimmed) {
+            Ok(serde_json::Value::Array(a)) => Some(a),
+            _ => None,
+        };
+    }
+    Some(
+        trimmed
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .collect(),
+    )
+}
+
 fn mint_host_dispatch_id(
     out_dir: &Path,
     verb: &str,
@@ -661,12 +696,12 @@ fn mint_host_dispatch_id(
         return None;
     }
     // Over the cap the ledger has to be trimmed, and that needs the parsed entries, so this is the one
-    // path that still reads and rewrites the whole file.
+    // path that still reads and rewrites the whole file. It is format-agnostic: a JSONL ledger is
+    // trimmed and written back as JSONL, and a historical JSON array as an array. Accepting only
+    // Value::Array here returned None for every dispatch once a JSONL ledger passed the cap, so no
+    // dispatch id was minted at all and every verb lost its dispatch_id.
     let serialized = if seq as usize >= DISPATCH_LEDGER_MAX_ENTRIES + DISPATCH_LEDGER_TRIM_SLACK {
-        let mut list: Vec<serde_json::Value> = match serde_json::from_str::<serde_json::Value>(&existing) {
-            Ok(serde_json::Value::Array(a)) => a,
-            _ => return None,
-        };
+        let mut list = parse_ledger_entries(&existing)?;
         list.push(serde_json::from_str(&entry).unwrap_or(serde_json::Value::Null));
         list.retain(|e| {
             e.get("ts")
@@ -677,7 +712,7 @@ fn mint_host_dispatch_id(
             let drop = list.len() - DISPATCH_LEDGER_MAX_ENTRIES;
             list.drain(0..drop);
         }
-        serde_json::Value::Array(list).to_string()
+        serialize_ledger_entries(&existing, &list)
     } else {
         append_ledger_entry(&existing, &entry)?
     };
@@ -3540,8 +3575,11 @@ const INBOX_WATCH_MASK: u32 =
 #[cfg(target_os = "linux")]
 const INBOX_PARENT_WATCH_MASK: u32 = libc::IN_CREATE | libc::IN_MOVED_TO;
 
+// A newly registered root keeps no inotify watch until the next sync, and wait() with no watches sleeps
+// the whole cap, so this interval was the floor on a project's first dispatch. sync() early-returns when
+// the wanted watch set is unchanged, so shortening it costs one comparison per idle wait, not a rescan.
 #[cfg(target_os = "linux")]
-const INBOX_RESYNC_INTERVAL: Duration = Duration::from_millis(500);
+const INBOX_RESYNC_INTERVAL: Duration = Duration::from_millis(50);
 
 #[cfg(target_os = "linux")]
 const INOTIFY_EVENT_HEADER_LEN: usize = 16;

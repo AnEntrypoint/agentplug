@@ -4061,11 +4061,16 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
     const STOP_REQUEST_DETACHED_GRACE_MS: u64 = 30_000;
     let mut last_any_dispatch = Instant::now();
 
-    const IDLE_WAIT_MIN_MS: u64 = 25;
-    const IDLE_WAIT_MAX_MS: u64 = 1_000;
+    // The idle wait is the latency a dispatch pays before the daemon can even look at it: a request that
+    // lands during the wait is seen only when the wait ends. On Linux and Windows the wait blocks on an
+    // inotify fd (or a change notification), so a longer wait buys no cpu -- it only adds up to its own
+    // length to the first dispatch after an idle stretch. Measured at 1000, a cold dispatch paid the whole
+    // backoff (1.1-1.3 s observed); at 100 the worst case is one tick of the claim poll plus the settle.
+    const IDLE_WAIT_MIN_MS: u64 = 10;
+    const IDLE_WAIT_MAX_MS: u64 = 100;
     // Equal to the spool-in settle age (claim_dispatch.rs SPOOL_IN_FILE_SETTLE): the stamp check needs two
     // sweeps one settle age apart, so a longer cap adds that gap to every trivial dispatch's claim wait.
-    const PENDING_UNCLAIMED_IDLE_WAIT_MAX_MS: u64 = 100;
+    const PENDING_UNCLAIMED_IDLE_WAIT_MAX_MS: u64 = 25;
     let mut idle_wait_ms = IDLE_WAIT_MIN_MS;
 
     let shared_plugin_release_idle_ms = daemon_cfg.shared_plugin_release_idle_ms();
