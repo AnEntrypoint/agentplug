@@ -306,7 +306,10 @@ pub(super) fn spool_in_file_has_no_writer(request_path: &Path) -> bool {
 
 // Age floor before a spool-in file's (len, mtime) stamp is recorded. The stamp must match on two
 // sweeps before the file is claimed, so that check, not this floor, refuses a file still being written.
-const SPOOL_IN_FILE_SETTLE: std::time::Duration = std::time::Duration::from_millis(100);
+// Both shipped writers (gm-mcp and scripts/triage/dispatch-verb.mjs) land the request with a rename,
+// so the bytes are complete the moment the name appears; the floor only bounds how early the first of
+// the two agreeing samples may be taken, and every millisecond here is paid by every dispatch.
+const SPOOL_IN_FILE_SETTLE: std::time::Duration = std::time::Duration::from_millis(25);
 
 #[cfg(not(windows))]
 pub(super) fn spool_in_file_has_no_writer(request_path: &Path) -> bool {
@@ -733,6 +736,55 @@ fn write_owner_file(path: &Path, contents: impl AsRef<[u8]>) -> bool {
     written
 }
 
+// A kv_get or env_get reply body is the stored value itself, and the reply file outlives its single
+// reader: gm-mcp deletes it after reading (its SECRET_REPLY_VERBS set), but the daemon cannot know when
+// a reader is done, so every other consumer leaves the plaintext in out/ for the whole witness horizon.
+// The value is still delivered -- these verbs exist to hand it to the caller -- but the copy is given a
+// bounded delivery window and then removed, instead of waiting for the count or age reaper.
+pub(super) const VALUE_REPLY_VERBS: &[&str] = &["env_get", "kv_get"];
+pub(super) const VALUE_REPLY_DELIVERY_MS: u64 = 30_000;
+
+static VALUE_REPLY_DEADLINES: OnceLock<Mutex<Vec<(PathBuf, u64)>>> = OnceLock::new();
+
+fn schedule_value_reply_reap(out_dir: &Path, verb: &str, task: &str) {
+    if !VALUE_REPLY_VERBS.contains(&verb) {
+        return;
+    }
+    let out_name = format!("{verb}-{task}.json");
+    let deadline = now_ms().saturating_add(VALUE_REPLY_DELIVERY_MS);
+    let queue = VALUE_REPLY_DEADLINES.get_or_init(|| Mutex::new(Vec::new()));
+    let mut queue = queue.lock().unwrap_or_else(|e| e.into_inner());
+    queue.push((out_dir.join(&out_name), deadline));
+    queue.push((out_dir.join(format!("{out_name}.ready")), deadline));
+}
+
+pub fn reap_expired_value_replies() -> usize {
+    let queue = VALUE_REPLY_DEADLINES.get_or_init(|| Mutex::new(Vec::new()));
+    let now = now_ms();
+    let mut due = Vec::new();
+    {
+        let mut queue = queue.lock().unwrap_or_else(|e| e.into_inner());
+        if queue.is_empty() {
+            return 0;
+        }
+        queue.retain(|(path, deadline)| {
+            if *deadline <= now {
+                due.push(path.clone());
+                false
+            } else {
+                true
+            }
+        });
+    }
+    let mut removed = 0;
+    for path in due {
+        if fs::remove_file(&path).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
 pub fn write_spool_out_confirmed(
     out_dir: &Path,
     verb: &str,
@@ -747,6 +799,7 @@ pub fn write_spool_out_confirmed(
         let _ = write_owner_file(&out_dir.join(format!("{out_name}.ready")), b"");
         let confirmed = dest.exists();
         if confirmed {
+            schedule_value_reply_reap(out_dir, verb, task);
             if let Some(root) = out_dir.ancestors().nth(3) {
                 reap_spool_out_files(root, false);
             }

@@ -3352,6 +3352,14 @@ fn spawn_heartbeat_ticker(heartbeat_interval: Duration) -> std::thread::JoinHand
                 );
             }
             refresh_project_heartbeats_off_loop();
+            let expired_values = crate::daemon::claim_dispatch::reap_expired_value_replies();
+            if expired_values > 0 {
+                eprintln!(
+                    "[agentplug daemon] removed {} env_get/kv_get reply file(s) past the {}ms delivery window -- those replies carry the stored value itself, so they are not kept in out/ for the witness horizon",
+                    expired_values,
+                    crate::daemon::claim_dispatch::VALUE_REPLY_DELIVERY_MS
+                );
+            }
             HEARTBEAT_TICK_TS.store(now_ms(), std::sync::atomic::Ordering::Relaxed);
         }
     })
@@ -4642,7 +4650,14 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
             } else {
                 IDLE_WAIT_MAX_MS
             };
-            idle_wait_ms = (idle_wait_ms.saturating_mul(2)).min(cap_ms);
+            if pending_work_exists_before_idle_wait || pending_work_after_wait {
+                // An unclaimed request needs two agreeing (len, mtime) samples before the claim, so
+                // backing off while one is pending adds the whole backoff to that request's latency.
+                // Poll at the floor instead; the cap above only bounds a request that is never claimable.
+                idle_wait_ms = IDLE_WAIT_MIN_MS;
+            } else {
+                idle_wait_ms = (idle_wait_ms.saturating_mul(2)).min(cap_ms);
+            }
         }
     }
 }
