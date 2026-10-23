@@ -1,0 +1,85 @@
+name: cargo-update
+
+on:
+  workflow_dispatch:
+    inputs:
+      crates:
+        description: 'Space-separated name=version pairs, each pinned with cargo update --precise'
+        required: false
+        default: 'rustls-webpki=0.103.16 tokio=1.54.1'
+      audit:
+        description: 'Run cargo audit on the resulting lockfile before pushing'
+        required: false
+        default: 'true'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: agentplug-cargo-update
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.PUBLISHER_TOKEN }}
+
+      - uses: Swatinem/rust-cache@63fed3e2fecf6f7b51dc6f043341b79ef82a9ae7
+        with:
+          key: cargo-update-linux-x64
+          add-job-id-key: false
+
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283
+        if: ${{ inputs.audit == 'true' }}
+        with:
+          tool: cargo-binstall
+
+      - name: Install cargo-audit 0.22.2 from its release binary
+        if: ${{ inputs.audit == 'true' }}
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: cargo binstall --no-confirm cargo-audit@0.22.2
+
+      # The push goes through PUBLISHER_TOKEN, not the job token: a push made with GITHUB_TOKEN
+      # does not start other workflows, and rust-ci and release are the jobs that prove the new
+      # lockfile still builds. checkout persists that token, so the push needs no credential text.
+      - name: Pin each named crate, audit, commit Cargo.lock, push to main
+        env:
+          CRATES: ${{ inputs.crates }}
+          DO_AUDIT: ${{ inputs.audit }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "lanmower"
+          git config user.email "lanmower@users.noreply.github.com"
+          for attempt in 1 2 3; do
+            git fetch -q origin main
+            git reset -q --hard origin/main
+            for spec in $CRATES; do
+              cargo update -p "${spec%%=*}" --precise "${spec##*=}"
+            done
+            cargo metadata --locked --offline --format-version=1 --no-deps >/dev/null
+            if [ "$DO_AUDIT" = "true" ]; then
+              cargo audit --file Cargo.lock
+            fi
+            git add Cargo.lock
+            if git diff --cached --quiet; then
+              echo "Cargo.lock already carries [ $CRATES ]; nothing to push"
+              break
+            fi
+            git commit -q -m "deps: cargo update $CRATES"
+            if git push -q origin HEAD:main; then
+              echo "pushed $(git rev-parse HEAD)"
+              break
+            fi
+            echo "push to main rejected on attempt $attempt; recomputing on the new tip"
+            if [ "$attempt" = 3 ]; then exit 1; fi
+          done
+          grep -A1 '^name = "rustls-webpki"' Cargo.lock || true
+          grep -A1 '^name = "tokio"' Cargo.lock || true
