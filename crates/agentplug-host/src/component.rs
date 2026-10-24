@@ -611,10 +611,9 @@ pub async fn dispatch_component_verb(
             if matches!(e.downcast_ref::<wasmtime::Trap>(), Some(wasmtime::Trap::Interrupt)) {
                 return Err(anyhow::anyhow!("plugin_call_deadline_exceeded: {plugin_name} exceeded {deadline_secs}s executing verb {verb}"));
             }
-            return Err(e);
+            return Err(e.into());
         }
     };
-    dispatch_fn.post_return_async(&mut store).await?;
     if reply.is_empty() {
         return Err(anyhow::anyhow!("plugin_response_missing: {plugin_name} verb {verb} returned an empty string from the component dispatch-verb export"));
     }
