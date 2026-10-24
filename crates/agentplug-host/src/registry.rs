@@ -119,6 +119,7 @@ pub fn read_plugin_lifecycle(plugin_name: &str) -> PluginFiberLifecycle {
 pub enum PluginDispatchError {
     NotRegistered {
         plugin_name: String,
+        state: String,
     },
     EvictedOrPoisoned {
         plugin_name: String,
@@ -139,8 +140,8 @@ pub enum PluginDispatchError {
 impl std::fmt::Display for PluginDispatchError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            PluginDispatchError::NotRegistered { plugin_name } => {
-                write!(f, "plugin {plugin_name} is not registered for this project (no plugin pool exists -- check .agentplug/plugins.txt and daemon startup logs for a compile/install failure)")
+            PluginDispatchError::NotRegistered { plugin_name, state } => {
+                write!(f, "plugin {plugin_name} is not registered for this project (no plugin pool exists -- {state} -- check .agentplug/plugins.txt and daemon startup logs for a compile/install failure)")
             }
             PluginDispatchError::EvictedOrPoisoned {
                 plugin_name,
@@ -1395,6 +1396,52 @@ pub fn set_sibling_reload_source(source: SiblingReloadSource) {
     *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(source));
 }
 
+pub type SiblingComponentSource = (Engine, HashMap<String, Component>);
+
+static SIBLING_COMPONENT_SOURCE: OnceLock<Mutex<Option<Arc<SiblingComponentSource>>>> = OnceLock::new();
+
+pub fn set_sibling_component_source(source: SiblingComponentSource) {
+    let slot = SIBLING_COMPONENT_SOURCE.get_or_init(|| Mutex::new(None));
+    *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(source));
+}
+
+fn global_component_source() -> Option<Arc<SiblingComponentSource>> {
+    SIBLING_COMPONENT_SOURCE
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
+fn not_registered_state(root: &Path, siblings: &SiblingPools, local_components: bool) -> String {
+    let sorted_keys = |keys: Vec<String>| {
+        let mut keys = keys;
+        keys.sort();
+        format!("{keys:?}")
+    };
+    let sibling_keys = sorted_keys(
+        siblings
+            .lock()
+            .map(|m| m.keys().cloned().collect())
+            .unwrap_or_default(),
+    );
+    let component_keys = sorted_keys(
+        global_component_source()
+            .map(|s| s.1.keys().cloned().collect())
+            .unwrap_or_default(),
+    );
+    let plugins_txt = root.join(".agentplug").join("plugins.txt");
+    format!(
+        "registry state: root={} plugins.txt={} local_components={} siblings={} global_component_source={} reload_source_set={}",
+        root.display(),
+        if plugins_txt.is_file() { "present" } else { "absent" },
+        local_components,
+        sibling_keys,
+        component_keys,
+        global_reload_source().is_some(),
+    )
+}
+
 pub fn ensure_sibling_registered(root: &Path, plugin_name: &str, siblings: &SiblingPools) -> bool {
     if siblings
         .lock()
@@ -1790,6 +1837,7 @@ impl ProjectPlugins {
         }
         let pool = pool.ok_or_else(|| PluginDispatchError::NotRegistered {
             plugin_name: plugin_name.to_string(),
+            state: not_registered_state(&self.root, &self.siblings, self.components.contains_key(plugin_name)),
         })?;
         let cost_class = cost_class_for_dispatch(verb, body);
         let mut _heavy_admission: Option<HeavyDispatchAdmission> = None;
@@ -1925,15 +1973,24 @@ impl DispatchHandle {
         &self,
         plugin_name: &str,
     ) -> anyhow::Result<Option<(Engine, LoadedArtifact)>> {
-        let Some((component_engine, components)) = self.components.as_ref() else {
+        let local = self.components.as_ref().and_then(|(engine, components)| {
+            components
+                .get(plugin_name)
+                .map(|component| (engine.clone(), component.clone()))
+        });
+        let Some((component_engine, component)) = local.or_else(|| {
+            global_component_source().and_then(|source| {
+                source
+                    .1
+                    .get(plugin_name)
+                    .map(|component| (source.0.clone(), component.clone()))
+            })
+        }) else {
             return Ok(None);
         };
-        let Some(component) = components.get(plugin_name).cloned() else {
-            return Ok(None);
-        };
-        let linker = crate::component::component_linker(component_engine)?;
+        let linker = crate::component::component_linker(&component_engine)?;
         Ok(Some((
-            component_engine.clone(),
+            component_engine,
             LoadedArtifact::Component { component, linker },
         )))
     }
@@ -2023,6 +2080,7 @@ impl DispatchHandle {
         }
         let pool = pool.ok_or_else(|| PluginDispatchError::NotRegistered {
             plugin_name: plugin_name.to_string(),
+            state: not_registered_state(&self.root, &self.siblings, self.components.is_some()),
         })?;
         let cost_class = cost_class_for_dispatch(verb, body);
         let mut _heavy_admission: Option<HeavyDispatchAdmission> = None;

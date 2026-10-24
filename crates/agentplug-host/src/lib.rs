@@ -60,7 +60,7 @@ pub use registry::{
     epoch_ticks_for_seconds, get_active_provider,
     note_shared_plugin_bytes_current, read_plugin_lifecycle, read_project_plugin_list,
     release_admission_for_current_thread, release_admission_for_thread,
-    release_shared_plugin, request_shared_store_swap, requeue_lane_claimer_front, set_gm_pool_size, set_sibling_reload_source,
+    release_shared_plugin, request_shared_store_swap, requeue_lane_claimer_front, set_gm_pool_size, set_sibling_component_source, set_sibling_reload_source,
     set_side_plugin_pool_size, shared_plugin_slot_content_hashes,
     shared_plugin_slot_snapshot_without_blocking, shared_plugin_swap_pending_hashes,
     AbandonedLaneOwner, AdmissionBand, AdmissionRecord, DispatchCostClass, DispatchHandle,

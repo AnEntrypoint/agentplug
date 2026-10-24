@@ -4324,7 +4324,7 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
                 "per-root-plugin-scan",
                 |root| {
                     refresh_dispatch_wait_ledger(root);
-                    for plugin_name in read_project_plugin_list(root) {
+                    for plugin_name in std::iter::once("gm".to_string()).chain(read_project_plugin_list(root)) {
                         if plugin_compile_in_backoff(&plugin_name) {
                             continue;
                         }
@@ -4387,6 +4387,7 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
             plugin_modules.engine.clone(),
             plugin_modules.modules_with_hashes(),
         ));
+        agentplug_host::set_sibling_component_source(plugin_modules.components_for_dispatch());
 
         const COLD_SWEEP_PASS_BUDGET: Duration = Duration::from_millis(500);
         let mut cold_sweep_ran_this_tick = false;
