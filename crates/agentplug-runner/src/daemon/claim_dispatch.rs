@@ -4113,8 +4113,15 @@ pub(super) fn dispatch_project(
     } else {
         let mut gm_load_failure_reason: Option<String> = None;
         for plugin_name in &requested_plugins {
-            if project.is_loaded(plugin_name) {
+            let current = plugin_modules
+                .content_hash_of(plugin_name)
+                .map(|hash| project.is_loaded_current(plugin_name, hash))
+                .unwrap_or_else(|| project.is_loaded(plugin_name));
+            if current {
                 continue;
+            }
+            if project.is_loaded(plugin_name) {
+                eprintln!("[agentplug daemon] {plugin_name} for {}: loaded module is not the current content -- installing the current artifact over it", root.display());
             }
             let Some(install) = plugin_modules.install_into_project(project, plugin_name) else {
                 let reason = match read_plugin_compile_failure(plugin_name) {

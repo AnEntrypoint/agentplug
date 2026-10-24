@@ -3772,6 +3772,7 @@ impl PluginModules {
         }
         let component = Component::new(&self.component_engine, &bytes)
             .map_err(|e| anyhow::anyhow!("{e:#}"))?;
+        eprintln!("[agentplug daemon] compiled {plugin_name}.wasm as a component (content {}) -- the component route serves it over any loaded core module", &on_disk_hash[..12]);
         self.components
             .insert(plugin_name.to_string(), (component, on_disk_hash));
         Ok(())
