@@ -4116,7 +4116,7 @@ pub(super) fn dispatch_project(
             if project.is_loaded(plugin_name) {
                 continue;
             }
-            let Some((module, content_hash)) = plugin_modules.module_with_hash(plugin_name) else {
+            let Some(install) = plugin_modules.install_into_project(project, plugin_name) else {
                 let reason = match read_plugin_compile_failure(plugin_name) {
                     Some(compile_err) => format!("plugin {plugin_name} failed to compile/install: {compile_err}"),
                     None => format!("plugin {plugin_name} not yet compiled for {}: dispatch this thread's own get_or_compile could not run against the shared PluginModules from a worker thread -- see plugin_modules.get_or_compile() call in run_daemon's pre-chunk warm pass", root.display()),
@@ -4129,9 +4129,7 @@ pub(super) fn dispatch_project(
                 }
                 continue;
             };
-            if let Err(e) =
-                project.load_plugin(&plugin_modules.engine, plugin_name, module, content_hash)
-            {
+            if let Err(e) = install {
                 let reason = format!(
                     "failed to instantiate plugin {plugin_name} for {}: {e:#}",
                     root.display()
@@ -4301,24 +4299,19 @@ pub(super) fn dispatch_project(
 
                 {
                     let current = plugin_modules
-                        .module_with_hash(&plugin_name)
-                        .map(|(_, hash)| project.is_loaded_current(&plugin_name, hash))
+                        .content_hash_of(&plugin_name)
+                        .map(|hash| project.is_loaded_current(&plugin_name, hash))
                         .unwrap_or_else(|| project.is_loaded(&plugin_name));
                     if !current {
-                        let Some((module, content_hash)) =
-                            plugin_modules.module_with_hash(&plugin_name)
+                        let Some(install) =
+                            plugin_modules.install_into_project(project, &plugin_name)
                         else {
                             let out_name = format!("{plugin_name}-{verb}-{task}.json");
                             let out_body = serde_json::json!({"ok": false, "error": format!("plugin {plugin_name} not compiled yet for this daemon -- retry shortly")}).to_string();
                             write_pd_out(&out_name, &out_body);
                             return true;
                         };
-                        if let Err(e) = project.load_plugin(
-                            &plugin_modules.engine,
-                            &plugin_name,
-                            module,
-                            content_hash,
-                        ) {
+                        if let Err(e) = install {
                             let out_name = format!("{plugin_name}-{verb}-{task}.json");
                             let out_body = serde_json::json!({"ok": false, "error": format!("plugin instantiate failed: {e:#}")}).to_string();
                             write_pd_out(&out_name, &out_body);

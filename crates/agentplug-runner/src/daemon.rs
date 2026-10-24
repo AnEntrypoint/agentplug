@@ -9,7 +9,10 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use fs2::FileExt;
+use wasmtime::component::Component;
 use wasmtime::{Engine, Module, Trap};
+use agentplug_host::component::{build_component_engine, component_linker};
+use agentplug_host::loader::{artifact_kind, ArtifactKind, LoadedArtifact};
 
 use agentplug_host::{
     build_engine, dispatch_serial_lane, install_dir, now_ms, read_project_plugin_list,
@@ -3545,7 +3548,9 @@ fn refresh_project_heartbeats_off_loop() {
 
 struct PluginModules {
     engine: Engine,
+    component_engine: Engine,
     modules: HashMap<String, Module>,
+    components: HashMap<String, (Component, String)>,
     loaded_content_hash: HashMap<String, String>,
     last_hash_check_stat: HashMap<String, (std::time::SystemTime, u64)>,
     recompiling: HashMap<
@@ -3555,6 +3560,14 @@ struct PluginModules {
             Mutex<std::sync::mpsc::Receiver<Result<Module, String>>>,
         ),
     >,
+}
+
+fn artifact_is_component(wasm_path: &Path) -> bool {
+    let mut header = [0u8; 8];
+    std::fs::File::open(wasm_path)
+        .and_then(|mut file| std::io::Read::read_exact(&mut file, &mut header))
+        .is_ok()
+        && artifact_kind(&header).is_ok_and(|kind| kind == ArtifactKind::Component)
 }
 
 fn wasm_file_content_hash(wasm_path: &Path) -> anyhow::Result<String> {
@@ -3572,7 +3585,9 @@ impl PluginModules {
     fn new() -> anyhow::Result<Self> {
         Ok(Self {
             engine: build_engine()?,
+            component_engine: build_component_engine()?,
             modules: HashMap::new(),
+            components: HashMap::new(),
             loaded_content_hash: HashMap::new(),
             last_hash_check_stat: HashMap::new(),
             recompiling: HashMap::new(),
@@ -3660,6 +3675,10 @@ impl PluginModules {
     fn get_or_compile(&mut self, plugin_name: &str) -> anyhow::Result<()> {
         let wasm_path = ensure_plugin_installed(plugin_name, None)?;
         self.adopt_finished_recompile(plugin_name, &wasm_path)?;
+        if artifact_is_component(&wasm_path) {
+            return self.compile_component(plugin_name, &wasm_path);
+        }
+        self.components.remove(plugin_name);
         let current_stat = wasm_file_stat(&wasm_path);
         let stat_unchanged = current_stat.is_some()
             && current_stat == self.last_hash_check_stat.get(plugin_name).copied();
@@ -3729,6 +3748,72 @@ impl PluginModules {
         let module = compiled?;
         self.install_compiled(plugin_name, module, on_disk_hash, &wasm_path);
         Ok(())
+    }
+
+    fn compile_component(&mut self, plugin_name: &str, wasm_path: &Path) -> anyhow::Result<()> {
+        let current_stat = wasm_file_stat(wasm_path);
+        let stat_unchanged = current_stat.is_some()
+            && current_stat == self.last_hash_check_stat.get(plugin_name).copied();
+        if stat_unchanged && self.components.contains_key(plugin_name) {
+            return Ok(());
+        }
+        let bytes = fs::read(wasm_path)?;
+        let on_disk_hash = crate::download::sha256_hex(&bytes);
+        if let Some(stat) = current_stat {
+            self.last_hash_check_stat
+                .insert(plugin_name.to_string(), stat);
+        }
+        if self
+            .components
+            .get(plugin_name)
+            .is_some_and(|(_, loaded_hash)| loaded_hash == &on_disk_hash)
+        {
+            return Ok(());
+        }
+        let component = Component::new(&self.component_engine, &bytes)
+            .map_err(|e| anyhow::anyhow!("{e:#}"))?;
+        self.components
+            .insert(plugin_name.to_string(), (component, on_disk_hash));
+        Ok(())
+    }
+
+    fn content_hash_of(&self, plugin_name: &str) -> Option<&str> {
+        match self.components.get(plugin_name) {
+            Some((_, hash)) => Some(hash.as_str()),
+            None => self.module_with_hash(plugin_name).map(|(_, hash)| hash),
+        }
+    }
+
+    fn install_into_project(
+        &self,
+        project: &mut ProjectPlugins,
+        plugin_name: &str,
+    ) -> Option<anyhow::Result<()>> {
+        if let Some((component, content_hash)) = self.components.get(plugin_name) {
+            return Some(self.install_component_into_project(
+                project,
+                plugin_name,
+                component,
+                content_hash,
+            ));
+        }
+        let (module, content_hash) = self.module_with_hash(plugin_name)?;
+        Some(project.load_plugin(&self.engine, plugin_name, module, content_hash))
+    }
+
+    fn install_component_into_project(
+        &self,
+        project: &mut ProjectPlugins,
+        plugin_name: &str,
+        component: &Component,
+        content_hash: &str,
+    ) -> anyhow::Result<()> {
+        let linker = component_linker(&self.component_engine)?;
+        let artifact = LoadedArtifact::Component {
+            component: component.clone(),
+            linker,
+        };
+        project.load_component_hashed(&self.component_engine, plugin_name, artifact, content_hash)
     }
 
     fn module_with_hash(&self, plugin_name: &str) -> Option<(&Module, &str)> {
@@ -4718,5 +4803,35 @@ fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
                 idle_wait_ms = (idle_wait_ms.saturating_mul(2)).min(cap_ms);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod component_witness_tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "needs the wasip3 component artifact built from rs-plugkit (GM_WASIP3_COMPONENT)"]
+    fn daemon_loads_component_artifact_and_serves_health() {
+        let home = std::env::temp_dir().join(format!("agentplug-component-witness-{}", std::process::id()));
+        std::env::set_var("AGENTPLUG_HOME", &home);
+        let artifact = PathBuf::from(
+            std::env::var("GM_WASIP3_COMPONENT").expect("GM_WASIP3_COMPONENT names the rs-plugkit component"),
+        );
+        let installed = crate::download::plugin_wasm_path("gm");
+        fs::create_dir_all(installed.parent().unwrap()).unwrap();
+        fs::copy(&artifact, &installed).unwrap();
+        let mut plugin_modules = PluginModules::new().unwrap();
+        plugin_modules.get_or_compile("gm").unwrap();
+        let mut project = ProjectPlugins::new(std::env::temp_dir());
+        plugin_modules
+            .install_into_project(&mut project, "gm")
+            .expect("gm component was compiled")
+            .unwrap();
+        let reply = project.dispatch("gm", "health", "{}").unwrap();
+        let value: serde_json::Value = serde_json::from_str(&reply).unwrap();
+        assert_eq!(value["verb"], "health");
+        assert!(value["data"]["crate_version"].is_string());
+        let _ = fs::remove_dir_all(&home);
     }
 }

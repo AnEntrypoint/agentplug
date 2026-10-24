@@ -67,3 +67,4 @@ jobs:
           cargo test -p agentplug-host component_host_vec_embed_matches_core_path -- --ignored
           cargo test -p agentplug-host component_host_plugin_call_reaches_shared_gate -- --ignored
           cargo test -p agentplug-host component_host_git_layout_and_head_match_direct_git -- --ignored
+          cargo test -p agentplug-runner daemon_loads_component_artifact_and_serves_health -- --ignored

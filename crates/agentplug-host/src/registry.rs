@@ -1617,6 +1617,7 @@ pub struct ProjectPlugins {
     pub root: PathBuf,
     siblings: Arc<Mutex<HashMap<String, Arc<SharedPluginPool>>>>,
     components: HashMap<String, (Engine, LoadedArtifact)>,
+    component_hashes: HashMap<String, String>,
     pub last_active: Instant,
 }
 
@@ -1626,6 +1627,7 @@ impl ProjectPlugins {
             root,
             siblings: Arc::new(Mutex::new(HashMap::new())),
             components: HashMap::new(),
+            component_hashes: HashMap::new(),
             last_active: Instant::now(),
         }
     }
@@ -1649,6 +1651,12 @@ impl ProjectPlugins {
     }
 
     pub fn is_loaded_current(&self, plugin_name: &str, content_hash: &str) -> bool {
+        if self.components.contains_key(plugin_name) {
+            return self
+                .component_hashes
+                .get(plugin_name)
+                .is_some_and(|loaded| loaded.as_str() == content_hash);
+        }
         if is_stateless_shared_plugin(plugin_name) {
             return self.is_loaded(plugin_name);
         }
@@ -1670,11 +1678,23 @@ impl ProjectPlugins {
         plugin_name: &str,
         artifact: LoadedArtifact,
     ) -> anyhow::Result<()> {
+        self.load_component_hashed(component_engine, plugin_name, artifact, "")
+    }
+
+    pub fn load_component_hashed(
+        &mut self,
+        component_engine: &Engine,
+        plugin_name: &str,
+        artifact: LoadedArtifact,
+        content_hash: &str,
+    ) -> anyhow::Result<()> {
         if artifact.kind() != ArtifactKind::Component {
             anyhow::bail!("plugin {plugin_name} is a core module: load it with load_plugin");
         }
         self.components
             .insert(plugin_name.to_string(), (component_engine.clone(), artifact));
+        self.component_hashes
+            .insert(plugin_name.to_string(), content_hash.to_string());
         Ok(())
     }
 
