@@ -1,6 +1,7 @@
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use wasmtime::component::{Linker, ResourceTable};
@@ -15,6 +16,8 @@ use crate::imports::{
 };
 
 pub const GM_ENV_INTERFACE: &str = "gm:plugkit/env@0.1.0";
+pub const GM_GUEST_INTERFACE: &str = "gm:plugkit/guest@0.1.0";
+static COMPONENT_ENGINE: OnceLock<Engine> = OnceLock::new();
 
 const BINARY_READ_MAX_BYTES: u64 = 20 * 1024 * 1024;
 const GIT_STDOUT_CAP_BYTES: usize = 1_048_576;
@@ -52,9 +55,19 @@ impl WasiView for ComponentState {
 }
 
 pub fn build_component_engine() -> anyhow::Result<Engine> {
+    if let Some(engine) = COMPONENT_ENGINE.get() {
+        return Ok(engine.clone());
+    }
     let mut config = Config::new();
     config.wasm_component_model_async(true);
-    Engine::new(&config).map_err(|e| anyhow::anyhow!(e))
+    config.epoch_interruption(true);
+    let engine = Engine::new(&config).map_err(|e| anyhow::anyhow!(e))?;
+    let ticker = engine.clone();
+    std::thread::spawn(move || loop {
+        std::thread::sleep(Duration::from_millis(crate::EPOCH_TICK_INTERVAL_MS));
+        ticker.increment_epoch();
+    });
+    Ok(COMPONENT_ENGINE.get_or_init(|| engine).clone())
 }
 
 fn parse_json_object(text: &str) -> serde_json::Value {
@@ -572,6 +585,42 @@ pub fn component_linker(engine: &Engine) -> anyhow::Result<Linker<ComponentState
     Ok(linker)
 }
 
+pub async fn dispatch_component_verb(
+    engine: &Engine,
+    component: &wasmtime::component::Component,
+    linker: &Linker<ComponentState>,
+    plugin_name: &str,
+    cwd: &Path,
+    verb: &str,
+    body: &str,
+) -> anyhow::Result<String> {
+    let deadline_secs = crate::registry::deadline_secs_for_call(plugin_name, body);
+    let mut store = wasmtime::Store::new(engine, ComponentState::new(cwd.to_path_buf()));
+    store.set_epoch_deadline(crate::registry::epoch_ticks_for_seconds(deadline_secs));
+    let instance = linker.instantiate_async(&mut store, component).await?;
+    let guest = instance
+        .get_export_index(&mut store, None, GM_GUEST_INTERFACE)
+        .ok_or_else(|| anyhow::anyhow!("component exports no {GM_GUEST_INTERFACE} interface"))?;
+    let dispatch = instance
+        .get_export_index(&mut store, Some(&guest), "dispatch-verb")
+        .ok_or_else(|| anyhow::anyhow!("{GM_GUEST_INTERFACE} exports no dispatch-verb function"))?;
+    let dispatch_fn = instance.get_typed_func::<(&str, &str), (String,)>(&mut store, &dispatch)?;
+    let (reply,) = match dispatch_fn.call_async(&mut store, (verb, body)).await {
+        Ok(result) => result,
+        Err(e) => {
+            if matches!(e.downcast_ref::<wasmtime::Trap>(), Some(wasmtime::Trap::Interrupt)) {
+                return Err(anyhow::anyhow!("plugin_call_deadline_exceeded: {plugin_name} exceeded {deadline_secs}s executing verb {verb}"));
+            }
+            return Err(e);
+        }
+    };
+    dispatch_fn.post_return_async(&mut store).await?;
+    if reply.is_empty() {
+        return Err(anyhow::anyhow!("plugin_response_missing: {plugin_name} verb {verb} returned an empty string from the component dispatch-verb export"));
+    }
+    Ok(reply)
+}
+
 // Live feed host side: the body is JSON {"action":"start"|"status"|"stop","session":"<id>","url"?,"maxMs"?}.
 // Start takes the project's browser lease and keeps it renewed with attend_while_running for as long as the
 // node helper runs (refresh_heartbeat accepts only this process as holder, so the heartbeat lives here).
@@ -802,6 +851,30 @@ mod tests {
                 .instantiate_async(&mut store, &component)
                 .await
                 .expect("every gm:plugkit/env import must be provided by component_linker");
+        });
+    }
+
+    #[test]
+    #[ignore = "needs the wasip3 component artifact built from rs-plugkit"]
+    fn component_dispatches_health_through_registry() {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        runtime.block_on(async {
+            let path = std::env::var("GM_WASIP3_COMPONENT").map(PathBuf::from).unwrap_or_else(|_| {
+                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../../rs-plugkit/target/wasm32-wasip3/release/rs_plugkit.wasm")
+            });
+            let core_engine = crate::build_engine().unwrap();
+            let component_engine = build_component_engine().unwrap();
+            let artifact = crate::loader::load_selected_artifact(&core_engine, &component_engine, &path, "rs-plugkit", "").unwrap();
+            let reply = artifact
+                .dispatch_verb(&component_engine, "rs-plugkit", &std::env::temp_dir(), "health", "{}")
+                .await
+                .unwrap();
+            assert!(!reply.is_empty(), "health reply is empty");
+            assert!(reply.starts_with('{'), "health reply is not a JSON object: {reply}");
+            let value: serde_json::Value = serde_json::from_str(&reply).unwrap();
+            assert_eq!(value["verb"], "health");
+            assert!(value["data"]["crate_version"].is_string());
         });
     }
 }

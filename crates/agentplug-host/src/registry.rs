@@ -40,7 +40,7 @@ fn caller_supplied_deadline_secs(body: &str) -> Option<u64> {
         .map(|s| s.min(CALLER_SUPPLIED_DEADLINE_CEILING_SECS))
 }
 
-fn deadline_secs_for_call(plugin_name: &str, body: &str) -> u64 {
+pub(crate) fn deadline_secs_for_call(plugin_name: &str, body: &str) -> u64 {
     caller_supplied_deadline_secs(body).unwrap_or_else(|| dispatch_call_deadline_secs(plugin_name))
 }
 
