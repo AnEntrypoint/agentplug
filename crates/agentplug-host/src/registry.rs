@@ -7,6 +7,7 @@ use wasmtime::{Engine, Linker, Module, Store};
 
 use crate::host_state::{HostState, SiblingHandle};
 use crate::imports::{register_env_imports, register_wasi};
+use crate::loader::{ArtifactKind, LoadedArtifact};
 
 pub const PLUGIN_IDLE_EVICT_MS: u64 = 30 * 60 * 1000;
 
@@ -1594,9 +1595,28 @@ fn instantiate_plugin(
     })
 }
 
+fn block_on_component<F: std::future::Future>(future: F) -> F::Output {
+    struct ThreadWaker(std::thread::Thread);
+    impl std::task::Wake for ThreadWaker {
+        fn wake(self: Arc<Self>) {
+            self.0.unpark();
+        }
+    }
+    let waker = std::task::Waker::from(Arc::new(ThreadWaker(std::thread::current())));
+    let mut context = std::task::Context::from_waker(&waker);
+    let mut future = std::pin::pin!(future);
+    loop {
+        if let std::task::Poll::Ready(output) = std::future::Future::poll(future.as_mut(), &mut context) {
+            return output;
+        }
+        std::thread::park();
+    }
+}
+
 pub struct ProjectPlugins {
     pub root: PathBuf,
     siblings: Arc<Mutex<HashMap<String, Arc<SharedPluginPool>>>>,
+    components: HashMap<String, (Engine, LoadedArtifact)>,
     pub last_active: Instant,
 }
 
@@ -1605,11 +1625,15 @@ impl ProjectPlugins {
         Self {
             root,
             siblings: Arc::new(Mutex::new(HashMap::new())),
+            components: HashMap::new(),
             last_active: Instant::now(),
         }
     }
 
     pub fn is_loaded(&self, plugin_name: &str) -> bool {
+        if self.components.contains_key(plugin_name) {
+            return true;
+        }
         self.siblings
             .lock()
             .unwrap()
@@ -1638,6 +1662,20 @@ impl ProjectPlugins {
                     .any(|h| h.as_deref() == Some(content_hash))
             })
             .unwrap_or(false)
+    }
+
+    pub fn load_component(
+        &mut self,
+        component_engine: &Engine,
+        plugin_name: &str,
+        artifact: LoadedArtifact,
+    ) -> anyhow::Result<()> {
+        if artifact.kind() != ArtifactKind::Component {
+            anyhow::bail!("plugin {plugin_name} is a core module: load it with load_plugin");
+        }
+        self.components
+            .insert(plugin_name.to_string(), (component_engine.clone(), artifact));
+        Ok(())
     }
 
     pub fn load_plugin(
@@ -1706,6 +1744,16 @@ impl ProjectPlugins {
         self.last_active = Instant::now();
         let (routed_name, _route_lease) = resolve_routed_plugin_name(plugin_name);
         let plugin_name = routed_name.as_str();
+        if let Some((component_engine, artifact)) = self.components.get(plugin_name) {
+            return block_on_component(artifact.dispatch_verb(
+                component_engine,
+                plugin_name,
+                &self.siblings,
+                &self.root,
+                verb,
+                body,
+            ));
+        }
         const DISPATCH_LOOKUP_RETRY_ATTEMPTS: u32 = 3;
         const DISPATCH_LOOKUP_RETRY_BACKOFF_MS: u64 = 200;
         let mut pool = None;
