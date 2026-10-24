@@ -1860,13 +1860,25 @@ pub fn refresh_plugin_if_stale(plugin_name: &str) -> anyhow::Result<Option<Strin
     if plugin_asset_spec(plugin_name).is_none() {
         return Ok(None);
     }
-    let (latest, probed_sha) = match probe_latest_plugin_release(plugin_name) {
-        Ok(Some(release)) => (release.version, Some(release.sha256)),
-        _ => match fetch_latest_plugin_version_by_listing(plugin_name)? {
+    let probe_outcome = match probe_latest_plugin_release(plugin_name) {
+        Ok(Some(release)) => Some((release.version, Some(release.sha256))),
+        Ok(None) => None,
+        Err(e) => {
+            eprintln!("[agentplug daemon] plugin {plugin_name} release probe failed: {e:#} -- using the releases listing");
+            None
+        }
+    };
+    let (latest, probed_sha) = match probe_outcome {
+        Some(found) => found,
+        None => match fetch_latest_plugin_version_by_listing(plugin_name)? {
             Some(version) => (version, None),
-            None => return Ok(None),
+            None => {
+                eprintln!("[agentplug daemon] plugin {plugin_name} poll: no published release with a wasm asset; installed {installed} kept");
+                return Ok(None);
+            }
         },
     };
+    eprintln!("[agentplug daemon] plugin {plugin_name} poll: latest release {latest}, installed {installed}");
     match compare_release_semver(&latest, &installed) {
         Some(std::cmp::Ordering::Greater) => {}
         Some(std::cmp::Ordering::Equal) => {
