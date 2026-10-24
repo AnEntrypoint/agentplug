@@ -4181,10 +4181,12 @@ pub(super) fn dispatch_project(
             answer_bg_converts(bg_convert_requests);
         } else {
             for req in gm_requests {
-                let self_healing_dispatch_handle = project.dispatch_handle_with_reload(Some((
-                    plugin_modules.engine.clone(),
-                    plugin_modules.modules_with_hashes(),
-                )));
+                let self_healing_dispatch_handle = project
+                    .dispatch_handle_with_reload(Some((
+                        plugin_modules.engine.clone(),
+                        plugin_modules.modules_with_hashes(),
+                    )))
+                    .with_components(plugin_modules.components_for_dispatch());
                 let detach_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
                 let key: InFlightKey = (root.to_path_buf(), req.verb.clone(), req.task.clone());
                 let failed_spawn_key = key.clone();
