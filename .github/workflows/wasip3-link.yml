@@ -58,7 +58,9 @@ jobs:
         working-directory: rs-plugkit
         run: cargo +nightly build -p rs-plugkit --target wasm32-wasip3 --features slim,wit-env
 
-      - name: Link the component through agentplug-host (ignored link test)
+      - name: Link and dispatch the component through agentplug-host (ignored tests)
         env:
           GM_WASIP3_COMPONENT: ${{ github.workspace }}/rs-plugkit/target/wasm32-wasip3/debug/rs_plugkit.wasm
-        run: cargo test -p agentplug-host component_links_wasi_p3_and_every_env_import -- --ignored
+        run: |
+          cargo test -p agentplug-host component_links_wasi_p3_and_every_env_import -- --ignored
+          cargo test -p agentplug-host component_dispatches_health_through_registry -- --ignored

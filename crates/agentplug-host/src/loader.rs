@@ -71,6 +71,24 @@ impl LoadedArtifact {
     }
 }
 
+impl LoadedArtifact {
+    pub async fn dispatch_verb(
+        &self,
+        component_engine: &Engine,
+        plugin_name: &str,
+        cwd: &Path,
+        verb: &str,
+        body: &str,
+    ) -> anyhow::Result<String> {
+        match self {
+            LoadedArtifact::Component { component, linker } => {
+                crate::component::dispatch_component_verb(component_engine, component, linker, plugin_name, cwd, verb, body).await
+            }
+            LoadedArtifact::Core(_) => bail!("{plugin_name} is a core module, served through registry dispatch_on"),
+        }
+    }
+}
+
 pub fn load_selected_artifact(
     core_engine: &Engine,
     component_engine: &Engine,
