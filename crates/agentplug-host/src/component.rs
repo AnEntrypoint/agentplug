@@ -1,42 +1,42 @@
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 use std::sync::OnceLock;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use wasmtime::component::{Linker, ResourceTable};
 use wasmtime::{Config, Engine, StoreContextMut};
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 
 use crate::imports::{
-    atomic_cas_write_locked, atomic_write_locked, base64_encode, configure_github_git_credentials,
-    create_private_dir_all, fetch_agent, git_subprocess_timeout_ms_for, has_project_marker, kv_file_path, normalize_lexically,
-    plugin_call_capability_allowed, sandboxed_guest_path_with_extra_roots,
-    validate_plugin_call_body,
+    atomic_cas_write_locked, atomic_write_locked, base64_encode, create_private_dir_all, embed_text_via_bert, fetch_agent,
+    has_project_marker, host_git_reply, kv_file_path, normalize_lexically, plugin_call_reply, sandboxed_guest_path_with_extra_roots,
 };
+use crate::registry::SiblingPools;
 
 pub const GM_ENV_INTERFACE: &str = "gm:plugkit/env@0.1.0";
 pub const GM_GUEST_INTERFACE: &str = "gm:plugkit/guest@0.1.0";
 static COMPONENT_ENGINE: OnceLock<Engine> = OnceLock::new();
 
 const BINARY_READ_MAX_BYTES: u64 = 20 * 1024 * 1024;
-const GIT_STDOUT_CAP_BYTES: usize = 1_048_576;
-const GIT_STDERR_CAP_BYTES: usize = 262_144;
 
 pub struct ComponentState {
     ctx: WasiCtx,
     table: ResourceTable,
     cwd: PathBuf,
     extra_roots: Vec<PathBuf>,
+    plugin_name: String,
+    siblings: SiblingPools,
 }
 
 impl ComponentState {
-    pub fn new(cwd: PathBuf) -> Self {
+    pub fn new(cwd: PathBuf, plugin_name: String, siblings: SiblingPools) -> Self {
         Self {
             ctx: WasiCtxBuilder::new().build(),
             table: ResourceTable::new(),
             cwd,
             extra_roots: Vec::new(),
+            plugin_name,
+            siblings,
         }
     }
 
@@ -155,146 +155,22 @@ fn fetch(url: &str, opts_text: &str) -> serde_json::Value {
     }
 }
 
-fn run_git(root: &Path, args: &str, cwd_arg: &str) -> serde_json::Value {
-    let trimmed = args.trim();
-    let argv: Vec<String> = if trimmed.starts_with('[') {
-        serde_json::from_str::<Vec<String>>(trimmed)
-            .unwrap_or_else(|_| trimmed.split_whitespace().map(String::from).collect())
-    } else {
-        trimmed.split_whitespace().map(String::from).collect()
-    };
-    let cwd = if cwd_arg.is_empty() {
-        root.to_path_buf()
-    } else {
-        let requested = PathBuf::from(cwd_arg);
-        if requested.is_absolute() { requested } else { root.join(requested) }
-    };
-    if !cwd.is_dir() {
-        return serde_json::json!({
-            "stdout": "",
-            "stderr": format!(
-                "git cwd does not exist: {} (resolved from cwd arg {:?}) -- pass an absolute path, or a path relative to the dispatch's own working directory, not a bare project/repo name",
-                cwd.display(), cwd_arg
-            ),
-            "exit_code": -1,
-        });
-    }
-    let mut command = Command::new("git");
-    command
-        .args(&argv)
-        .current_dir(&cwd)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    configure_github_git_credentials(&mut command, &argv);
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        command.process_group(0);
-    }
-    #[cfg(windows)]
-    {
-        crate::windowless::apply_windowless(&mut command);
-    }
-    let mut child = match command.spawn() {
-        Ok(child) => child,
-        Err(e) => return serde_json::json!({"stdout": "", "stderr": e.to_string(), "exit_code": 1}),
-    };
-    let containment = match crate::process_tree::establish_containment(&child) {
-        Ok(containment) => containment,
-        Err(error) => {
-            crate::process_tree::kill_tree(child.id());
-            let _ = child.kill();
-            let _ = child.wait();
-            return serde_json::json!({
-                "stdout": "",
-                "stderr": format!("git process containment failed: {error}"),
-                "exit_code": -1,
-            });
+fn component_vec_embed(state: &ComponentState, text: &str, out_len: u32) -> (i32, Vec<f32>) {
+    match embed_text_via_bert(&state.cwd, &state.plugin_name, &state.siblings, text) {
+        Some(mut values) => {
+            values.truncate(out_len as usize);
+            (values.len() as i32, values)
         }
-    };
-    let cap_hit = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let out_handle = child.stdout.take().map(|o| crate::imports::drain_reader_capped(o, GIT_STDOUT_CAP_BYTES, cap_hit.clone()));
-    let err_handle = child.stderr.take().map(|e| crate::imports::drain_reader_capped(e, GIT_STDERR_CAP_BYTES, cap_hit.clone()));
-    let timeout_ms = git_subprocess_timeout_ms_for(&argv);
-    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
-    let mut exit_code: i32 = -1;
-    let mut timed_out = false;
-    let mut cap_stopped = false;
-    loop {
-        if cap_hit.load(std::sync::atomic::Ordering::SeqCst) {
-            crate::process_tree::terminate_containment(&containment, child.id());
-            let _ = child.wait();
-            cap_stopped = true;
-            break;
-        }
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                exit_code = status.code().unwrap_or(-1);
-                break;
-            }
-            Ok(None) => {}
-            Err(_) => break,
-        }
-        if Instant::now() >= deadline {
-            crate::process_tree::terminate_containment(&containment, child.id());
-            let _ = child.wait();
-            timed_out = true;
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(20));
+        None => (-1, Vec::new()),
     }
-    let (stdout, out_truncated) = out_handle.and_then(|h| h.join().ok()).unwrap_or_default();
-    let (stderr, err_truncated) = err_handle.and_then(|h| h.join().ok()).unwrap_or_default();
-    let output_truncated = out_truncated || err_truncated || cap_stopped;
-    let stderr = String::from_utf8_lossy(&stderr).into_owned();
-    if timed_out {
-        return serde_json::json!({
-            "stdout": String::from_utf8_lossy(&stdout),
-            "stderr": format!("git {argv:?} timed out after {timeout_ms}ms, killed"),
-            "exit_code": -1,
-        });
-    }
-    let limit_error = format!("git {argv:?} output exceeded the host capture limit");
-    serde_json::json!({
-        "stdout": String::from_utf8_lossy(&stdout),
-        "stderr": if output_truncated {
-            if stderr.is_empty() { limit_error } else { format!("{stderr}\n{limit_error}") }
-        } else {
-            stderr
-        },
-        "exit_code": if output_truncated { -1 } else { exit_code },
-        "stdout_truncated": out_truncated,
-        "stderr_truncated": err_truncated,
-    })
 }
 
-fn is_well_formed_plugin_name(name: &str) -> bool {
-    !name.is_empty()
-        && name.len() <= 64
-        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+fn component_plugin_call(state: &ComponentState, plugin: &str, verb: &str, body: &str) -> String {
+    plugin_call_reply(&state.cwd, &state.plugin_name, &state.siblings, plugin, verb, body)
 }
 
-fn is_well_formed_verb(verb: &str) -> bool {
-    !verb.is_empty()
-        && verb.len() <= 128
-        && verb.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
-}
-
-fn plugin_call_reply(store_cwd: &Path, plugin: &str, verb: &str, body: &str) -> serde_json::Value {
-    if !is_well_formed_plugin_name(plugin) {
-        return serde_json::json!({"ok": false, "error": "invalid_plugin_name", "plugin": plugin});
-    }
-    if !is_well_formed_verb(verb) {
-        return serde_json::json!({"ok": false, "error": "invalid_verb", "verb": verb});
-    }
-    if let Err(reason) = validate_plugin_call_body(body) {
-        return serde_json::json!({"ok": false, "error": "invalid_body", "reason": reason});
-    }
-    if !plugin_call_capability_allowed(store_cwd, "", plugin) {
-        return serde_json::json!({"ok": false, "error": "capability_denied", "caller": "", "plugin": plugin});
-    }
-    serde_json::json!({"ok": false, "error": "unknown_plugin", "plugin": plugin})
+fn component_git(state: &ComponentState, args: &str, cwd_arg: &str) -> serde_json::Value {
+    host_git_reply(&state.cwd, args, cwd_arg)
 }
 
 pub fn component_linker(engine: &Engine) -> anyhow::Result<Linker<ComponentState>> {
@@ -491,8 +367,8 @@ pub fn component_linker(engine: &Engine) -> anyhow::Result<Linker<ComponentState
     )?;
     env.func_wrap(
         "host-vec-embed",
-        |_: StoreContextMut<'_, ComponentState>, (_text, _out_len): (String, u32)| {
-            Ok(((-1i32, Vec::<f32>::new()),))
+        |store: StoreContextMut<'_, ComponentState>, (text, out_len): (String, u32)| {
+            Ok((component_vec_embed(store.data(), &text, out_len),))
         },
     )?;
     env.func_wrap(
@@ -550,15 +426,15 @@ pub fn component_linker(engine: &Engine) -> anyhow::Result<Linker<ComponentState
     env.func_wrap(
         "host-git",
         |store: StoreContextMut<'_, ComponentState>, (args, cwd_arg): (String, String)| {
-            let reply = run_git(&store.data().cwd, &args, &cwd_arg);
+            let reply = component_git(store.data(), &args, &cwd_arg);
             Ok((Some(reply.to_string()),))
         },
     )?;
     env.func_wrap(
         "host-plugin-call",
         |store: StoreContextMut<'_, ComponentState>, (plugin, verb, body): (String, String, String)| {
-            let reply = plugin_call_reply(&store.data().cwd, &plugin, &verb, &body);
-            Ok((Some(reply.to_string()),))
+            let reply = component_plugin_call(store.data(), &plugin, &verb, &body);
+            Ok((Some(reply),))
         },
     )?;
     env.func_wrap(
@@ -590,12 +466,13 @@ pub async fn dispatch_component_verb(
     component: &wasmtime::component::Component,
     linker: &Linker<ComponentState>,
     plugin_name: &str,
+    siblings: &SiblingPools,
     cwd: &Path,
     verb: &str,
     body: &str,
 ) -> anyhow::Result<String> {
     let deadline_secs = crate::registry::deadline_secs_for_call(plugin_name, body);
-    let mut store = wasmtime::Store::new(engine, ComponentState::new(cwd.to_path_buf()));
+    let mut store = wasmtime::Store::new(engine, ComponentState::new(cwd.to_path_buf(), plugin_name.to_string(), siblings.clone()));
     store.set_epoch_deadline(crate::registry::epoch_ticks_for_seconds(deadline_secs));
     let instance = linker.instantiate_async(&mut store, component).await?;
     let guest = instance
@@ -845,7 +722,7 @@ mod tests {
             let engine = build_component_engine().unwrap();
             let component = Component::from_file(&engine, &path).unwrap();
             let linker = component_linker(&engine).unwrap();
-            let mut store = Store::new(&engine, ComponentState::new(std::env::temp_dir()));
+            let mut store = Store::new(&engine, ComponentState::new(std::env::temp_dir(), "gm".to_string(), new_sibling_pools()));
             store.set_epoch_deadline(crate::registry::epoch_ticks_for_seconds(crate::registry::DISPATCH_CALL_DEADLINE_SECS));
             linker
                 .instantiate_async(&mut store, &component)
@@ -867,7 +744,7 @@ mod tests {
             let component_engine = build_component_engine().unwrap();
             let artifact = crate::loader::load_selected_artifact(&core_engine, &component_engine, &path, "rs-plugkit", "").unwrap();
             let reply = artifact
-                .dispatch_verb(&component_engine, "rs-plugkit", &std::env::temp_dir(), "health", "{}")
+                .dispatch_verb(&component_engine, "rs-plugkit", &new_sibling_pools(), &std::env::temp_dir(), "health", "{}")
                 .await
                 .unwrap();
             assert!(!reply.is_empty(), "health reply is empty");
@@ -877,4 +754,64 @@ mod tests {
             assert!(value["data"]["crate_version"].is_string());
         });
     }
+
+    fn new_sibling_pools() -> crate::registry::SiblingPools {
+        std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()))
+    }
+
+    #[test]
+    #[ignore = "component host-vec-embed answers as the core embed does in this environment"]
+    fn component_host_vec_embed_matches_core_path() {
+        let siblings = new_sibling_pools();
+        let state = ComponentState::new(std::env::temp_dir(), "gm".to_string(), siblings.clone());
+        let (code, values) = component_vec_embed(&state, "parity probe", 384);
+        match crate::imports::embed_text_via_bert(&state.cwd, "gm", &siblings, "parity probe") {
+            None => {
+                assert_eq!(code, -1);
+                assert!(values.is_empty());
+            }
+            Some(core_values) => {
+                let dim = core_values.len().min(384);
+                assert!(dim > 0, "core embed returned an empty vector");
+                assert_eq!(code as usize, dim);
+                assert_eq!(values.len(), dim);
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "component host-plugin-call reaches the shared gate; CI loads no sibling plugin"]
+    fn component_host_plugin_call_reaches_shared_gate() {
+        let siblings = new_sibling_pools();
+        let gm = ComponentState::new(std::env::temp_dir(), "gm".to_string(), siblings.clone());
+        let unloaded: serde_json::Value = serde_json::from_str(&component_plugin_call(&gm, "bert", "embed", "{}")).unwrap();
+        assert_eq!(unloaded["error"], "unknown_plugin", "{unloaded}");
+        let outsider = ComponentState::new(std::env::temp_dir(), "rs-plugkit".to_string(), siblings.clone());
+        let denied: serde_json::Value = serde_json::from_str(&component_plugin_call(&outsider, "bert", "embed", "{}")).unwrap();
+        assert_eq!(denied["error"], "capability_denied", "{denied}");
+        let malformed: serde_json::Value = serde_json::from_str(&component_plugin_call(&gm, "bad name", "embed", "{}")).unwrap();
+        assert_eq!(malformed["error"], "invalid_plugin_name", "{malformed}");
+    }
+
+    #[test]
+    #[ignore = "component host-git answers layout and HEAD as direct git does on the checkout"]
+    fn component_host_git_layout_and_head_match_direct_git() {
+        let root = std::fs::canonicalize(Path::new(env!("CARGO_MANIFEST_DIR")).join("../.."))
+            .expect("checkout root resolves");
+        let state = ComponentState::new(root.clone(), "gm".to_string(), new_sibling_pools());
+        for args in ["rev-parse --show-toplevel", "rev-parse HEAD"] {
+            let direct = std::process::Command::new("git")
+                .args(args.split_whitespace())
+                .current_dir(&root)
+                .output()
+                .expect("git runs");
+            let expected = String::from_utf8_lossy(&direct.stdout).into_owned();
+            for _ in 0..2 {
+                let reply = component_git(&state, args, "");
+                assert_eq!(reply["exit_code"], 0, "{reply}");
+                assert_eq!(reply["stdout"].as_str(), Some(expected.as_str()), "{reply}");
+            }
+        }
+    }
+
 }
