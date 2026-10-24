@@ -18,19 +18,75 @@ async function getJson(path, method = 'GET') {
   return res.json();
 }
 
-// One browser per project shares one tab: the persisted session tab if it is still open, else any open page.
-// A new tab is created only when the browser has no page at all.
-async function acquireTarget(targetId) {
+// One browser per project shares one tab: the persisted session tab if it is still open, else any open page
+// that is not an isolated session's page. A new tab is created only when the browser has no shared page at all.
+async function acquireTarget(targetId, isolatedIds) {
   const list = await getJson('/json/list');
   if (Array.isArray(list)) {
     const same = targetId && list.find((t) => t.id === targetId && t.webSocketDebuggerUrl);
     if (same) return same;
-    const page = list.find((t) => t.type === 'page' && t.webSocketDebuggerUrl);
+    const page = list.find((t) => t.type === 'page' && t.webSocketDebuggerUrl && !isolatedIds.has(t.id));
     if (page) return page;
   }
   const created = await getJson('/json/new?about:blank', 'PUT');
   if (!created.webSocketDebuggerUrl) throw new Error('the endpoint created a target without webSocketDebuggerUrl');
   return { ...created, created: true };
+}
+
+function isolatedTargetIds(dir) {
+  const ids = new Set();
+  let names = [];
+  try { names = fs.readdirSync(dir); } catch (_) { return ids; }
+  for (const name of names) {
+    if (!name.endsWith('.json')) continue;
+    try {
+      const state = JSON.parse(fs.readFileSync(path.join(dir, name), 'utf8'));
+      if (state.isolated && state.targetId) ids.add(state.targetId);
+    } catch (_) {}
+  }
+  return ids;
+}
+
+async function createIsolatedPage(browser, contextId) {
+  if (contextId) {
+    try {
+      const { targetId } = await browser.send('Target.createTarget', { url: 'about:blank', browserContextId: contextId });
+      return { browserContextId: contextId, targetId };
+    } catch (_) {}
+  }
+  const { browserContextId } = await browser.send('Target.createBrowserContext', { disposeOnDetach: false });
+  const { targetId } = await browser.send('Target.createTarget', { url: 'about:blank', browserContextId });
+  return { browserContextId, targetId };
+}
+
+async function awaitPageTarget(targetId) {
+  for (let attempt = 0; attempt < 50; attempt++) {
+    const list = await getJson('/json/list');
+    const found = Array.isArray(list) && list.find((t) => t.id === targetId && t.webSocketDebuggerUrl);
+    if (found) return found;
+    await sleep(100);
+  }
+  throw new Error(`target ${targetId} did not appear in the endpoint target list`);
+}
+
+// An isolated session owns a page in its own browser context (separate cookies and localStorage). It reuses
+// that page while it is open, otherwise opens a new page in the same context, or in a new context.
+async function acquireIsolatedTarget(persisted) {
+  if (persisted && persisted.isolated && persisted.targetId) {
+    const list = await getJson('/json/list');
+    const same = Array.isArray(list) && list.find((t) => t.id === persisted.targetId && t.webSocketDebuggerUrl);
+    if (same) return { ...same, created: false, isolated: true, browserContextId: persisted.browserContextId || null };
+  }
+  const version = await getJson('/json/version');
+  if (!version.webSocketDebuggerUrl) throw new Error('the endpoint has no browser websocket for isolated pages');
+  const browser = await openSession(version.webSocketDebuggerUrl, 5000);
+  try {
+    const page = await createIsolatedPage(browser, persisted && persisted.isolated ? persisted.browserContextId : null);
+    const target = await awaitPageTarget(page.targetId);
+    return { ...target, created: true, isolated: true, browserContextId: page.browserContextId };
+  } finally {
+    browser.close();
+  }
 }
 
 async function closeHttpTarget(id) {
@@ -200,7 +256,13 @@ async function main() {
     }
     if (cfg.session && ctx && out.targetId && !closedByStep) {
       try {
-        writeSessionFile(cfg.session.file, { version: SESSION_VERSION, targetId: out.targetId, ...snapshotUidState(ctx) });
+        writeSessionFile(cfg.session.file, {
+          version: SESSION_VERSION,
+          targetId: out.targetId,
+          isolated: out.tab.isolated,
+          browserContextId: out.tab.browserContextId,
+          ...snapshotUidState(ctx),
+        });
       } catch (e) {
         out.ok = false;
         out.error = out.error || `session state was not saved: ${e.message}`;
@@ -223,9 +285,18 @@ async function main() {
       unlock = await lockSession(cfg.session.file, cfg.lockWaitMs || SESSION_LOCK_WAIT_MS);
       persisted = readSessionFile(cfg.session.file);
     }
-    const target = await acquireTarget((persisted && persisted.targetId) || cfg.targetId);
+    const wantsIsolation = !!(cfg.session && cfg.session.isolated);
+    const isolatedIds = isolatedTargetIds(path.join(cfg.cwd || safeCwd(), '.gm', 'browser-cdp-sessions'));
+    const target = wantsIsolation
+      ? await acquireIsolatedTarget(persisted)
+      : await acquireTarget((persisted && persisted.targetId) || cfg.targetId, isolatedIds);
     out.targetId = target.id;
-    out.tab = { targetId: target.id, state: target.created ? 'opened' : 'reused', url: null };
+    const isolation = target.isolated
+      ? { isolated: true, browserContextId: target.browserContextId }
+      : persisted && persisted.isolated && persisted.targetId === target.id
+        ? { isolated: true, browserContextId: persisted.browserContextId || null }
+        : { isolated: false, browserContextId: null };
+    out.tab = { targetId: target.id, state: target.created ? 'opened' : 'reused', url: null, ...isolation };
     const page = await openSession(target.webSocketDebuggerUrl, 5000);
     close = () => page.close();
     session = page;

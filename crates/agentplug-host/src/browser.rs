@@ -286,6 +286,7 @@ impl Expectation {
 
 pub struct CdpBrowser {
     pub session: Option<String>,
+    pub isolated: bool,
     pub steps: Vec<Value>,
     pub headful: bool,
     pub expect: Expectation,
@@ -300,6 +301,7 @@ const TOOL_STEP_GRAMMAR: &str ="snapshot, click=<uid>, dblclick=<uid>, hover=<ui
 
 pub fn parse_cdp_browser_body(body: &str) -> Result<CdpBrowser, String> {
     let mut session = None;
+    let mut isolated = false;
     let headful = true;
     let mut expect = Expectation::default();
     let mut timeout = None;
@@ -332,6 +334,18 @@ pub fn parse_cdp_browser_body(body: &str) -> Result<CdpBrowser, String> {
                 }
                 session =
                     Some(session_name(value.trim()).map_err(|e| format!("line {number}: {e}"))?);
+                continue;
+            }
+            if let Some(value) = line.strip_prefix("isolated=") {
+                isolated = match value.trim() {
+                    "true" => true,
+                    "false" => false,
+                    other => {
+                        return Err(format!(
+                            "line {number}: isolated must be true or false, got '{other}'"
+                        ))
+                    }
+                };
                 continue;
             }
             if let Some(value) = line.strip_prefix("expect=") {
@@ -373,8 +387,15 @@ pub fn parse_cdp_browser_body(body: &str) -> Result<CdpBrowser, String> {
                 .to_string(),
         );
     }
+    if isolated && session.is_none() {
+        return Err(
+            "isolated=true needs session=<name>: the isolated page is kept in that session's state"
+                .to_string(),
+        );
+    }
     Ok(CdpBrowser {
         session,
+        isolated,
         steps,
         headful,
         expect,
@@ -1084,7 +1105,7 @@ pub fn browser_cdp(cwd: &Path, body: &str) -> Value {
         None,
         &parsed.steps,
         budget,
-        cdp_run_config(cwd, parsed.session.as_deref(), budget),
+        cdp_run_config(cwd, parsed.session.as_deref(), parsed.isolated, budget),
     );
     drop(attendance);
     let mut reply = match run {
@@ -1400,7 +1421,7 @@ fn check_expectations(
     }
 }
 
-fn cdp_run_config(cwd: &Path, session: Option<&str>, budget: Duration) -> Value {
+fn cdp_run_config(cwd: &Path, session: Option<&str>, isolated: bool, budget: Duration) -> Value {
     let mut config = json!({
         "cwd": cwd.display().to_string(),
         "watchdogMs": (budget.as_millis() as u64).saturating_sub(10_000),
@@ -1410,6 +1431,7 @@ fn cdp_run_config(cwd: &Path, session: Option<&str>, budget: Duration) -> Value 
         config["session"] = json!({
             "name": name,
             "file": session_file(cwd, name).display().to_string(),
+            "isolated": isolated,
         });
     }
     config
