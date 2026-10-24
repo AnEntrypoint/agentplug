@@ -3980,6 +3980,12 @@ fn plugin_failure_first_seen(plugin_name: &str, root: &std::path::Path) -> bool 
         .unwrap_or(true)
 }
 
+fn update_poll_targets() -> Vec<String> {
+    let mut names: std::collections::BTreeSet<String> = POOL_NAMES.iter().map(|name| name.to_string()).collect();
+    names.extend(loaded_plugin_versions().lock().unwrap_or_else(|e| e.into_inner()).keys().cloned());
+    names.into_iter().collect()
+}
+
 fn spawn_update_poll_worker(
     daemon_cfg: DaemonConfig,
 ) -> std::sync::mpsc::Receiver<(PathBuf, String)> {
@@ -4017,7 +4023,7 @@ fn spawn_update_poll_worker(
                 write_persisted_poll_ts(&persisted_plugin_poll_ts_path(), poll_ts);
                 let targets: Vec<String> = match &forced_refresh_request {
                     Some(Some(name)) => vec![name.clone()],
-                    _ => loaded_plugin_versions().lock().unwrap_or_else(|e| e.into_inner()).keys().cloned().collect(),
+                    _ => update_poll_targets(),
                 };
                 let mut cycle_errors: Vec<String> = Vec::new();
                 for plugin_name in targets {
