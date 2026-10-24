@@ -1644,12 +1644,27 @@ fn instantiate_plugin(
     })
 }
 
-fn block_on_component<F: std::future::Future>(future: F) -> F::Output {
-    let runtime = tokio::runtime::Builder::new_current_thread()
+fn block_on_component<F>(future: F) -> F::Output
+where
+    F: std::future::Future + Send,
+    F::Output: Send,
+{
+    if tokio::runtime::Handle::try_current().is_err() {
+        return component_runtime().block_on(future);
+    }
+    std::thread::scope(|scope| {
+        scope
+            .spawn(|| component_runtime().block_on(future))
+            .join()
+            .unwrap_or_else(|payload| std::panic::resume_unwind(payload))
+    })
+}
+
+fn component_runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .expect("tokio runtime for wasip3 component dispatch");
-    runtime.block_on(future)
+        .expect("tokio runtime for wasip3 component dispatch")
 }
 
 pub struct ProjectPlugins {
