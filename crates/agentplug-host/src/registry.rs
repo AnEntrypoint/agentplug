@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+use wasmtime::component::Component;
 use wasmtime::{Engine, Linker, Module, Store};
 
 use crate::host_state::{HostState, SiblingHandle};
@@ -1412,6 +1413,7 @@ pub fn ensure_sibling_registered(root: &Path, plugin_name: &str, siblings: &Sibl
         root: root.to_path_buf(),
         siblings: siblings.clone(),
         reload_source: Some(source.as_ref().clone()),
+        components: None,
     };
     let _ = handle.reinstantiate_plugin_into_pool_slot_if_reload_source_available(plugin_name);
     siblings
@@ -1891,6 +1893,7 @@ impl ProjectPlugins {
             root: self.root.clone(),
             siblings: self.siblings.clone(),
             reload_source,
+            components: None,
         }
     }
 
@@ -1899,6 +1902,7 @@ impl ProjectPlugins {
             root: self.root.clone(),
             siblings: self.siblings.clone(),
             reload_source: None,
+            components: None,
         }
     }
 }
@@ -1908,9 +1912,32 @@ pub struct DispatchHandle {
     root: PathBuf,
     siblings: Arc<Mutex<HashMap<String, Arc<SharedPluginPool>>>>,
     reload_source: Option<(Engine, HashMap<String, (Module, String)>)>,
+    components: Option<(Engine, HashMap<String, Component>)>,
 }
 
 impl DispatchHandle {
+    pub fn with_components(mut self, source: (Engine, HashMap<String, Component>)) -> Self {
+        self.components = Some(source);
+        self
+    }
+
+    fn component_artifact(
+        &self,
+        plugin_name: &str,
+    ) -> anyhow::Result<Option<(Engine, LoadedArtifact)>> {
+        let Some((component_engine, components)) = self.components.as_ref() else {
+            return Ok(None);
+        };
+        let Some(component) = components.get(plugin_name).cloned() else {
+            return Ok(None);
+        };
+        let linker = crate::component::component_linker(component_engine)?;
+        Ok(Some((
+            component_engine.clone(),
+            LoadedArtifact::Component { component, linker },
+        )))
+    }
+
     fn reinstantiate_plugin_into_pool_slot_if_reload_source_available(
         &self,
         plugin_name: &str,
@@ -1967,6 +1994,16 @@ impl DispatchHandle {
     pub fn dispatch(&self, plugin_name: &str, verb: &str, body: &str) -> anyhow::Result<String> {
         let (routed_name, _route_lease) = resolve_routed_plugin_name(plugin_name);
         let plugin_name = routed_name.as_str();
+        if let Some((component_engine, artifact)) = self.component_artifact(plugin_name)? {
+            return block_on_component(artifact.dispatch_verb(
+                &component_engine,
+                plugin_name,
+                &self.siblings,
+                &self.root,
+                verb,
+                body,
+            ));
+        }
         const REGISTRATION_LOOKUP_RETRY_ATTEMPTS: u32 = 3;
         const REGISTRATION_LOOKUP_RETRY_BACKOFF_MS: u64 = 200;
         let mut pool = None;

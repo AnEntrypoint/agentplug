@@ -3832,6 +3832,15 @@ impl PluginModules {
             })
             .collect()
     }
+
+    fn components_for_dispatch(&self) -> (Engine, HashMap<String, Component>) {
+        let components = self
+            .components
+            .iter()
+            .map(|(name, (component, _))| (name.clone(), component.clone()))
+            .collect();
+        (self.component_engine.clone(), components)
+    }
 }
 
 mod claim_dispatch;
