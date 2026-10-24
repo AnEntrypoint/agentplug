@@ -609,7 +609,7 @@ fn append_ledger_entry(existing: &str, entry: &str) -> Option<String> {
         };
     }
     if trimmed.starts_with('{') {
-        return Some(format!("{trimmed}\n{entry}"));
+        return Some(format!("{trimmed}\n{entry}\n"));
     }
     None
 }
