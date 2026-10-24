@@ -734,25 +734,21 @@ mod tests {
     #[test]
     #[ignore = "needs the wasip3 component artifact built from rs-plugkit"]
     fn component_dispatches_health_through_registry() {
-        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-        runtime.block_on(async {
-            let path = std::env::var("GM_WASIP3_COMPONENT").map(PathBuf::from).unwrap_or_else(|_| {
-                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                    .join("../../../rs-plugkit/target/wasm32-wasip3/release/rs_plugkit.wasm")
-            });
-            let core_engine = crate::build_engine().unwrap();
-            let component_engine = build_component_engine().unwrap();
-            let artifact = crate::loader::load_selected_artifact(&core_engine, &component_engine, &path, "rs-plugkit", "").unwrap();
-            let reply = artifact
-                .dispatch_verb(&component_engine, "rs-plugkit", &new_sibling_pools(), &std::env::temp_dir(), "health", "{}")
-                .await
-                .unwrap();
-            assert!(!reply.is_empty(), "health reply is empty");
-            assert!(reply.starts_with('{'), "health reply is not a JSON object: {reply}");
-            let value: serde_json::Value = serde_json::from_str(&reply).unwrap();
-            assert_eq!(value["verb"], "health");
-            assert!(value["data"]["crate_version"].is_string());
+        let path = std::env::var("GM_WASIP3_COMPONENT").map(PathBuf::from).unwrap_or_else(|_| {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../../rs-plugkit/target/wasm32-wasip3/release/rs_plugkit.wasm")
         });
+        let core_engine = crate::build_engine().unwrap();
+        let component_engine = build_component_engine().unwrap();
+        let artifact = crate::loader::load_selected_artifact(&core_engine, &component_engine, &path, "rs-plugkit", "").unwrap();
+        let mut project = crate::registry::ProjectPlugins::new(std::env::temp_dir());
+        project.load_component(&component_engine, "rs-plugkit", artifact).unwrap();
+        let reply = project.dispatch("rs-plugkit", "health", "{}").unwrap();
+        assert!(!reply.is_empty(), "health reply is empty");
+        assert!(reply.starts_with('{'), "health reply is not a JSON object: {reply}");
+        let value: serde_json::Value = serde_json::from_str(&reply).unwrap();
+        assert_eq!(value["verb"], "health");
+        assert!(value["data"]["crate_version"].is_string());
     }
 
     fn new_sibling_pools() -> crate::registry::SiblingPools {
