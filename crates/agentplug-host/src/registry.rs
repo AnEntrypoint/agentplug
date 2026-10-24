@@ -1645,21 +1645,11 @@ fn instantiate_plugin(
 }
 
 fn block_on_component<F: std::future::Future>(future: F) -> F::Output {
-    struct ThreadWaker(std::thread::Thread);
-    impl std::task::Wake for ThreadWaker {
-        fn wake(self: Arc<Self>) {
-            self.0.unpark();
-        }
-    }
-    let waker = std::task::Waker::from(Arc::new(ThreadWaker(std::thread::current())));
-    let mut context = std::task::Context::from_waker(&waker);
-    let mut future = std::pin::pin!(future);
-    loop {
-        if let std::task::Poll::Ready(output) = std::future::Future::poll(future.as_mut(), &mut context) {
-            return output;
-        }
-        std::thread::park();
-    }
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime for wasip3 component dispatch");
+    runtime.block_on(future)
 }
 
 pub struct ProjectPlugins {
