@@ -6,6 +6,7 @@ use wasmtime::component::{Component, Linker};
 use wasmtime::{Engine, Module};
 
 use crate::component::{component_linker, ComponentState};
+use crate::registry::SiblingPools;
 use crate::precompiled::load_module_file_backed;
 
 const WASM_MAGIC: [u8; 4] = *b"\0asm";
@@ -76,13 +77,14 @@ impl LoadedArtifact {
         &self,
         component_engine: &Engine,
         plugin_name: &str,
+        siblings: &SiblingPools,
         cwd: &Path,
         verb: &str,
         body: &str,
     ) -> anyhow::Result<String> {
         match self {
             LoadedArtifact::Component { component, linker } => {
-                crate::component::dispatch_component_verb(component_engine, component, linker, plugin_name, cwd, verb, body).await
+                crate::component::dispatch_component_verb(component_engine, component, linker, plugin_name, siblings, cwd, verb, body).await
             }
             LoadedArtifact::Core(_) => bail!("{plugin_name} is a core module, served through registry dispatch_on"),
         }

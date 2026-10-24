@@ -64,3 +64,6 @@ jobs:
         run: |
           cargo test -p agentplug-host component_links_wasi_p3_and_every_env_import -- --ignored
           cargo test -p agentplug-host component_dispatches_health_through_registry -- --ignored
+          cargo test -p agentplug-host component_host_vec_embed_matches_core_path -- --ignored
+          cargo test -p agentplug-host component_host_plugin_call_reaches_shared_gate -- --ignored
+          cargo test -p agentplug-host component_host_git_layout_and_head_match_direct_git -- --ignored
