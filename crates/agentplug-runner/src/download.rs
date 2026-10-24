@@ -1610,6 +1610,7 @@ fn probe_latest_asset(repo: &str, asset: &str) -> anyhow::Result<Option<(String,
         .unwrap_or(0);
     if now_secs < backoff_until {
         if let Some(hit) = cached_release.clone() {
+            eprintln!("[agentplug probe] {repo}/{asset}: rate-limited, serving cached release {} for {}s more", hit.0, backoff_until - now_secs);
             return Ok(Some(hit));
         }
     }
@@ -1624,6 +1625,7 @@ fn probe_latest_asset(repo: &str, asset: &str) -> anyhow::Result<Option<(String,
             // Anonymous or rate-limited: hold off until the reset header and serve the cached release meanwhile.
             let reset = resp.header("x-ratelimit-reset").and_then(|v| v.parse::<u64>().ok());
             let until = reset.unwrap_or(now_secs + 600).max(now_secs + 60);
+            eprintln!("[agentplug probe] {repo}/{asset}: HTTP {code}, backing off until unix {until}s before probing again");
             let mut record = cached.clone().unwrap_or_else(|| serde_json::json!({}));
             if let Some(object) = record.as_object_mut() {
                 object.insert("backoff_until_secs".to_string(), serde_json::json!(until));
@@ -1641,6 +1643,7 @@ fn probe_latest_asset(repo: &str, asset: &str) -> anyhow::Result<Option<(String,
     };
     if response.status() == 304 {
         if let Some(hit) = cached_release.clone() {
+            eprintln!("[agentplug probe] {repo}/{asset}: etag unchanged, serving cached release {}", hit.0);
             return Ok(Some(hit));
         }
     }
