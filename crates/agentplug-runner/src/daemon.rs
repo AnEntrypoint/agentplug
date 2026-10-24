@@ -1815,36 +1815,24 @@ mod staged_binary_self_check_tests {
     }
 }
 
-fn staged_binary_self_check(staged_exe: &Path, expected_version: &str) -> bool {
+fn staged_binary_self_check(staged_exe: &Path, expected_version: &str) -> Result<(), String> {
     let mut cmd = std::process::Command::new(staged_exe);
     cmd.arg("--version");
     agentplug_host::apply_windowless(&mut cmd);
-    let output = cmd.output();
-    match output {
+    match cmd.output() {
         Ok(out) if out.status.success() => {
             let text = String::from_utf8_lossy(&out.stdout);
             if staged_version_output_matches(&text, expected_version) {
-                true
+                Ok(())
             } else {
-                eprintln!(
-                    "[agentplug daemon] staged binary {} --version printed {:?}, expected to contain {expected_version} -- refusing handoff",
-                    staged_exe.display(), text.trim()
-                );
-                false
+                Err(format!(
+                    "--version printed {:?}, expected agentplug-runner {expected_version}",
+                    text.trim()
+                ))
             }
         }
-        Ok(out) => {
-            eprintln!(
-                "[agentplug daemon] staged binary {} --version exited with {} -- refusing handoff",
-                staged_exe.display(),
-                out.status
-            );
-            false
-        }
-        Err(e) => {
-            eprintln!("[agentplug daemon] staged binary {} --version failed to spawn: {e} -- refusing handoff", staged_exe.display());
-            false
-        }
+        Ok(out) => Err(format!("--version exited with {}", out.status)),
+        Err(e) => Err(format!("--version failed to spawn: {e}")),
     }
 }
 
@@ -1946,11 +1934,15 @@ fn attempt_self_update_handoff(staged_exe: &Path, version: &str) -> bool {
         record_handoff_failure(version, reason);
         return false;
     }
-    if !staged_binary_self_check(staged_exe, version) {
+    if let Err(reason) = staged_binary_self_check(staged_exe, version) {
+        eprintln!(
+            "[agentplug daemon] staged binary {} self-check for {version} refused: {reason} -- refusing handoff",
+            staged_exe.display()
+        );
         let _ = fs::remove_file(staged_exe);
         record_handoff_failure(
             version,
-            format!("staged_binary_self_check failed for {version}, staged exe removed"),
+            format!("staged_binary_self_check failed for {version}: {reason}; staged exe removed"),
         );
         return false;
     }
@@ -2343,12 +2335,60 @@ fn exe_reported_runner_version(exe: &Path) -> Option<String> {
     }
 }
 
+#[derive(PartialEq, Eq)]
+struct ExeStamp {
+    path: PathBuf,
+    len: u64,
+    modified_ns: u128,
+}
+
+fn exe_stamp(path: &Path) -> Option<ExeStamp> {
+    let meta = fs::metadata(path).ok()?;
+    let modified_ns = meta
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_nanos();
+    Some(ExeStamp {
+        path: path.to_path_buf(),
+        len: meta.len(),
+        modified_ns,
+    })
+}
+
+/// (sha256 of the exe bytes, version the exe reports for --version) for the exe at `path`.
+/// Both are re-derived only when the exe's path, length or mtime changes, so a swap on disk
+/// is seen by the next status write without hashing or spawning the exe on every heartbeat.
+fn live_exe_probe(path: &Path) -> (Option<String>, Option<String>) {
+    static SLOT: OnceLock<Mutex<Option<(ExeStamp, (Option<String>, Option<String>))>>> =
+        OnceLock::new();
+    let slot = SLOT.get_or_init(|| Mutex::new(None));
+    let Some(stamp) = exe_stamp(path) else {
+        return (None, None);
+    };
+    let mut cached = slot.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((seen, probe)) = cached.as_ref() {
+        if *seen == stamp {
+            return probe.clone();
+        }
+    }
+    let probe = (
+        fs::read(path)
+            .ok()
+            .map(|bytes| crate::download::sha256_hex(&bytes)),
+        exe_reported_runner_version(path),
+    );
+    *cached = Some((stamp, probe.clone()));
+    probe
+}
+
 fn probe_runner_version_parity() -> RunnerVersionParity {
     let exe = canonical_runner_exe_path();
-    let sha256 = exe
-        .as_ref()
-        .and_then(|p| fs::read(p).ok())
-        .map(|b| crate::download::sha256_hex(&b));
+    let (sha256, exe_reported_version) = match exe.as_deref() {
+        Some(path) => live_exe_probe(path),
+        None => (None, None),
+    };
     let pinned_local_build_sha256 = crate::download::local_build_pin_record()
         .as_ref()
         .and_then(|v| v.get("sha256"))
@@ -2357,7 +2397,7 @@ fn probe_runner_version_parity() -> RunnerVersionParity {
     RunnerVersionParity {
         exe: exe.as_ref().map(|p| p.display().to_string()),
         sha256,
-        exe_reported_version: exe.as_ref().and_then(|p| exe_reported_runner_version(p)),
+        exe_reported_version,
         compiled_version: env!("CARGO_PKG_VERSION").to_string(),
         installed_version_file: installed_runner_version(),
         recorded_swap_version: read_recorded_swap_field("version"),
@@ -2447,9 +2487,8 @@ impl RunnerVersionParity {
     }
 }
 
-fn runner_version_parity() -> &'static RunnerVersionParity {
-    static SLOT: OnceLock<RunnerVersionParity> = OnceLock::new();
-    SLOT.get_or_init(probe_runner_version_parity)
+fn runner_version_parity() -> RunnerVersionParity {
+    probe_runner_version_parity()
 }
 
 fn runner_version_parity_json() -> serde_json::Value {
@@ -3980,12 +4019,6 @@ fn plugin_failure_first_seen(plugin_name: &str, root: &std::path::Path) -> bool 
         .unwrap_or(true)
 }
 
-fn update_poll_targets() -> Vec<String> {
-    let mut names: std::collections::BTreeSet<String> = POOL_NAMES.iter().map(|name| name.to_string()).collect();
-    names.extend(loaded_plugin_versions().lock().unwrap_or_else(|e| e.into_inner()).keys().cloned());
-    names.into_iter().collect()
-}
-
 fn spawn_update_poll_worker(
     daemon_cfg: DaemonConfig,
 ) -> std::sync::mpsc::Receiver<(PathBuf, String)> {
@@ -4023,7 +4056,7 @@ fn spawn_update_poll_worker(
                 write_persisted_poll_ts(&persisted_plugin_poll_ts_path(), poll_ts);
                 let targets: Vec<String> = match &forced_refresh_request {
                     Some(Some(name)) => vec![name.clone()],
-                    _ => update_poll_targets(),
+                    _ => loaded_plugin_versions().lock().unwrap_or_else(|e| e.into_inner()).keys().cloned().collect(),
                 };
                 let mut cycle_errors: Vec<String> = Vec::new();
                 for plugin_name in targets {
