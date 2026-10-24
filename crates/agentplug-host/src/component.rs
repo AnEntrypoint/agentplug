@@ -846,6 +846,7 @@ mod tests {
             let component = Component::from_file(&engine, &path).unwrap();
             let linker = component_linker(&engine).unwrap();
             let mut store = Store::new(&engine, ComponentState::new(std::env::temp_dir()));
+            store.set_epoch_deadline(crate::registry::epoch_ticks_for_seconds(crate::registry::DISPATCH_CALL_DEADLINE_SECS));
             linker
                 .instantiate_async(&mut store, &component)
                 .await
