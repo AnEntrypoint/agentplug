@@ -1622,9 +1622,9 @@ fn probe_latest_asset(repo: &str, asset: &str) -> anyhow::Result<Option<(String,
     let response = match github_api_call_with(&api, &headers) {
         Ok(response) => response,
         Err(ureq::Error::Status(code, resp)) if code == 403 || code == 429 => {
-            // Anonymous or rate-limited: hold off until the reset header and serve the cached release meanwhile.
+            // Anonymous or rate-limited: hold off until the reset header, capped at 15 minutes so a backoff never hides a newer release for long, and serve the cached release meanwhile.
             let reset = resp.header("x-ratelimit-reset").and_then(|v| v.parse::<u64>().ok());
-            let until = reset.unwrap_or(now_secs + 600).max(now_secs + 60);
+            let until = reset.unwrap_or(now_secs + 600).max(now_secs + 60).min(now_secs + 900);
             eprintln!("[agentplug probe] {repo}/{asset}: HTTP {code}, backing off until unix {until}s before probing again");
             let mut record = cached.clone().unwrap_or_else(|| serde_json::json!({}));
             if let Some(object) = record.as_object_mut() {
@@ -1664,6 +1664,14 @@ fn probe_latest_asset(repo: &str, asset: &str) -> anyhow::Result<Option<(String,
     let record = serde_json::json!({ "etag": etag, "version": version, "body": body, "at_ms": unix_ms_now() });
     let _ = fs::write(&cache_path, record.to_string());
     Ok(Some((version, body)))
+}
+
+pub fn clear_release_probe_cache(plugin_name: &str) {
+    let Some(spec) = plugin_asset_spec(plugin_name) else {
+        return;
+    };
+    let asset = format!("{}.wasm.sha256", spec.asset_basename);
+    let _ = fs::remove_file(probe_cache_path(&format!("api:{}:{asset}", spec.repo)));
 }
 
 pub fn probe_latest_plugin_release(plugin_name: &str) -> anyhow::Result<Option<LatestPluginRelease>> {

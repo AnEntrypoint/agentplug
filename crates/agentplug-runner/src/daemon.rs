@@ -3816,6 +3816,13 @@ impl PluginModules {
         eprintln!("[agentplug daemon] compiled {plugin_name}.wasm as a component (content {}) -- the component route serves it over any loaded core module", &on_disk_hash[..12]);
         self.components
             .insert(plugin_name.to_string(), (component, on_disk_hash));
+        loaded_plugin_versions()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(
+                plugin_name.to_string(),
+                installed_plugin_version(plugin_name).unwrap_or_else(|| "unversioned".to_string()),
+            );
         Ok(())
     }
 
@@ -4021,6 +4028,14 @@ fn plugin_failure_first_seen(plugin_name: &str, root: &std::path::Path) -> bool 
         .unwrap_or(true)
 }
 
+// Every pool plugin is polled, including one whose artifact is a wasm component: compile_component
+// does not add a component to loaded_plugin_versions, so the loaded set alone left gm unpolled.
+fn update_poll_targets() -> Vec<String> {
+    let mut names: std::collections::BTreeSet<String> = POOL_NAMES.iter().map(|name| name.to_string()).collect();
+    names.extend(loaded_plugin_versions().lock().unwrap_or_else(|e| e.into_inner()).keys().cloned());
+    names.into_iter().collect()
+}
+
 fn spawn_update_poll_worker(
     daemon_cfg: DaemonConfig,
 ) -> std::sync::mpsc::Receiver<(PathBuf, String)> {
@@ -4058,11 +4073,14 @@ fn spawn_update_poll_worker(
                 write_persisted_poll_ts(&persisted_plugin_poll_ts_path(), poll_ts);
                 let targets: Vec<String> = match &forced_refresh_request {
                     Some(Some(name)) => vec![name.clone()],
-                    _ => loaded_plugin_versions().lock().unwrap_or_else(|e| e.into_inner()).keys().cloned().collect(),
+                    _ => update_poll_targets(),
                 };
                 let mut cycle_errors: Vec<String> = Vec::new();
                 for plugin_name in targets {
                     let forced = matches!(&forced_refresh_request, Some(Some(name)) if name == &plugin_name);
+                    if forced {
+                        crate::download::clear_release_probe_cache(&plugin_name);
+                    }
                     if !forced {
                         let due = last_plugin_specific_poll
                             .get(&plugin_name)
