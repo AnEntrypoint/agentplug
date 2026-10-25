@@ -1522,7 +1522,7 @@ struct Tracked {
 }
 
 struct Reaped {
-    owner: Option<PathBuf>,
+    owner: PathBuf,
     pid: u32,
     age_s: u64,
     ts_ms: u64,
@@ -1700,13 +1700,14 @@ fn own_entry(main: &ChromiumMain, tracked: &[Tracked], caller: &Path) -> Value {
 }
 
 // The open_browsers block every browser-style reply carries, scoped to the caller's project. Its own browsers are
-// listed in full with their tabs; another project's browsers are only counted; a gm-launched process with no project
-// is an orphan, reported by pid and age only. Reaps inside the idle window are listed for the caller that owns them.
+// listed in full with their tabs; another project's browsers are only counted; a gm-launched process with no lease
+// profile is untracked, reported by pid and age only and never reaped. Reaps inside the idle window are listed only
+// for the project that owns them.
 pub fn open_browsers_block(caller: &Path) -> Value {
     let tracked = tracked_snapshot();
     let mains = chromium_mains();
     let mut own: Vec<Value> = Vec::new();
-    let mut orphans: Vec<Value> = Vec::new();
+    let mut untracked: Vec<Value> = Vec::new();
     let mut other_projects = 0usize;
     for main in mains.iter().filter(|main| main.port.is_some()) {
         let owner = main
@@ -1722,7 +1723,7 @@ pub fn open_browsers_block(caller: &Path) -> Value {
         match owner {
             Some(root) if root.as_path() == caller => own.push(own_entry(main, &tracked, caller)),
             Some(_) => other_projects += 1,
-            None => orphans.push(json!({"pid": main.pid, "age_s": main.age_s})),
+            None => untracked.push(json!({"pid": main.pid, "age_s": main.age_s})),
         }
     }
     for t in tracked.iter().filter(|t| t.root.as_path() == caller) {
@@ -1743,23 +1744,21 @@ pub fn open_browsers_block(caller: &Path) -> Value {
     let cutoff = now_ms().saturating_sub(idle_window_ms());
     let reaped_recent: Vec<Value> = reaped()
         .iter()
-        .filter(|r| r.ts_ms >= cutoff && r.owner.as_deref().map_or(true, |owner| owner == caller))
-        .map(|r| {
-            let kind = if r.owner.is_some() { "own" } else { "orphan" };
-            json!({"pid": r.pid, "age_s": r.age_s, "ts_ms": r.ts_ms, "owner": kind})
-        })
+        .filter(|r| r.ts_ms >= cutoff && r.owner.as_path() == caller)
+        .map(|r| json!({"pid": r.pid, "age_s": r.age_s, "ts_ms": r.ts_ms}))
         .collect();
     json!({
         "root": caller.display().to_string(),
         "own": own,
         "other_projects": other_projects,
-        "orphans": orphans,
+        "untracked": untracked,
         "reaped": reaped_recent,
     })
 }
 
-// Closes a gm-launched Chromium main that no record tracks and that has run longer than the idle window. A process of
-// a project with a live lease or a call in flight is never touched; an unattributed process is an orphan.
+// Closes a Chromium main that no record tracks and that has run longer than the idle window, but only when its profile
+// sits under a gm lease directory and that project holds no live lease and no call. A Chromium started by hand (no lease
+// profile) is reported as untracked and never reaped; a process of a project with a live lease or call is never touched.
 pub fn reap_idle_untracked() {
     let tracked = tracked_snapshot();
     let window_s = idle_window_ms() / 1_000;
@@ -1770,17 +1769,17 @@ pub fn reap_idle_untracked() {
         if tracked.iter().any(|t| t.pid == main.pid || main.port == Some(t.port)) {
             continue;
         }
-        let owner = main.profile.as_deref().and_then(profile_owner);
-        if let Some(root) = owner.as_deref() {
-            if claimed().contains(root) || has_waiter(root) || holder_live(root, TTL_MS) {
-                continue;
-            }
+        let Some(owner) = main.profile.as_deref().and_then(profile_owner) else {
+            continue;
+        };
+        if claimed().contains(owner.as_path()) || has_waiter(&owner) || holder_live(&owner, TTL_MS) {
+            continue;
         }
         reap_untracked(&main, owner);
     }
 }
 
-fn reap_untracked(main: &ChromiumMain, owner: Option<PathBuf>) {
+fn reap_untracked(main: &ChromiumMain, owner: PathBuf) {
     if request_exit(main.pid) {
         let deadline = Instant::now() + Duration::from_secs(5);
         while process_exists(main.pid) && Instant::now() < deadline {
@@ -1790,14 +1789,12 @@ fn reap_untracked(main: &ChromiumMain, owner: Option<PathBuf>) {
     if process_exists(main.pid) {
         kill_process_tree(main.pid);
     }
-    if let Some(root) = owner.as_deref() {
-        log_browser(
-            root,
-            "browser-reaped",
-            main.pid,
-            &format!("reason=untracked-idle age_s={}", main.age_s),
-        );
-    }
+    log_browser(
+        &owner,
+        "browser-reaped",
+        main.pid,
+        &format!("reason=untracked-idle age_s={}", main.age_s),
+    );
     let mut log = reaped();
     log.push(Reaped {
         owner,
