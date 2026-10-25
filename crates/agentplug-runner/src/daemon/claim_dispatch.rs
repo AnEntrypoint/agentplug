@@ -1715,6 +1715,106 @@ fn lane_hold_stuck_min_ms() -> u64 {
     env_ms_or("AGENTPLUG_LANE_HOLD_STUCK_MIN_MS", LANE_HOLD_STUCK_MIN_MS_DEFAULT)
 }
 
+pub(super) const BROWSER_LANE_HOLDER_FILE: &str = "browser.json";
+
+fn browser_lane_holder_path(root: &Path) -> PathBuf {
+    root.join(".gm").join("lane-holder").join(BROWSER_LANE_HOLDER_FILE)
+}
+
+fn read_browser_lane_holder_record(path: &Path) -> Option<serde_json::Value> {
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+}
+
+// Durable record of the dispatch holding the browser lane: its id, verb, session, start time and the hold
+// budget the watchdog enforces. Written by a create-new temp file renamed into place, so a reader never sees
+// a torn record. Dropped with the holder's guard (completion, timeout or error), and only the record naming
+// this dispatch is removed, so a later holder's record is never deleted by an earlier one.
+pub(super) struct BrowserLaneHolderRecord {
+    path: PathBuf,
+    dispatch_id: String,
+}
+
+impl BrowserLaneHolderRecord {
+    pub(super) fn publish(root: &Path, verb: &str, dispatch_id: &str, session: &str) -> Option<Self> {
+        use std::io::Write;
+        let path = browser_lane_holder_path(root);
+        let dir = path.parent()?;
+        fs::create_dir_all(dir).ok()?;
+        let record = serde_json::json!({
+            "lane": "browser",
+            "dispatch_id": dispatch_id,
+            "verb": verb,
+            "session": session,
+            "started_ms": now_ms(),
+            "budget_ms": lane_hold_running_max_ms(),
+            "daemon_pid": std::process::id(),
+        });
+        let tmp = dir.join(format!(
+            ".{}.{}.{}.tmp",
+            BROWSER_LANE_HOLDER_FILE,
+            std::process::id(),
+            now_ms()
+        ));
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+            .ok()?;
+        let written = file
+            .write_all(record.to_string().as_bytes())
+            .and_then(|_| file.sync_all());
+        drop(file);
+        if written.is_err() || fs::rename(&tmp, &path).is_err() {
+            let _ = fs::remove_file(&tmp);
+            return None;
+        }
+        Some(Self {
+            path,
+            dispatch_id: dispatch_id.to_string(),
+        })
+    }
+}
+
+impl Drop for BrowserLaneHolderRecord {
+    fn drop(&mut self) {
+        let ours = read_browser_lane_holder_record(&self.path)
+            .and_then(|record| record["dispatch_id"].as_str().map(|id| id == self.dispatch_id))
+            .unwrap_or(false);
+        if ours {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+// The browser lane holder as the project status reports it. The live holder comes from the in-memory lane
+// owner, so a record left by a stopped daemon is never reported: its dispatch id must match the live holder.
+pub(crate) fn browser_lane_holder_status(root: &Path) -> serde_json::Value {
+    let Some(hold) = agentplug_host::registry::lane_holds(root)
+        .into_iter()
+        .find(|hold| hold.lane == "browser")
+    else {
+        return serde_json::Value::Null;
+    };
+    let record = read_browser_lane_holder_record(&browser_lane_holder_path(root))
+        .filter(|record| record["dispatch_id"].as_str() == Some(hold.task.as_str()));
+    let record_field = |key: &str| {
+        record
+            .as_ref()
+            .map(|record| record[key].clone())
+            .unwrap_or(serde_json::Value::Null)
+    };
+    serde_json::json!({
+        "dispatch_id": hold.task,
+        "verb": hold.verb,
+        "session": record_field("session"),
+        "held_ms": hold.held_ms,
+        "budget_ms": record_field("budget_ms"),
+        "waiters": hold.waiters,
+    })
+}
+
 fn lane_hold_running_max_ms() -> u64 {
     env_ms_or(
         "AGENTPLUG_LANE_HOLD_RUNNING_MAX_MS",
@@ -2491,6 +2591,7 @@ pub(super) struct LaneWaitAnnotation {
     pub(super) lane: Option<&'static str>,
     pub(super) holder_verb: Option<String>,
     pub(super) holder_task: Option<String>,
+    pub(super) holder_age_ms: Option<u64>,
     pub(super) lane_position: Option<u64>,
     pub(super) lane_waiters: usize,
 }
@@ -2526,6 +2627,10 @@ pub(super) fn annotate_lane_wait_on_reply(out_body: String, waited: &LaneWaitAnn
         fields.insert(
             "lane_wait_holder_verb".to_string(),
             serde_json::json!(waited.holder_verb),
+        );
+        fields.insert(
+            "lane_wait_holder_age_ms".to_string(),
+            serde_json::json!(waited.holder_age_ms),
         );
         fields.insert(
             "lane_wait_holder_task".to_string(),
@@ -3025,6 +3130,7 @@ pub(crate) fn run_gm_dispatch_to_file(
         lane,
         holder_verb: lane_queue_before.lane_holder_verb,
         holder_task: lane_queue_before.lane_holder_task,
+        holder_age_ms: lane_queue_before.lane_holder_age_ms,
         lane_position: lane_queue_before.lane_position,
         lane_waiters: lane_queue_before.lane_waiters,
     };
@@ -3040,6 +3146,16 @@ pub(crate) fn run_gm_dispatch_to_file(
         refresh_dispatch_wait_ledger(root);
         return;
     }
+    let _browser_holder = if lane == Some("browser") {
+        BrowserLaneHolderRecord::publish(
+            root,
+            tool_verb,
+            task,
+            &extract_session_id(body).unwrap_or_default(),
+        )
+    } else {
+        None
+    };
     let _store_owner = if lane == Some("store") {
         match settle_store_lock(root) {
             StoreLockState::Held { lock_dir, owner_pid, detail } => {

@@ -2663,6 +2663,8 @@ fn write_project_heartbeat_with_queue_info(
     // different containers or hosts see each other's pids in different process tables, so a foreign
     // record is judged by this field and by heartbeat age, never by pid_is_alive.
     payload["host_id"] = serde_json::json!(crate::daemon::claim_dispatch::host_identity());
+    payload["browser_lane_holder"] =
+        crate::daemon::claim_dispatch::browser_lane_holder_status(root);
     payload["runtime"] = serde_json::json!("agentplug");
     if let Some(busy_until) = busy_until {
         payload["busy_until"] = serde_json::json!(busy_until);
