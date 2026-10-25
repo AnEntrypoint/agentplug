@@ -119,7 +119,7 @@ fn git_head_question(cwd: &Path, argv: &[String]) -> Option<PathBuf> {
     }
 }
 
-fn git_dir_of(dir: &Path) -> Option<PathBuf> {
+pub(crate) fn git_dir_of(dir: &Path) -> Option<PathBuf> {
     let dot_git = dir.join(".git");
     if dot_git.is_dir() {
         return Some(dot_git);

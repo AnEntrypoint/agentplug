@@ -14,6 +14,7 @@ use crate::browser::{
     kill_process_tree, process_exists, reap_stale_browsers, request_exit, CDP_POLL_INTERVAL,
     CDP_READY_DEADLINE,
 };
+use crate::imports::git_dir_of;
 use crate::watcher_log::append_watcher_event;
 use crate::windowless::apply_windowless;
 
@@ -56,7 +57,7 @@ pub struct LaunchOptions {
 const DEFAULT_CDP_PORT: u16 = 9222;
 const ATTACH_PROBE: Duration = Duration::from_secs(2);
 
-pub const BROWSER_IDLE_CLOSE_MS: u64 = 15 * 60 * 1_000;
+pub const BROWSER_IDLE_CLOSE_MS: u64 = 5 * 60 * 1_000;
 
 fn idle_window_ms() -> u64 {
     std::env::var("GM_BROWSER_IDLE_MS")
@@ -152,6 +153,71 @@ pub fn profile_dir(root: &Path) -> PathBuf {
 pub fn profile_owner(profile: &Path) -> Option<PathBuf> {
     let root = profile.ancestors().nth(4)?;
     (profile == profile_dir(root).as_path()).then(|| root.to_path_buf())
+}
+
+// The window a checkout's browser lives in. A checkout whose origin remote names a repo shares one window per repo
+// identity, so scratch clones of that repo reuse it or queue behind its holder. A checkout with no origin keeps its own
+// root. The identity root has the same .gm/browser-lease layout, so profile_owner maps its profile back to it.
+pub fn identity_root(project_root: &Path) -> PathBuf {
+    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
+    match (origin_identity(project_root), home) {
+        (Some(identity), Some(home)) => PathBuf::from(home)
+            .join(".gm")
+            .join("browser-identity")
+            .join(identity_slug(&identity)),
+        _ => project_root.to_path_buf(),
+    }
+}
+
+fn origin_identity(project_root: &Path) -> Option<String> {
+    let git_dir = git_dir_of(project_root)?;
+    let config_dir = match std::fs::read_to_string(git_dir.join("commondir")) {
+        Ok(common) => {
+            let common = PathBuf::from(common.trim());
+            if common.is_absolute() {
+                common
+            } else {
+                git_dir.join(common)
+            }
+        }
+        Err(_) => git_dir,
+    };
+    let config = std::fs::read_to_string(config_dir.join("config")).ok()?;
+    normalise_remote(&origin_url(&config)?)
+}
+
+fn origin_url(config: &str) -> Option<String> {
+    let mut in_origin = false;
+    for line in config.lines().map(str::trim) {
+        if line.starts_with('[') {
+            in_origin = line == "[remote \"origin\"]";
+        } else if in_origin {
+            if let Some(url) = line.strip_prefix("url").and_then(|rest| rest.trim_start().strip_prefix('=')) {
+                return Some(url.trim().to_string());
+            }
+        }
+    }
+    None
+}
+
+// "https://user@Host:443/Owner/Repo.git" and "git@host:Owner/Repo" both normalise to "host/owner/repo".
+fn normalise_remote(url: &str) -> Option<String> {
+    let url = url.trim().trim_end_matches('/');
+    let url = url.strip_suffix(".git").unwrap_or(url);
+    let (authority, path) = match url.split_once("://") {
+        Some((_, rest)) => rest.split_once('/')?,
+        None => url.split_once(':')?,
+    };
+    let host = authority.rsplit('@').next()?.split(':').next()?.to_ascii_lowercase();
+    let path = path.trim_matches('/').to_ascii_lowercase();
+    (!host.is_empty() && !path.is_empty()).then(|| format!("{host}/{path}"))
+}
+
+fn identity_slug(identity: &str) -> String {
+    identity
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '-' { c } else { '_' })
+        .collect()
 }
 
 #[derive(Clone)]
@@ -361,11 +427,11 @@ impl Drop for Attendance {
     }
 }
 
-pub fn attend_while_running(root: &Path) -> Attendance {
-    attend(root);
+pub fn attend_while_running(project_root: &Path) -> Attendance {
+    let key = identity_root(project_root);
+    attend(&key);
     let stop = Arc::new(AtomicBool::new(false));
     let thread_stop = Arc::clone(&stop);
-    let key = root.to_path_buf();
     std::thread::spawn(move || {
         while !thread_stop.load(Ordering::Relaxed) {
             std::thread::sleep(Duration::from_millis(HEARTBEAT_MS));
@@ -1050,13 +1116,15 @@ pub fn acquire_session(
 }
 
 pub fn acquire_with(
-    root: &Path,
+    project_root: &Path,
     agent: &str,
     opts: &LaunchOptions,
     headful: bool,
     ttl_ms: u64,
     wait_ms: u64,
 ) -> Result<(u16, u32), String> {
+    let root = identity_root(project_root);
+    let root = root.as_path();
     refuse_foreign_profile(root, opts)?;
     let _waiting = WaitTicket::enter(root);
     claim_session(root, agent, ttl_ms, wait_ms)?;
@@ -1064,33 +1132,41 @@ pub fn acquire_with(
 }
 
 // Drops the shared browser of a root (and its record) without touching the lease. A closed attached browser is only forgotten.
-fn drop_shared_browser(root: &Path, cause: &str) {
+// Returns the pid of a Chromium this call closed (an attached browser is only forgotten, never closed).
+fn drop_shared_browser(root: &Path, cause: &str) -> Option<u32> {
+    let mut closed = None;
     if let Some(mut browser) = browsers().remove(root) {
         let pid = browser.pid;
         let detail = exit_detail(&mut browser);
         close_browser(&mut browser);
         log_browser(root, "browser-closed", pid, &format!("reason={cause} {detail}"));
+        closed = (!browser.attached).then_some(pid);
     }
     forget_browser_record(root);
+    closed
 }
 
 // reset: closes the shared browser and gives up the lease. The next acquire launches a fresh browser on the same profile.
-pub fn reset_session(root: &Path, agent: &str, ttl_ms: u64, wait_ms: u64) -> Result<(), String> {
+// Returns the pids it closed: the shared browser, then every orphan Chromium under this identity's lease directory.
+pub fn reset_session(project_root: &Path, agent: &str, ttl_ms: u64, wait_ms: u64) -> Result<Vec<u32>, String> {
+    let root = identity_root(project_root);
+    let root = root.as_path();
     let _waiting = WaitTicket::enter(root);
     let attached = browsers().get(root).is_some_and(|browser| browser.attached);
+    let mut closed: Vec<u32> = Vec::new();
     if claim_session(root, agent, ttl_ms, wait_ms).is_err() {
         // The holder outlived the wait: closing its browser ends its helper, and its call then releases the claim.
-        drop_shared_browser(root, "reset-wedged");
+        closed.extend(drop_shared_browser(root, "reset-wedged"));
         claim_session(root, agent, ttl_ms, wait_ms)?;
     }
-    drop_shared_browser(root, "reset");
+    closed.extend(drop_shared_browser(root, "reset"));
     // The record is only in memory: after a runner restart, or a record dropped without a close, nothing else would
-    // end this project's Chromium. The sweep covers this project's own profile only, never an attached browser.
+    // end this identity's Chromium. The sweep covers its own lease directory only, never an attached browser.
     if !attached {
-        let _ = reap_stale_browsers(root);
+        closed.extend(reap_stale_browsers(root).unwrap_or_default());
     }
     release_claim(root);
-    Ok(())
+    Ok(closed)
 }
 
 // A call acts only on its own project's browser: a named profile of another project is refused before any claim.
@@ -1109,13 +1185,15 @@ fn refuse_foreign_profile(root: &Path, opts: &LaunchOptions) -> Result<(), Strin
 
 // reconnect: closes the shared browser under the caller's lease and opens it again, keeping the lease.
 pub fn reconnect_session(
-    root: &Path,
+    project_root: &Path,
     agent: &str,
     opts: &LaunchOptions,
     headful: bool,
     ttl_ms: u64,
     wait_ms: u64,
 ) -> Result<(u16, u32), String> {
+    let root = identity_root(project_root);
+    let root = root.as_path();
     refuse_foreign_profile(root, opts)?;
     let _waiting = WaitTicket::enter(root);
     claim_session(root, agent, ttl_ms, wait_ms)?;
@@ -1182,7 +1260,9 @@ fn attach_after_claim(
     Ok((port, chrome_pid))
 }
 
-pub fn release(root: &Path, agent: &str) {
+pub fn release(project_root: &Path, agent: &str) {
+    let root = identity_root(project_root);
+    let root = root.as_path();
     if let Some(browser) = browsers().get_mut(root) {
         browser.active.remove(agent);
         browser.idle_since_ms = Some(now_ms());
@@ -1193,13 +1273,16 @@ pub fn release(root: &Path, agent: &str) {
 
 // Gives up the lease and clears the holder record only when `agent` holds it. A caller that never got the lease
 // removes nothing, even when another agent of this process holds it (release_claim matches on pid alone).
-pub fn release_owned(root: &Path, agent: &str) {
-    if read_holder(root).is_some_and(|holder| holder.owner == agent) {
-        release(root, agent);
+pub fn release_owned(project_root: &Path, agent: &str) {
+    let root = identity_root(project_root);
+    if read_holder(&root).is_some_and(|holder| holder.owner == agent) {
+        release(&root, agent);
     }
 }
 
-pub fn status(root: &Path) -> Value {
+pub fn status(project_root: &Path) -> Value {
+    let root = identity_root(project_root);
+    let root = root.as_path();
     let mine = {
         let mut map = browsers();
         map.get_mut(root).map(|browser| {
@@ -1328,7 +1411,8 @@ pub fn lease_reply(verb: &str, dispatch_root: &Path, body: &str) -> String {
         return json!({"ok": false, "error": format!("{verb} acts only on the calling project {}", dispatch_root.display())})
             .to_string();
     }
-    let root = dispatch_root.to_path_buf();
+    let project = dispatch_root.to_path_buf();
+    let root = identity_root(dispatch_root);
     let ttl_ms = req.ttl_ms.unwrap_or(TTL_MS);
     let wait_ms = req.wait_ms.unwrap_or(WAIT_MS);
     let opts = LaunchOptions {
@@ -1360,9 +1444,10 @@ pub fn lease_reply(verb: &str, dispatch_root: &Path, body: &str) -> String {
         }
         ("browser_lease_release", Some(agent)) if req.reset.unwrap_or(false) => {
             match reset_session(&root, agent, ttl_ms, wait_ms) {
-                Ok(()) => {
+                Ok(closed) => {
                     let mut state = status(&root);
                     state["reset"] = json!(agent);
+                    state["closed_pids"] = json!(closed);
                     state["ok"] = json!(true);
                     state
                 }
@@ -1390,6 +1475,10 @@ pub fn lease_reply(verb: &str, dispatch_root: &Path, body: &str) -> String {
     };
     if let Some(obj) = reply.as_object_mut() {
         obj.insert("open_browsers".to_string(), open_browsers_block(&root));
+        if root != project {
+            obj.insert("redirected_from".to_string(), json!(project.display().to_string()));
+            obj.insert("window".to_string(), json!(root.display().to_string()));
+        }
     }
     reply.to_string()
 }
@@ -1703,7 +1792,9 @@ fn own_entry(main: &ChromiumMain, tracked: &[Tracked], caller: &Path) -> Value {
 // listed in full with their tabs; another project's browsers are only counted; a gm-launched process with no lease
 // profile is untracked, reported by pid and age only and never reaped. Reaps inside the idle window are listed only
 // for the project that owns them.
-pub fn open_browsers_block(caller: &Path) -> Value {
+pub fn open_browsers_block(project_root: &Path) -> Value {
+    let caller = identity_root(project_root);
+    let caller = caller.as_path();
     let tracked = tracked_snapshot();
     let mains = chromium_mains();
     let mut own: Vec<Value> = Vec::new();

@@ -109,10 +109,11 @@ fn like_any(markers: &[String]) -> String {
         .join(" -or ")
 }
 
-pub(crate) fn reap_stale_browsers(root: &Path) -> Result<(), String> {
-    let profile = browser_lease::profile_dir(root);
+// Asks every Chromium whose profile sits under this root's lease directory to exit; returns the pids asked.
+pub(crate) fn reap_stale_browsers(root: &Path) -> Result<Vec<u32>, String> {
+    let lease = browser_lease::session_dir(root);
     if cfg!(windows) {
-        let markers = gm_profile_command_line_markers(&profile);
+        let markers = gm_profile_command_line_markers(&lease);
         let script = format!(
             "Get-CimInstance Win32_Process -Filter \"Name='chrome.exe'\" | Where-Object {{ ({}) -and $_.CommandLine -notlike '*--type=*' }} | ForEach-Object {{ $_.ProcessId }}",
             like_any(&markers)
@@ -120,32 +121,44 @@ pub(crate) fn reap_stale_browsers(root: &Path) -> Result<(), String> {
         let mut cmd = Command::new("powershell");
         cmd.args(["-NoProfile", "-Command", &script]).stderr(Stdio::null());
         crate::windowless::apply_windowless(&mut cmd);
-        let Ok(output) = cmd.output() else { return Ok(()) };
-        for pid in String::from_utf8_lossy(&output.stdout)
+        let Ok(output) = cmd.output() else { return Ok(Vec::new()) };
+        let pids: Vec<u32> = String::from_utf8_lossy(&output.stdout)
             .lines()
             .filter_map(|line| line.trim().parse::<u32>().ok())
-        {
+            .collect();
+        for &pid in &pids {
             kill_process_tree(pid);
             browser_lease::log_browser(root, "browser-reaped", pid, "reason=profile-sweep");
         }
-        Ok(())
+        Ok(pids)
     } else {
-        let marker = format!("--user-data-dir={}", profile.display());
         let output = Command::new("ps")
             .args(["-axww", "-o", "pid=,args="])
             .output()
             .map_err(|e| format!("could not run ps to reap stale browser browsers: {e}"))?;
         let listed: Vec<u32> = String::from_utf8_lossy(&output.stdout)
             .lines()
-            .filter(|line| marker_ends_at_boundary(line, &marker))
+            .filter(|line| names_profile_under(line, &lease))
             .filter_map(|line| line.split_whitespace().next()?.parse::<u32>().ok())
             .collect();
-        for pid in listed {
+        for &pid in &listed {
             request_exit(pid);
             browser_lease::log_browser(root, "browser-reaped", pid, "reason=profile-sweep");
         }
-        Ok(())
+        Ok(listed)
     }
+}
+
+// True when a command line carries --user-data-dir=<dir> or a path under it. The separator check keeps a sibling
+// directory that shares the name prefix out of the sweep.
+fn names_profile_under(line: &str, dir: &Path) -> bool {
+    let marker = format!("--user-data-dir={}", dir.display());
+    line.match_indices(&marker).any(|(at, _)| {
+        line[at + marker.len()..]
+            .chars()
+            .next()
+            .map_or(true, |c| c.is_whitespace() || c == '/' || c == '\\')
+    })
 }
 
 #[cfg(unix)]

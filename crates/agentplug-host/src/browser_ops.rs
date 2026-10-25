@@ -61,7 +61,7 @@ fn dispatch(root: &Path, op: &str, body: &str) -> Value {
         "browser-reset" => {
             let agent = browser_lease::next_agent_id();
             match browser_lease::reset_session(root, &agent, RESET_TTL_MS, RESET_WAIT_MS) {
-                Ok(()) => json!({ "ok": true, "op": op, "reset": true }),
+                Ok(closed) => json!({ "ok": true, "op": op, "reset": true, "closed_pids": closed }),
                 Err(e) => json!({ "ok": false, "op": op, "error": e }),
             }
         }
