@@ -977,8 +977,11 @@ fn run_helper_with(
         .stderr(Stdio::piped());
     crate::windowless::apply_windowless(&mut cmd);
     let mut child = KillOnDrop(cmd.spawn().map_err(|e| format!("could not start node: {e}"))?);
+    // Written off-thread: a helper that never reads its script must not block the caller past its budget.
     if let Some(mut stdin) = child.0.stdin.take() {
-        let _ = stdin.write_all(BROWSER_HELPER_JS.as_bytes());
+        std::thread::spawn(move || {
+            let _ = stdin.write_all(BROWSER_HELPER_JS.as_bytes());
+        });
     }
     let out_pipe: Option<ChildStdout> = child.0.stdout.take();
     let err_pipe: Option<ChildStderr> = child.0.stderr.take();
@@ -1082,7 +1085,17 @@ pub fn browser_cdp(cwd: &Path, body: &str) -> Value {
     };
     let headless = !parsed.headful;
     let agent = browser_lease::next_agent_id();
-    let (port, _) = match browser_lease::acquire(cwd, &agent, parsed.headful) {
+    let budget = parsed.timeout.unwrap_or(CDP_HELPER_BUDGET);
+    // The lease wait is bounded by this call's own budget: a waiter that outlives its caller gives up
+    // before it can open a tab, and the reply (with its out-file) is written within the budget.
+    let lease_wait_ms = budget.as_millis() as u64;
+    let (port, _) = match browser_lease::acquire_session(
+        cwd,
+        &agent,
+        parsed.headful,
+        browser_lease::TTL_MS,
+        lease_wait_ms,
+    ) {
         Ok(attached) => attached,
         Err(e) => return browser_error_reply("cdp", headless, started, e),
     };
@@ -1099,7 +1112,6 @@ pub fn browser_cdp(cwd: &Path, body: &str) -> Value {
         }
     };
     let attendance = browser_lease::attend_while_running(cwd);
-    let budget = parsed.timeout.unwrap_or(CDP_HELPER_BUDGET);
     let run = run_helper_with(
         port,
         None,

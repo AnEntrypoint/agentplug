@@ -2647,10 +2647,16 @@ fn serial_lane_for_dispatch(verb: &str, body: &str) -> Option<&'static str> {
         Some("read")
     } else if STORE_LANE_VERBS.contains(&verb) || verb == "codesearch" {
         Some("store")
+    } else if BROWSER_LANE_VERBS.contains(&verb) {
+        Some("browser")
     } else {
         Some("state")
     }
 }
+
+// Browser verbs queue on their own lane, never the shared state lane: a browser call can wait up to its
+// budget for the browser lease, and PRD writes must not wait behind it.
+const BROWSER_LANE_VERBS: &[&str] = &["browser", "chrome", "browser-reset"];
 
 pub fn dispatch_serial_lane(verb: &str, body: &str) -> Option<&'static str> {
     serial_lane_for_dispatch(verb, body)
@@ -2736,6 +2742,7 @@ fn lane_name(name: &str) -> Option<&'static str> {
         "read" => Some("read"),
         "store" => Some("store"),
         "state" => Some("state"),
+        "browser" => Some("browser"),
         _ => None,
     }
 }
