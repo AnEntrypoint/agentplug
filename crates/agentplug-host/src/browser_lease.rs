@@ -1148,6 +1148,14 @@ pub fn release(root: &Path, agent: &str) {
     release_claim(root);
 }
 
+// Gives up the lease and clears the holder record only when `agent` holds it. A caller that never got the lease
+// removes nothing, even when another agent of this process holds it (release_claim matches on pid alone).
+pub fn release_owned(root: &Path, agent: &str) {
+    if read_holder(root).is_some_and(|holder| holder.owner == agent) {
+        release(root, agent);
+    }
+}
+
 pub fn status(root: &Path) -> Value {
     let mine = {
         let mut map = browsers();

@@ -1,6 +1,8 @@
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStderr, ChildStdout, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
@@ -23,6 +25,10 @@ const BROWSER_HELPER_JS: &str = concat!(
 pub(crate) const CDP_READY_DEADLINE: Duration = Duration::from_secs(30);
 pub(crate) const CDP_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const CDP_HELPER_BUDGET: Duration = Duration::from_secs(100);
+// The worker gives up this long before the call's budget, so the caller's reply always arrives within it.
+const CALL_RESERVE: Duration = Duration::from_secs(3);
+// The helper is killed this long after its own deadline, so it can write the step that stalled instead of being cut off.
+const HELPER_KILL_GRACE: Duration = Duration::from_secs(2);
 const MAX_WAIT_MS: u64 = 60_000;
 const MAX_EVENT_LIMIT: u64 = 10_000;
 const DEFAULT_EVENT_LIMIT: u64 = 200;
@@ -949,6 +955,7 @@ fn run_helper_with(
         "steps": steps,
         "pageTimeoutMs": 30000,
         "textLimit": 20000,
+        "budgetMs": budget.as_millis() as u64,
     });
     if let (Some(base), Some(extra)) = (config.as_object_mut(), extra.as_object()) {
         for (key, value) in extra {
@@ -987,7 +994,7 @@ fn run_helper_with(
     let err_pipe: Option<ChildStderr> = child.0.stderr.take();
     let out_reader = std::thread::spawn(move || read_pipe(out_pipe));
     let err_reader = std::thread::spawn(move || read_pipe(err_pipe));
-    let (exit_code, timed_out) = match child.0.wait_timeout(budget) {
+    let (exit_code, timed_out) = match child.0.wait_timeout(budget + HELPER_KILL_GRACE) {
         Ok(Some(status)) => (status.code(), false),
         Ok(None) | Err(_) => {
             let _ = child.0.kill();
@@ -1077,6 +1084,9 @@ pub fn browser_reply_from_run(
     })
 }
 
+// One cdp call has one budget (timeout=<ms>, default CDP_HELPER_BUDGET) that covers the lease wait, the
+// expectation probe and the helper run. The caller waits for the worker only until the budget ends; on expiry
+// it cancels the worker, releases this agent's lease (which clears the holder record) and replies with a timeout.
 pub fn browser_cdp(cwd: &Path, body: &str) -> Value {
     let started = Instant::now();
     let parsed = match parse_cdp_browser_body(body) {
@@ -1084,14 +1094,58 @@ pub fn browser_cdp(cwd: &Path, body: &str) -> Value {
         Err(e) => return browser_error_reply("cdp", false, started, e),
     };
     let headless = !parsed.headful;
-    let agent = browser_lease::next_agent_id();
     let budget = parsed.timeout.unwrap_or(CDP_HELPER_BUDGET);
-    // The lease wait is bounded by this call's own budget: a waiter that outlives its caller gives up
-    // before it can open a tab, and the reply (with its out-file) is written within the budget.
-    let lease_wait_ms = budget.as_millis() as u64;
+    let worker_deadline = started + budget.checked_sub(CALL_RESERVE).unwrap_or(budget / 2);
+    let agent = browser_lease::next_agent_id();
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let (tx, rx) = mpsc::channel();
+    {
+        let cwd = cwd.to_path_buf();
+        let agent = agent.clone();
+        let cancelled = Arc::clone(&cancelled);
+        std::thread::spawn(move || {
+            let reply = browser_cdp_run(&cwd, &agent, parsed, worker_deadline, started, &cancelled);
+            let _ = tx.send(reply);
+        });
+    }
+    match rx.recv_timeout((started + budget).saturating_duration_since(Instant::now())) {
+        Ok(reply) => reply,
+        Err(failure) => {
+            cancelled.store(true, Ordering::SeqCst);
+            browser_lease::release_owned(cwd, &agent);
+            let message = match failure {
+                mpsc::RecvTimeoutError::Timeout => {
+                    format!("browser call exceeded its {}ms budget; its lease was released", budget.as_millis())
+                }
+                mpsc::RecvTimeoutError::Disconnected => {
+                    "browser call worker stopped without a reply; its lease was released".to_string()
+                }
+            };
+            let mut reply = browser_error_reply("cdp", headless, started, message);
+            if let Some(obj) = reply.as_object_mut() {
+                obj.insert("timed_out".to_string(), json!(true));
+                obj.insert("steps".to_string(), json!([]));
+                obj.insert("tab".to_string(), Value::Null);
+                obj.insert("expect".to_string(), Value::Null);
+            }
+            reply
+        }
+    }
+}
+
+fn browser_cdp_run(
+    cwd: &Path,
+    agent: &str,
+    parsed: CdpBrowser,
+    deadline: Instant,
+    started: Instant,
+    cancelled: &AtomicBool,
+) -> Value {
+    let headless = !parsed.headful;
+    let lease_wait_ms = deadline.saturating_duration_since(Instant::now()).as_millis() as u64;
     let (port, _) = match browser_lease::acquire_session(
         cwd,
-        &agent,
+        agent,
         parsed.headful,
         browser_lease::TTL_MS,
         lease_wait_ms,
@@ -1099,10 +1153,19 @@ pub fn browser_cdp(cwd: &Path, body: &str) -> Value {
         Ok(attached) => attached,
         Err(e) => return browser_error_reply("cdp", headless, started, e),
     };
+    if cancelled.load(Ordering::SeqCst) || Instant::now() >= deadline {
+        browser_lease::release_owned(cwd, agent);
+        return browser_error_reply(
+            "cdp",
+            headless,
+            started,
+            "browser call ran out of budget before its steps started".to_string(),
+        );
+    }
     let expect = match check_expectations(port, cwd, parsed.session.as_deref(), &parsed.expect) {
         Ok(report) => report,
         Err(e) => {
-            browser_lease::release(cwd, &agent);
+            browser_lease::release_owned(cwd, agent);
             let mut reply = browser_error_reply("cdp", headless, started, e.clone());
             if let Some(obj) = reply.as_object_mut() {
                 obj.insert("expect".to_string(), json!({ "ok": false, "error": e }));
@@ -1112,12 +1175,13 @@ pub fn browser_cdp(cwd: &Path, body: &str) -> Value {
         }
     };
     let attendance = browser_lease::attend_while_running(cwd);
+    let remaining = deadline.saturating_duration_since(Instant::now());
     let run = run_helper_with(
         port,
         None,
         &parsed.steps,
-        budget,
-        cdp_run_config(cwd, parsed.session.as_deref(), parsed.isolated, budget),
+        remaining,
+        cdp_run_config(cwd, parsed.session.as_deref(), parsed.isolated, remaining),
     );
     drop(attendance);
     let mut reply = match run {
@@ -1132,7 +1196,7 @@ pub fn browser_cdp(cwd: &Path, body: &str) -> Value {
             if parsed.expect.is_empty() { Value::Null } else { json!({ "ok": true, "report": expect }) },
         );
     }
-    browser_lease::release(cwd, &agent);
+    browser_lease::release_owned(cwd, agent);
     reply
 }
 
@@ -1436,7 +1500,7 @@ fn check_expectations(
 fn cdp_run_config(cwd: &Path, session: Option<&str>, isolated: bool, budget: Duration) -> Value {
     let mut config = json!({
         "cwd": cwd.display().to_string(),
-        "watchdogMs": (budget.as_millis() as u64).saturating_sub(10_000),
+        "watchdogMs": budget.as_millis() as u64 + 1_000,
         "partialFile": partial_result_file(cwd).display().to_string(),
     });
     if let Some(name) = session {

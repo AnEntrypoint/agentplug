@@ -1,6 +1,10 @@
 const cfg =JSON.parse(process.env.GM_BROWSER_CONFIG || '{}');
 const endpoint = `http://127.0.0.1:${cfg.port}`;
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+// One deadline for the whole helper run: every CDP command, HTTP probe and lock wait is capped by what is left of it.
+const deadlineAt = Number.isFinite(cfg.budgetMs) ? Date.now() + cfg.budgetMs : Infinity;
+const remainingMs = () => Math.max(0, deadlineAt - Date.now());
+const budgetCap = (ms) => Math.max(1, Math.min(ms, remainingMs()));
 
 // process.cwd() throws ENOENT when the spawning project directory was removed
 // while the helper ran; fall back to the home directory so the helper still starts.
@@ -13,7 +17,7 @@ function safeCwd() {
 }
 
 async function getJson(path, method = 'GET') {
-  const res = await fetch(endpoint + path, { method, signal: AbortSignal.timeout(3000) });
+  const res = await fetch(endpoint + path, { method, signal: AbortSignal.timeout(budgetCap(3000)) });
   if (!res.ok) throw new Error(`${method} ${path} answered HTTP ${res.status}`);
   return res.json();
 }
@@ -61,6 +65,7 @@ async function createIsolatedPage(browser, contextId) {
 
 async function awaitPageTarget(targetId) {
   for (let attempt = 0; attempt < 50; attempt++) {
+    if (remainingMs() <= 0) throw new Error(`call budget exhausted while waiting for target ${targetId}`);
     const list = await getJson('/json/list');
     const found = Array.isArray(list) && list.find((t) => t.id === targetId && t.webSocketDebuggerUrl);
     if (found) return found;
@@ -79,7 +84,7 @@ async function acquireIsolatedTarget(persisted) {
   }
   const version = await getJson('/json/version');
   if (!version.webSocketDebuggerUrl) throw new Error('the endpoint has no browser websocket for isolated pages');
-  const browser = await openSession(version.webSocketDebuggerUrl, 5000);
+  const browser = await openSession(version.webSocketDebuggerUrl, budgetCap(5000));
   try {
     const page = await createIsolatedPage(browser, persisted && persisted.isolated ? persisted.browserContextId : null);
     const target = await awaitPageTarget(page.targetId);
@@ -99,6 +104,7 @@ function openSession(wsUrl, timeoutMs) {
     const pending = new Map();
     const listeners = new Map();
     let nextId = 1;
+    let closed = false;
     const timer = setTimeout(() => {
       try { ws.close(); } catch (_) {}
       reject(new Error('cdp websocket did not open in time'));
@@ -108,10 +114,21 @@ function openSession(wsUrl, timeoutMs) {
       pending.clear();
     };
     const session = {
+      // A command with no answer fails when the call's budget runs out, so no step can outlive the call.
       send(method, params = {}, sessionId) {
         const id = nextId++;
         return new Promise((res, rej) => {
-          pending.set(id, { res, rej });
+          if (closed) return rej(new Error(`cdp websocket closed before ${method} was sent`));
+          const ms = remainingMs();
+          if (ms <= 0) return rej(new Error(`call budget exhausted before ${method} was sent`));
+          const commandTimer = Number.isFinite(ms) ? setTimeout(() => {
+            pending.delete(id);
+            rej(new Error(`${method} got no response within the call budget (${cfg.budgetMs}ms)`));
+          }, ms) : null;
+          pending.set(id, {
+            res: (value) => { clearTimeout(commandTimer); res(value); },
+            rej: (error) => { clearTimeout(commandTimer); rej(error); },
+          });
           const message = { id, method, params };
           if (sessionId) message.sessionId = sessionId;
           ws.send(JSON.stringify(message));
@@ -143,11 +160,13 @@ function openSession(wsUrl, timeoutMs) {
       else res(msg.result);
     });
     ws.addEventListener('error', () => {
+      closed = true;
       clearTimeout(timer);
       failAll('cdp websocket error');
       reject(new Error('cdp websocket error'));
     });
     ws.addEventListener('close', () => {
+      closed = true;
       clearTimeout(timer);
       failAll('cdp websocket closed');
       reject(new Error('cdp websocket closed before it opened'));
@@ -282,7 +301,7 @@ async function main() {
     : null;
   try {
     if (cfg.session) {
-      unlock = await lockSession(cfg.session.file, cfg.lockWaitMs || SESSION_LOCK_WAIT_MS);
+      unlock = await lockSession(cfg.session.file, Math.min(cfg.lockWaitMs || SESSION_LOCK_WAIT_MS, remainingMs()));
       persisted = readSessionFile(cfg.session.file);
     }
     const wantsIsolation = !!(cfg.session && cfg.session.isolated);
@@ -297,7 +316,7 @@ async function main() {
         ? { isolated: true, browserContextId: persisted.browserContextId || null }
         : { isolated: false, browserContextId: null };
     out.tab = { targetId: target.id, state: target.created ? 'opened' : 'reused', url: null, ...isolation };
-    const page = await openSession(target.webSocketDebuggerUrl, 5000);
+    const page = await openSession(target.webSocketDebuggerUrl, budgetCap(5000));
     close = () => page.close();
     session = page;
     ctx = createToolContext({
@@ -314,6 +333,7 @@ async function main() {
     await attachCapture(ctx, steps);
     for (let index = 0; index < steps.length; index++) {
       const step = steps[index];
+      if (remainingMs() <= 0) throw new Error(`call budget exhausted before step ${index + 1} (${step.op})`);
       const record = {
         index: index + 1,
         action: step.op,
@@ -329,6 +349,7 @@ async function main() {
         record.navigated = pageOut.navigated;
         if (!pageOut.navigated) record.skipped = 'already-at-url';
       } else if (step.op === 'wait') {
+        if (step.ms > remainingMs()) throw new Error(`wait ${step.ms}ms is longer than the call's remaining budget`);
         await sleep(step.ms);
         out.pages.push({ op: 'wait', ms: step.ms });
       } else if (step.op === 'eval') {
