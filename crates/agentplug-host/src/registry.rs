@@ -1491,6 +1491,42 @@ pub fn dispatch_on(
     caller_root: &Path,
     caller_siblings: Arc<Mutex<HashMap<String, Arc<SharedPluginPool>>>>,
 ) -> anyhow::Result<String> {
+    outside_tokio_context(move || {
+        dispatch_on_here(store, instance, verb, body, caller_root, caller_siblings)
+    })
+}
+
+// wasmtime-wasi sync shims call tokio block_on (in_tokio) and panic with "Cannot start a
+// runtime from within a runtime" when a runtime is entered on the calling thread, so the
+// dispatch runs on a scoped thread that enters none and carries the dispatch origin across.
+pub(crate) fn outside_tokio_context<T, F>(work: F) -> T
+where
+    F: FnOnce() -> T + Send,
+    T: Send,
+{
+    if tokio::runtime::Handle::try_current().is_err() {
+        return work();
+    }
+    let origin = crate::dispatch_origin::current_origin();
+    std::thread::scope(|scope| {
+        scope
+            .spawn(move || {
+                let _origin = crate::dispatch_origin::enter_origin(origin);
+                work()
+            })
+            .join()
+            .unwrap_or_else(|payload| std::panic::resume_unwind(payload))
+    })
+}
+
+fn dispatch_on_here(
+    store: &mut Store<HostState>,
+    instance: wasmtime::Instance,
+    verb: &str,
+    body: &str,
+    caller_root: &Path,
+    caller_siblings: Arc<Mutex<HashMap<String, Arc<SharedPluginPool>>>>,
+) -> anyhow::Result<String> {
     store.data().set_cwd(caller_root.to_path_buf());
     store.data().set_siblings(caller_siblings);
     let _ = store.data().take_lost_response();

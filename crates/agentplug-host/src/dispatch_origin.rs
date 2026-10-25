@@ -48,6 +48,15 @@ pub(crate) fn current_session_id() -> Option<String> {
     CURRENT_DISPATCH_ORIGIN.with(|cell| cell.borrow().as_ref().and_then(|origin| origin.session_id.clone()))
 }
 
+pub(crate) fn current_origin() -> Option<DispatchOrigin> {
+    CURRENT_DISPATCH_ORIGIN.with(|cell| cell.borrow().clone())
+}
+
+pub(crate) fn enter_origin(origin: Option<DispatchOrigin>) -> DispatchOriginScope {
+    let previous = CURRENT_DISPATCH_ORIGIN.with(|cell| cell.replace(origin));
+    DispatchOriginScope { previous }
+}
+
 pub(crate) fn dispatch_env_value(key: &str) -> Option<Option<String>> {
     if !key.starts_with(DISPATCH_ENV_PREFIX) {
         return None;
