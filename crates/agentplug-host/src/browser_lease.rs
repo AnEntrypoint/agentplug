@@ -10,8 +10,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde_json::{json, Value};
 
 use crate::browser::{
-    browser_pid, endpoint_failure, endpoint_ready, find_chrome, free_local_port,
-    kill_process_tree, process_exists, reap_stale_browsers, CDP_POLL_INTERVAL,
+    browser_pid, endpoint_failure, endpoint_get, endpoint_ready, find_chrome, free_local_port,
+    kill_process_tree, process_exists, reap_stale_browsers, request_exit, CDP_POLL_INTERVAL,
     CDP_READY_DEADLINE,
 };
 use crate::watcher_log::append_watcher_event;
@@ -146,6 +146,12 @@ pub fn owner_file(root: &Path) -> PathBuf {
 
 pub fn profile_dir(root: &Path) -> PathBuf {
     session_dir(root).join(PROFILE)
+}
+
+// The project a profile directory belongs to: only the lease's own profile of <root> maps back to <root>.
+pub fn profile_owner(profile: &Path) -> Option<PathBuf> {
+    let root = profile.ancestors().nth(4)?;
+    (profile == profile_dir(root).as_path()).then(|| root.to_path_buf())
 }
 
 #[derive(Clone)]
@@ -672,6 +678,12 @@ fn open_browser(
             }
             port
         };
+        if port_owned_elsewhere(root, port) {
+            return Err(format!(
+                "port {port} is the debugging port of another project's browser; {} may attach only to its own",
+                root.display()
+            ));
+        }
         log_browser(root, "browser-discovered", 0, &format!("port={port}"));
         return Ok(SharedBrowser {
             child: None,
@@ -799,14 +811,6 @@ fn exit_detail(browser: &mut SharedBrowser) -> String {
     }
 }
 
-fn browser_gone(browser: &mut SharedBrowser) -> bool {
-    let reaped = match browser.child.as_mut() {
-        Some(child) => matches!(child.try_wait(), Ok(Some(_))),
-        None => false,
-    };
-    reaped || !process_exists(browser.pid)
-}
-
 pub(crate) fn log_browser(root: &Path, event: &str, pid: u32, detail: &str) {
     append_watcher_event(
         root,
@@ -825,20 +829,33 @@ fn close_browser(browser: &mut SharedBrowser) {
     if browser.attached {
         return;
     }
-    if crate::browser::request_exit(browser.pid) {
+    // browser.pid can be the launcher wrapper (Ubuntu's /usr/bin/chromium is a shell script that runs chromium.real).
+    // Signalling only the wrapper left chromium.real running with no record, so the main process is resolved first.
+    let main = browser_pid(&browser.profile).unwrap_or(browser.pid);
+    if request_exit(main) {
         let deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < deadline {
-            if browser_gone(browser) {
+            let launcher_reaped = browser
+                .child
+                .as_mut()
+                .is_some_and(|child| matches!(child.try_wait(), Ok(Some(_))));
+            if launcher_reaped || !process_exists(main) {
                 break;
             }
             std::thread::sleep(Duration::from_millis(100));
         }
     }
-    kill_tree(browser.pid);
+    if process_exists(main) {
+        kill_tree(main);
+    }
     if let Some(child) = browser.child.as_mut() {
         kill_tree(child.id());
         let _ = child.kill();
         let _ = child.wait();
+    }
+    // Only a lease-owned profile is swept: a caller-named profile may belong to a Chrome the user runs.
+    if let Some(root) = profile_owner(&browser.profile) {
+        let _ = reap_stale_browsers(&root);
     }
     prune_regenerable_profile_cache(&browser.profile);
 }
@@ -1040,6 +1057,7 @@ pub fn acquire_with(
     ttl_ms: u64,
     wait_ms: u64,
 ) -> Result<(u16, u32), String> {
+    refuse_foreign_profile(root, opts)?;
     let _waiting = WaitTicket::enter(root);
     claim_session(root, agent, ttl_ms, wait_ms)?;
     attach_after_claim(root, agent, opts, headful)
@@ -1059,14 +1077,34 @@ fn drop_shared_browser(root: &Path, cause: &str) {
 // reset: closes the shared browser and gives up the lease. The next acquire launches a fresh browser on the same profile.
 pub fn reset_session(root: &Path, agent: &str, ttl_ms: u64, wait_ms: u64) -> Result<(), String> {
     let _waiting = WaitTicket::enter(root);
+    let attached = browsers().get(root).is_some_and(|browser| browser.attached);
     if claim_session(root, agent, ttl_ms, wait_ms).is_err() {
         // The holder outlived the wait: closing its browser ends its helper, and its call then releases the claim.
         drop_shared_browser(root, "reset-wedged");
         claim_session(root, agent, ttl_ms, wait_ms)?;
     }
     drop_shared_browser(root, "reset");
+    // The record is only in memory: after a runner restart, or a record dropped without a close, nothing else would
+    // end this project's Chromium. The sweep covers this project's own profile only, never an attached browser.
+    if !attached {
+        let _ = reap_stale_browsers(root);
+    }
     release_claim(root);
     Ok(())
+}
+
+// A call acts only on its own project's browser: a named profile of another project is refused before any claim.
+fn refuse_foreign_profile(root: &Path, opts: &LaunchOptions) -> Result<(), String> {
+    let profile = profile_for(root, opts);
+    match profile_owner(&profile) {
+        Some(owner) if owner.as_path() != root => Err(format!(
+            "profile {} belongs to project {}; {} may open only its own browser",
+            profile.display(),
+            owner.display(),
+            root.display()
+        )),
+        _ => Ok(()),
+    }
 }
 
 // reconnect: closes the shared browser under the caller's lease and opens it again, keeping the lease.
@@ -1078,6 +1116,7 @@ pub fn reconnect_session(
     ttl_ms: u64,
     wait_ms: u64,
 ) -> Result<(u16, u32), String> {
+    refuse_foreign_profile(root, opts)?;
     let _waiting = WaitTicket::enter(root);
     claim_session(root, agent, ttl_ms, wait_ms)?;
     drop_shared_browser(root, "reconnect");
@@ -1221,17 +1260,18 @@ pub fn status(root: &Path) -> Value {
     out
 }
 
-// Every shared browser in this process, across roots: the list verb form of browser_lease_status.
-pub fn list_browsers() -> Value {
+// The caller's own shared browser and the open_browsers block. Another project's browser is never listed or touched here.
+pub fn list_browsers(root: &Path) -> Value {
     let rows: Vec<Value> = {
         let mut map = browsers();
         let collected: Vec<Value> = map
             .iter_mut()
-            .map(|(root, browser)| {
+            .filter(|(owned, _)| owned.as_path() == root)
+            .map(|(owned, browser)| {
                 let mut leases: Vec<String> = browser.active.iter().cloned().collect();
                 leases.sort();
                 json!({
-                    "root": root.display().to_string(),
+                    "root": owned.display().to_string(),
                     "port": browser.port,
                     "chrome_pid": browser.pid,
                     "attached": browser.attached,
@@ -1246,7 +1286,7 @@ pub fn list_browsers() -> Value {
             .collect();
         collected
     };
-    json!({"count": rows.len(), "browsers": rows})
+    json!({"count": rows.len(), "browsers": rows, "open_browsers": open_browsers_block(root)})
 }
 
 pub fn lease_reply(verb: &str, dispatch_root: &Path, body: &str) -> String {
@@ -1284,7 +1324,11 @@ pub fn lease_reply(verb: &str, dispatch_root: &Path, body: &str) -> String {
     if req.user_data_dir.as_deref().is_some_and(|dir| dir.trim().is_empty()) {
         return json!({"ok": false, "error": format!("{verb} userDataDir is empty")}).to_string();
     }
-    let root = req.root.clone().unwrap_or_else(|| dispatch_root.to_path_buf());
+    if req.root.as_deref().is_some_and(|named| named != dispatch_root) {
+        return json!({"ok": false, "error": format!("{verb} acts only on the calling project {}", dispatch_root.display())})
+            .to_string();
+    }
+    let root = dispatch_root.to_path_buf();
     let ttl_ms = req.ttl_ms.unwrap_or(TTL_MS);
     let wait_ms = req.wait_ms.unwrap_or(WAIT_MS);
     let opts = LaunchOptions {
@@ -1293,7 +1337,7 @@ pub fn lease_reply(verb: &str, dispatch_root: &Path, body: &str) -> String {
         disable_sandbox: req.disable_sandbox.unwrap_or(false),
         endpoint: req.endpoint.clone(),
     };
-    let reply = match (verb, req.agent.as_deref()) {
+    let mut reply = match (verb, req.agent.as_deref()) {
         ("browser_lease_acquire", None) | ("browser_lease_release", None) => {
             json!({"ok": false, "error": format!("{verb} needs an agent")})
         }
@@ -1333,7 +1377,7 @@ pub fn lease_reply(verb: &str, dispatch_root: &Path, body: &str) -> String {
             state
         }
         ("browser_lease_status", _) if req.list.unwrap_or(false) => {
-            let mut state = list_browsers();
+            let mut state = list_browsers(&root);
             state["ok"] = json!(true);
             state
         }
@@ -1344,6 +1388,9 @@ pub fn lease_reply(verb: &str, dispatch_root: &Path, body: &str) -> String {
         }
         _ => json!({"ok": false, "error": format!("{verb} is not a browser lease verb")}),
     };
+    if let Some(obj) = reply.as_object_mut() {
+        obj.insert("open_browsers".to_string(), open_browsers_block(&root));
+    }
     reply.to_string()
 }
 
@@ -1412,6 +1459,7 @@ pub fn housekeeping(_now: Instant) {
         release_claim(&root);
         log_browser(&root, &reason.label(), pid, &detail);
     }
+    reap_idle_untracked();
 }
 
 pub fn spawn_housekeeping_timer() {
@@ -1454,4 +1502,309 @@ pub fn shutdown_shared_browsers() {
         stop_heartbeat(&root);
         release_session(&root);
     }
+}
+
+// Attribution of the Chromium main processes on this host. gm always passes a remote-debugging port and a profile, so
+// a Chromium without them is the user's own browser and is never listed, counted or reaped.
+
+struct ChromiumMain {
+    pid: u32,
+    age_s: u64,
+    port: Option<u16>,
+    profile: Option<PathBuf>,
+}
+
+struct Tracked {
+    root: PathBuf,
+    pid: u32,
+    port: u16,
+    attached: bool,
+}
+
+struct Reaped {
+    owner: Option<PathBuf>,
+    pid: u32,
+    age_s: u64,
+    ts_ms: u64,
+}
+
+const REAP_LOG_MAX: usize = 100;
+static REAPED: OnceLock<Mutex<Vec<Reaped>>> = OnceLock::new();
+
+fn reaped() -> MutexGuard<'static, Vec<Reaped>> {
+    REAPED
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
+// Snapshot of the shared browsers this runner tracks, taken without holding the map across any other call.
+fn tracked_snapshot() -> Vec<Tracked> {
+    browsers()
+        .iter()
+        .map(|(root, browser)| Tracked {
+            root: root.clone(),
+            pid: browser.pid,
+            port: browser.port,
+            attached: browser.attached,
+        })
+        .collect()
+}
+
+fn take_field(text: &str) -> Option<(&str, &str)> {
+    let text = text.trim_start();
+    if text.is_empty() {
+        return None;
+    }
+    let end = text.find(char::is_whitespace).unwrap_or(text.len());
+    Some((&text[..end], &text[end..]))
+}
+
+// ps etime is [[dd-]hh:]mm:ss on both Linux procps and macOS.
+fn parse_etime(text: &str) -> Option<u64> {
+    let (days, clock) = match text.split_once('-') {
+        Some((days, clock)) => (days.parse::<u64>().ok()?, clock),
+        None => (0, text),
+    };
+    let mut seconds = 0u64;
+    for part in clock.split(':') {
+        seconds = seconds * 60 + part.parse::<u64>().ok()?;
+    }
+    Some(days * 86_400 + seconds)
+}
+
+#[cfg(not(windows))]
+fn scan_processes() -> Vec<(u32, u64, String)> {
+    let Ok(output) = Command::new("ps")
+        .args(["-axww", "-o", "pid=,etime=,args="])
+        .stderr(Stdio::null())
+        .output()
+    else {
+        return Vec::new();
+    };
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            let (pid, rest) = take_field(line)?;
+            let (etime, args) = take_field(rest)?;
+            let pid: u32 = pid.parse().ok()?;
+            Some((pid, parse_etime(etime)?, args.trim().to_string()))
+        })
+        .collect()
+}
+
+#[cfg(windows)]
+fn scan_processes() -> Vec<(u32, u64, String)> {
+    const SCRIPT: &str = "Get-CimInstance Win32_Process -Filter \"Name='chrome.exe'\" | ForEach-Object { '{0}|{1}|{2}' -f $_.ProcessId, [int]((Get-Date) - $_.CreationDate).TotalSeconds, $_.CommandLine }";
+    let mut cmd = Command::new("powershell");
+    cmd.args(["-NoProfile", "-Command", SCRIPT]).stderr(Stdio::null());
+    apply_windowless(&mut cmd);
+    let Ok(output) = cmd.output() else {
+        return Vec::new();
+    };
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.splitn(3, '|');
+            let pid: u32 = parts.next()?.trim().parse().ok()?;
+            let age: u64 = parts.next()?.trim().parse().ok()?;
+            Some((pid, age, parts.next().unwrap_or("").trim().to_string()))
+        })
+        .collect()
+}
+
+// The executable is the command text before the first flag; a shell wrapper that runs Chromium is not the main process.
+fn is_chromium_argv0(args: &str) -> bool {
+    let argv0 = args.split(" --").next().unwrap_or("").trim();
+    let first = argv0.split_whitespace().next().unwrap_or("");
+    let base = first
+        .rsplit(|c: char| c == '/' || c == '\\')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    !matches!(base.as_str(), "sh" | "bash" | "dash" | "zsh")
+        && argv0.to_ascii_lowercase().contains("chrom")
+}
+
+fn arg_value(args: &str, key: &str) -> Option<String> {
+    let needle = format!("--{key}=");
+    let rest = &args[args.find(&needle)? + needle.len()..];
+    let end = rest.find(" --").unwrap_or(rest.len());
+    Some(rest[..end].trim().to_string())
+}
+
+fn chromium_mains() -> Vec<ChromiumMain> {
+    scan_processes()
+        .into_iter()
+        .filter(|(_, _, args)| {
+            !args.contains("--type=") && args.contains("--user-data-dir=") && is_chromium_argv0(args)
+        })
+        .map(|(pid, age_s, args)| ChromiumMain {
+            pid,
+            age_s,
+            port: arg_value(&args, "remote-debugging-port").and_then(|value| value.parse::<u16>().ok()),
+            profile: arg_value(&args, "user-data-dir").map(PathBuf::from),
+        })
+        .collect()
+}
+
+fn port_owned_elsewhere(root: &Path, port: u16) -> bool {
+    chromium_mains().iter().any(|main| {
+        main.port == Some(port)
+            && main
+                .profile
+                .as_deref()
+                .and_then(profile_owner)
+                .is_some_and(|owner| owner.as_path() != root)
+    })
+}
+
+// The page targets of a browser whose debugging port answers; an error text otherwise.
+fn tabs_of(port: u16) -> Value {
+    match endpoint_get(port, "/json/list") {
+        Ok(text) => match serde_json::from_str::<Value>(&text) {
+            Ok(Value::Array(targets)) => Value::Array(
+                targets
+                    .iter()
+                    .filter(|target| target.get("type").and_then(Value::as_str) == Some("page"))
+                    .map(|target| {
+                        json!({
+                            "url": target.get("url").cloned().unwrap_or(Value::Null),
+                            "title": target.get("title").cloned().unwrap_or(Value::Null),
+                        })
+                    })
+                    .collect(),
+            ),
+            _ => json!({"error": "target list was not a JSON array"}),
+        },
+        Err(e) => json!({"error": e}),
+    }
+}
+
+fn own_entry(main: &ChromiumMain, tracked: &[Tracked], caller: &Path) -> Value {
+    let is_tracked = tracked.iter().any(|t| t.pid == main.pid || main.port == Some(t.port));
+    let holder = read_holder(caller).filter(|holder| holder.browser_pid == main.pid);
+    let lease_live = holder
+        .as_ref()
+        .is_some_and(|holder| holder_live(caller, holder.ttl_ms));
+    json!({
+        "pid": main.pid,
+        "port": main.port,
+        "profile": main.profile.as_ref().map(|p| p.display().to_string()),
+        "age_s": main.age_s,
+        "tracked": is_tracked,
+        "lease_holder": holder.as_ref().map(|holder| holder.owner.clone()),
+        "lease_live": lease_live,
+        "tabs": main.port.map_or(Value::Null, tabs_of),
+    })
+}
+
+// The open_browsers block every browser-style reply carries, scoped to the caller's project. Its own browsers are
+// listed in full with their tabs; another project's browsers are only counted; a gm-launched process with no project
+// is an orphan, reported by pid and age only. Reaps inside the idle window are listed for the caller that owns them.
+pub fn open_browsers_block(caller: &Path) -> Value {
+    let tracked = tracked_snapshot();
+    let mains = chromium_mains();
+    let mut own: Vec<Value> = Vec::new();
+    let mut orphans: Vec<Value> = Vec::new();
+    let mut other_projects = 0usize;
+    for main in mains.iter().filter(|main| main.port.is_some()) {
+        let owner = main
+            .profile
+            .as_deref()
+            .and_then(profile_owner)
+            .or_else(|| {
+                tracked
+                    .iter()
+                    .find(|t| t.pid == main.pid || main.port == Some(t.port))
+                    .map(|t| t.root.clone())
+            });
+        match owner {
+            Some(root) if root.as_path() == caller => own.push(own_entry(main, &tracked, caller)),
+            Some(_) => other_projects += 1,
+            None => orphans.push(json!({"pid": main.pid, "age_s": main.age_s})),
+        }
+    }
+    for t in tracked.iter().filter(|t| t.root.as_path() == caller) {
+        if !mains.iter().any(|main| main.pid == t.pid || main.port == Some(t.port)) {
+            own.push(json!({
+                "pid": t.pid,
+                "port": t.port,
+                "profile": Value::Null,
+                "age_s": Value::Null,
+                "tracked": true,
+                "attached": t.attached,
+                "lease_holder": Value::Null,
+                "lease_live": false,
+                "tabs": tabs_of(t.port),
+            }));
+        }
+    }
+    let cutoff = now_ms().saturating_sub(idle_window_ms());
+    let reaped_recent: Vec<Value> = reaped()
+        .iter()
+        .filter(|r| r.ts_ms >= cutoff && r.owner.as_deref().map_or(true, |owner| owner == caller))
+        .map(|r| {
+            let kind = if r.owner.is_some() { "own" } else { "orphan" };
+            json!({"pid": r.pid, "age_s": r.age_s, "ts_ms": r.ts_ms, "owner": kind})
+        })
+        .collect();
+    json!({
+        "root": caller.display().to_string(),
+        "own": own,
+        "other_projects": other_projects,
+        "orphans": orphans,
+        "reaped": reaped_recent,
+    })
+}
+
+// Closes a gm-launched Chromium main that no record tracks and that has run longer than the idle window. A process of
+// a project with a live lease or a call in flight is never touched; an unattributed process is an orphan.
+pub fn reap_idle_untracked() {
+    let tracked = tracked_snapshot();
+    let window_s = idle_window_ms() / 1_000;
+    for main in chromium_mains() {
+        if main.port.is_none() || main.age_s < window_s {
+            continue;
+        }
+        if tracked.iter().any(|t| t.pid == main.pid || main.port == Some(t.port)) {
+            continue;
+        }
+        let owner = main.profile.as_deref().and_then(profile_owner);
+        if let Some(root) = owner.as_deref() {
+            if claimed().contains(root) || has_waiter(root) || holder_live(root, TTL_MS) {
+                continue;
+            }
+        }
+        reap_untracked(&main, owner);
+    }
+}
+
+fn reap_untracked(main: &ChromiumMain, owner: Option<PathBuf>) {
+    if request_exit(main.pid) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while process_exists(main.pid) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+    if process_exists(main.pid) {
+        kill_process_tree(main.pid);
+    }
+    if let Some(root) = owner.as_deref() {
+        log_browser(
+            root,
+            "browser-reaped",
+            main.pid,
+            &format!("reason=untracked-idle age_s={}", main.age_s),
+        );
+    }
+    let mut log = reaped();
+    log.push(Reaped {
+        owner,
+        pid: main.pid,
+        age_s: main.age_s,
+        ts_ms: now_ms(),
+    });
+    let surplus = log.len().saturating_sub(REAP_LOG_MAX);
+    log.drain(..surplus);
 }

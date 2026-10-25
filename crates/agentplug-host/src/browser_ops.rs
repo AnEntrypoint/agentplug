@@ -34,6 +34,16 @@ fn lift(op: &str, result: Result<Value, String>) -> Value {
 // body: JSON. session-* take {"name"}; session-update also {"title"?, "color"?}; recorder-* take {"session"};
 // recorder-events takes {"type"?, "errors"?, "exclude"?}; recorder-frame takes {"eventId"}.
 pub fn reply(root: &Path, op: &str, body: &str) -> Value {
+    let mut out = dispatch(root, op, body);
+    if op == "browser-reset" {
+        if let Some(obj) = out.as_object_mut() {
+            obj.insert("open_browsers".to_string(), browser_lease::open_browsers_block(root));
+        }
+    }
+    out
+}
+
+fn dispatch(root: &Path, op: &str, body: &str) -> Value {
     let req = match parse_body(body) {
         Ok(req) => req,
         Err(e) => return json!({ "ok": false, "op": op, "error": e }),
@@ -55,7 +65,7 @@ pub fn reply(root: &Path, op: &str, body: &str) -> Value {
                 Err(e) => json!({ "ok": false, "op": op, "error": e }),
             }
         }
-        "browser-list" => browser_lease::list_browsers(),
+        "browser-list" => browser_lease::list_browsers(root),
         "recorder-start" => lift(op, action_recorder::start(text(&req, "session"))),
         "recorder-stop" => lift(op, action_recorder::stop(text(&req, "session"))),
         "recorder-events" => {

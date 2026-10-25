@@ -865,7 +865,7 @@ fn endpoint_state(port: u16, require_targets: bool) -> Result<(), String> {
     Ok(())
 }
 
-fn endpoint_get(port: u16, path: &str) -> Result<String, String> {
+pub(crate) fn endpoint_get(port: u16, path: &str) -> Result<String, String> {
     shared_agent()
         .get(&format!("http://127.0.0.1:{port}{path}"))
         .timeout(Duration::from_millis(800))
@@ -1170,6 +1170,14 @@ pub fn browser_reply_from_run(
 // expectation probe and the helper run. The caller waits for the worker only until the budget ends; on expiry
 // it cancels the worker, releases this agent's lease (which clears the holder record) and replies with a timeout.
 pub fn browser_cdp(cwd: &Path, body: &str) -> Value {
+    let mut reply = browser_cdp_call(cwd, body);
+    if let Some(obj) = reply.as_object_mut() {
+        obj.insert("open_browsers".to_string(), browser_lease::open_browsers_block(cwd));
+    }
+    reply
+}
+
+fn browser_cdp_call(cwd: &Path, body: &str) -> Value {
     let started = Instant::now();
     let parsed = match parse_cdp_browser_body(body) {
         Ok(parsed) => parsed,
