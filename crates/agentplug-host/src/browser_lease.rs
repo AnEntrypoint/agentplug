@@ -1059,7 +1059,11 @@ fn drop_shared_browser(root: &Path, cause: &str) {
 // reset: closes the shared browser and gives up the lease. The next acquire launches a fresh browser on the same profile.
 pub fn reset_session(root: &Path, agent: &str, ttl_ms: u64, wait_ms: u64) -> Result<(), String> {
     let _waiting = WaitTicket::enter(root);
-    claim_session(root, agent, ttl_ms, wait_ms)?;
+    if claim_session(root, agent, ttl_ms, wait_ms).is_err() {
+        // The holder outlived the wait: closing its browser ends its helper, and its call then releases the claim.
+        drop_shared_browser(root, "reset-wedged");
+        claim_session(root, agent, ttl_ms, wait_ms)?;
+    }
     drop_shared_browser(root, "reset");
     release_claim(root);
     Ok(())

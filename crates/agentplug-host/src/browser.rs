@@ -316,7 +316,7 @@ const CAPTURE_REPLY_KEYS: [&str; 8] = [
 const CDP_TIMEOUT_MIN_MS: u64 = 1_000;
 const CDP_TIMEOUT_MAX_MS: u64 = 300_000;
 
-const TOOL_STEP_GRAMMAR: &str ="snapshot, click=<uid>, dblclick=<uid>, hover=<uid>, click_at=<x>,<y>, fill=<uid> <value>, type=<text>, press=<key>, press_uid=<uid> <key>, upload=<uid> <path>[;<path>], wait_for=<text>, reload, back, forward, console, console=on, network[=<reqid>], dialog=accept|dismiss, screenshot=<path>, screenshot_full=<path>, screenshot_uid=<uid> <path>, trace_start, trace_stop[=<path>], json <object with an op field>, cdp <Domain.method> (+ JSON params on the next line), events <Domain.event> [where <field>~<value>] [limit=N], wait <ms>";
+const TOOL_STEP_GRAMMAR: &str ="snapshot, click=<uid>, dblclick=<uid>, hover=<uid>, click_at=<x>,<y>, fill=<uid> <value>, type=<text>, press=<key>, press_uid=<uid> <key>, upload=<uid> <path>[;<path>], wait_for=<text>, reload, back, forward, console, console=on, network[=<reqid>], dialog=accept|dismiss, viewport=<W>x<H>, screenshot=<path>, screenshot_full=<path>,screenshot_uid=<uid> <path>, trace_start, trace_stop[=<path>], json <object with an op field>, cdp <Domain.method> (+ JSON params on the next line), events <Domain.event> [where <field>~<value>] [limit=N], wait <ms>";
 
 pub fn parse_cdp_browser_body(body: &str) -> Result<CdpBrowser, String> {
     let mut session = None;
@@ -721,6 +721,10 @@ fn parse_tool_step(line: &str) -> Result<Value, String> {
         ("dialog", Some(action)) if action == "accept" || action == "dismiss" => {
             json!({ "op": "dialog", "action": action })
         }
+        ("viewport", Some(size)) => {
+            let (width, height) = parse_viewport(size)?;
+            json!({ "op": "viewport", "width": width, "height": height })
+        }
         ("screenshot", Some(path)) => {
             json!({ "op": "screenshot", "path": non_empty(path, "screenshot path")? })
         }
@@ -739,6 +743,23 @@ fn parse_tool_step(line: &str) -> Result<Value, String> {
         }
     };
     Ok(step)
+}
+
+const VIEWPORT_MAX_EDGE: u64 = 7680;
+
+// viewport=WxH sets the page's CSS viewport size for the rest of the call (for example viewport=1280x720).
+fn parse_viewport(size: &str) -> Result<(u64, u64), String> {
+    let (width, height) = size
+        .split_once(|c: char| c == 'x' || c == 'X')
+        .ok_or_else(|| format!("viewport needs WIDTHxHEIGHT in CSS pixels, got '{size}'"))?;
+    let width = require_number(width.trim(), "viewport width")?;
+    let height = require_number(height.trim(), "viewport height")?;
+    if !(1..=VIEWPORT_MAX_EDGE).contains(&width) || !(1..=VIEWPORT_MAX_EDGE).contains(&height) {
+        return Err(format!(
+            "viewport edges must be 1..{VIEWPORT_MAX_EDGE} CSS pixels, got {width}x{height}"
+        ));
+    }
+    Ok((width, height))
 }
 
 fn split_first_word(rest: &str) -> (&str, &str) {

@@ -5,7 +5,7 @@ import zlib from 'node:zlib';
 const TOOL_OPS = new Set([
   'snapshot', 'click', 'dblclick', 'hover', 'click_at', 'fill', 'type', 'press', 'upload',
   'wait_for', 'reload', 'back', 'forward', 'console', 'network', 'dialog',
-  'screenshot', 'trace_start', 'trace_stop', 'console_clear', 'clean_html', 'page_markdown',
+  'screenshot', 'viewport', 'trace_start', 'trace_stop', 'console_clear', 'clean_html', 'page_markdown',
   'locator', 'ref_to_locator', 'inspect', 'resize',
   'cursor', 'debugger', 'editor',
 ]);
@@ -1031,6 +1031,30 @@ async function viewportSize(s) {
   return { x: view.pageX || 0, y: view.pageY || 0, width: view.clientWidth, height: view.clientHeight };
 }
 
+const VIEWPORT_STEP_MS = 10000;
+
+// Sets the device metrics for the rest of this call and reads back the size the page reports. Each command has
+// its own VIEWPORT_STEP_MS cap (and the call budget still bounds it), so a stalled emulation fails this step.
+async function viewportStep(ctx, step) {
+  const s = ctx.session;
+  const width = Number(step.width);
+  const height = Number(step.height);
+  if (!Number.isInteger(width) || !Number.isInteger(height) || width < 1 || height < 1) {
+    throw new Error(`viewport needs whole-number width and height, got ${step.width}x${step.height}`);
+  }
+  await withDeadline(
+    s.send('Emulation.setDeviceMetricsOverride', { width, height, deviceScaleFactor: 1, mobile: false }),
+    VIEWPORT_STEP_MS,
+    `viewport ${width}x${height}`,
+  );
+  const reported = await withDeadline(
+    ctx.host.evaluate(s, '({ width: innerWidth, height: innerHeight })'),
+    VIEWPORT_STEP_MS,
+    'viewport readback',
+  );
+  return { op: 'viewport', width, height, reported };
+}
+
 function summarizeTrace(events) {
   const timed = events.filter((e) => typeof e.ts === 'number' && e.ph !== 'M');
   if (timed.length === 0) {
@@ -1342,6 +1366,7 @@ async function runToolStep(ctx, step) {
     case 'network': return networkReport(ctx, step.reqid);
     case 'dialog': return setDialogPolicy(ctx, step.action, step.promptText);
     case 'screenshot': return screenshotStep(ctx, step);
+    case 'viewport': return viewportStep(ctx, step);
     case 'trace_start': return traceStart(ctx);
     case 'trace_stop': return traceStop(ctx, step.path || '');
     case 'cursor': return cursorStep(ctx, step);

@@ -2499,6 +2499,7 @@ fn tool_step_released() -> &'static Condvar {
 const MAX_CONCURRENT_HEAVY_DISPATCHES: usize = 3;
 
 const UNSERIALIZED_VERBS: &[&str] = &[
+    "browser-reset",
     "dream-replay-cycle",
     "exec_js",
     "lang",
@@ -2691,8 +2692,9 @@ fn serial_lane_for_dispatch(verb: &str, body: &str) -> Option<&'static str> {
 }
 
 // Browser verbs queue on their own lane, never the shared state lane: a browser call can wait up to its
-// budget for the browser lease, and PRD writes must not wait behind it.
-const BROWSER_LANE_VERBS: &[&str] = &["browser", "chrome", "browser-reset"];
+// budget for the browser lease, and PRD writes must not wait behind it. browser-reset is unserialized
+// (UNSERIALIZED_VERBS) so it can release a wedged browser call that still holds the lane.
+const BROWSER_LANE_VERBS: &[&str] = &["browser", "chrome"];
 
 pub fn dispatch_serial_lane(verb: &str, body: &str) -> Option<&'static str> {
     serial_lane_for_dispatch(verb, body)
