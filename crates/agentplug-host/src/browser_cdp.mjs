@@ -228,6 +228,12 @@ function writePartial(out) {
   }
 }
 
+// Every failure carries text: a thrown value with no message is named by what it is, never left empty.
+function errorText(e) {
+  const text = e && e.message ? String(e.message) : String(e);
+  return text.trim() || 'browser helper failed without an error message';
+}
+
 function sameUrl(a, b) {
   try {
     return new URL(a).href === new URL(b).href;
@@ -258,7 +264,7 @@ async function gotoStep(session, url) {
 
 async function main() {
   const started = Date.now();
-  const out = { ok: false, targetId: null, tab: null, steps: [], pages: [], error: null };
+  const out = { ok: false, targetId: null, tab: null, steps: [], pages: [], error: null, failed_step: null, failed_action: null };
   const steps = cfg.steps || [];
   let session = null;
   let close = () => {};
@@ -267,12 +273,15 @@ async function main() {
   let persisted = null;
   let closedByStep = false;
   let cleaned = false;
+  let current = null;
   const cleanup = async () => {
     if (cleaned) return;
     cleaned = true;
     if (session && out.tab && !closedByStep) {
       out.tab.url = await withDeadline(currentUrl(session), CLEANUP_URL_DEADLINE_MS, 'cleanup url read').catch((e) => `url unreadable: ${e.message}`);
     }
+    if (ctx && session && !closedByStep) await disableCapture(ctx);
+    finishCapture(ctx, out, { consoleAll: cfg.consoleAll === true, cwd: cfg.cwd || safeCwd() });
     if (cfg.session && ctx && out.targetId && !closedByStep) {
       try {
         writeSessionFile(cfg.session.file, {
@@ -294,6 +303,8 @@ async function main() {
     ? setTimeout(async () => {
         out.ok = false;
         out.error = out.error || `browser helper ran past its ${cfg.watchdogMs}ms budget`;
+        out.failed_step = out.failed_step ?? (current ? current.index : null);
+        out.failed_action = out.failed_action ?? (current ? current.action : null);
         await cleanup();
         process.stdout.write(JSON.stringify(out) + '\n');
         process.exit(1);
@@ -333,6 +344,7 @@ async function main() {
     await attachCapture(ctx, steps);
     for (let index = 0; index < steps.length; index++) {
       const step = steps[index];
+      current = { index: index + 1, action: step.op };
       if (remainingMs() <= 0) throw new Error(`call budget exhausted before step ${index + 1} (${step.op})`);
       const record = {
         index: index + 1,
@@ -380,10 +392,13 @@ async function main() {
       record.url_after = closedByStep ? null : await currentUrl(session);
       out.steps.push(record);
       writePartial(out);
+      current = null;
     }
     out.ok = true;
   } catch (e) {
-    out.error = String((e && e.message) || e);
+    out.error = errorText(e);
+    out.failed_step = current ? current.index : null;
+    out.failed_action = current ? current.action : null;
   } finally {
     await cleanup();
   }

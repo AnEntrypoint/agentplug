@@ -15,8 +15,7 @@ const INTERACTIVE_ROLES = new Set([
 ]);
 const AGENT_MAX_DIMENSION = 1568;
 const CLEAN_HTML_STRIP = 'script, style, noscript, template, svg, link, meta';
-const CONSOLE_OPS = new Set(['console']);
-const NETWORK_OPS = new Set(['network']);
+const CAPTURE_LIST_LIMIT = 20;
 const MODIFIER_BITS = { Alt: 1, Control: 2, Meta: 4, Shift: 8 };
 const MODIFIER_DEFS = {
   Alt: { key: 'Alt', code: 'AltLeft', vk: 18 },
@@ -100,6 +99,8 @@ function createToolContext({ session, host, cwd, timeoutMs, textLimit }) {
     consoleMessages: [],
     networkEntries: [],
     networkByRequest: new Map(),
+    captureStartedAt: 0,
+    captureFaults: [],
     dialogPolicy: { accept: true, promptText: '' },
     loadWaiters: [],
     trace: null,
@@ -643,29 +644,61 @@ function describeRemote(arg) {
   return arg.description || arg.type || 'undefined';
 }
 
+// Events stamped before the call started are history the page logged earlier, not this call's events.
+function capturedDuring(ctx, timestamp) {
+  return typeof timestamp !== 'number' || timestamp >= ctx.captureStartedAt;
+}
+
+function stackLines(stackTrace) {
+  const frames = (stackTrace && stackTrace.callFrames) || [];
+  return frames
+    .map((f) => `    at ${f.functionName || '<anonymous>'} (${f.url || '<anonymous>'}:${f.lineNumber + 1}:${f.columnNumber + 1})`)
+    .join('\n');
+}
+
 function attachConsole(ctx, s) {
   const push = (message) => ctx.consoleMessages.push({ msgid: ctx.consoleMessages.length + 1, ...message });
   s.on('Runtime.consoleAPICalled', (p) => {
+    if (!capturedDuring(ctx, p.timestamp)) return;
     const frame = p.stackTrace && p.stackTrace.callFrames && p.stackTrace.callFrames[0];
     push({
-      type: p.type,
-      text: p.args.map(describeRemote).join(' '),
+      kind: 'console',
+      type: p.type === 'assert' ? 'error' : p.type,
+      text: (p.args || []).map(describeRemote).join(' '),
       url: frame ? frame.url || null : null,
       line: frame ? frame.lineNumber + 1 : null,
+      column: frame ? frame.columnNumber + 1 : null,
+      timestamp: p.timestamp ?? null,
     });
   });
   s.on('Runtime.exceptionThrown', (p) => {
+    if (!capturedDuring(ctx, p.timestamp)) return;
     const details = p.exceptionDetails || {};
+    const exception = details.exception || {};
     push({
+      kind: details.text === 'Uncaught (in promise)' ? 'unhandled_rejection' : 'exception',
       type: 'error',
-      text: (details.exception && details.exception.description) || details.text || 'uncaught exception',
+      text: exception.description || exception.value || details.text || 'uncaught exception',
       url: details.url || null,
       line: details.lineNumber != null ? details.lineNumber + 1 : null,
+      column: details.columnNumber != null ? details.columnNumber + 1 : null,
+      timestamp: p.timestamp ?? null,
+      stack: stackLines(details.stackTrace) || null,
     });
   });
   s.on('Log.entryAdded', (p) => {
     const e = p.entry;
-    push({ type: e.level, text: e.text, url: e.url || null, line: e.lineNumber != null ? e.lineNumber + 1 : null, source: e.source });
+    if (!capturedDuring(ctx, e.timestamp)) return;
+    push({
+      kind: 'log',
+      type: e.level === 'verbose' ? 'debug' : e.level,
+      text: e.text,
+      url: e.url || null,
+      line: e.lineNumber != null ? e.lineNumber + 1 : null,
+      column: null,
+      timestamp: e.timestamp ?? null,
+      source: e.source,
+    });
   });
 }
 
@@ -720,6 +753,7 @@ async function attachCapture(ctx, steps) {
   s.on('Page.javascriptDialogOpening', (p) => {
     ctx.consoleMessages.push({
       msgid: ctx.consoleMessages.length + 1,
+      kind: 'dialog',
       type: 'dialog',
       text: `${p.type}: ${p.message}`,
       url: p.url || null,
@@ -740,15 +774,12 @@ async function attachCapture(ctx, steps) {
   });
   await s.send('Page.enable').catch(() => {});
   if (steps.some((step) => TOOL_OPS.has(step.op))) await s.send('DOM.enable').catch(() => {});
-  if (steps.some((step) => CONSOLE_OPS.has(step.op))) {
-    attachConsole(ctx, s);
-    await s.send('Runtime.enable');
-    await s.send('Log.enable').catch(() => {});
-  }
-  if (steps.some((step) => NETWORK_OPS.has(step.op))) {
-    attachNetwork(ctx, s);
-    await s.send('Network.enable');
-  }
+  attachConsole(ctx, s);
+  attachNetwork(ctx, s);
+  ctx.captureStartedAt = Date.now();
+  await Promise.all(['Runtime.enable', 'Log.enable', 'Network.enable'].map((method) => s.send(method).catch((error) => {
+    ctx.captureFaults.push(`${method}: ${error.message}`);
+  })));
   const eventSteps = steps.filter((step) => step.op === 'events');
   for (const step of eventSteps) {
     ctx.eventEntries.set(step, {
@@ -762,6 +793,126 @@ async function attachCapture(ctx, steps) {
   }
   for (const step of eventSteps) {
     await armEventCapture(s, step, ctx.eventEntries.get(step));
+  }
+}
+
+async function disableCapture(ctx) {
+  const s = ctx.session;
+  await Promise.all(['Runtime.disable', 'Log.disable', 'Network.disable'].map((method) =>
+    withDeadline(s.send(method), 500, method).catch(() => {})));
+}
+
+const CAPTURE_DIR_PARTS = ['.gm', 'browser-cdp-capture'];
+const CAPTURE_KEEP_FILES = 100;
+
+function isConsoleError(message) {
+  return message.type === 'error';
+}
+
+function isFailedRequest(entry) {
+  return !!entry.failed || (typeof entry.status === 'number' && entry.status >= 400);
+}
+
+function hostOfUrl(url) {
+  try {
+    const parsed = new URL(url);
+    return parsed.host || parsed.protocol;
+  } catch (_) {
+    return 'unparsed';
+  }
+}
+
+function tally(items, keyOf) {
+  const counts = {};
+  for (const item of items) {
+    const key = String(keyOf(item));
+    counts[key] = (counts[key] || 0) + 1;
+  }
+  return counts;
+}
+
+function consoleView(message) {
+  return {
+    msgid: message.msgid,
+    level: message.type,
+    kind: message.kind,
+    text: message.text,
+    url: message.url ?? null,
+    line: message.line ?? null,
+    column: message.column ?? null,
+    timestamp: message.timestamp ?? null,
+    ...(message.source !== undefined ? { source: message.source } : {}),
+    ...(message.stack ? { stack: message.stack } : {}),
+  };
+}
+
+function failureView(entry) {
+  return {
+    reqid: entry.reqid,
+    method: entry.method,
+    url: entry.url,
+    type: entry.type,
+    status: entry.status,
+    failed: entry.failed || null,
+  };
+}
+
+function pruneCaptureDir(dir) {
+  const files = fs.readdirSync(dir).filter((name) => name.endsWith('.json')).sort();
+  for (const name of files.slice(0, Math.max(0, files.length - CAPTURE_KEEP_FILES))) {
+    try { fs.unlinkSync(path.join(dir, name)); } catch (_) {}
+  }
+}
+
+function notificationFor(error, failure) {
+  if (error) {
+    return { kind: error.kind, level: error.type, text: error.text, url: error.url ?? null, line: error.line ?? null };
+  }
+  if (failure) {
+    const outcome = failure.failed ? `failed: ${failure.failed}` : `HTTP ${failure.status}`;
+    return { kind: 'network', level: 'error', text: `${failure.method} ${failure.url} ${outcome}`, url: failure.url, line: null, status: failure.status ?? null };
+  }
+  return null;
+}
+
+// Writes the call's capture into out. The reply stays small: console_events lists errors (every event with
+// consoleAll), network counts and the first CAPTURE_LIST_LIMIT failing urls. The capture file holds every
+// console event and every failed request (status 400+ or a failed load), and is written only when there are some.
+function finishCapture(ctx, out, options) {
+  const messages = ctx ? ctx.consoleMessages : [];
+  const requests = ctx ? ctx.networkEntries : [];
+  const faults = ctx ? ctx.captureFaults : [];
+  const failures = requests.filter(isFailedRequest);
+  const errors = messages.filter(isConsoleError);
+  out.console_event_count = messages.length;
+  out.console_levels = tally(messages, (message) => message.type);
+  out.console_events = (options.consoleAll ? messages : errors).map(consoleView);
+  out.network = {
+    requests: requests.length,
+    failed: failures.length,
+    by_status: tally(failures, (entry) => (entry.failed ? 'failed' : entry.status)),
+    by_host: tally(failures, (entry) => hostOfUrl(entry.url)),
+    urls: failures.slice(0, CAPTURE_LIST_LIMIT).map((entry) => entry.url),
+  };
+  out.notification_count = errors.length + failures.length;
+  out.notification = notificationFor(errors[0], failures[0]);
+  if (faults.length) out.capture_faults = faults;
+  out.capture_file = null;
+  if (messages.length === 0 && failures.length === 0 && faults.length === 0) return;
+  const dir = path.join(options.cwd, ...CAPTURE_DIR_PARTS);
+  const file = path.join(dir, `${Date.now()}-${process.pid}.json`);
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(file, JSON.stringify({
+      console_events: messages.map(consoleView),
+      network_requests: requests.length,
+      network_failures: failures.map(failureView),
+      capture_faults: faults,
+    }, null, 2));
+    out.capture_file = file;
+    pruneCaptureDir(dir);
+  } catch (e) {
+    out.capture_error = `capture file was not written: ${e.message}`;
   }
 }
 

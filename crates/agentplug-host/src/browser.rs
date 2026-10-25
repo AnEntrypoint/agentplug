@@ -297,13 +297,26 @@ pub struct CdpBrowser {
     pub headful: bool,
     pub expect: Expectation,
     pub timeout: Option<Duration>,
+    pub console_all: bool,
 }
+
+// Reply keys the helper fills from the call's capture (console events, network summary, notification).
+const CAPTURE_REPLY_KEYS: [&str; 8] = [
+    "console_events",
+    "console_event_count",
+    "console_levels",
+    "network",
+    "notification",
+    "notification_count",
+    "capture_file",
+    "capture_faults",
+];
 
 // timeout=<ms> bounds one call's helper run. Default CDP_HELPER_BUDGET.
 const CDP_TIMEOUT_MIN_MS: u64 = 1_000;
 const CDP_TIMEOUT_MAX_MS: u64 = 300_000;
 
-const TOOL_STEP_GRAMMAR: &str ="snapshot, click=<uid>, dblclick=<uid>, hover=<uid>, click_at=<x>,<y>, fill=<uid> <value>, type=<text>, press=<key>, press_uid=<uid> <key>, upload=<uid> <path>[;<path>], wait_for=<text>, reload, back, forward, console, network[=<reqid>], dialog=accept|dismiss, screenshot=<path>, screenshot_full=<path>, screenshot_uid=<uid> <path>, trace_start, trace_stop[=<path>], json <object with an op field>, cdp <Domain.method> (+ JSON params on the next line), events <Domain.event> [where <field>~<value>] [limit=N], wait <ms>";
+const TOOL_STEP_GRAMMAR: &str ="snapshot, click=<uid>, dblclick=<uid>, hover=<uid>, click_at=<x>,<y>, fill=<uid> <value>, type=<text>, press=<key>, press_uid=<uid> <key>, upload=<uid> <path>[;<path>], wait_for=<text>, reload, back, forward, console, console=on, network[=<reqid>], dialog=accept|dismiss, screenshot=<path>, screenshot_full=<path>, screenshot_uid=<uid> <path>, trace_start, trace_stop[=<path>], json <object with an op field>, cdp <Domain.method> (+ JSON params on the next line), events <Domain.event> [where <field>~<value>] [limit=N], wait <ms>";
 
 pub fn parse_cdp_browser_body(body: &str) -> Result<CdpBrowser, String> {
     let mut session = None;
@@ -311,11 +324,16 @@ pub fn parse_cdp_browser_body(body: &str) -> Result<CdpBrowser, String> {
     let headful = true;
     let mut expect = Expectation::default();
     let mut timeout = None;
+    let mut console_all = false;
     let mut steps = Vec::new();
     let mut lines = body.lines().enumerate().peekable();
     while let Some((index, raw)) = lines.next() {
         let line = raw.trim();
         if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if line == "console=on" {
+            console_all = true;
             continue;
         }
         let number = index + 1;
@@ -406,6 +424,7 @@ pub fn parse_cdp_browser_body(body: &str) -> Result<CdpBrowser, String> {
         headful,
         expect,
         timeout,
+        console_all,
     })
 }
 
@@ -1024,7 +1043,14 @@ fn run_helper_with(
     })
 }
 
+// A failed call always names its error: a helper that stated none, or exited without a result, is described by
+// its exit code and the tail of its stderr rather than an empty string.
 pub fn browser_error_reply(engine: &str, headless: bool, started: Instant, error: String) -> Value {
+    let error = if error.trim().is_empty() {
+        "browser call failed without an error message".to_string()
+    } else {
+        error
+    };
     json!({
         "ok": false,
         "engine": engine,
@@ -1036,8 +1062,42 @@ pub fn browser_error_reply(engine: &str, headless: bool, started: Instant, error
         "timed_out": false,
         "target_id": null,
         "pages": [],
+        "failed_step": null,
+        "failed_action": null,
         "error": error,
     })
+}
+
+fn helper_failure_text(result: &Value, run: &HelperRun) -> String {
+    let stated = result
+        .get("error")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty());
+    let stderr = run.stderr.trim();
+    let tail: String = stderr
+        .chars()
+        .skip(stderr.chars().count().saturating_sub(400))
+        .collect();
+    let detail = if tail.is_empty() {
+        String::new()
+    } else {
+        format!("; stderr: {tail}")
+    };
+    if run.timed_out {
+        let stated = stated.map(|text| format!(": {text}")).unwrap_or_default();
+        return format!("browser helper exceeded its time budget and was killed{stated}{detail}");
+    }
+    match stated {
+        Some(text) => text.to_string(),
+        None if result.is_null() => {
+            format!("browser helper printed no result (exit code {:?}){detail}", run.exit_code)
+        }
+        None => format!(
+            "browser helper reported a failure with no error text (exit code {:?}){detail}",
+            run.exit_code
+        ),
+    }
 }
 
 pub fn browser_reply_from_run(
@@ -1051,23 +1111,16 @@ pub fn browser_reply_from_run(
     let ok = !run.timed_out && run.exit_code == Some(0) && helper_ok;
     let error = if ok {
         Value::Null
-    } else if run.timed_out {
-        json!("browser helper exceeded its time budget and was killed")
     } else {
-        match result.get("error").filter(|e| !e.is_null()) {
-            Some(e) => e.clone(),
-            None => json!(format!(
-                "browser helper exited with {:?} without a result: {}",
-                run.exit_code,
-                run.stderr.trim()
-            )),
-        }
+        json!(helper_failure_text(&result, &run))
     };
     let target_id = result.get("targetId").cloned().unwrap_or(Value::Null);
     let pages = result.get("pages").cloned().unwrap_or_else(|| json!([]));
     let steps = result.get("steps").cloned().unwrap_or_else(|| json!([]));
     let tab = result.get("tab").cloned().unwrap_or(Value::Null);
-    json!({
+    let failed_step = result.get("failed_step").cloned().unwrap_or(Value::Null);
+    let failed_action = result.get("failed_action").cloned().unwrap_or(Value::Null);
+    let mut reply = json!({
         "ok": ok,
         "engine": engine,
         "headless": headless,
@@ -1080,8 +1133,16 @@ pub fn browser_reply_from_run(
         "pages": pages,
         "steps": steps,
         "tab": tab,
+        "failed_step": failed_step,
+        "failed_action": failed_action,
         "error": error,
-    })
+    });
+    if let Some(obj) = reply.as_object_mut() {
+        for key in CAPTURE_REPLY_KEYS {
+            obj.insert(key.to_string(), result.get(key).cloned().unwrap_or(Value::Null));
+        }
+    }
+    reply
 }
 
 // One cdp call has one budget (timeout=<ms>, default CDP_HELPER_BUDGET) that covers the lease wait, the
@@ -1181,7 +1242,7 @@ fn browser_cdp_run(
         None,
         &parsed.steps,
         remaining,
-        cdp_run_config(cwd, parsed.session.as_deref(), parsed.isolated, remaining),
+        cdp_run_config(cwd, parsed.session.as_deref(), parsed.isolated, parsed.console_all, remaining),
     );
     drop(attendance);
     let mut reply = match run {
@@ -1497,11 +1558,18 @@ fn check_expectations(
     }
 }
 
-fn cdp_run_config(cwd: &Path, session: Option<&str>, isolated: bool, budget: Duration) -> Value {
+fn cdp_run_config(
+    cwd: &Path,
+    session: Option<&str>,
+    isolated: bool,
+    console_all: bool,
+    budget: Duration,
+) -> Value {
     let mut config = json!({
         "cwd": cwd.display().to_string(),
         "watchdogMs": budget.as_millis() as u64 + 1_000,
         "partialFile": partial_result_file(cwd).display().to_string(),
+        "consoleAll": console_all,
     });
     if let Some(name) = session {
         config["session"] = json!({
