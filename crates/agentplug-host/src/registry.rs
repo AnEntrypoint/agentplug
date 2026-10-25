@@ -58,7 +58,7 @@ fn caller_supplied_deadline_secs(body: &str) -> Option<u64> {
 
 pub(crate) fn deadline_secs_for_call(plugin_name: &str, verb: &str, body: &str) -> u64 {
     caller_supplied_deadline_secs(body).unwrap_or_else(|| match verb {
-        "git_fetch" => git_fetch_deadline_secs(body),
+        "git_fetch" | "git_push" => git_fetch_deadline_secs(body),
         _ => dispatch_call_deadline_secs(plugin_name),
     })
 }
