@@ -22,8 +22,19 @@ pub const DISPATCH_CALL_DEADLINE_SECS: u64 = 120;
 
 pub const BERT_DISPATCH_CALL_DEADLINE_SECS: u64 = 1200;
 
-// Above the git child budget (300 s, imports.rs git_subprocess_timeout_ms_for), so a slow fetch ends as a git error, not as a call deadline.
+// The git_fetch call deadline without a fetch_timeout_seconds body key; the git child budget for fetch is at least 600 s (imports.rs), so the call deadline ends the fetch.
 pub const GIT_FETCH_CALL_DEADLINE_SECS: u64 = 360;
+
+const GIT_FETCH_CALL_DEADLINE_MIN_SECS: u64 = 120;
+const GIT_FETCH_CALL_DEADLINE_MAX_SECS: u64 = 600;
+
+fn git_fetch_deadline_secs(body: &str) -> u64 {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v.get("fetch_timeout_seconds").and_then(|d| d.as_u64()))
+        .map(|s| s.clamp(GIT_FETCH_CALL_DEADLINE_MIN_SECS, GIT_FETCH_CALL_DEADLINE_MAX_SECS))
+        .unwrap_or(GIT_FETCH_CALL_DEADLINE_SECS)
+}
 
 fn dispatch_call_deadline_secs(plugin_name: &str) -> u64 {
     match plugin_name {
@@ -47,7 +58,7 @@ fn caller_supplied_deadline_secs(body: &str) -> Option<u64> {
 
 pub(crate) fn deadline_secs_for_call(plugin_name: &str, verb: &str, body: &str) -> u64 {
     caller_supplied_deadline_secs(body).unwrap_or_else(|| match verb {
-        "git_fetch" => GIT_FETCH_CALL_DEADLINE_SECS,
+        "git_fetch" => git_fetch_deadline_secs(body),
         _ => dispatch_call_deadline_secs(plugin_name),
     })
 }

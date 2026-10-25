@@ -421,6 +421,9 @@ const GIT_PUSH_SUBPROCESS_TIMEOUT_MS_DEFAULT: u64 = 120_000;
 /// Budget for one git child. A push is capped at 120 s (AGENTPLUG_GIT_PUSH_TIMEOUT_MS overrides it), so a hung push
 /// releases the git lane sooner; clone and fetch keep the full git budget.
 pub fn git_subprocess_timeout_ms_for(argv: &[String]) -> u64 {
+    if git_argv_subcommand(argv) == Some("fetch") {
+        return git_subprocess_timeout_ms().max(600_000);
+    }
     if git_argv_subcommand(argv) != Some("push") {
         return git_subprocess_timeout_ms();
     }
