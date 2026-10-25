@@ -22,6 +22,9 @@ pub const DISPATCH_CALL_DEADLINE_SECS: u64 = 120;
 
 pub const BERT_DISPATCH_CALL_DEADLINE_SECS: u64 = 1200;
 
+// Above the git child budget (300 s, imports.rs git_subprocess_timeout_ms_for), so a slow fetch ends as a git error, not as a call deadline.
+pub const GIT_FETCH_CALL_DEADLINE_SECS: u64 = 360;
+
 fn dispatch_call_deadline_secs(plugin_name: &str) -> u64 {
     match plugin_name {
         "bert" => BERT_DISPATCH_CALL_DEADLINE_SECS,
@@ -42,8 +45,11 @@ fn caller_supplied_deadline_secs(body: &str) -> Option<u64> {
         .map(|s| s.min(CALLER_SUPPLIED_DEADLINE_CEILING_SECS))
 }
 
-pub(crate) fn deadline_secs_for_call(plugin_name: &str, body: &str) -> u64 {
-    caller_supplied_deadline_secs(body).unwrap_or_else(|| dispatch_call_deadline_secs(plugin_name))
+pub(crate) fn deadline_secs_for_call(plugin_name: &str, verb: &str, body: &str) -> u64 {
+    caller_supplied_deadline_secs(body).unwrap_or_else(|| match verb {
+        "git_fetch" => GIT_FETCH_CALL_DEADLINE_SECS,
+        _ => dispatch_call_deadline_secs(plugin_name),
+    })
 }
 
 pub const RELEASABLE_SHARED_PLUGINS: [&str; 3] = ["bert", "treesitter", "gm"];
@@ -1534,7 +1540,7 @@ fn dispatch_on_here(
     if is_stateless_shared_plugin(&plugin_name) {
         crate::memory_pressure::note_shared_plugin_dispatch();
     }
-    let call_deadline_secs = deadline_secs_for_call(&plugin_name, body);
+    let call_deadline_secs = deadline_secs_for_call(&plugin_name, verb, body);
     store.data().set_call_deadline_secs(call_deadline_secs);
     store.set_epoch_deadline(epoch_ticks_for_seconds(call_deadline_secs));
     let alloc = instance.get_typed_func::<u32, u32>(&mut *store, "plugkit_alloc")?;

@@ -471,7 +471,7 @@ pub async fn dispatch_component_verb(
     verb: &str,
     body: &str,
 ) -> anyhow::Result<String> {
-    let deadline_secs = crate::registry::deadline_secs_for_call(plugin_name, body);
+    let deadline_secs = crate::registry::deadline_secs_for_call(plugin_name, verb, body);
     let mut store = wasmtime::Store::new(engine, ComponentState::new(cwd.to_path_buf(), plugin_name.to_string(), siblings.clone()));
     store.set_epoch_deadline(crate::registry::epoch_ticks_for_seconds(deadline_secs));
     let instance = linker.instantiate_async(&mut store, component).await?;
