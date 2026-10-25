@@ -597,6 +597,16 @@ function consoleClear(ctx) {
   return { op: 'console_clear', cleared };
 }
 
+// An HTTP error is a response with status 400 or more, whatever loadingFailed said after it. A transport
+// failure is a loadingFailed on a request with no HTTP error status (DNS, abort, CORS, no response).
+function httpErrorStatus(entry) {
+  return typeof entry.status === 'number' && entry.status >= 400;
+}
+
+function transportFailed(entry) {
+  return !!entry.failed && !httpErrorStatus(entry);
+}
+
 function networkSummary(entry) {
   return {
     reqid: entry.reqid,
@@ -604,7 +614,7 @@ function networkSummary(entry) {
     url: entry.url,
     type: entry.type,
     status: entry.status,
-    failed: entry.failed,
+    failed: transportFailed(entry) ? entry.failed : null,
     bytes: entry.bytes,
   };
 }
@@ -735,6 +745,11 @@ function attachNetwork(ctx, s) {
     entry.mimeType = p.response.mimeType;
     entry.responseHeaders = p.response.headers || {};
   });
+  s.on('Network.responseReceivedExtraInfo', (p) => {
+    const entry = ctx.networkByRequest.get(p.requestId);
+    if (!entry || entry.status !== null || typeof p.statusCode !== 'number') return;
+    entry.status = p.statusCode;
+  });
   s.on('Network.loadingFinished', (p) => {
     const entry = ctx.networkByRequest.get(p.requestId);
     if (!entry) return;
@@ -809,8 +824,13 @@ function isConsoleError(message) {
   return message.type === 'error';
 }
 
+// by_status key: the HTTP status of an HTTP error, else 'failed' for a transport failure.
+function failureKey(entry) {
+  return httpErrorStatus(entry) ? String(entry.status) : 'failed';
+}
+
 function isFailedRequest(entry) {
-  return !!entry.failed || (typeof entry.status === 'number' && entry.status >= 400);
+  return httpErrorStatus(entry) || transportFailed(entry);
 }
 
 function hostOfUrl(url) {
@@ -853,7 +873,7 @@ function failureView(entry) {
     url: entry.url,
     type: entry.type,
     status: entry.status,
-    failed: entry.failed || null,
+    failed: transportFailed(entry) ? entry.failed : null,
   };
 }
 
@@ -869,7 +889,7 @@ function notificationFor(error, failure) {
     return { kind: error.kind, level: error.type, text: error.text, url: error.url ?? null, line: error.line ?? null };
   }
   if (failure) {
-    const outcome = failure.failed ? `failed: ${failure.failed}` : `HTTP ${failure.status}`;
+    const outcome = httpErrorStatus(failure) ? `HTTP ${failure.status}` : `failed: ${failure.failed}`;
     return { kind: 'network', level: 'error', text: `${failure.method} ${failure.url} ${outcome}`, url: failure.url, line: null, status: failure.status ?? null };
   }
   return null;
@@ -889,8 +909,8 @@ function finishCapture(ctx, out, options) {
   out.console_events = (options.consoleAll ? messages : errors).map(consoleView);
   out.network = {
     requests: requests.length,
-    failed: failures.length,
-    by_status: tally(failures, (entry) => (entry.failed ? 'failed' : entry.status)),
+    failed: failures.filter(transportFailed).length,
+    by_status: tally(failures, failureKey),
     by_host: tally(failures, (entry) => hostOfUrl(entry.url)),
     urls: failures.slice(0, CAPTURE_LIST_LIMIT).map((entry) => entry.url),
   };
