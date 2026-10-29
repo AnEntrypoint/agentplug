@@ -4059,7 +4059,6 @@ fn spawn_update_poll_worker(
         let runner_update_poll_interval = daemon_cfg.runner_update_poll_interval();
         let mut last_runner_update_poll = seed_poll_timer_from_persisted_ts(&persisted_runner_poll_ts_path());
         let mut first_runner_poll_pending = true;
-        let mut last_skill_refresh: Option<Instant> = None;
         let persisted_runner_poll_ts_at_boot = read_persisted_poll_ts(&persisted_runner_poll_ts_path());
         if persisted_runner_poll_ts_at_boot > 0 {
             HEARTBEAT_LAST_RUNNER_POLL_TS.store(persisted_runner_poll_ts_at_boot, std::sync::atomic::Ordering::Relaxed);
@@ -4106,13 +4105,6 @@ fn spawn_update_poll_worker(
                     }
                 }
                 record_plugin_poll_error(if cycle_errors.is_empty() { None } else { Some(cycle_errors.join("; ")) });
-            }
-
-            if last_skill_refresh.is_none_or(|at| at.elapsed() >= crate::download::SKILL_REFRESH_INTERVAL) {
-                last_skill_refresh = Some(Instant::now());
-                if let Err(e) = crate::download::refresh_installed_skills() {
-                    eprintln!("[agentplug daemon] skill refresh failed: {e:#}");
-                }
             }
 
             if first_runner_poll_pending || last_runner_update_poll.elapsed() >= runner_update_poll_interval || take_forced_runner_refresh_request() {

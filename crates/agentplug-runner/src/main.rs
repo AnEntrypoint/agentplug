@@ -2096,8 +2096,7 @@ fn selfcheck_spawn_backoff() -> anyhow::Result<()> {
     println!("[{NAME}] the lock-serialised counter keeps every increment: PASS");
     Ok(())
 }
-// Reads the release channel for the runner, every loaded plugin and the skill manifest, without staging,
-// installing or writing anything except the skill manifest cache the daemon already keeps.
+// Reads the release channel for the runner and every loaded plugin, without staging, installing or writing anything.
 fn selfcheck_update_probes() -> anyhow::Result<()> {
     const NAME: &str = "selfcheck-update-probes";
     let mut problems: Vec<String> = Vec::new();
@@ -2116,10 +2115,6 @@ fn selfcheck_update_probes() -> anyhow::Result<()> {
             Ok(None) => problems.push(format!("plugin {plugin}: no latest release resolved")),
             Err(e) => problems.push(format!("plugin {plugin}: probe failed: {e:#}")),
         }
-    }
-    match download::skill_manifest_status() {
-        Ok(status) => println!("skill manifest: {status}"),
-        Err(e) => problems.push(format!("skill manifest: {e:#}")),
     }
     if problems.is_empty() {
         println!("RESULT: PASS");

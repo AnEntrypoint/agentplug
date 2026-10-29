@@ -103,7 +103,6 @@ Moved from crates/agentplug-runner source comments (checked against source at 15
 - Shared payload cache keyed by sha256 (the release `.wasm.sha256` sidecar is the identity): one copy per hash under the real home, never `install_dir()`. Each home's `plugins/<name>.wasm` is a hard link to it, with copy as fallback. A hit is served only after its bytes re-hash. Entries unused past their bound are removed; live links keep their data.
 - No writer mutates `plugins/<name>.wasm` in place: writes and rollbacks use temp plus rename (`write_download_atomically`, `record_plugin_load_failure_and_rollback`), so a shared inode is replaced, never written through.
 - Staged names are `<exe>.new` or `<exe>.new2`; any staged suffix is stripped first, so a copy is overwritten, not chained.
-- A junction or symlink to an installed skill means the source tree is the install; its SKILL.md is never overwritten.
 - `source-head` in the release body names the commit recorded in `plugins/<name>.build.json`. A failure there never fails an install.
 - A version file with a UTF-8 BOM is stripped before any semver compare.
 
