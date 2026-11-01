@@ -714,6 +714,9 @@ pub fn claim_ownership() -> bool {
     installed
 }
 
+const TAKEOVER_LOCK_WAIT_MS: u64 = 15_000;
+const OWNERSHIP_CLAIM_WAIT_MS: u64 = 30_000;
+
 /// Takes the stale-owner takeover lock for one claim; the lock is held while the returned value lives.
 /// On unix it is an exclusive flock on takeover.lock, which is never removed: the kernel drops the lock
 /// when the holder exits, so a crashed taker cannot leave a lock that a second taker steals.
@@ -726,9 +729,17 @@ fn acquire_takeover(takeover_lock: &Path) -> Option<fs::File> {
         .truncate(false)
         .open(takeover_lock)
         .ok()?;
-    // SAFETY: `file` owns the descriptor and stays open until the caller drops the returned File.
-    let locked = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0;
-    locked.then_some(file)
+    let deadline = std::time::Instant::now() + Duration::from_millis(TAKEOVER_LOCK_WAIT_MS);
+    loop {
+        // SAFETY: `file` owns the descriptor and stays open until the caller drops the returned File.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return Some(file);
+        }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 /// Off unix there is no flock here: the lock is a create-new file, removed when the guard drops.
@@ -751,22 +762,42 @@ fn acquire_takeover(takeover_lock: &Path) -> Option<TakeoverFile> {
             .open(takeover_lock)
             .is_ok()
     };
-    if !create() {
+    let deadline = std::time::Instant::now() + Duration::from_millis(TAKEOVER_LOCK_WAIT_MS);
+    loop {
+        if create() {
+            return Some(TakeoverFile(takeover_lock.to_path_buf()));
+        }
         let lock_stale = fs::metadata(takeover_lock)
             .and_then(|m| m.modified())
             .ok()
             .and_then(|t| t.elapsed().ok())
             .map(|age| age >= Duration::from_millis(DAEMON_STALE_MS))
             .unwrap_or(false);
-        if !lock_stale {
+        if lock_stale {
+            let _ = fs::remove_file(takeover_lock);
+            if create() {
+                return Some(TakeoverFile(takeover_lock.to_path_buf()));
+            }
+        }
+        if std::time::Instant::now() >= deadline {
             return None;
         }
-        let _ = fs::remove_file(takeover_lock);
-        if !create() {
-            return None;
-        }
+        std::thread::sleep(Duration::from_millis(50));
     }
-    Some(TakeoverFile(takeover_lock.to_path_buf()))
+}
+
+fn claim_ownership_when_free() -> bool {
+    let deadline = std::time::Instant::now() + Duration::from_millis(OWNERSHIP_CLAIM_WAIT_MS);
+    loop {
+        if claim_ownership() {
+            return true;
+        }
+        let owner_alive = read_owner_pid().is_some_and(pid_is_alive);
+        if owner_alive || std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
 }
 
 fn install_stale_owner(owner_path: &Path, observed_pid: Option<u64>, my_pid: u64) -> bool {
@@ -3981,7 +4012,7 @@ pub fn run_daemon() -> anyhow::Result<()> {
         registry_path().display()
     );
 
-    if !claim_ownership() {
+    if !claim_ownership_when_free() {
         record_wasted_daemon_start();
         let existing_pid = read_owner_pid();
         eprintln!(
@@ -4138,6 +4169,7 @@ fn spawn_update_poll_worker(
 }
 
 fn run_daemon_body(mut plugin_modules: PluginModules) -> anyhow::Result<()> {
+    let _ = fs::remove_file(stop_request_path());
     configure_github_cli_config_dir();
     HEARTBEAT_DAEMON_BOOT_TS.store(now_ms(), std::sync::atomic::Ordering::Relaxed);
     write_daemon_heartbeat(0, 0);
