@@ -632,6 +632,7 @@ pub fn run(code: &str, opts: &Value, cwd: &Path) -> Value {
 }
 
 pub(crate) fn configure_execution_environment(command: &mut Command) {
+    command.env("PYTHONUNBUFFERED", "1");
     if std::env::var_os("XDG_RUNTIME_DIR").is_none() {
         if let Some(directory) = &login_environment().runtime_directory {
             command.env("XDG_RUNTIME_DIR", directory);
