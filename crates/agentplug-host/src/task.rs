@@ -24,6 +24,9 @@ struct TaskEntry {
     // Set when the deadline killed the task, so its reply carries the same exec_timeout label as a
     // foreground timeout (exec_js.rs) instead of a bare exit_code -1.
     timed_out: bool,
+    // Adopted background children only: reaped once no caller has polled them for ORPHAN_IDLE_MS.
+    idle_deadline: Option<Instant>,
+    orphaned: bool,
 }
 
 pub(crate) struct DrainedPipe {
@@ -81,6 +84,21 @@ impl DrainedPipe {
 }
 
 const ADOPTED_TASK_TIMEOUT_MS: u64 = 30 * 60 * 1000;
+const ORPHAN_IDLE_MS: u64 = 120_000;
+
+fn orphan_reap_at(from: Instant, deadline: Instant) -> Instant {
+    (from + Duration::from_millis(ORPHAN_IDLE_MS)).min(deadline)
+}
+
+fn touch_orphan_clock(entry: &mut TaskEntry) {
+    if entry.finished_ms.is_some() {
+        return;
+    }
+    let deadline = entry.deadline;
+    if let Some(idle) = entry.idle_deadline.as_mut() {
+        *idle = orphan_reap_at(Instant::now(), deadline);
+    }
+}
 
 fn deadline_after(started: Instant, timeout_ms: u64) -> Option<Instant> {
     started.checked_add(Duration::from_millis(timeout_ms))
@@ -365,7 +383,10 @@ fn poll_entry(entry: &mut TaskEntry) {
             harvest_finished_drains(entry);
         }
         Ok(None) => {
-            if Instant::now() >= entry.deadline {
+            let now = Instant::now();
+            let idle_expired = entry.idle_deadline.is_some_and(|idle| now >= idle);
+            if now >= entry.deadline || idle_expired {
+                entry.orphaned = idle_expired && now < entry.deadline;
                 crate::process_tree::terminate_containment(&entry.containment, entry.child.id());
                 let _ = entry.child.kill();
                 let _ = entry.child.wait();
@@ -380,7 +401,7 @@ fn poll_entry(entry: &mut TaskEntry) {
                     }
                 }
                 entry.exit_code = Some(-1);
-                entry.timed_out = true;
+                entry.timed_out = !entry.orphaned;
                 entry.finished_ms = Some(now_ms());
                 harvest_finished_drains(entry);
             }
@@ -399,15 +420,16 @@ pub(crate) fn adopt_running(
     stderr_pipe: Option<DrainedPipe>,
 ) -> Result<String, String> {
     let started_ms = now_ms().saturating_sub(started.elapsed().as_millis() as u64);
+    // The caller's child budget (limit_ms) counts from the start of the call, so a child that moves
+    // to background is still killed at that deadline; the 30 min ceiling only caps larger budgets.
+    let deadline = deadline_after(started, timeout_ms.min(ADOPTED_TASK_TIMEOUT_MS))
+        .expect("adopted task timeout fits Instant");
     let entry = TaskEntry {
         child,
         containment,
         lang: lang.to_string(),
         started_ms,
-        // The caller's child budget (limit_ms) counts from the start of the call, so a child that moves
-        // to background is still killed at that deadline; the 30 min ceiling only caps larger budgets.
-        deadline: deadline_after(started, timeout_ms.min(ADOPTED_TASK_TIMEOUT_MS))
-            .expect("adopted task timeout fits Instant"),
+        deadline,
         stdout_pipe,
         stderr_pipe,
         stdout: Vec::new(),
@@ -415,6 +437,8 @@ pub(crate) fn adopt_running(
         exit_code: None,
         finished_ms: None,
         timed_out: false,
+        idle_deadline: Some(orphan_reap_at(Instant::now(), deadline)),
+        orphaned: false,
     };
     register_task(entry)
 }
@@ -537,6 +561,8 @@ fn spawn(params: &Value, cwd: &Path) -> Value {
         exit_code: None,
         finished_ms: None,
         timed_out: false,
+        idle_deadline: None,
+        orphaned: false,
     };
     let id = match register_task(entry) {
         Ok(id) => id,
@@ -553,6 +579,7 @@ fn list(params: &Value) -> Value {
     let mut tasks = Vec::new();
     for id in ids {
         if let Some(entry) = reg.get_mut(&id) {
+            touch_orphan_clock(entry);
             poll_entry(entry);
             tasks.push(entry_summary(&id, entry));
         }
@@ -591,6 +618,7 @@ fn output(params: &Value) -> Value {
             }
         };
     };
+    touch_orphan_clock(entry);
     poll_entry(entry);
     let tail = |buf: &[u8]| -> String {
         let start = buf.len().saturating_sub(max_bytes);
@@ -616,6 +644,9 @@ fn output(params: &Value) -> Value {
         "running": entry.finished_ms.is_none(),
         "exit_code": entry.exit_code,
     });
+    if entry.orphaned {
+        reply["orphaned"] = json!(true);
+    }
     if entry.timed_out {
         timeout_label(&mut reply);
     }
