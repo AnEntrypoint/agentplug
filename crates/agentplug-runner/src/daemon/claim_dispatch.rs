@@ -5,6 +5,29 @@ use std::sync::Arc;
 
 pub(crate) type InFlightKey = (PathBuf, String, String);
 
+/// Caps how many gm dispatch threads run a verb at once, at most four. A thread past the cap waits on a condvar and uses no CPU.
+static GM_DISPATCH_RUNNING: std::sync::Mutex<usize> = std::sync::Mutex::new(0);
+static GM_DISPATCH_RUNNING_RELEASED: std::sync::Condvar = std::sync::Condvar::new();
+
+struct GmDispatchRunSlot;
+
+fn acquire_gm_dispatch_run_slot() -> GmDispatchRunSlot {
+    let limit = super::GM_PROCESSOR_CAPACITY.load(std::sync::atomic::Ordering::Relaxed).clamp(1, 4);
+    let mut running = GM_DISPATCH_RUNNING.lock().unwrap_or_else(|e| e.into_inner());
+    while *running >= limit {
+        running = GM_DISPATCH_RUNNING_RELEASED.wait(running).unwrap_or_else(|e| e.into_inner());
+    }
+    *running += 1;
+    GmDispatchRunSlot
+}
+
+impl Drop for GmDispatchRunSlot {
+    fn drop(&mut self) {
+        *GM_DISPATCH_RUNNING.lock().unwrap_or_else(|e| e.into_inner()) -= 1;
+        GM_DISPATCH_RUNNING_RELEASED.notify_one();
+    }
+}
+
 pub(crate) struct InFlightHandle {
     pub(crate) detach: Arc<std::sync::atomic::AtomicBool>,
 }
@@ -4328,6 +4351,7 @@ pub(super) fn dispatch_project(
                     .name(format!("gm-dispatch-{}", req.task))
                     .spawn(move || {
                         let _release_in_flight_entry = InFlightEntryRelease { key };
+                        let _run_slot = acquire_gm_dispatch_run_slot();
                         run_gm_dispatch_to_file(
                             &thread_root,
                             &self_healing_dispatch_handle,
