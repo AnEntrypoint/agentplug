@@ -2702,6 +2702,7 @@ fn write_project_heartbeat_with_queue_info(
         map.remove("runner_update_in_progress");
         map.remove("runner_update_staged_age_ms");
         map.remove("runner_update_handoff_backed_off");
+        map.remove("runner_update_waiting_ms");
     }
     match crate::daemon::claim_dispatch::foreign_host_spool_sweeper(&spool_dir) {
         Some(pid) => {
