@@ -940,17 +940,24 @@ fn macos_chrome_candidates() -> Vec<PathBuf> {
 
 #[cfg(not(any(windows, target_os = "macos")))]
 fn linux_chrome_candidates() -> Vec<PathBuf> {
-    [
-        "/usr/bin/google-chrome-stable",
-        "/usr/bin/google-chrome",
-        "/opt/google/chrome/chrome",
-        "/usr/bin/chromium",
-        "/usr/bin/chromium-browser",
-        "/snap/bin/chromium",
-    ]
-    .iter()
-    .map(PathBuf::from)
-    .collect()
+    let host_chrome_launcher = Path::new("/usr/bin/google-chrome-stable")
+        .is_file()
+        .then(|| PathBuf::from("/data/cache/bin/google-chrome"));
+    host_chrome_launcher
+        .into_iter()
+        .chain(
+            [
+                "/usr/bin/google-chrome-stable",
+                "/usr/bin/google-chrome",
+                "/opt/google/chrome/chrome",
+                "/usr/bin/chromium",
+                "/usr/bin/chromium-browser",
+                "/data/cache/bin/chromium",
+            ]
+            .into_iter()
+            .map(PathBuf::from),
+        )
+        .collect()
 }
 
 pub(crate) fn find_chrome() -> Option<PathBuf> {
