@@ -85,6 +85,10 @@ impl DrainedPipe {
 
 const ADOPTED_TASK_TIMEOUT_MS: u64 = 30 * 60 * 1000;
 const ORPHAN_IDLE_MS: u64 = 120_000;
+// task-spawn's WASM wrapper clamps an omitted timeoutMs to this cap before it
+// reaches host_task("spawn"). A direct host call must not get a shorter budget
+// than the verb advertises, so the fallback matches that cap.
+const SPAWN_DEFAULT_TIMEOUT_MS: u64 = 30 * 60 * 1000;
 
 fn orphan_reap_at(from: Instant, deadline: Instant) -> Instant {
     // An adopted child's declared limit_ms is authoritative. A caller that never polls
@@ -483,11 +487,10 @@ fn resolve_cwd(params: &Value, cwd: &Path) -> Result<PathBuf, String> {
 fn spawn(params: &Value, cwd: &Path) -> Value {
     let lang = params.get("lang").and_then(|v| v.as_str()).unwrap_or("");
     let code = params.get("code").and_then(|v| v.as_str()).unwrap_or("");
-    let agent_spawn = matches!(lang, "agent" | "claude");
     let timeout_ms = params
         .get("timeoutMs")
         .and_then(|v| v.as_u64())
-        .unwrap_or(if agent_spawn { 1_800_000 } else { 120_000 });
+        .unwrap_or(SPAWN_DEFAULT_TIMEOUT_MS);
     if lang.is_empty() {
         return json!({"ok": false, "error": "lang required"});
     }
@@ -776,6 +779,43 @@ mod tests {
         assert!(
             refreshed >= deadline,
             "a refreshed orphan clock must not move the reap ahead of the declared limit"
+        );
+    }
+
+    #[test]
+    fn spawn_without_timeout_uses_the_declared_cap() {
+        let _guard = super::test_registry_guard();
+        let spawned = super::handle(
+            "spawn",
+            &json!({"lang": "bash", "code": "sleep 30"}),
+            Path::new("."),
+        );
+        assert_eq!(
+            spawned.get("ok").and_then(|value| value.as_bool()),
+            Some(true)
+        );
+        let id = spawned
+            .get("id")
+            .and_then(|value| value.as_str())
+            .expect("spawn returns a task id")
+            .to_string();
+        let remaining_ms = {
+            let reg = super::registry().lock().unwrap();
+            reg.get(&id)
+                .expect("spawned task is registered")
+                .deadline
+                .saturating_duration_since(Instant::now())
+                .as_millis() as u64
+        };
+        const DECLARED_CAP_MS: u64 = 30 * 60 * 1000;
+        assert!(
+            remaining_ms >= DECLARED_CAP_MS - 5_000,
+            "an omitted timeoutMs must not truncate a spawned task to 120 s (got {remaining_ms} ms)"
+        );
+        let stopped = super::handle("stop", &json!({"id": id}), Path::new("."));
+        assert_eq!(
+            stopped.get("ok").and_then(|value| value.as_bool()),
+            Some(true)
         );
     }
 
