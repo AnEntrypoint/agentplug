@@ -87,7 +87,11 @@ const ADOPTED_TASK_TIMEOUT_MS: u64 = 30 * 60 * 1000;
 const ORPHAN_IDLE_MS: u64 = 120_000;
 
 fn orphan_reap_at(from: Instant, deadline: Instant) -> Instant {
-    (from + Duration::from_millis(ORPHAN_IDLE_MS)).min(deadline)
+    // An adopted child's declared limit_ms is authoritative. A caller that never polls
+    // task-output/task-list is quiet, not gone: clamping to the earlier of the two used
+    // to kill in_progress tasks 120 s into a 300 s budget. Reap no earlier than the
+    // declared deadline, which poll_entry enforces on its own.
+    (from + Duration::from_millis(ORPHAN_IDLE_MS)).max(deadline)
 }
 
 fn touch_orphan_clock(entry: &mut TaskEntry) {
@@ -756,6 +760,22 @@ mod tests {
                 .unwrap()
                 .duration_since(started),
             Duration::from_millis(super::ADOPTED_TASK_TIMEOUT_MS),
+        );
+    }
+
+    #[test]
+    fn orphan_reap_never_shortens_declared_limit() {
+        let from = Instant::now();
+        let deadline = super::deadline_after(from, 300_000).unwrap();
+        assert_eq!(
+            super::orphan_reap_at(from, deadline),
+            deadline,
+            "a quiet caller must not reap an in_progress task before its declared limit_ms"
+        );
+        let refreshed = super::orphan_reap_at(from + Duration::from_millis(200_000), deadline);
+        assert!(
+            refreshed >= deadline,
+            "a refreshed orphan clock must not move the reap ahead of the declared limit"
         );
     }
 
